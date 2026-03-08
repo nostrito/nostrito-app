@@ -22,5 +22,5 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 nostr-sdk = "0.36"
 tokio-tungstenite = "0.21"
 anyhow = "1"
-tracing = "1"
-tracing-subscriber = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
