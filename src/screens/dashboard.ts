@@ -170,16 +170,25 @@ async function loadStats(): Promise<void> {
     setTextContent("dash-sync-rate", status.sync_tier > 0 ? "~syncing" : "idle");
     setTextContent("dash-uptime", uptimeStr);
 
-    // Relay badge
+    // Relay badge — show URL when running
+    const relayUrl = `ws://localhost:${status.relay_port}`;
     const badge = document.getElementById("dash-relay-badge");
     if (badge) {
       if (status.relay_running) {
-        badge.innerHTML = `<span class="status-dot"></span> Live`;
+        badge.innerHTML = `<span class="status-dot"></span> ${relayUrl}`;
         badge.className = "status-badge";
       } else {
         badge.innerHTML = `○ Offline`;
         badge.className = "status-badge offline";
       }
+    }
+
+    // Update titlebar to show relay URL
+    const titleEl = document.getElementById("titlebar-title");
+    if (titleEl) {
+      titleEl.textContent = status.relay_running
+        ? `nostrito — ${relayUrl}`
+        : `nostrito — Dashboard`;
     }
 
     // Sync tiers

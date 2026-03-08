@@ -77,6 +77,24 @@ export function renderSettings(container: HTMLElement): void {
           <div class="settings-field"><div class="settings-field-info"><span class="settings-field-label">Relay port</span><span class="settings-field-desc">Local WebSocket relay port</span></div><span style="font-family:var(--mono);font-size:0.85rem;color:var(--text-dim)" id="settings-port">—</span></div>
           <div class="settings-field"><div class="settings-field-info"><span class="settings-field-label">Auto-start</span><span class="settings-field-desc">Start nostrito on login</span></div><label class="toggle"><input type="checkbox" id="settings-autostart"><span class="toggle-slider"></span></label></div>
           <div class="settings-field"><div class="settings-field-info"><span class="settings-field-label">Max storage</span><span class="settings-field-desc">Database size limit</span></div><span style="font-family:var(--mono);font-size:0.85rem;color:var(--text-dim)" id="settings-max-storage">—</span></div>
+
+          <div class="danger-zone">
+            <div class="danger-zone-title">⚠️ Danger Zone</div>
+            <div class="danger-zone-row">
+              <div>
+                <div class="danger-zone-label">Reset App Data</div>
+                <div class="danger-zone-desc">Clears all events, WoT graph, and config. Returns to setup wizard.</div>
+              </div>
+              <button class="btn-danger" id="btn-reset-app">Reset App Data</button>
+            </div>
+            <div class="danger-zone-row">
+              <div>
+                <div class="danger-zone-label">Change Account</div>
+                <div class="danger-zone-desc">Remove your npub and start over. Keeps your event data.</div>
+              </div>
+              <button class="btn-danger" id="btn-change-account">Change Account</button>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -94,6 +112,35 @@ export function renderSettings(container: HTMLElement): void {
       const target = container.querySelector(`#pane-${pane}`);
       if (target) target.classList.add("active");
     });
+  });
+
+  // Wire danger zone buttons
+  document.getElementById("btn-reset-app")?.addEventListener("click", async () => {
+    if (confirm("Are you sure? This will delete ALL data and return to the setup wizard.")) {
+      try {
+        await invoke("reset_app_data");
+        // Backend emits app:reset which app.ts listens to → navigates to wizard
+        // Fallback: clear local state and reload
+        localStorage.removeItem("nostrito_initialized");
+        localStorage.removeItem("nostrito_config");
+        window.dispatchEvent(new CustomEvent("nostrito:reset"));
+      } catch (e) {
+        console.error("[settings] Reset failed:", e);
+      }
+    }
+  });
+
+  document.getElementById("btn-change-account")?.addEventListener("click", async () => {
+    if (confirm("Remove your npub and start over? Event data will be kept.")) {
+      try {
+        await invoke("reset_app_data");
+        localStorage.removeItem("nostrito_initialized");
+        localStorage.removeItem("nostrito_config");
+        window.dispatchEvent(new CustomEvent("nostrito:reset"));
+      } catch (e) {
+        console.error("[settings] Change account failed:", e);
+      }
+    }
   });
 
   loadSettings();

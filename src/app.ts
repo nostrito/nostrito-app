@@ -107,6 +107,15 @@ export async function initApp(root: HTMLElement): Promise<void> {
     navigateTo("wizard");
   }
 
+  // Listen for frontend reset fallback
+  window.addEventListener("nostrito:reset", () => {
+    const sidebar = document.getElementById("sidebar");
+    if (sidebar) sidebar.style.display = "none";
+    const tb = document.querySelector(".titlebar") as HTMLElement;
+    if (tb) tb.style.display = "none";
+    navigateTo("wizard");
+  });
+
   // Listen for app reset event from backend (e.g. after reset_app_data)
   listen("app:reset", () => {
     localStorage.removeItem("nostrito_initialized");
