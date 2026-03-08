@@ -27,10 +27,12 @@ html,
 body {
   height: 100%;
   font-family: var(--font);
-  background: var(--bg);
+  background: transparent;
   color: var(--text);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  border-radius: 12px;
+  overflow: hidden;
 }
 
 body {

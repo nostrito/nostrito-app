@@ -2,23 +2,56 @@
 
 #app {
   display: flex;
+  flex-direction: column;
   height: 100vh;
   width: 100vw;
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+/* App container — sidebar + content below titlebar */
+.app-container {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
 }
 
 /* Titlebar drag region (frameless window) */
 .titlebar {
   height: 32px;
+  background: #0d0d0f;
   display: flex;
   align-items: center;
   padding: 0 12px;
   -webkit-app-region: drag;
   user-select: none;
+  flex-shrink: 0;
+  border-radius: 12px 12px 0 0;
 }
 
-.titlebar button {
+.titlebar-buttons {
+  display: flex;
+  gap: 8px;
   -webkit-app-region: no-drag;
 }
+
+.tb-btn {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+  transition: opacity 0.15s;
+}
+
+.tb-close { background: #ff5f57; }
+.tb-minimize { background: #febc2e; }
+.tb-maximize { background: #28c840; }
+
+.tb-btn:hover { opacity: 0.8; }
+.titlebar:not(:hover) .tb-btn { background: #3a3a3a; }
 
 /* Sidebar */
 .sidebar {

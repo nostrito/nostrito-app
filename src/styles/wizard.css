@@ -49,6 +49,16 @@
   width: 12px;
   height: 12px;
   border-radius: 50%;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+
+.dot-red:hover,
+.dot-yellow:hover,
+.dot-green:hover {
+  opacity: 0.8;
 }
 
 .dot-red { background: #ff5f57; }

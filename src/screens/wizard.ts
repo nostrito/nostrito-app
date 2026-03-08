@@ -1,6 +1,7 @@
 /** Onboarding wizard — 3 steps: Identity → Relays → Storage */
 
 import { showAppShell } from "../app";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 export interface WizardConfig {
   npub: string;
@@ -67,9 +68,9 @@ export class WizardScreen {
     const titlebar = el("div", "wizard-titlebar");
     titlebar.innerHTML = `
       <div class="wizard-dots-decorative">
-        <span class="dot-red"></span>
-        <span class="dot-yellow"></span>
-        <span class="dot-green"></span>
+        <button class="dot-red tb-btn" id="wiz-close" title="Close"></button>
+        <button class="dot-yellow tb-btn" id="wiz-minimize" title="Minimize"></button>
+        <button class="dot-green tb-btn" id="wiz-maximize" title="Maximize"></button>
       </div>
       <span class="wizard-titlebar-text">nostrito</span>
       <div class="wizard-dots-decorative" style="visibility:hidden">
@@ -79,6 +80,12 @@ export class WizardScreen {
       </div>
     `;
     c.appendChild(titlebar);
+
+    // Wire wizard titlebar buttons
+    const appWindow = getCurrentWindow();
+    titlebar.querySelector("#wiz-close")?.addEventListener("click", () => appWindow.close());
+    titlebar.querySelector("#wiz-minimize")?.addEventListener("click", () => appWindow.minimize());
+    titlebar.querySelector("#wiz-maximize")?.addEventListener("click", () => appWindow.toggleMaximize());
 
     // Wrapper
     const wrapper = el("div", "wizard-wrapper");
