@@ -1,0 +1,61 @@
+/* nostrito — base reset + design tokens */
+
+:root {
+  --bg: #0a0a0a;
+  --bg-card: #111113;
+  --bg-elevated: #161618;
+  --border: #1e1e24;
+  --text: #e8e8f0;
+  --text-dim: #7a7a90;
+  --accent: #7c3aed;
+  --accent-light: #8b5cf6;
+  --green: #34d399;
+  --red: #ef4444;
+  --font: 'Inter', system-ui, sans-serif;
+  --mono: 'JetBrains Mono', monospace;
+}
+
+*,
+*::before,
+*::after {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  font-family: var(--font);
+  background: var(--bg);
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  overflow: hidden;
+}
+
+a {
+  color: var(--accent-light);
+  text-decoration: none;
+}
+
+code,
+pre {
+  font-family: var(--mono);
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
