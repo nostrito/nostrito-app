@@ -88,12 +88,14 @@ impl Database {
                 kind INTEGER NOT NULL,
                 tags TEXT NOT NULL,
                 content TEXT NOT NULL,
-                sig TEXT NOT NULL
+                sig TEXT NOT NULL,
+                stored_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
             );
 
             CREATE INDEX IF NOT EXISTS idx_events_pubkey ON nostr_events(pubkey);
             CREATE INDEX IF NOT EXISTS idx_events_kind ON nostr_events(kind);
             CREATE INDEX IF NOT EXISTS idx_events_created ON nostr_events(created_at);
+            CREATE INDEX IF NOT EXISTS idx_events_stored ON nostr_events(stored_at);
 
             CREATE TABLE IF NOT EXISTS app_config (
                 key TEXT PRIMARY KEY,
@@ -101,6 +103,20 @@ impl Database {
             );
         "#,
         )?;
+
+        // Migration: add stored_at column if missing (for existing databases)
+        let has_stored_at: bool = conn
+            .prepare("SELECT stored_at FROM nostr_events LIMIT 1")
+            .is_ok();
+        if !has_stored_at {
+            conn.execute_batch(
+                "ALTER TABLE nostr_events ADD COLUMN stored_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'));"
+            )?;
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_events_stored ON nostr_events(stored_at);"
+            )?;
+            info!("Migrated nostr_events: added stored_at column");
+        }
 
         info!("Database schema initialized");
         Ok(())
@@ -347,9 +363,10 @@ impl Database {
         sig: &str,
     ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
         let result = conn.execute(
-            "INSERT OR IGNORE INTO nostr_events (id, pubkey, created_at, kind, tags, content, sig) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![id, pubkey, created_at, kind as i64, tags_json, content, sig],
+            "INSERT OR IGNORE INTO nostr_events (id, pubkey, created_at, kind, tags, content, sig, stored_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![id, pubkey, created_at, kind as i64, tags_json, content, sig, now],
         )?;
         let inserted = result > 0;
         if inserted {
@@ -487,9 +504,9 @@ impl Database {
         let mut counts = vec![0u64; hours as usize];
 
         let mut stmt = conn.prepare(
-            "SELECT (created_at - ?1) / 3600 AS bucket, COUNT(*) \
+            "SELECT (stored_at - ?1) / 3600 AS bucket, COUNT(*) \
              FROM nostr_events \
-             WHERE created_at >= ?1 \
+             WHERE stored_at >= ?1 \
              GROUP BY bucket \
              ORDER BY bucket",
         )?;
