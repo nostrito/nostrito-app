@@ -6,6 +6,7 @@ export interface ProfileInfo {
   display_name: string | null;
   picture: string | null;
   nip05: string | null;
+  about: string | null;
 }
 
 const profileCache = new Map<string, ProfileInfo>();

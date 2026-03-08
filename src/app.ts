@@ -9,7 +9,7 @@ import { renderSettings } from "./screens/settings";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { ProfileInfo } from "./utils/profiles";
+import { getProfiles, profileDisplayName, type ProfileInfo } from "./utils/profiles";
 
 let currentScreen: Screen = "wizard";
 
@@ -149,6 +149,8 @@ export function showAppShell(): void {
   loadOwnProfile();
 }
 
+let previousScreen: Screen = "dashboard";
+
 async function loadOwnProfile(): Promise<void> {
   try {
     const profile = await invoke<ProfileInfo | null>("get_own_profile");
@@ -162,10 +164,116 @@ async function loadOwnProfile(): Promise<void> {
 
     el.innerHTML = `${avatarHtml}<span class="own-profile-name">${escapeHtml(name)}</span>`;
     el.style.display = "flex";
+    el.style.cursor = "pointer";
+
+    el.onclick = () => showOwnProfilePanel(profile);
   } catch (e) {
     console.warn("[app] Failed to load own profile:", e);
   }
 }
+
+async function showOwnProfilePanel(profile: ProfileInfo): Promise<void> {
+  previousScreen = currentScreen;
+  const content = document.getElementById("main-content");
+  if (!content) return;
+
+  const name = profile.display_name || profile.name || "Me";
+  const npub = profile.pubkey.length > 20
+    ? profile.pubkey.slice(0, 10) + "..." + profile.pubkey.slice(-8)
+    : profile.pubkey;
+
+  const avatarHtml = profile.picture
+    ? `<img src="${escapeHtml(profile.picture)}" class="own-panel-avatar" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'" /><div class="own-panel-avatar own-panel-avatar-fallback" style="display:none;background:var(--accent)"></div>`
+    : `<div class="own-panel-avatar own-panel-avatar-fallback" style="background:var(--accent)"></div>`;
+
+  let eventCount = "—";
+  try {
+    const status = await invoke<{ events_stored: number }>("get_status");
+    eventCount = status.events_stored.toLocaleString();
+  } catch (_) {}
+
+  content.className = "main-content";
+  content.innerHTML = `
+    <div class="own-profile-panel">
+      <button class="own-panel-close" id="own-panel-close">← Back</button>
+      <div class="own-panel-header">
+        ${avatarHtml}
+        <div class="own-panel-name">${escapeHtml(name)}</div>
+        <div class="own-panel-npub">${escapeHtml(npub)}</div>
+        ${profile.nip05 ? `<div class="own-panel-nip05">✅ ${escapeHtml(profile.nip05)}</div>` : ""}
+      </div>
+      ${(profile as any).about ? `<div class="own-panel-about">${escapeHtml((profile as any).about)}</div>` : ""}
+      <div class="own-panel-stats">
+        <div class="own-panel-stat"><div class="own-panel-stat-val">${eventCount}</div><div class="own-panel-stat-label">Events Stored</div></div>
+      </div>
+      <button class="own-panel-edit" disabled>Edit Profile (coming soon)</button>
+    </div>
+  `;
+
+  document.getElementById("own-panel-close")?.addEventListener("click", () => {
+    navigateTo(previousScreen);
+  });
+}
+
+/** Show a profile popup for any pubkey */
+async function showProfilePopup(pubkey: string): Promise<void> {
+  let overlay = document.getElementById("profile-popup-overlay");
+  if (!overlay) {
+    overlay = document.createElement("div");
+    overlay.id = "profile-popup-overlay";
+    overlay.className = "profile-popup-overlay";
+    overlay.innerHTML = `
+      <div class="profile-popup-card">
+        <button id="popup-close" class="popup-close-btn">✕</button>
+        <div id="popup-content" class="popup-content">
+          <div class="popup-loading">Loading...</div>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+
+    // Close on clicking overlay background
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) {
+        overlay!.style.display = "none";
+      }
+    });
+    overlay.querySelector("#popup-close")?.addEventListener("click", () => {
+      overlay!.style.display = "none";
+    });
+  }
+
+  // Show with loading state
+  overlay.style.display = "flex";
+  const popupContent = overlay.querySelector("#popup-content")!;
+  popupContent.innerHTML = `<div class="popup-loading">Loading...</div>`;
+
+  try {
+    const profileMap = await getProfiles([pubkey]);
+    const profile = profileMap.get(pubkey);
+    const name = profileDisplayName(profile, pubkey);
+    const npub = pubkey.length > 20
+      ? pubkey.slice(0, 10) + "..." + pubkey.slice(-8)
+      : pubkey;
+
+    const avatarHtml = profile?.picture
+      ? `<img src="${escapeHtml(profile.picture)}" class="popup-avatar-img" onerror="this.style.display='none'" />`
+      : "";
+
+    popupContent.innerHTML = `
+      ${avatarHtml}
+      <div class="popup-name">${escapeHtml(name)}</div>
+      <div class="popup-npub">${escapeHtml(npub)}</div>
+      ${profile?.nip05 ? `<div class="popup-nip05">✅ ${escapeHtml(profile.nip05)}</div>` : ""}
+      ${(profile as any)?.about ? `<div class="popup-about">${escapeHtml((profile as any).about)}</div>` : ""}
+    `;
+  } catch (e) {
+    popupContent.innerHTML = `<div class="popup-loading">Failed to load profile</div>`;
+  }
+}
+
+// Expose globally for inline onclick handlers
+(window as any).showProfilePopup = showProfilePopup;
 
 function escapeHtml(str: string): string {
   const div = document.createElement("div");
