@@ -12,10 +12,12 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, RwLock};
+use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 
@@ -206,6 +208,175 @@ pub async fn run_relay(
         }
     }
 
+    Ok(())
+}
+
+/// Load TLS configuration from PEM certificate and key files.
+fn load_tls_config(
+    cert: &Path,
+    key: &Path,
+) -> Result<Arc<tokio_rustls::rustls::ServerConfig>> {
+    use rustls_pemfile::{certs, pkcs8_private_keys};
+    use tokio_rustls::rustls;
+
+    let cert_file = std::fs::read(cert)?;
+    let key_file = std::fs::read(key)?;
+
+    let certs: Vec<_> = certs(&mut cert_file.as_slice())
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let key = pkcs8_private_keys(&mut key_file.as_slice())
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no private key found in key file"))??;
+
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, rustls::pki_types::PrivateKeyDer::Pkcs8(key))?;
+
+    Ok(Arc::new(config))
+}
+
+/// Run the relay server with TLS (wss://)
+pub async fn run_relay_tls(
+    port: u16,
+    cert_pem: std::path::PathBuf,
+    key_pem: std::path::PathBuf,
+    db: Arc<Database>,
+    allowed_pubkey: Option<String>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    let tls_config = load_tls_config(&cert_pem, &key_pem)?;
+    let tls_acceptor = TlsAcceptor::from(tls_config);
+
+    let addr = format!("127.0.0.1:{}", port);
+    let listener = TcpListener::bind(&addr).await?;
+    info!("Relay listening on wss://{}", addr);
+
+    let (broadcast_tx, _) = broadcast::channel::<StoredEvent>(1024);
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                info!("TLS relay server shutting down");
+                break;
+            }
+            result = listener.accept() => {
+                match result {
+                    Ok((stream, addr)) => {
+                        let db = db.clone();
+                        let allowed = allowed_pubkey.clone();
+                        let tx = broadcast_tx.clone();
+                        let rx = broadcast_tx.subscribe();
+                        let cancel = cancel.clone();
+                        let acceptor = tls_acceptor.clone();
+                        tokio::spawn(async move {
+                            match acceptor.accept(stream).await {
+                                Ok(tls_stream) => {
+                                    match tokio_tungstenite::accept_async(tls_stream).await {
+                                        Ok(ws_stream) => {
+                                            if let Err(e) = handle_tls_connection(
+                                                ws_stream, addr, db, allowed, tx, rx, cancel,
+                                            )
+                                            .await
+                                            {
+                                                debug!("TLS connection {} closed: {}", addr, e);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            debug!("TLS WebSocket upgrade failed from {}: {}", addr, e);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!("TLS handshake failed from {}: {}", addr, e);
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        error!("Accept error: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle a TLS WebSocket connection (same logic as plain, different stream type)
+async fn handle_tls_connection(
+    ws_stream: tokio_tungstenite::WebSocketStream<
+        tokio_rustls::server::TlsStream<TcpStream>,
+    >,
+    addr: SocketAddr,
+    db: Arc<Database>,
+    allowed_pubkey: Option<String>,
+    broadcast_tx: EventBroadcast,
+    mut broadcast_rx: broadcast::Receiver<StoredEvent>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    info!("[relay-tls] New connection from {}", addr);
+
+    let (mut ws_tx, mut ws_rx) = ws_stream.split();
+    let subscriptions: Arc<RwLock<HashMap<String, Subscription>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+
+    let subs_clone = subscriptions.clone();
+
+    let forward_task = tokio::spawn(async move {
+        loop {
+            match broadcast_rx.recv().await {
+                Ok(event) => {
+                    let subs = subs_clone.read().await;
+                    for (sub_id, sub) in subs.iter() {
+                        if sub.filters.iter().any(|f| f.matches_event(&event)) {
+                            let _ = serde_json::json!(["EVENT", sub_id, event.to_json()]);
+                        }
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    warn!("Broadcast lagged by {} messages", n);
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            msg = ws_rx.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        let responses = handle_message(
+                            &text,
+                            &db,
+                            &subscriptions,
+                            &allowed_pubkey,
+                            &broadcast_tx,
+                        ).await;
+                        for resp in responses {
+                            if ws_tx.send(Message::Text(resp.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Ping(data))) => {
+                        ws_tx.send(Message::Pong(data)).await.ok();
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Err(e)) => {
+                        debug!("TLS WebSocket error from {}: {}", addr, e);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    forward_task.abort();
+    info!("[relay-tls] Connection from {} closed", addr);
     Ok(())
 }
 
