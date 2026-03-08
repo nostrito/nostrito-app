@@ -495,6 +495,53 @@ async fn reset_app_data(
     Ok(())
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RelayStatusInfo {
+    pub url: String,
+    pub name: String,
+    pub connected: bool,
+    pub latency_ms: Option<u32>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct KindCounts {
+    pub counts: std::collections::HashMap<u32, u64>,
+}
+
+#[tauri::command]
+async fn get_activity_data(state: State<'_, AppState>) -> Result<Vec<u64>, String> {
+    state.db.get_hourly_counts(24).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_relay_status(state: State<'_, AppState>) -> Result<Vec<RelayStatusInfo>, String> {
+    let config = state.config.read().await;
+    Ok(config
+        .outbound_relays
+        .iter()
+        .map(|url| {
+            let name = url
+                .replace("wss://", "")
+                .replace("ws://", "")
+                .replace("relay.", "")
+                .trim_end_matches('/')
+                .to_string();
+            RelayStatusInfo {
+                url: url.clone(),
+                name,
+                connected: true, // reflects configured status; real connectivity TBD
+                latency_ms: None, // TODO: measure actual latency
+            }
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn get_kind_counts(state: State<'_, AppState>) -> Result<KindCounts, String> {
+    let counts = state.db.get_kind_counts().map_err(|e| e.to_string())?;
+    Ok(KindCounts { counts })
+}
+
 #[tauri::command]
 async fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
     let config = state.config.read().await;
@@ -655,6 +702,9 @@ pub fn run() {
             stop_relay,
             get_uptime,
             reset_app_data,
+            get_activity_data,
+            get_relay_status,
+            get_kind_counts,
         ])
         .run(tauri::generate_context!())
         .expect("error while running nostrito");

@@ -1,5 +1,6 @@
 use anyhow::Result;
 use rusqlite::{params, Connection};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use tracing::{debug, info};
@@ -455,6 +456,60 @@ impl Database {
         let newest: i64 = conn
             .query_row("SELECT COALESCE(MAX(created_at), 0) FROM nostr_events", [], |row| row.get(0))?;
         Ok((oldest as u64, newest as u64))
+    }
+
+    /// Get hourly event counts for the last N hours (for activity chart).
+    /// Returns a Vec of length `hours`, index 0 = oldest hour, last = most recent.
+    pub fn get_hourly_counts(&self, hours: u32) -> Result<Vec<u64>> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let start = now - (hours as i64 * 3600);
+
+        let mut counts = vec![0u64; hours as usize];
+
+        let mut stmt = conn.prepare(
+            "SELECT (created_at - ?1) / 3600 AS bucket, COUNT(*) \
+             FROM nostr_events \
+             WHERE created_at >= ?1 \
+             GROUP BY bucket \
+             ORDER BY bucket",
+        )?;
+
+        let rows = stmt.query_map(params![start], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
+
+        for row in rows {
+            if let Ok((bucket, count)) = row {
+                let idx = bucket as usize;
+                if idx < counts.len() {
+                    counts[idx] = count as u64;
+                }
+            }
+        }
+
+        Ok(counts)
+    }
+
+    /// Get event counts grouped by kind
+    pub fn get_kind_counts(&self) -> Result<HashMap<u32, u64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT kind, COUNT(*) FROM nostr_events GROUP BY kind ORDER BY COUNT(*) DESC",
+        )?;
+
+        let mut map = HashMap::new();
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
+
+        for row in rows {
+            if let Ok((kind, count)) = row {
+                map.insert(kind as u32, count as u64);
+            }
+        }
+
+        Ok(map)
     }
 
     /// Clear all data from the database (reset to fresh state)

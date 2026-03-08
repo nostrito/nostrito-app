@@ -1,6 +1,5 @@
 use anyhow::Result;
 use nostr_sdk::prelude::*;
-use nostr_sdk::client::options::EventSource;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -63,68 +62,81 @@ pub struct SyncStats {
 }
 
 // ── Relay Policy ───────────────────────────────────────────────────
+// Polite relay access: max 1 request per 3 seconds per relay.
+// Back off aggressively on NOTICE or connection failure.
 
-#[allow(dead_code)]
 struct RelayPolicy {
-    requests_per_minute: u32,
-    backoff_secs: u64,
-    last_notice: Option<String>,
-    request_times: Vec<Instant>,
+    last_request: Option<Instant>,
+    min_interval: Duration,
     paused_until: Option<Instant>,
     consecutive_failures: u32,
+    last_notice: Option<String>,
 }
 
-#[allow(dead_code)]
 impl RelayPolicy {
     fn new() -> Self {
         Self {
-            requests_per_minute: 10,
-            backoff_secs: 5,
-            last_notice: None,
-            request_times: Vec::new(),
+            last_request: None,
+            min_interval: Duration::from_secs(3),
             paused_until: None,
             consecutive_failures: 0,
+            last_notice: None,
         }
     }
 
-    fn can_request(&mut self) -> bool {
+    /// Wait until we're allowed to send the next request, respecting rate limits.
+    async fn wait_for_slot(&mut self) {
+        // Check pause (from NOTICE or failure backoff)
         if let Some(paused_until) = self.paused_until {
-            if Instant::now() < paused_until {
-                return false;
+            let now = Instant::now();
+            if now < paused_until {
+                let wait = paused_until - now;
+                info!("RelayPolicy: paused, waiting {:.1}s", wait.as_secs_f32());
+                tokio::time::sleep(wait).await;
             }
             self.paused_until = None;
         }
 
-        let now = Instant::now();
-        let one_min_ago = now - Duration::from_secs(60);
-        self.request_times.retain(|&t| t > one_min_ago);
-        self.request_times.len() < self.requests_per_minute as usize
-    }
+        // Enforce minimum interval between requests
+        if let Some(last) = self.last_request {
+            let elapsed = last.elapsed();
+            if elapsed < self.min_interval {
+                let wait = self.min_interval - elapsed;
+                tokio::time::sleep(wait).await;
+            }
+        }
 
-    fn record_request(&mut self) {
-        self.request_times.push(Instant::now());
+        self.last_request = Some(Instant::now());
     }
 
     fn on_notice(&mut self, msg: &str) {
         let lower = msg.to_lowercase();
-        if lower.contains("rate") || lower.contains("limit") {
-            info!("Rate limit notice from relay, pausing 60s");
-            self.paused_until = Some(Instant::now() + Duration::from_secs(60));
-        }
         self.last_notice = Some(msg.to_string());
+
+        if lower.contains("rate") || lower.contains("limit") || lower.contains("too many")
+            || lower.contains("slow down") || lower.contains("blocked")
+        {
+            warn!("Rate limit NOTICE from relay: {}", msg);
+            // Pause for 90 seconds on rate limit
+            self.paused_until = Some(Instant::now() + Duration::from_secs(90));
+            // Also increase minimum interval for this relay
+            self.min_interval = Duration::from_secs(5);
+        } else {
+            // Generic NOTICE — brief pause just in case
+            info!("Relay NOTICE: {}", msg);
+            self.paused_until = Some(Instant::now() + Duration::from_secs(5));
+        }
     }
 
     fn on_connection_failure(&mut self) {
         self.consecutive_failures += 1;
         let backoff = match self.consecutive_failures {
-            1 => 5,
-            2 => 10,
-            3 => 30,
-            4 => 60,
-            5 => 120,
+            1 => 10,
+            2 => 30,
+            3 => 60,
+            4 => 120,
             _ => 300,
         };
-        self.backoff_secs = backoff;
         self.paused_until = Some(Instant::now() + Duration::from_secs(backoff));
         warn!(
             "Connection failure #{}, backing off {}s",
@@ -132,9 +144,8 @@ impl RelayPolicy {
         );
     }
 
-    fn on_connection_success(&mut self) {
+    fn on_success(&mut self) {
         self.consecutive_failures = 0;
-        self.backoff_secs = 5;
     }
 }
 
@@ -162,6 +173,75 @@ struct FollowUpdate {
     follows: Vec<String>,
     event_id: String,
     created_at: i64,
+}
+
+// ── Subscribe + Collect Helper ─────────────────────────────────────
+// All relay fetching goes through this: subscribe, collect events until
+// EOSE or timeout, then unsubscribe. Handles NOTICE for rate limiting.
+
+async fn subscribe_and_collect(
+    client: &Client,
+    filter: Vec<Filter>,
+    timeout_secs: u64,
+    policy: &mut RelayPolicy,
+) -> Result<Vec<Event>> {
+    // Respect rate limits before sending
+    policy.wait_for_slot().await;
+
+    let sub_id = client.subscribe(filter, None).await?;
+    let mut notifications = client.notifications();
+    let mut events: Vec<Event> = Vec::new();
+    let deadline = tokio::time::sleep(Duration::from_secs(timeout_secs));
+    tokio::pin!(deadline);
+
+    let mut got_eose = false;
+
+    loop {
+        tokio::select! {
+            result = notifications.recv() => {
+                match result {
+                    Ok(notification) => {
+                        match notification {
+                            RelayPoolNotification::Event { event, .. } => {
+                                events.push(*event);
+                            }
+                            RelayPoolNotification::Message { message, .. } => {
+                                match &message {
+                                    RelayMessage::EndOfStoredEvents(_) => {
+                                        got_eose = true;
+                                        break;
+                                    }
+                                    RelayMessage::Notice { message: msg } => {
+                                        policy.on_notice(msg);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Notification channel error: {}", e);
+                        policy.on_connection_failure();
+                        break;
+                    }
+                }
+            }
+            _ = &mut deadline => {
+                warn!("Subscribe timeout after {}s, got {} events (no EOSE)", timeout_secs, events.len());
+                break;
+            }
+        }
+    }
+
+    client.unsubscribe(sub_id).await;
+
+    if got_eose || !events.is_empty() {
+        policy.on_success();
+    }
+
+    debug!("Collected {} events (EOSE={})", events.len(), got_eose);
+    Ok(events)
 }
 
 // ── Sync Engine ────────────────────────────────────────────────────
@@ -220,13 +300,6 @@ impl SyncEngine {
 
     fn set_tier(&self, tier: SyncTier) {
         self.sync_tier.store(tier as u8, Ordering::Relaxed);
-    }
-
-    fn primary_relay_url(&self) -> String {
-        self.relay_aliases
-            .first()
-            .map(|a| resolve_relay_url(a).to_string())
-            .unwrap_or_else(|| "wss://relay.damus.io".to_string())
     }
 
     fn all_relay_urls(&self) -> Vec<String> {
@@ -294,97 +367,136 @@ impl SyncEngine {
     }
 
     // ── Tier 1: Critical ──────────────────────────────────────────
+    // Stagger across relays: connect to one relay at a time, fetch, disconnect, wait.
 
     async fn run_tier1(&self, policies: &mut HashMap<String, RelayPolicy>) -> Result<()> {
         self.set_tier(SyncTier::Critical);
         info!("Tier 1: Fetching own profile + follow list");
 
-        let primary = self.primary_relay_url();
-        let client = Client::default();
-
-        // Connect to all relays for Tier 1 (profile + follows are critical)
-        let mut connected_any = false;
-        for url in self.all_relay_urls() {
-            match client.add_relay(&url).await {
-                Ok(_) => {
-                    info!("Tier 1: Added relay {}", url);
-                    if let Some(policy) = policies.get_mut(&url) {
-                        policy.on_connection_success();
-                    }
-                    connected_any = true;
-                }
-                Err(e) => {
-                    warn!("Tier 1: Failed to add relay {}: {}", url, e);
-                    if let Some(policy) = policies.get_mut(&url) {
-                        policy.on_connection_failure();
-                    }
-                }
-            }
-        }
-
-        if !connected_any {
-            warn!("Tier 1: Could not add any relay, skipping");
-            return Ok(());
-        }
-
-        client.connect().await;
-
-        // Give relay connections time to establish before querying
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
         let pk = PublicKey::from_hex(&self.hex_pubkey)?;
-        info!("Tier 1: Querying {} for pubkey {}", primary, pk.to_hex());
-
-        // Fetch kind:0 (profile metadata) + kind:3 (follow list)
         let filter = Filter::new()
             .author(pk)
             .kinds(vec![Kind::Metadata, Kind::ContactList])
             .limit(10);
 
+        info!(
+            "Tier 1: Filter — authors=[{}…], kinds=[0,3], limit=10",
+            &self.hex_pubkey[..12]
+        );
+
         let mut fetched: u64 = 0;
-        self.emit_progress(1, 0, 2, &primary);
+        let mut all_events: Vec<Event> = Vec::new();
+        let relay_urls = self.all_relay_urls();
 
-        match tokio::time::timeout(
-            Duration::from_secs(20),
-            client.get_events_of(vec![filter], EventSource::relays(Some(Duration::from_secs(15)))),
-        )
-        .await
-        {
-            Ok(Ok(events)) => {
-                for event in events.iter() {
-                    if event.kind == Kind::ContactList {
-                        if let Some(update) = process_contact_event(event) {
-                            self.graph.update_follows(
-                                &update.pubkey,
-                                &update.follows,
-                                Some(update.event_id.clone()),
-                                Some(update.created_at),
-                            );
+        // Stagger: one relay at a time, 2s gap between relays
+        for (i, url) in relay_urls.iter().enumerate() {
+            if self.cancel.is_cancelled() {
+                break;
+            }
 
-                            // Persist
-                            let batch = vec![FollowUpdateBatch {
-                                pubkey: &update.pubkey,
-                                follows: &update.follows,
-                                event_id: Some(&update.event_id),
-                                created_at: Some(update.created_at),
-                            }];
-                            self.db.update_follows_batch(&batch).ok();
+            self.emit_progress(1, fetched, 2, url);
 
-                            info!(
-                                "Tier 1: Loaded {} follows from own contact list",
-                                update.follows.len()
-                            );
-                        }
-                    }
-                    fetched += 1;
-                    self.emit_progress(1, fetched, 2, &primary);
+            let policy = policies
+                .entry(url.clone())
+                .or_insert_with(RelayPolicy::new);
+
+            let client = Client::default();
+            match client.add_relay(url.as_str()).await {
+                Ok(_) => {
+                    info!("Tier 1: Connecting to relay {}/{}: {}", i + 1, relay_urls.len(), url);
+                }
+                Err(e) => {
+                    warn!("Tier 1: Failed to add relay {}: {}", url, e);
+                    policy.on_connection_failure();
+                    continue;
                 }
             }
-            Ok(Err(e)) => warn!("Tier 1: fetch error: {}", e),
-            Err(_) => warn!("Tier 1: timeout fetching profile"),
+
+            client.connect().await;
+            // Let WebSocket handshake settle
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            match subscribe_and_collect(&client, vec![filter.clone()], 15, policy).await {
+                Ok(events) => {
+                    info!("Tier 1: Got {} events from {}", events.len(), url);
+                    for event in events {
+                        // Deduplicate by event ID
+                        if !all_events.iter().any(|e| e.id == event.id) {
+                            all_events.push(event);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Tier 1: Subscribe failed on {}: {}", url, e);
+                    policy.on_connection_failure();
+                }
+            }
+
+            client.disconnect().await.ok();
+
+            // Stagger gap between relays
+            if i + 1 < relay_urls.len() {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+
+            // Stop early if we already have both kind:0 and kind:3
+            let has_metadata = all_events.iter().any(|e| e.kind == Kind::Metadata);
+            let has_contacts = all_events.iter().any(|e| e.kind == Kind::ContactList);
+            if has_metadata && has_contacts {
+                info!("Tier 1: Got both profile and contact list, skipping remaining relays");
+                break;
+            }
         }
 
-        client.disconnect().await?;
+        info!("Tier 1: Processing {} total events", all_events.len());
+
+        for event in all_events.iter() {
+            if event.kind == Kind::ContactList {
+                if let Some(update) = process_contact_event(event) {
+                    self.graph.update_follows(
+                        &update.pubkey,
+                        &update.follows,
+                        Some(update.event_id.clone()),
+                        Some(update.created_at),
+                    );
+
+                    let batch = vec![FollowUpdateBatch {
+                        pubkey: &update.pubkey,
+                        follows: &update.follows,
+                        event_id: Some(&update.event_id),
+                        created_at: Some(update.created_at),
+                    }];
+                    self.db.update_follows_batch(&batch).ok();
+
+                    info!(
+                        "Tier 1: Loaded {} follows from own contact list",
+                        update.follows.len()
+                    );
+                }
+            }
+
+            // Store all events (metadata too)
+            let tags: Vec<Vec<String>> = event
+                .tags
+                .iter()
+                .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
+                .collect();
+            let tags_json = serde_json::to_string(&tags).unwrap_or_default();
+            self.db
+                .store_event(
+                    &event.id.to_hex(),
+                    &event.pubkey.to_hex(),
+                    event.created_at.as_u64() as i64,
+                    event.kind.as_u16() as u32,
+                    &tags_json,
+                    &event.content.to_string(),
+                    &event.sig.to_string(),
+                )
+                .ok();
+
+            fetched += 1;
+            self.emit_progress(1, fetched, 2, "");
+        }
 
         {
             let mut stats = self.sync_stats.write().await;
@@ -398,6 +510,8 @@ impl SyncEngine {
     }
 
     // ── Tier 2: Important ─────────────────────────────────────────
+    // Fetch recent notes from follows. Chunks of 10 follows, limit 50 per request,
+    // 5s pause between batches, staggered across relays.
 
     async fn run_tier2(&self, policies: &mut HashMap<String, RelayPolicy>) -> Result<()> {
         self.set_tier(SyncTier::Important);
@@ -412,14 +526,7 @@ impl SyncEngine {
             }
         };
 
-        let primary = self.primary_relay_url();
-        let client = Client::default();
-        for url in self.all_relay_urls() {
-            if let Err(e) = client.add_relay(&url).await {
-                warn!("Tier 2: Failed to add relay {}: {}", url, e);
-            }
-        }
-        client.connect().await;
+        info!("Tier 2: {} follows to fetch", follows.len());
 
         let since = Timestamp::from(
             chrono::Utc::now()
@@ -428,24 +535,17 @@ impl SyncEngine {
                 .timestamp() as u64,
         );
 
+        let relay_urls = self.all_relay_urls();
         let total = follows.len() as u64;
         let mut fetched: u64 = 0;
 
-        // Process 20 pubkeys per batch
-        for chunk in follows.chunks(20) {
+        // Round-robin across relays, one at a time
+        let mut relay_idx = 0;
+
+        // Small batches: 10 follows at a time, limit 50 events per request
+        for chunk in follows.chunks(10) {
             if self.cancel.is_cancelled() {
                 break;
-            }
-
-            // Rate limit check
-            if let Some(policy) = policies.get_mut(&primary) {
-                while !policy.can_request() {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    if self.cancel.is_cancelled() {
-                        break;
-                    }
-                }
-                policy.record_request();
             }
 
             let authors: Vec<PublicKey> = chunk
@@ -461,54 +561,65 @@ impl SyncEngine {
                 .authors(authors)
                 .kind(Kind::TextNote)
                 .since(since)
-                .limit(500);
+                .limit(50);
 
-            match tokio::time::timeout(
-                Duration::from_secs(10),
-                client.get_events_of(vec![filter], EventSource::relays(Some(Duration::from_secs(10)))),
-            )
-            .await
-            {
-                Ok(Ok(events)) => {
+            // Pick relay (round-robin)
+            let url = &relay_urls[relay_idx % relay_urls.len()];
+            relay_idx += 1;
+
+            let policy = policies
+                .entry(url.clone())
+                .or_insert_with(RelayPolicy::new);
+
+            let client = Client::default();
+            if client.add_relay(url.as_str()).await.is_err() {
+                policy.on_connection_failure();
+                continue;
+            }
+            client.connect().await;
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+
+            match subscribe_and_collect(&client, vec![filter], 10, policy).await {
+                Ok(events) => {
                     for event in events.iter() {
-                        let tags: Vec<Vec<String>> = event.tags
+                        let tags: Vec<Vec<String>> = event
+                            .tags
                             .iter()
                             .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
                             .collect();
                         let tags_json = serde_json::to_string(&tags).unwrap_or_default();
-                        let content: String = event.content.to_string();
-                        let sig: String = event.sig.to_string();
-                        self.db.store_event(
-                            &event.id.to_hex(),
-                            &event.pubkey.to_hex(),
-                            event.created_at.as_u64() as i64,
-                            event.kind.as_u16() as u32,
-                            &tags_json,
-                            &content,
-                            &sig,
-                        ).ok();
+                        self.db
+                            .store_event(
+                                &event.id.to_hex(),
+                                &event.pubkey.to_hex(),
+                                event.created_at.as_u64() as i64,
+                                event.kind.as_u16() as u32,
+                                &tags_json,
+                                &event.content.to_string(),
+                                &event.sig.to_string(),
+                            )
+                            .ok();
                     }
                     fetched += events.len() as u64;
-                    debug!("Tier 2: batch fetched and stored {} events", events.len());
+                    debug!(
+                        "Tier 2: batch of {} follows → {} events from {}",
+                        chunk.len(),
+                        events.len(),
+                        url
+                    );
                 }
-                Ok(Err(e)) => {
-                    warn!("Tier 2: fetch error: {}", e);
-                    if let Some(policy) = policies.get_mut(&primary) {
-                        policy.on_connection_failure();
-                    }
-                }
-                Err(_) => {
-                    warn!("Tier 2: timeout on batch");
+                Err(e) => {
+                    warn!("Tier 2: subscribe error on {}: {}", url, e);
+                    policy.on_connection_failure();
                 }
             }
 
-            self.emit_progress(2, fetched, total, &primary);
+            client.disconnect().await.ok();
+            self.emit_progress(2, fetched, total, url);
 
-            // Polite pause between batches
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            // Polite pause: 5 seconds between batches
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
-
-        client.disconnect().await?;
 
         {
             let mut stats = self.sync_stats.write().await;
@@ -522,6 +633,7 @@ impl SyncEngine {
     }
 
     // ── Tier 3: Background ────────────────────────────────────────
+    // WoT crawl. Very polite: 5 follows per batch, limit 10, 5s between batches.
 
     async fn run_tier3(&self, policies: &mut HashMap<String, RelayPolicy>) -> Result<()> {
         self.set_tier(SyncTier::Background);
@@ -544,7 +656,10 @@ impl SyncEngine {
                     processed.insert(pk.to_string());
                 }
             }
-            info!("Tier 3: Resuming from checkpoint ({} already processed)", processed.len());
+            info!(
+                "Tier 3: Resuming from checkpoint ({} already processed)",
+                processed.len()
+            );
         }
 
         let remaining: Vec<String> = follows
@@ -552,12 +667,7 @@ impl SyncEngine {
             .filter(|pk| !processed.contains(pk))
             .collect();
 
-        let primary = self.primary_relay_url();
-        let client = Client::default();
-        for url in self.all_relay_urls() {
-            client.add_relay(&url).await.ok();
-        }
-        client.connect().await;
+        info!("Tier 3: {} pubkeys remaining to crawl", remaining.len());
 
         let (persist_tx, persist_rx) = mpsc::channel::<FollowUpdate>(10000);
         let db = self.db.clone();
@@ -566,24 +676,15 @@ impl SyncEngine {
             persistence_worker(db, persist_rx, cancel).await;
         });
 
+        let relay_urls = self.all_relay_urls();
         let total = remaining.len() as u64;
         let mut fetched: u64 = 0;
+        let mut relay_idx = 0;
 
-        // Process 10 pubkeys per batch
-        for chunk in remaining.chunks(10) {
+        // Small batches: 5 pubkeys at a time
+        for chunk in remaining.chunks(5) {
             if self.cancel.is_cancelled() {
                 break;
-            }
-
-            // Rate limit
-            if let Some(policy) = policies.get_mut(&primary) {
-                while !policy.can_request() {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    if self.cancel.is_cancelled() {
-                        break;
-                    }
-                }
-                policy.record_request();
             }
 
             let authors: Vec<PublicKey> = chunk
@@ -600,13 +701,24 @@ impl SyncEngine {
                 .kind(Kind::ContactList)
                 .limit(10);
 
-            match tokio::time::timeout(
-                Duration::from_secs(10),
-                client.get_events_of(vec![filter], EventSource::relays(Some(Duration::from_secs(10)))),
-            )
-            .await
-            {
-                Ok(Ok(events)) => {
+            // Pick relay (round-robin)
+            let url = &relay_urls[relay_idx % relay_urls.len()];
+            relay_idx += 1;
+
+            let policy = policies
+                .entry(url.clone())
+                .or_insert_with(RelayPolicy::new);
+
+            let client = Client::default();
+            if client.add_relay(url.as_str()).await.is_err() {
+                policy.on_connection_failure();
+                continue;
+            }
+            client.connect().await;
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+
+            match subscribe_and_collect(&client, vec![filter], 10, policy).await {
+                Ok(events) => {
                     for event in events.iter() {
                         if let Some(update) = process_contact_event(event) {
                             let updated = self.graph.update_follows(
@@ -622,16 +734,13 @@ impl SyncEngine {
                         }
                     }
                 }
-                Ok(Err(e)) => {
-                    warn!("Tier 3: fetch error: {}", e);
-                    if let Some(policy) = policies.get_mut(&primary) {
-                        policy.on_connection_failure();
-                    }
-                }
-                Err(_) => {
-                    warn!("Tier 3: timeout on batch");
+                Err(e) => {
+                    warn!("Tier 3: subscribe error on {}: {}", url, e);
+                    policy.on_connection_failure();
                 }
             }
+
+            client.disconnect().await.ok();
 
             // Mark processed and checkpoint
             for pk in chunk {
@@ -640,20 +749,21 @@ impl SyncEngine {
 
             // Checkpoint every 50 pubkeys
             if processed.len() % 50 == 0 {
-                let checkpoint: String = processed.iter().cloned().collect::<Vec<_>>().join(",");
-                self.db.set_config("sync_tier3_checkpoint", &checkpoint).ok();
+                let checkpoint: String =
+                    processed.iter().cloned().collect::<Vec<_>>().join(",");
+                self.db
+                    .set_config("sync_tier3_checkpoint", &checkpoint)
+                    .ok();
             }
 
-            self.emit_progress(3, fetched, total, &primary);
+            self.emit_progress(3, fetched, total, url);
 
-            // Polite pause — 2 seconds between batches
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            // Polite pause: 5 seconds between batches
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
 
-        // Final checkpoint
-        self.db.set_config("sync_tier3_checkpoint", "").ok(); // clear on completion
-
-        client.disconnect().await?;
+        // Final checkpoint — clear on completion
+        self.db.set_config("sync_tier3_checkpoint", "").ok();
 
         {
             let mut stats = self.sync_stats.write().await;
@@ -674,13 +784,11 @@ impl SyncEngine {
 
         // Tier 4 is a placeholder — media download, historical events, deep WoT
         // will be implemented as the storage layer matures.
-        // For now, emit completion.
 
         // TODO: Blossom media downloads
         // TODO: Historical events (older than 7 days)
         // TODO: Deep WoT (hop-3+ pubkeys)
 
-        // Simulate slow background work with 5s pauses
         let fetched: u64 = 0;
         self.emit_progress(4, fetched, 0, "");
 
