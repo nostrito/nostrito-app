@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
-use tauri::State;
+use tauri::{Manager, State};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
@@ -444,6 +444,45 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .manage(app_state)
+        .setup(|app| {
+            let state = app.state::<AppState>();
+            let config = state.config.clone();
+            let wot_graph = state.wot_graph.clone();
+            let db = state.db.clone();
+            let sync_tier = state.sync_tier.clone();
+            let sync_stats = state.sync_stats.clone();
+            let sync_cancel = state.sync_cancel.clone();
+            let app_handle = app.handle().clone();
+
+            // Auto-resume sync if previously configured
+            tauri::async_runtime::spawn(async move {
+                let cfg = config.read().await;
+                if let Some(ref hex_pubkey) = cfg.hex_pubkey {
+                    let relays = cfg.outbound_relays.clone();
+                    let hex: String = hex_pubkey.clone();
+                    drop(cfg);
+
+                    tracing::info!("Auto-resuming sync for {}...", &hex[..8]);
+
+                    let sync_engine = Arc::new(SyncEngine::new(
+                        wot_graph,
+                        db,
+                        relays,
+                        hex,
+                        sync_tier,
+                        sync_stats,
+                        app_handle,
+                    ));
+
+                    let cancel = sync_engine.start();
+                    *sync_cancel.write().await = Some(cancel);
+
+                    tracing::info!("Sync auto-resumed successfully");
+                }
+            });
+
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             get_status,
             init_nostrito,

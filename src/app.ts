@@ -6,6 +6,7 @@ import { renderWot } from "./screens/wot";
 import { renderStorage } from "./screens/storage";
 import { renderSettings } from "./screens/settings";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { invoke } from "@tauri-apps/api/core";
 
 let currentScreen: Screen = "wizard";
 
@@ -31,9 +32,7 @@ export function navigateTo(screen: Screen): void {
   });
 }
 
-export function initApp(root: HTMLElement): void {
-  const isInitialized = localStorage.getItem("nostrito_initialized") === "true";
-
+export async function initApp(root: HTMLElement): Promise<void> {
   root.innerHTML = `
     <div class="titlebar" data-tauri-drag-region>
       <div class="titlebar-buttons">
@@ -73,6 +72,16 @@ export function initApp(root: HTMLElement): void {
       navigateTo(screen);
     });
   });
+
+  // Check initialization state from Rust backend (source of truth)
+  let isInitialized = false;
+  try {
+    const status = await invoke<{ initialized: boolean }>("get_status");
+    isInitialized = status.initialized;
+  } catch (_e) {
+    // Tauri not available (browser preview) — fall back to localStorage
+    isInitialized = localStorage.getItem("nostrito_initialized") === "true";
+  }
 
   if (isInitialized) {
     showAppShell();
