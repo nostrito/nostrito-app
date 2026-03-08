@@ -1,11 +1,21 @@
 use anyhow::Result;
 use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 use crate::wot::WotGraph;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileInfo {
+    pub pubkey: String,
+    pub name: Option<String>,
+    pub display_name: Option<String>,
+    pub picture: Option<String>,
+    pub nip05: Option<String>,
+}
 
 pub struct Database {
     conn: Mutex<Connection>,
@@ -519,6 +529,60 @@ impl Database {
         }
 
         Ok(map)
+    }
+
+    /// Get profile info (kind:0 metadata) for given pubkeys.
+    /// Parses the JSON content of the most recent kind:0 event per pubkey.
+    pub fn get_profiles(&self, pubkeys: &[String]) -> Result<Vec<ProfileInfo>> {
+        if pubkeys.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let conn = self.conn.lock().unwrap();
+        let mut profiles = Vec::new();
+
+        // Process in chunks to avoid SQLite variable limits
+        for chunk in pubkeys.chunks(500) {
+            let placeholders: Vec<String> = (0..chunk.len())
+                .map(|i| format!("?{}", i + 1))
+                .collect();
+            let sql = format!(
+                "SELECT pubkey, content FROM nostr_events \
+                 WHERE kind = 0 AND pubkey IN ({}) \
+                 ORDER BY created_at DESC",
+                placeholders.join(",")
+            );
+
+            let mut stmt = conn.prepare(&sql)?;
+            let params_vec: Vec<&dyn rusqlite::ToSql> =
+                chunk.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+
+            let rows = stmt.query_map(params_vec.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+
+            let mut seen = std::collections::HashSet::new();
+            for row in rows {
+                if let Ok((pubkey, content)) = row {
+                    // Only take the first (most recent) per pubkey
+                    if !seen.insert(pubkey.clone()) {
+                        continue;
+                    }
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
+                        profiles.push(ProfileInfo {
+                            pubkey,
+                            name: parsed.get("name").and_then(|v| v.as_str()).map(String::from),
+                            display_name: parsed.get("display_name").and_then(|v| v.as_str()).map(String::from),
+                            picture: parsed.get("picture").and_then(|v| v.as_str()).map(String::from),
+                            nip05: parsed.get("nip05").and_then(|v| v.as_str()).map(String::from),
+                        });
+                    }
+                }
+            }
+        }
+
+        debug!("[db] get_profiles: requested={}, found={}", pubkeys.len(), profiles.len());
+        Ok(profiles)
     }
 
     /// Clear all data from the database (reset to fresh state)

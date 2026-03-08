@@ -559,3 +559,35 @@
   .settings-sub-nav { width: 50px; }
   .settings-sub-item { font-size: 0; padding: 11px 8px; text-align: center; }
 }
+
+/* Profile avatars */
+.ev-avatar-img {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  object-fit: cover;
+  flex-shrink: 0;
+}
+.own-profile {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--border);
+}
+.own-profile-avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  object-fit: cover;
+  background: var(--accent);
+  flex-shrink: 0;
+}
+.own-profile-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

@@ -1,6 +1,7 @@
 /** Feed — event feed view. All data from get_feed backend command. */
 
 import { invoke } from "@tauri-apps/api/core";
+import { getProfiles, profileDisplayName, type ProfileInfo } from "../utils/profiles";
 
 interface NostrEvent {
   id: string;
@@ -48,16 +49,21 @@ function kindLabel(kind: number): { tag: string; cls: string } {
   }
 }
 
-function renderEventCard(event: NostrEvent): string {
+function renderEventCard(event: NostrEvent, profile?: ProfileInfo): string {
   const initial = event.pubkey.charAt(0).toUpperCase();
   const k = kindLabel(event.kind);
+  const displayName = profileDisplayName(profile, event.pubkey);
+
+  const avatarHtml = profile?.picture
+    ? `<img src="${escapeHtml(profile.picture)}" class="ev-avatar ev-avatar-img" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'" /><div class="ev-avatar ${avatarClass(event.pubkey)}" style="display:none">${initial}</div>`
+    : `<div class="ev-avatar ${avatarClass(event.pubkey)}">${initial}</div>`;
 
   return `
     <div class="event-card" data-kind="${k.tag}">
-      <div class="ev-avatar ${avatarClass(event.pubkey)}">${initial}</div>
+      ${avatarHtml}
       <div class="ev-content">
         <div class="ev-meta">
-          <span class="ev-npub">${shortPubkey(event.pubkey)}</span>
+          <span class="ev-npub">${escapeHtml(displayName)}</span>
           <span class="ev-kind-tag ${k.cls}">${k.tag}</span>
           <span class="ev-time">${timeAgo(event.created_at)}</span>
         </div>
@@ -118,7 +124,11 @@ async function loadEvents(container: HTMLElement): Promise<void> {
       if (events.length === 0) {
         feedEl.innerHTML = `<div class="event-card" style="justify-content:center;color:var(--text-muted);padding:32px;">No events yet — syncing will populate your feed.</div>`;
       } else {
-        feedEl.innerHTML = events.map(renderEventCard).join("");
+        const pubkeys = [...new Set(events.map((e) => e.pubkey))];
+        const profileMap = await getProfiles(pubkeys);
+        feedEl.innerHTML = events
+          .map((e) => renderEventCard(e, profileMap.get(e.pubkey)))
+          .join("");
       }
     }
   } catch (_) {

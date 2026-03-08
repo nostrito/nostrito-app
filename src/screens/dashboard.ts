@@ -2,6 +2,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { getProfiles, profileDisplayName, type ProfileInfo } from "../utils/profiles";
 
 interface AppStatus {
   initialized: boolean;
@@ -71,17 +72,22 @@ function timeAgo(ts: number): string {
   return `${Math.floor(diff / 86400)}d ago`;
 }
 
-function renderEventCard(event: NostrEvent): string {
+function renderEventCard(event: NostrEvent, profile?: ProfileInfo): string {
   const initial = event.pubkey.charAt(0).toUpperCase();
   const kindTag = event.kind === 1 ? "note" : event.kind === 30023 ? "long-form" : `k:${event.kind}`;
   const kindClass = event.kind === 1 ? "ev-kind-note" : event.kind === 30023 ? "ev-kind-long" : "ev-kind-note";
+  const displayName = profileDisplayName(profile, event.pubkey);
+
+  const avatarHtml = profile?.picture
+    ? `<img src="${escapeHtml(profile.picture)}" class="ev-avatar ev-avatar-img" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'" /><div class="ev-avatar ${avatarClass(event.pubkey)}" style="display:none">${initial}</div>`
+    : `<div class="ev-avatar ${avatarClass(event.pubkey)}">${initial}</div>`;
 
   return `
     <div class="event-card">
-      <div class="ev-avatar ${avatarClass(event.pubkey)}">${initial}</div>
+      ${avatarHtml}
       <div class="ev-content">
         <div class="ev-meta">
-          <span class="ev-npub">${shortPubkey(event.pubkey)}</span>
+          <span class="ev-npub">${escapeHtml(displayName)}</span>
           <span class="ev-kind-tag ${kindClass}">${kindTag}</span>
           <span class="ev-time">${timeAgo(event.created_at)}</span>
         </div>
@@ -247,7 +253,11 @@ async function loadFeed(): Promise<void> {
       if (events.length === 0) {
         feedEl.innerHTML = `<div class="event-card" style="justify-content:center;color:var(--text-muted);padding:32px;">No events yet — syncing will populate your feed.</div>`;
       } else {
-        feedEl.innerHTML = events.map(renderEventCard).join("");
+        const pubkeys = [...new Set(events.map((e) => e.pubkey))];
+        const profileMap = await getProfiles(pubkeys);
+        feedEl.innerHTML = events
+          .map((e) => renderEventCard(e, profileMap.get(e.pubkey)))
+          .join("");
       }
     }
   } catch (_) {}

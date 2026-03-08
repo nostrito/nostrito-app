@@ -11,7 +11,7 @@ use tauri::{Emitter, Manager, State};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-use storage::Database;
+use storage::{Database, ProfileInfo};
 use sync::{SyncEngine, SyncStats, SyncTier};
 use wot::WotGraph;
 
@@ -603,6 +603,36 @@ async fn save_settings(settings: Settings, state: State<'_, AppState>) -> Result
     Ok(())
 }
 
+#[tauri::command]
+async fn get_profiles(
+    pubkeys: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<ProfileInfo>, String> {
+    tracing::debug!("[cmd:get_profiles] called for {} pubkeys", pubkeys.len());
+    state
+        .db
+        .get_profiles(&pubkeys)
+        .map_err(|e| format!("Failed to get profiles: {}", e))
+}
+
+#[tauri::command]
+async fn get_own_profile(state: State<'_, AppState>) -> Result<Option<ProfileInfo>, String> {
+    tracing::debug!("[cmd:get_own_profile] called");
+    let config = state.config.read().await;
+    let hex_pubkey = match &config.hex_pubkey {
+        Some(pk) => pk.clone(),
+        None => return Ok(None),
+    };
+    drop(config);
+
+    let profiles = state
+        .db
+        .get_profiles(&[hex_pubkey])
+        .map_err(|e| format!("Failed to get own profile: {}", e))?;
+
+    Ok(profiles.into_iter().next())
+}
+
 // ── App Entry ──────────────────────────────────────────────────────
 
 pub fn run() {
@@ -751,6 +781,8 @@ pub fn run() {
             get_activity_data,
             get_relay_status,
             get_kind_counts,
+            get_profiles,
+            get_own_profile,
         ])
         .run(tauri::generate_context!())
         .expect("error while running nostrito");

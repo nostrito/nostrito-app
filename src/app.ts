@@ -9,6 +9,7 @@ import { renderSettings } from "./screens/settings";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import type { ProfileInfo } from "./utils/profiles";
 
 let currentScreen: Screen = "wizard";
 
@@ -69,6 +70,7 @@ export async function initApp(root: HTMLElement): Promise<void> {
         <div class="app-nav-item" data-screen="storage">💾 Storage</div>
         <div class="app-nav-item" data-screen="settings">⚙️ Settings</div>
         <div class="sidebar-spacer"></div>
+        <div class="own-profile" id="own-profile" style="display:none"></div>
         <div class="sidebar-status"><span class="pulse-dot"></span> Live · ws://localhost:4869</div>
       </aside>
       <main class="main-content" id="main-content"></main>
@@ -144,4 +146,29 @@ export function showAppShell(): void {
   const titlebar = document.querySelector(".titlebar") as HTMLElement;
   if (titlebar) titlebar.style.display = "flex";
   navigateTo("dashboard");
+  loadOwnProfile();
+}
+
+async function loadOwnProfile(): Promise<void> {
+  try {
+    const profile = await invoke<ProfileInfo | null>("get_own_profile");
+    const el = document.getElementById("own-profile");
+    if (!el || !profile) return;
+
+    const name = profile.name || profile.display_name || "Me";
+    const avatarHtml = profile.picture
+      ? `<img src="${profile.picture}" class="own-profile-avatar" onerror="this.style.display='none'" />`
+      : `<div class="own-profile-avatar"></div>`;
+
+    el.innerHTML = `${avatarHtml}<span class="own-profile-name">${escapeHtml(name)}</span>`;
+    el.style.display = "flex";
+  } catch (e) {
+    console.warn("[app] Failed to load own profile:", e);
+  }
+}
+
+function escapeHtml(str: string): string {
+  const div = document.createElement("div");
+  div.textContent = str;
+  return div.innerHTML;
 }
