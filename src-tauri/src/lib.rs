@@ -258,7 +258,7 @@ async fn init_nostrito(
     let cancel = sync_engine.start();
     *state.sync_cancel.write().await = Some(cancel);
 
-    // Auto-start relay
+    // Auto-start relay (TLS if certs available)
     {
         let config = state.config.read().await;
         let port = config.relay_port;
@@ -269,11 +269,31 @@ async fn init_nostrito(
         let relay_cancel = CancellationToken::new();
         let relay_cancel_clone = relay_cancel.clone();
 
-        tokio::spawn(async move {
-            if let Err(e) = relay::run_relay(port, db_relay, allowed, relay_cancel_clone).await {
-                tracing::error!("Relay server error: {}", e);
-            }
-        });
+        let cert_path = dirs::home_dir()
+            .unwrap_or_default()
+            .join(".nostrito/certs/localhost.pem");
+        let key_path = dirs::home_dir()
+            .unwrap_or_default()
+            .join(".nostrito/certs/localhost-key.pem");
+
+        if cert_path.exists() && key_path.exists() {
+            tracing::info!("[relay] Starting TLS relay on wss://127.0.0.1:{}", port);
+            tokio::spawn(async move {
+                if let Err(e) =
+                    relay::run_relay_tls(port, cert_path, key_path, db_relay, allowed, relay_cancel_clone)
+                        .await
+                {
+                    tracing::error!("TLS relay error: {}", e);
+                }
+            });
+        } else {
+            tracing::info!("[relay] Starting plain relay on ws://127.0.0.1:{}", port);
+            tokio::spawn(async move {
+                if let Err(e) = relay::run_relay(port, db_relay, allowed, relay_cancel_clone).await {
+                    tracing::error!("Relay server error: {}", e);
+                }
+            });
+        }
 
         *state.relay_cancel.write().await = Some(relay_cancel);
         tracing::info!("Relay auto-started on port {}", port);
@@ -448,11 +468,31 @@ async fn start_relay(state: State<'_, AppState>) -> Result<(), String> {
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
 
-    tokio::spawn(async move {
-        if let Err(e) = relay::run_relay(port, db, allowed_pubkey, cancel_clone).await {
-            tracing::error!("Relay server error: {}", e);
-        }
-    });
+    let cert_path = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".nostrito/certs/localhost.pem");
+    let key_path = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".nostrito/certs/localhost-key.pem");
+
+    if cert_path.exists() && key_path.exists() {
+        tracing::info!("[relay] Starting TLS relay on wss://127.0.0.1:{}", port);
+        tokio::spawn(async move {
+            if let Err(e) =
+                relay::run_relay_tls(port, cert_path, key_path, db, allowed_pubkey, cancel_clone)
+                    .await
+            {
+                tracing::error!("TLS relay error: {}", e);
+            }
+        });
+    } else {
+        tracing::info!("[relay] Starting plain relay on ws://127.0.0.1:{}", port);
+        tokio::spawn(async move {
+            if let Err(e) = relay::run_relay(port, db, allowed_pubkey, cancel_clone).await {
+                tracing::error!("Relay server error: {}", e);
+            }
+        });
+    }
 
     *state.relay_cancel.write().await = Some(cancel);
     tracing::info!("Relay server started on port {}", port);
@@ -639,6 +679,94 @@ async fn get_own_profile(state: State<'_, AppState>) -> Result<Option<ProfileInf
     Ok(profiles.into_iter().next())
 }
 
+// ── Browser Integration (mkcert TLS) ───────────────────────────────
+
+#[tauri::command]
+async fn setup_browser_integration(app: tauri::AppHandle) -> Result<String, String> {
+    use std::process::Command;
+
+    // Find bundled mkcert
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|e| e.to_string())?;
+
+    let mkcert_name = if cfg!(target_os = "macos") {
+        if cfg!(target_arch = "aarch64") {
+            "mkcert-macos-arm64"
+        } else {
+            "mkcert-macos-amd64"
+        }
+    } else if cfg!(target_os = "linux") {
+        "mkcert-linux-amd64"
+    } else {
+        "mkcert-windows-amd64.exe"
+    };
+
+    let mkcert_path = resource_dir.join("resources").join(mkcert_name);
+
+    // chmod +x on unix
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&mkcert_path)
+            .map_err(|e| format!("mkcert binary not found at {:?}: {}", mkcert_path, e))?
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&mkcert_path, perms).map_err(|e| e.to_string())?;
+    }
+
+    // mkcert -install (triggers OS trust dialog)
+    let install = Command::new(&mkcert_path)
+        .arg("-install")
+        .output()
+        .map_err(|e| format!("mkcert -install failed: {}", e))?;
+
+    if !install.status.success() {
+        return Err(format!(
+            "mkcert -install error: {}",
+            String::from_utf8_lossy(&install.stderr)
+        ));
+    }
+
+    // Generate cert
+    let cert_dir = dirs::home_dir()
+        .ok_or("no home dir")?
+        .join(".nostrito/certs");
+    std::fs::create_dir_all(&cert_dir).map_err(|e| e.to_string())?;
+
+    let gen = Command::new(&mkcert_path)
+        .args([
+            "-cert-file",
+            "localhost.pem",
+            "-key-file",
+            "localhost-key.pem",
+            "localhost",
+            "127.0.0.1",
+        ])
+        .current_dir(&cert_dir)
+        .output()
+        .map_err(|e| format!("mkcert gen failed: {}", e))?;
+
+    if !gen.status.success() {
+        return Err(format!(
+            "mkcert gen error: {}",
+            String::from_utf8_lossy(&gen.stderr)
+        ));
+    }
+
+    tracing::info!("[mkcert] Browser integration set up — certs at {:?}", cert_dir);
+    Ok(cert_dir.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+async fn check_browser_integration() -> Result<bool, String> {
+    let cert_path = dirs::home_dir()
+        .ok_or("no home")?
+        .join(".nostrito/certs/localhost.pem");
+    Ok(cert_path.exists())
+}
+
 // ── App Entry ──────────────────────────────────────────────────────
 
 pub fn run() {
@@ -753,14 +881,38 @@ pub fn run() {
                     let cancel = sync_engine.start();
                     *sync_cancel.write().await = Some(cancel);
 
-                    // Auto-start relay
+                    // Auto-start relay (TLS if certs available)
                     let relay_ct = CancellationToken::new();
                     let relay_ct_clone = relay_ct.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = relay::run_relay(port, db_relay, allowed, relay_ct_clone).await {
-                            tracing::error!("Relay auto-start error: {}", e);
-                        }
-                    });
+
+                    let cert_path = dirs::home_dir()
+                        .unwrap_or_default()
+                        .join(".nostrito/certs/localhost.pem");
+                    let key_path = dirs::home_dir()
+                        .unwrap_or_default()
+                        .join(".nostrito/certs/localhost-key.pem");
+
+                    if cert_path.exists() && key_path.exists() {
+                        tracing::info!("[relay] Auto-starting TLS relay on wss://127.0.0.1:{}", port);
+                        tokio::spawn(async move {
+                            if let Err(e) = relay::run_relay_tls(
+                                port, cert_path, key_path, db_relay, allowed, relay_ct_clone,
+                            )
+                            .await
+                            {
+                                tracing::error!("TLS relay auto-start error: {}", e);
+                            }
+                        });
+                    } else {
+                        tracing::info!("[relay] Auto-starting plain relay on ws://127.0.0.1:{}", port);
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                relay::run_relay(port, db_relay, allowed, relay_ct_clone).await
+                            {
+                                tracing::error!("Relay auto-start error: {}", e);
+                            }
+                        });
+                    }
                     *relay_cancel_setup.write().await = Some(relay_ct);
 
                     tracing::info!("Sync and relay auto-resumed successfully");
@@ -789,6 +941,8 @@ pub fn run() {
             get_kind_counts,
             get_profiles,
             get_own_profile,
+            setup_browser_integration,
+            check_browser_integration,
         ])
         .run(tauri::generate_context!())
         .expect("error while running nostrito");
