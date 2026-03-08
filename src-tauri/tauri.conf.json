@@ -32,5 +32,10 @@
       "csp": null
     }
   },
+  "bundle": {
+    "resources": {
+      "resources/*": "resources/"
+    }
+  },
   "plugins": {}
 }

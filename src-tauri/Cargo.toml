@@ -34,3 +34,5 @@ chrono = { version = "0.4", features = ["serde"] }
 dirs = "5"
 tokio-util = { version = "0.7", features = ["rt"] }
 futures-util = "0.3"
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
