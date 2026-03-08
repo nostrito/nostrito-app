@@ -572,7 +572,15 @@ impl SyncEngine {
 
             let filter = Filter::new()
                 .authors(authors)
-                .kind(Kind::TextNote)
+                .kinds(vec![
+                    Kind::Metadata,          // 0 — profile pics + WoT
+                    Kind::TextNote,          // 1 — notes
+                    Kind::ContactList,       // 3 — WoT depth
+                    Kind::Repost,            // 6
+                    Kind::Reaction,          // 7
+                    Kind::ZapReceipt,        // 9735
+                    Kind::LongFormTextNote,  // 30023
+                ])
                 .since(since)
                 .limit(50);
 
@@ -583,6 +591,7 @@ impl SyncEngine {
             match subscribe_and_collect(&client, vec![filter], 10, policy).await {
                 Ok(events) => {
                     for event in events.iter() {
+                        // Store every event in DB
                         let tags: Vec<Vec<String>> = event
                             .tags
                             .iter()
@@ -600,6 +609,32 @@ impl SyncEngine {
                                 &event.sig.to_string(),
                             )
                             .ok();
+
+                        // Process kind:3 → update WoT graph with follows-of-follows
+                        if event.kind == Kind::ContactList {
+                            if let Some(update) = process_contact_event(event) {
+                                let updated = self.graph.update_follows(
+                                    &update.pubkey,
+                                    &update.follows,
+                                    Some(update.event_id.clone()),
+                                    Some(update.created_at),
+                                );
+                                if updated {
+                                    let batch = vec![FollowUpdateBatch {
+                                        pubkey: &update.pubkey,
+                                        follows: &update.follows,
+                                        event_id: Some(&update.event_id),
+                                        created_at: Some(update.created_at),
+                                    }];
+                                    self.db.update_follows_batch(&batch).ok();
+                                    debug!(
+                                        "Tier 2: Updated WoT for {} ({} follows)",
+                                        &update.pubkey[..8],
+                                        update.follows.len()
+                                    );
+                                }
+                            }
+                        }
                     }
                     fetched += events.len() as u64;
                     debug!(
@@ -725,8 +760,8 @@ impl SyncEngine {
 
             let filter = Filter::new()
                 .authors(authors)
-                .kind(Kind::ContactList)
-                .limit(10);
+                .kinds(vec![Kind::Metadata, Kind::ContactList])
+                .limit(15);
 
             let policy = policies
                 .entry(policy_url.clone())
@@ -735,6 +770,26 @@ impl SyncEngine {
             match subscribe_and_collect(&client, vec![filter], 10, policy).await {
                 Ok(events) => {
                     for event in events.iter() {
+                        // Store every event in DB (metadata + contact lists)
+                        let tags: Vec<Vec<String>> = event
+                            .tags
+                            .iter()
+                            .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
+                            .collect();
+                        let tags_json = serde_json::to_string(&tags).unwrap_or_default();
+                        self.db
+                            .store_event(
+                                &event.id.to_hex(),
+                                &event.pubkey.to_hex(),
+                                event.created_at.as_u64() as i64,
+                                event.kind.as_u16() as u32,
+                                &tags_json,
+                                &event.content.to_string(),
+                                &event.sig.to_string(),
+                            )
+                            .ok();
+
+                        // Process kind:3 → update WoT graph
                         if let Some(update) = process_contact_event(event) {
                             let updated = self.graph.update_follows(
                                 &update.pubkey,
