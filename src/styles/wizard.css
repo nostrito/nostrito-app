@@ -1,0 +1,462 @@
+/* nostrito — Wizard screen styles */
+
+.wizard-root {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100vh;
+  width: 100vw;
+  background: var(--bg);
+  padding: 0;
+}
+
+.wizard-wrapper {
+  width: 100%;
+  max-width: 560px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 24px;
+  padding: 0 24px;
+}
+
+/* Titlebar */
+.wizard-titlebar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 16px;
+  -webkit-app-region: drag;
+  user-select: none;
+  z-index: 100;
+}
+
+.wizard-dots-decorative {
+  display: flex;
+  gap: 8px;
+  -webkit-app-region: no-drag;
+}
+
+.dot-red,
+.dot-yellow,
+.dot-green {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+}
+
+.dot-red { background: #ff5f57; }
+.dot-yellow { background: #febc2e; }
+.dot-green { background: #28c840; }
+
+.wizard-titlebar-text {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-dim);
+  letter-spacing: 0.5px;
+}
+
+/* Logo */
+.wizard-logo {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 20px;
+}
+
+.wizard-logo-icon {
+  font-size: 32px;
+}
+
+.wizard-logo-text {
+  font-size: 26px;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: -0.5px;
+}
+
+/* Progress bar */
+.wizard-progress {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  width: 280px;
+  justify-content: center;
+}
+
+.wizard-progress-dot {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid var(--border);
+  background: transparent;
+  transition: all 0.3s ease;
+  flex-shrink: 0;
+}
+
+.wizard-progress-dot.active {
+  border-color: var(--accent);
+  background: var(--accent);
+  box-shadow: 0 0 12px rgba(124, 58, 237, 0.5);
+}
+
+.wizard-progress-dot.completed {
+  border-color: var(--accent-light);
+  background: var(--accent-light);
+}
+
+.wizard-progress-line {
+  height: 2px;
+  flex: 1;
+  background: var(--border);
+  transition: background 0.3s ease;
+}
+
+.wizard-progress-line.done {
+  background: var(--accent);
+}
+
+/* Progress labels */
+.wizard-progress-labels {
+  display: flex;
+  width: 320px;
+  justify-content: space-between;
+  margin-top: -12px;
+}
+
+.wizard-progress-label {
+  font-size: 12px;
+  color: var(--text-dim);
+  transition: color 0.3s ease;
+}
+
+.wizard-progress-label.active {
+  color: var(--accent-light);
+  font-weight: 600;
+}
+
+/* Step content */
+.wizard-content {
+  width: 100%;
+  opacity: 0;
+  transform: translateY(12px);
+  transition: opacity 0.35s ease, transform 0.35s ease;
+}
+
+.wizard-content.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.wizard-heading {
+  font-size: 26px;
+  font-weight: 700;
+  margin-bottom: 8px;
+  text-align: center;
+  letter-spacing: -0.5px;
+}
+
+.wizard-subtext {
+  font-size: 15px;
+  color: var(--text-dim);
+  text-align: center;
+  margin-bottom: 28px;
+  line-height: 1.5;
+}
+
+/* Identity step */
+.wizard-input-group {
+  width: 100%;
+  max-width: 460px;
+  margin: 0 auto;
+}
+
+.wizard-input {
+  width: 100%;
+  padding: 14px 18px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 1.1rem;
+  outline: none;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.wizard-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(124, 58, 237, 0.25);
+}
+
+.wizard-input::placeholder {
+  color: var(--text-dim);
+  opacity: 0.5;
+}
+
+.wizard-error {
+  color: var(--red);
+  font-size: 13px;
+  margin-top: 8px;
+  text-align: left;
+}
+
+/* Relay grid */
+.relay-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.relay-card {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  gap: 6px;
+  height: 160px;
+  padding: 20px 16px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  text-align: center;
+  user-select: none;
+}
+
+.relay-card:hover {
+  transform: translateY(-3px);
+  border-color: rgba(124, 58, 237, 0.3);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+}
+
+.relay-card.on {
+  border-color: var(--accent);
+  background: rgba(124, 58, 237, 0.08);
+  box-shadow: 0 0 20px rgba(124, 58, 237, 0.15);
+}
+
+.relay-name {
+  font-family: var(--mono);
+  font-weight: 700;
+  font-size: 16px;
+  color: var(--text);
+}
+
+.relay-desc {
+  font-size: 13px;
+  color: var(--text-dim);
+  line-height: 1.4;
+}
+
+.relay-toggle {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  padding: 3px 10px;
+  border-radius: 20px;
+  background: var(--bg-elevated);
+  color: var(--text-dim);
+  margin-top: 4px;
+  transition: all 0.2s ease;
+}
+
+.relay-card.on .relay-toggle {
+  background: var(--accent);
+  color: #fff;
+}
+
+/* Storage step */
+.storage-section {
+  margin-bottom: 22px;
+}
+
+.storage-bar-own {
+  position: relative;
+  width: 100%;
+  height: 48px;
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--bg-card);
+  border: 1px solid rgba(52, 211, 153, 0.3);
+}
+
+.storage-bar-fill {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, rgba(52, 211, 153, 0.15), rgba(52, 211, 153, 0.08));
+}
+
+.storage-bar-label {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  height: 100%;
+  padding: 0 16px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--green);
+}
+
+.storage-slider-label {
+  display: block;
+  font-size: 14px;
+  color: var(--text);
+  margin-bottom: 10px;
+}
+
+.storage-slider-label strong {
+  color: var(--accent-light);
+  font-family: var(--mono);
+}
+
+/* Custom slider */
+.wizard-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--bg-elevated);
+  outline: none;
+  cursor: pointer;
+}
+
+.wizard-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--accent);
+  cursor: pointer;
+  box-shadow: 0 0 8px rgba(124, 58, 237, 0.4);
+  transition: transform 0.15s ease;
+}
+
+.wizard-slider::-webkit-slider-thumb:hover {
+  transform: scale(1.15);
+}
+
+.wizard-slider::-moz-range-thumb {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: none;
+  cursor: pointer;
+  box-shadow: 0 0 8px rgba(124, 58, 237, 0.4);
+}
+
+/* Media type pills */
+.media-types-row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.media-pill {
+  padding: 8px 18px;
+  border-radius: 20px;
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  color: var(--text-dim);
+  font-size: 14px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  font-family: inherit;
+}
+
+.media-pill:hover {
+  border-color: var(--accent);
+}
+
+.media-pill.active {
+  background: rgba(124, 58, 237, 0.12);
+  border-color: var(--accent);
+  color: var(--accent-light);
+  font-weight: 600;
+}
+
+/* Radio group */
+.radio-group {
+  display: flex;
+  gap: 12px;
+}
+
+.radio-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 18px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  cursor: pointer;
+  font-size: 14px;
+  color: var(--text-dim);
+  transition: all 0.2s ease;
+}
+
+.radio-option:hover {
+  border-color: rgba(124, 58, 237, 0.3);
+}
+
+.radio-option.selected {
+  border-color: var(--accent);
+  color: var(--accent-light);
+  background: rgba(124, 58, 237, 0.08);
+}
+
+.radio-option input[type="radio"] {
+  accent-color: var(--accent);
+}
+
+/* Buttons */
+.wizard-buttons {
+  display: flex;
+  justify-content: center;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.btn.disabled,
+.btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
+.btn-finish {
+  padding: 12px 28px;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+/* Responsive */
+@media (max-width: 520px) {
+  .relay-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .relay-card {
+    height: 120px;
+  }
+
+  .wizard-heading {
+    font-size: 22px;
+  }
+
+  .radio-group {
+    flex-direction: column;
+  }
+}

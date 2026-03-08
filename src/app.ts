@@ -31,9 +31,7 @@ export function navigateTo(screen: Screen): void {
 }
 
 export function initApp(root: HTMLElement): void {
-  // TODO: Check AppStatus via invoke('get_status') to decide
-  // whether to show wizard or dashboard on startup.
-  // For now, always start with wizard.
+  const isInitialized = localStorage.getItem("nostrito_initialized") === "true";
 
   root.innerHTML = `
     <aside class="sidebar" id="sidebar" style="display: none;">
@@ -60,8 +58,11 @@ export function initApp(root: HTMLElement): void {
     });
   });
 
-  // Start on wizard (sidebar hidden until onboarding complete)
-  navigateTo("wizard");
+  if (isInitialized) {
+    showAppShell();
+  } else {
+    navigateTo("wizard");
+  }
 }
 
 /** Call after wizard completes to show full app shell */
