@@ -40,6 +40,7 @@ export function renderStorage(container: HTMLElement): void {
         <div class="kind-card-p"><div class="kind-card-top"><span class="kind-icon">❤️</span><span class="kind-name">Reactions</span><span class="kind-count" id="kc-7">—</span></div><span class="kind-meta">kind 7</span></div>
         <div class="kind-card-p"><div class="kind-card-top"><span class="kind-icon">🏷️</span><span class="kind-name">Metadata</span><span class="kind-count" id="kc-0">—</span></div><span class="kind-meta">kind 0</span></div>
         <div class="kind-card-p"><div class="kind-card-top"><span class="kind-icon">👥</span><span class="kind-name">Contacts</span><span class="kind-count" id="kc-3">—</span></div><span class="kind-meta">kind 3</span></div>
+        <div class="kind-card-p"><div class="kind-card-top"><span class="kind-icon">💬</span><span class="kind-name">DMs</span><span class="kind-count" id="kc-dms">—</span></div><span class="kind-meta">kind 4 + 1059</span></div>
       </div>
       <div id="storage-db-info" style="font-size:0.8rem;color:var(--text-muted);margin-top:12px">
       </div>
@@ -83,6 +84,13 @@ async function loadStorageStats(): Promise<void> {
           const count = counts[k] || 0;
           el.textContent = count.toLocaleString();
         }
+      }
+
+      // DMs: sum kind 4 (NIP-04) + kind 1059 (NIP-17 gift wrap)
+      const dmCount = (counts["4"] || 0) + (counts["1059"] || 0);
+      const dmEl = document.getElementById("kc-dms");
+      if (dmEl) {
+        dmEl.textContent = dmCount.toLocaleString();
       }
 
       // Compute storage bar segments from real data

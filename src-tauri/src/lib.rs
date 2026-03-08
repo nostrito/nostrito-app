@@ -621,6 +621,38 @@ async fn get_kind_counts(state: State<'_, AppState>) -> Result<KindCounts, Strin
 }
 
 #[tauri::command]
+async fn get_dm_events(
+    own_pubkey: String,
+    limit: Option<u32>,
+    state: State<'_, AppState>,
+) -> Result<Vec<NostrEvent>, String> {
+    tracing::debug!("[cmd:get_dm_events] called for pubkey={}..., limit={:?}", &own_pubkey[..std::cmp::min(8, own_pubkey.len())], limit);
+    let lim = limit.unwrap_or(200);
+    let events = state
+        .db
+        .get_dm_events(&own_pubkey, lim)
+        .map_err(|e| format!("Failed to query DM events: {}", e))?;
+
+    tracing::info!("[cmd:get_dm_events] returning {} DM events", events.len());
+
+    Ok(events
+        .into_iter()
+        .map(|(id, pubkey, created_at, kind, tags_json, content, sig)| {
+            let tags: Vec<Vec<String>> = serde_json::from_str(&tags_json).unwrap_or_default();
+            NostrEvent {
+                id,
+                pubkey,
+                created_at: created_at as u64,
+                kind: kind as u32,
+                tags,
+                content,
+                sig,
+            }
+        })
+        .collect())
+}
+
+#[tauri::command]
 async fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
     tracing::debug!("[cmd:get_settings] called");
     let config = state.config.read().await;
@@ -939,6 +971,7 @@ pub fn run() {
             get_activity_data,
             get_relay_status,
             get_kind_counts,
+            get_dm_events,
             get_profiles,
             get_own_profile,
             setup_browser_integration,

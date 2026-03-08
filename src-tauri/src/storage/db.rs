@@ -602,6 +602,40 @@ impl Database {
         Ok(profiles)
     }
 
+    /// Get DM events (kind:4) involving a specific pubkey (as sender or recipient).
+    /// Returns (id, pubkey, created_at, kind, tags_json, content, sig).
+    pub fn get_dm_events(
+        &self,
+        own_pubkey: &str,
+        limit: u32,
+    ) -> Result<Vec<(String, String, i64, i64, String, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, pubkey, created_at, kind, tags, content, sig \
+             FROM nostr_events \
+             WHERE kind = 4 AND (pubkey = ?1 OR tags LIKE '%' || ?1 || '%') \
+             ORDER BY created_at DESC \
+             LIMIT ?2",
+        )?;
+
+        let rows = stmt
+            .query_map(params![own_pubkey, limit as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(rows)
+    }
+
     /// Clear all data from the database (reset to fresh state)
     pub fn clear_all(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();

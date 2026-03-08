@@ -573,13 +573,14 @@ impl SyncEngine {
             let filter = Filter::new()
                 .authors(authors)
                 .kinds(vec![
-                    Kind::Metadata,          // 0 — profile pics + WoT
-                    Kind::TextNote,          // 1 — notes
-                    Kind::ContactList,       // 3 — WoT depth
-                    Kind::Repost,            // 6
-                    Kind::Reaction,          // 7
-                    Kind::ZapReceipt,        // 9735
-                    Kind::LongFormTextNote,  // 30023
+                    Kind::Metadata,                  // 0 — profile pics + WoT
+                    Kind::TextNote,                  // 1 — notes
+                    Kind::ContactList,               // 3 — WoT depth
+                    Kind::EncryptedDirectMessage,    // 4 — NIP-04 DMs
+                    Kind::Repost,                    // 6
+                    Kind::Reaction,                  // 7
+                    Kind::ZapReceipt,                // 9735
+                    Kind::LongFormTextNote,          // 30023
                 ])
                 .since(since)
                 .limit(50);
