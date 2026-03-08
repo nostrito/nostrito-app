@@ -188,7 +188,7 @@ async fn subscribe_and_collect(
     // Respect rate limits before sending
     policy.wait_for_slot().await;
 
-    let sub_id = client.subscribe(filter, None).await?;
+    let sub_id = client.subscribe(filter, None).await?.val;
     let mut notifications = client.notifications();
     let mut events: Vec<Event> = Vec::new();
     let deadline = tokio::time::sleep(Duration::from_secs(timeout_secs));
