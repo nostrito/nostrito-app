@@ -476,7 +476,7 @@ impl SyncEngine {
                             .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
                             .collect();
                         let tags_json = serde_json::to_string(&tags).unwrap_or_default();
-                        let content: String = event.content().to_string();
+                        let content: String = event.content.to_string();
                         let sig: String = event.sig.to_string();
                         self.db.store_event(
                             &event.id.to_hex(),

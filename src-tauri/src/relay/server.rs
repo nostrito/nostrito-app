@@ -204,7 +204,7 @@ async fn handle_connection(
     let subs_clone = subscriptions.clone();
 
     // Task to forward broadcast events to matching subscriptions
-    let mut forward_task = tokio::spawn(async move {
+    let forward_task = tokio::spawn(async move {
         loop {
             match broadcast_rx.recv().await {
                 Ok(event) => {
