@@ -18,9 +18,18 @@ tauri-plugin-shell = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
-rusqlite = { version = "0.31", features = ["bundled"] }
-nostr-sdk = "0.36"
+rusqlite = { version = "0.32", features = ["bundled"] }
+nostr-sdk = "0.35"
 tokio-tungstenite = "0.21"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+dashmap = "6"
+parking_lot = "0.12"
+rustc-hash = "2"
+moka = { version = "0.12", features = ["sync"] }
+lru = "0.12"
+thiserror = "2"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5"
+tokio-util = { version = "0.7", features = ["rt"] }
