@@ -25,6 +25,8 @@ pub struct AppState {
     pub sync_cancel: Arc<RwLock<Option<CancellationToken>>>,
     pub sync_tier: Arc<AtomicU8>,
     pub sync_stats: Arc<RwLock<SyncStats>>,
+    pub relay_cancel: Arc<RwLock<Option<CancellationToken>>>,
+    pub start_time: std::time::Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -149,15 +151,17 @@ async fn get_status(state: State<'_, AppState>) -> Result<AppStatus, String> {
     let config = state.config.read().await;
     let stats = state.wot_graph.stats();
     let sync_running = state.sync_cancel.read().await.is_some();
+    let relay_running = state.relay_cancel.read().await.is_some();
     let current_tier = state.sync_tier.load(Ordering::Relaxed);
     let sync_stats = state.sync_stats.read().await.clone();
+    let events_stored = state.db.event_count().unwrap_or(0);
 
     Ok(AppStatus {
         initialized: config.npub.is_some(),
         npub: config.npub.clone(),
-        relay_running: false, // relay server still stubbed
+        relay_running,
         relay_port: config.relay_port,
-        events_stored: 0, // TODO: query nostr_events table
+        events_stored,
         wot_nodes: stats.node_count,
         wot_edges: stats.edge_count,
         sync_status: if sync_running {
@@ -251,6 +255,27 @@ async fn init_nostrito(
     let cancel = sync_engine.start();
     *state.sync_cancel.write().await = Some(cancel);
 
+    // Auto-start relay
+    {
+        let config = state.config.read().await;
+        let port = config.relay_port;
+        let allowed = config.hex_pubkey.clone();
+        drop(config);
+
+        let db_relay = state.db.clone();
+        let relay_cancel = CancellationToken::new();
+        let relay_cancel_clone = relay_cancel.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) = relay::run_relay(port, db_relay, allowed, relay_cancel_clone).await {
+                tracing::error!("Relay server error: {}", e);
+            }
+        });
+
+        *state.relay_cancel.write().await = Some(relay_cancel);
+        tracing::info!("Relay auto-started on port {}", port);
+    }
+
     tracing::info!("Nostrito initialized for {}", &hex_pubkey[..8]);
     Ok(())
 }
@@ -339,20 +364,135 @@ async fn stop_sync(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn get_feed(filter: FeedFilter) -> Result<Vec<NostrEvent>, String> {
-    let _ = filter;
-    // TODO: Query nostr_events table with filter
-    Ok(vec![])
+async fn get_feed(filter: FeedFilter, state: State<'_, AppState>) -> Result<Vec<NostrEvent>, String> {
+    let kinds = filter.kinds.as_deref();
+    let limit = filter.limit.unwrap_or(50);
+
+    let events = state
+        .db
+        .query_events(None, None, kinds, filter.since, None, limit)
+        .map_err(|e| format!("Failed to query events: {}", e))?;
+
+    Ok(events
+        .into_iter()
+        .map(|(id, pubkey, created_at, kind, tags_json, content, sig)| {
+            let tags: Vec<Vec<String>> = serde_json::from_str(&tags_json).unwrap_or_default();
+            NostrEvent {
+                id,
+                pubkey,
+                created_at: created_at as u64,
+                kind: kind as u32,
+                tags,
+                content,
+                sig,
+            }
+        })
+        .collect())
 }
 
 #[tauri::command]
-async fn get_storage_stats() -> Result<StorageStats, String> {
+async fn get_storage_stats(state: State<'_, AppState>) -> Result<StorageStats, String> {
+    let total_events = state.db.event_count().map_err(|e| e.to_string())?;
+    let db_size_bytes = state.db.db_size_bytes().map_err(|e| e.to_string())?;
+    let (oldest_event, newest_event) = state.db.event_time_range().map_err(|e| e.to_string())?;
+
     Ok(StorageStats {
-        total_events: 0,
-        db_size_bytes: 0,
-        oldest_event: 0,
-        newest_event: 0,
+        total_events,
+        db_size_bytes,
+        oldest_event,
+        newest_event,
     })
+}
+
+#[tauri::command]
+async fn start_relay(state: State<'_, AppState>) -> Result<(), String> {
+    let existing = state.relay_cancel.read().await;
+    if existing.is_some() {
+        return Err("Relay already running".into());
+    }
+    drop(existing);
+
+    let config = state.config.read().await;
+    let port = config.relay_port;
+    let allowed_pubkey = config.hex_pubkey.clone();
+    drop(config);
+
+    let db = state.db.clone();
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+
+    tokio::spawn(async move {
+        if let Err(e) = relay::run_relay(port, db, allowed_pubkey, cancel_clone).await {
+            tracing::error!("Relay server error: {}", e);
+        }
+    });
+
+    *state.relay_cancel.write().await = Some(cancel);
+    tracing::info!("Relay server started on port {}", port);
+    Ok(())
+}
+
+#[tauri::command]
+async fn stop_relay(state: State<'_, AppState>) -> Result<(), String> {
+    let cancel = state.relay_cancel.write().await.take();
+    if let Some(cancel) = cancel {
+        cancel.cancel();
+        tracing::info!("Relay server stopped");
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_uptime(state: State<'_, AppState>) -> Result<u64, String> {
+    Ok(state.start_time.elapsed().as_secs())
+}
+
+#[tauri::command]
+async fn reset_app_data(
+    app_handle: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    tracing::info!("Resetting app data — clearing DB, config, and graph");
+
+    // Stop sync if running
+    if let Some(cancel) = state.sync_cancel.write().await.take() {
+        cancel.cancel();
+        state
+            .sync_tier
+            .store(SyncTier::Idle as u8, Ordering::Relaxed);
+    }
+
+    // Stop relay if running
+    if let Some(cancel) = state.relay_cancel.write().await.take() {
+        cancel.cancel();
+    }
+
+    // Clear database
+    state
+        .db
+        .clear_all()
+        .map_err(|e| format!("Failed to clear database: {}", e))?;
+
+    // Clear in-memory WoT graph
+    state.wot_graph.clear();
+
+    // Reset sync stats
+    {
+        let mut stats = state.sync_stats.write().await;
+        *stats = SyncStats::default();
+    }
+
+    // Reset config to defaults (no npub)
+    {
+        let mut config = state.config.write().await;
+        *config = AppConfig::default();
+    }
+
+    // Emit event to frontend to show wizard
+    app_handle.emit("app:reset", ()).ok();
+
+    tracing::info!("App data reset complete");
+    Ok(())
 }
 
 #[tauri::command]
@@ -439,6 +579,8 @@ pub fn run() {
         sync_cancel: Arc::new(RwLock::new(None)),
         sync_tier: Arc::new(AtomicU8::new(0)),
         sync_stats: Arc::new(RwLock::new(SyncStats::default())),
+        relay_cancel: Arc::new(RwLock::new(None)),
+        start_time: std::time::Instant::now(),
     };
 
     tauri::Builder::default()
@@ -454,12 +596,18 @@ pub fn run() {
             let sync_cancel = state.sync_cancel.clone();
             let app_handle = app.handle().clone();
 
-            // Auto-resume sync if previously configured
+            // Auto-resume sync and relay if previously configured
+            let relay_cancel_setup = state.relay_cancel.clone();
+            let db_relay = state.db.clone();
+            let config_relay = state.config.clone();
+
             tauri::async_runtime::spawn(async move {
                 let cfg = config.read().await;
                 if let Some(ref hex_pubkey) = cfg.hex_pubkey {
                     let relays = cfg.outbound_relays.clone();
                     let hex: String = hex_pubkey.clone();
+                    let port = cfg.relay_port;
+                    let allowed = cfg.hex_pubkey.clone();
                     drop(cfg);
 
                     tracing::info!("Auto-resuming sync for {}...", &hex[..8]);
@@ -477,7 +625,17 @@ pub fn run() {
                     let cancel = sync_engine.start();
                     *sync_cancel.write().await = Some(cancel);
 
-                    tracing::info!("Sync auto-resumed successfully");
+                    // Auto-start relay
+                    let relay_ct = CancellationToken::new();
+                    let relay_ct_clone = relay_ct.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = relay::run_relay(port, db_relay, allowed, relay_ct_clone).await {
+                            tracing::error!("Relay auto-start error: {}", e);
+                        }
+                    });
+                    *relay_cancel_setup.write().await = Some(relay_ct);
+
+                    tracing::info!("Sync and relay auto-resumed successfully");
                 }
             });
 
@@ -494,6 +652,10 @@ pub fn run() {
             save_settings,
             start_sync,
             stop_sync,
+            start_relay,
+            stop_relay,
+            get_uptime,
+            reset_app_data,
         ])
         .run(tauri::generate_context!())
         .expect("error while running nostrito");

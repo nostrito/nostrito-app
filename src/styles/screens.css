@@ -1,0 +1,97 @@
+/* WoT page */
+.wot-page-inner { padding: 24px; }
+.wot-stats { display: flex; gap: 16px; margin-bottom: 24px; }
+.wot-stat-card {
+  flex: 1; padding: 16px; background: var(--bg);
+  border: 1px solid var(--border); border-radius: 10px; text-align: center;
+}
+.wot-stat-val { font-size: 1.4rem; font-weight: 800; color: var(--accent-light); }
+.wot-stat-label {
+  font-size: 0.72rem; color: var(--text-dim);
+  text-transform: uppercase; letter-spacing: 0.5px; margin-top: 4px;
+}
+.wot-graph-wrap {
+  background: var(--bg); border: 1px solid var(--border);
+  border-radius: 12px; padding: 24px; margin-bottom: 24px; text-align: center;
+}
+
+/* Storage page */
+.storage-page-inner { padding: 24px; }
+.storage-usage-bar {
+  background: var(--bg); border: 1px solid var(--border);
+  border-radius: 12px; padding: 20px; margin-bottom: 20px;
+}
+.storage-usage-title { font-size: 0.9rem; font-weight: 700; margin-bottom: 12px; }
+.storage-usage-visual {
+  height: 24px; background: var(--border); border-radius: 6px;
+  overflow: hidden; display: flex; margin-bottom: 8px;
+}
+.storage-seg { height: 100%; }
+.storage-seg-notes { background: var(--accent); }
+.storage-seg-media { background: #a78bfa; }
+.storage-seg-meta { background: #60a5fa; }
+.storage-seg-other { background: var(--green); }
+.storage-legend { display: flex; gap: 16px; flex-wrap: wrap; }
+.storage-legend-item { display: flex; align-items: center; gap: 6px; font-size: 0.75rem; color: var(--text-dim); }
+.storage-legend-dot { width: 10px; height: 10px; border-radius: 3px; }
+.kind-grid {
+  display: grid; grid-template-columns: repeat(3, 1fr);
+  gap: 10px; margin-bottom: 20px;
+}
+.kind-card {
+  display: flex; flex-direction: column; gap: 4px; padding: 14px 16px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
+}
+.kind-card-top { display: flex; align-items: center; gap: 8px; }
+.kind-icon { font-size: 1.1rem; }
+.kind-name { font-weight: 600; font-size: 0.85rem; }
+.kind-count { margin-left: auto; font-family: var(--mono); font-size: 0.75rem; color: var(--accent-light); }
+.kind-meta { font-size: 0.7rem; color: var(--text-dim); font-family: var(--mono); }
+
+/* Settings page */
+.settings-container { display: flex; min-height: 100%; }
+.settings-sub-nav {
+  width: 180px; border-right: 1px solid var(--border);
+  background: rgba(255,255,255,0.01); padding: 8px 0; flex-shrink: 0;
+}
+.settings-sub-item {
+  padding: 11px 20px; font-size: 0.82rem; font-weight: 500;
+  color: var(--text-dim); cursor: pointer; transition: all 0.15s;
+  border-left: 3px solid transparent; user-select: none;
+}
+.settings-sub-item:hover { background: rgba(255,255,255,0.02); color: var(--text); }
+.settings-sub-item.active {
+  color: var(--accent-light); background: rgba(124,58,237,0.06);
+  border-left-color: var(--accent); font-weight: 600;
+}
+.settings-panel { flex: 1; padding: 24px 28px; }
+.settings-pane { display: none; }
+.settings-pane.active { display: block; }
+.settings-pane-title { font-size: 1.15rem; font-weight: 700; margin-bottom: 4px; letter-spacing: -0.02em; }
+.settings-pane-desc { color: var(--text-dim); font-size: 0.85rem; margin-bottom: 20px; }
+.settings-field {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 0; border-bottom: 1px solid var(--border);
+}
+.settings-field-info { display: flex; flex-direction: column; gap: 2px; }
+.settings-field-label { font-weight: 600; font-size: 0.88rem; }
+.settings-field-desc { font-size: 0.75rem; color: var(--text-dim); }
+.toggle {
+  position: relative; display: inline-block; width: 40px; height: 22px; flex-shrink: 0;
+}
+.toggle input { opacity: 0; width: 0; height: 0; }
+.toggle-slider {
+  position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
+  background: #2a2a34; border-radius: 22px; transition: 0.2s;
+}
+.toggle-slider::before {
+  content: ''; position: absolute; width: 16px; height: 16px; left: 3px; bottom: 3px;
+  background: #fff; border-radius: 50%; transition: 0.2s;
+}
+.toggle input:checked + .toggle-slider { background: var(--accent); }
+.toggle input:checked + .toggle-slider::before { transform: translateX(18px); }
+.settings-mono {
+  font-family: var(--mono); font-size: 0.82rem; color: var(--text-dim);
+  padding: 10px 14px; background: var(--bg); border: 1px solid var(--border);
+  border-radius: 8px; margin-top: 8px;
+}

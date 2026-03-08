@@ -77,4 +77,4 @@ export interface Settings {
   autoStart: boolean;
 }
 
-export type Screen = "wizard" | "dashboard" | "feed" | "wot" | "storage" | "settings";
+export type Screen = "wizard" | "dashboard" | "feed" | "dms" | "wot" | "storage" | "settings";

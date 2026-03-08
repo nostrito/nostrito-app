@@ -1,10 +1,14 @@
-/** Onboarding wizard — 3 steps: Identity → Relays → Storage */
+/** Onboarding wizard — 3 steps: Identity → Relays → Storage
+ *  Design matches the landing page interactive demo exactly.
+ */
 
 import { showAppShell } from "../app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 export interface WizardConfig {
+  identityMode: "readonly" | "full";
   npub: string;
+  signerType?: "nsec" | "bunker" | "connect" | "new";
   relays: string[];
   storage: {
     othersEventsGb: number;
@@ -22,32 +26,34 @@ interface RelayOption {
 }
 
 const RELAYS: RelayOption[] = [
-  { id: "primal", name: "primal", description: "Popular social relay", defaultOn: true },
-  { id: "damus", name: "damus", description: "iOS-first community", defaultOn: true },
-  { id: "nos", name: "nos", description: "Open social network", defaultOn: true },
+  { id: "primal", name: "primal", description: "Fast global relay", defaultOn: true },
+  { id: "damus", name: "damus", description: "iOS community hub", defaultOn: true },
+  { id: "nos", name: "nos", description: "Curated social relay", defaultOn: false },
   { id: "snort", name: "snort", description: "Web client relay", defaultOn: false },
-  { id: "coracle", name: "coracle", description: "Privacy-focused", defaultOn: false },
-  { id: "nostr.wine", name: "nostr.wine", description: "Curated content", defaultOn: false },
+  { id: "coracle", name: "coracle", description: "Discovery-focused", defaultOn: false },
+  { id: "nostr.wine", name: "nostr.wine", description: "Premium paid relay", defaultOn: true },
   { id: "amethyst", name: "amethyst", description: "Android community", defaultOn: false },
-  { id: "yakihonne", name: "yakihonne", description: "Long-form content", defaultOn: false },
+  { id: "yakihonne", name: "yakihonne", description: "Long-form content", defaultOn: true },
 ];
 
 const STEP_LABELS = ["Identity", "Relays", "Storage"];
 
 export class WizardScreen {
-  private step = 0;
+  private step = 1; // 1-indexed to match landing page
   private container!: HTMLElement;
   private completeCallback: ((config: WizardConfig) => void) | null = null;
 
   // State
+  private identityMode: "readonly" | "full" = "readonly";
   private npub = "";
   private npubError = "";
+  private signerType: "nsec" | "bunker" | "connect" | "new" | null = null;
   private selectedRelays: Set<string> = new Set(
     RELAYS.filter((r) => r.defaultOn).map((r) => r.id)
   );
   private othersEventsGb = 5;
   private othersMediaGb = 2;
-  private mediaTypes = { images: true, videos: true, audio: false };
+  private mediaTypes = { images: true, videos: true, audio: true };
   private cleanupPolicy: "oldest" | "least-interacted" = "oldest";
 
   render(container: HTMLElement): void {
@@ -64,122 +70,131 @@ export class WizardScreen {
     c.innerHTML = "";
     c.className = "wizard-root";
 
-    // Title bar (appended to root, outside wrapper)
-    const titlebar = el("div", "wizard-titlebar");
+    // Titlebar
+    const titlebar = document.createElement("div");
+    titlebar.className = "wizard-titlebar";
+    titlebar.setAttribute("data-tauri-drag-region", "");
     titlebar.innerHTML = `
       <div class="wizard-dots-decorative">
         <button class="dot-red tb-btn" id="wiz-close" title="Close"></button>
         <button class="dot-yellow tb-btn" id="wiz-minimize" title="Minimize"></button>
         <button class="dot-green tb-btn" id="wiz-maximize" title="Maximize"></button>
       </div>
-      <span class="wizard-titlebar-text">nostrito</span>
-      <div class="wizard-dots-decorative" style="visibility:hidden">
-        <span class="dot-red"></span>
-        <span class="dot-yellow"></span>
-        <span class="dot-green"></span>
-      </div>
+      <span class="wizard-titlebar-text">nostrito — Setup</span>
+      <div style="width:52px"></div>
     `;
     c.appendChild(titlebar);
 
-    // Wire wizard titlebar buttons
+    // Wire titlebar buttons
     const appWindow = getCurrentWindow();
     titlebar.querySelector("#wiz-close")?.addEventListener("click", () => appWindow.close());
     titlebar.querySelector("#wiz-minimize")?.addEventListener("click", () => appWindow.minimize());
     titlebar.querySelector("#wiz-maximize")?.addEventListener("click", () => appWindow.toggleMaximize());
 
-    // Wrapper
-    const wrapper = el("div", "wizard-wrapper");
+    // Wizard container
+    const wizContainer = document.createElement("div");
+    wizContainer.className = "wizard-container";
 
-    // Logo
-    const logo = el("div", "wizard-logo");
-    logo.innerHTML = `<span class="wizard-logo-icon">🌶️</span> <span class="wizard-logo-text">nostrito</span>`;
-    wrapper.appendChild(logo);
+    // Progress bar
+    const progress = document.createElement("div");
+    progress.className = "wizard-progress";
+    for (let i = 1; i <= 3; i++) {
+      const dotWrap = document.createElement("div");
+      dotWrap.className = "wiz-dot-wrap";
+      if (i < this.step) dotWrap.classList.add("done");
+      else if (i === this.step) dotWrap.classList.add("active");
 
-    // Progress
-    const progress = el("div", "wizard-progress");
-    for (let i = 0; i < 3; i++) {
-      if (i > 0) {
-        const line = el("div", `wizard-progress-line${i <= this.step ? " done" : ""}`);
+      const dotNum = document.createElement("span");
+      dotNum.className = "wiz-dot-num";
+      dotNum.textContent = i < this.step ? "✓" : String(i);
+      dotWrap.appendChild(dotNum);
+
+      const dotLabel = document.createElement("span");
+      dotLabel.className = "wiz-dot-label";
+      dotLabel.textContent = STEP_LABELS[i - 1];
+      dotWrap.appendChild(dotLabel);
+
+      progress.appendChild(dotWrap);
+
+      if (i < 3) {
+        const line = document.createElement("div");
+        line.className = "wiz-line";
+        if (i < this.step) line.classList.add("done");
         progress.appendChild(line);
       }
-      const dot = el("div", `wizard-progress-dot${i <= this.step ? " active" : ""}${i < this.step ? " completed" : ""}`);
-      progress.appendChild(dot);
     }
-    wrapper.appendChild(progress);
+    wizContainer.appendChild(progress);
 
-    // Progress labels
-    const labels = el("div", "wizard-progress-labels");
-    STEP_LABELS.forEach((label, i) => {
-      const lbl = el("span", `wizard-progress-label${i <= this.step ? " active" : ""}`);
-      lbl.textContent = label;
-      labels.appendChild(lbl);
-    });
-    wrapper.appendChild(labels);
-
-    // Step content
-    const content = el("div", "wizard-content");
-    content.setAttribute("key", String(this.step));
-    // Animate in
-    requestAnimationFrame(() => content.classList.add("visible"));
+    // Panel content
+    const panel = document.createElement("div");
+    panel.className = "wiz-panel";
 
     switch (this.step) {
-      case 0:
-        this.renderIdentity(content);
-        break;
       case 1:
-        this.renderRelays(content);
+        this.renderIdentity(panel);
         break;
       case 2:
-        this.renderStorage(content);
+        this.renderRelays(panel);
+        break;
+      case 3:
+        this.renderStorage(panel);
         break;
     }
-    wrapper.appendChild(content);
+    wizContainer.appendChild(panel);
 
-    // Buttons
-    const buttons = el("div", "wizard-buttons");
-    if (this.step > 0) {
-      const back = el("button", "btn btn-ghost");
-      back.textContent = "Back";
-      back.addEventListener("click", () => {
+    // Navigation bar
+    const nav = document.createElement("div");
+    nav.className = "wiz-nav";
+
+    const backBtn = document.createElement("button");
+    backBtn.className = "btn btn-secondary";
+    backBtn.textContent = "← Back";
+    backBtn.style.visibility = this.step === 1 ? "hidden" : "visible";
+    backBtn.addEventListener("click", () => {
+      if (this.step > 1) {
         this.step--;
         this.draw();
-      });
-      buttons.appendChild(back);
+      }
+    });
+    nav.appendChild(backBtn);
+
+    const nextBtn = document.createElement("button");
+    nextBtn.className = "btn btn-primary";
+    nextBtn.textContent = this.step === 3 ? "Finish →" : "Next →";
+
+    if (this.step === 1 && this.identityMode === "readonly" && !this.isNpubValid()) {
+      nextBtn.classList.add("disabled");
+      nextBtn.setAttribute("disabled", "true");
+    }
+    if (this.step === 1 && this.identityMode === "full" && !this.signerType) {
+      nextBtn.classList.add("disabled");
+      nextBtn.setAttribute("disabled", "true");
+    }
+    if (this.step === 2 && this.selectedRelays.size === 0) {
+      nextBtn.classList.add("disabled");
+      nextBtn.setAttribute("disabled", "true");
     }
 
-    if (this.step < 2) {
-      const next = el("button", "btn btn-primary");
-      next.textContent = "Next →";
-      if (this.step === 0 && !this.isNpubValid()) {
-        next.classList.add("disabled");
-        next.setAttribute("disabled", "true");
-      }
-      if (this.step === 1 && this.selectedRelays.size === 0) {
-        next.classList.add("disabled");
-        next.setAttribute("disabled", "true");
-      }
-      next.addEventListener("click", () => {
-        if (this.step === 0) {
-          if (!this.isNpubValid()) {
-            this.npubError = "Enter a valid npub (starts with npub1, 63 characters)";
-            this.draw();
-            return;
-          }
+    nextBtn.addEventListener("click", () => {
+      if (this.step === 1) {
+        if (this.identityMode === "readonly" && !this.isNpubValid()) {
+          this.npubError = "Enter a valid npub (starts with npub1, 63 characters)";
+          this.draw();
+          return;
         }
-        if (this.step === 1 && this.selectedRelays.size === 0) return;
+      }
+      if (this.step === 2 && this.selectedRelays.size === 0) return;
+      if (this.step < 3) {
         this.step++;
         this.draw();
-      });
-      buttons.appendChild(next);
-    } else {
-      const finish = el("button", "btn btn-primary btn-finish");
-      finish.textContent = "Launch nostrito 🚀";
-      finish.addEventListener("click", () => this.finish());
-      buttons.appendChild(finish);
-    }
-    wrapper.appendChild(buttons);
+      } else {
+        this.finish();
+      }
+    });
+    nav.appendChild(nextBtn);
 
-    c.appendChild(wrapper);
+    wizContainer.appendChild(nav);
+    c.appendChild(wizContainer);
   }
 
   private isNpubValid(): boolean {
@@ -188,59 +203,97 @@ export class WizardScreen {
 
   private renderIdentity(container: HTMLElement): void {
     container.innerHTML = `
-      <h1 class="wizard-heading">What's your npub?</h1>
-      <p class="wizard-subtext">Your relay, your rules. Only you connect to it.</p>
-      <div class="wizard-input-group">
-        <input
-          type="text"
-          id="npub-input"
-          class="wizard-input"
-          placeholder="npub1..."
-          value="${escapeHtml(this.npub)}"
-          spellcheck="false"
-          autocomplete="off"
-        />
-        ${this.npubError ? `<p class="wizard-error">${escapeHtml(this.npubError)}</p>` : ""}
+      <h3 class="wiz-title">Your identity</h3>
+      <p class="wiz-subtitle">Choose how to connect. You can always upgrade later.</p>
+
+      <div style="display:flex;flex-direction:column;gap:10px;margin-bottom:20px;width:100%;max-width:480px">
+        <div class="wiz-identity-option${this.identityMode === "readonly" ? " selected" : ""}" id="opt-readonly">
+          <div class="wiz-identity-title">📖 Read-only <span class="wiz-identity-badge">Recommended</span></div>
+          <div class="wiz-identity-desc">Paste your npub. DMs disabled, everything else works.</div>
+        </div>
+        <div class="wiz-identity-option${this.identityMode === "full" ? " selected" : ""}" id="opt-full">
+          <div class="wiz-identity-title">🔑 Full access</div>
+          <div class="wiz-identity-desc">Connect nsec, NBunker, or Nostr Connect. Unlocks DMs.</div>
+        </div>
+      </div>
+
+      <div id="wiz-readonly-input" style="width:100%;max-width:480px;${this.identityMode !== "readonly" ? "display:none" : ""}">
+        <input type="text" class="wiz-input" id="npub-input" placeholder="npub1..." value="${escapeHtml(this.npub)}" spellcheck="false" autocomplete="off" />
+        ${this.npubError ? `<p class="wiz-error">${escapeHtml(this.npubError)}</p>` : ""}
+      </div>
+
+      <div id="wiz-full-input" style="${this.identityMode !== "full" ? "display:none;" : "display:flex;"}flex-direction:column;gap:10px;width:100%;max-width:480px">
+        <div class="wiz-signer-option${this.signerType === "nsec" ? " selected" : ""}" data-signer="nsec">🔑 Paste nsec</div>
+        <div class="wiz-signer-option${this.signerType === "bunker" ? " selected" : ""}" data-signer="bunker">🏰 NBunker / NIP-46</div>
+        <div class="wiz-signer-option${this.signerType === "connect" ? " selected" : ""}" data-signer="connect">🔌 Nostr Connect</div>
+        <div class="wiz-signer-option${this.signerType === "new" ? " selected" : ""}" data-signer="new">✨ Create new account</div>
       </div>
     `;
 
-    const input = container.querySelector("#npub-input") as HTMLInputElement;
-    input.addEventListener("input", () => {
-      this.npub = input.value.trim();
-      this.npubError = "";
-      // Update next button state
-      const next = this.container.querySelector(".btn-primary") as HTMLButtonElement | null;
-      if (next) {
-        if (this.isNpubValid()) {
-          next.classList.remove("disabled");
-          next.removeAttribute("disabled");
-        } else {
-          next.classList.add("disabled");
-          next.setAttribute("disabled", "true");
-        }
-      }
+    // Identity mode selector
+    container.querySelector("#opt-readonly")?.addEventListener("click", () => {
+      this.identityMode = "readonly";
+      this.draw();
     });
-    // Focus input
-    requestAnimationFrame(() => input.focus());
+    container.querySelector("#opt-full")?.addEventListener("click", () => {
+      this.identityMode = "full";
+      this.draw();
+    });
+
+    // Signer options
+    container.querySelectorAll(".wiz-signer-option").forEach((el) => {
+      el.addEventListener("click", () => {
+        this.signerType = (el as HTMLElement).dataset.signer as any;
+        this.draw();
+      });
+    });
+
+    // Npub input
+    const input = container.querySelector("#npub-input") as HTMLInputElement | null;
+    if (input) {
+      input.addEventListener("input", () => {
+        this.npub = input.value.trim();
+        this.npubError = "";
+        const next = this.container.querySelector(".btn-primary") as HTMLButtonElement | null;
+        if (next) {
+          if (this.isNpubValid()) {
+            next.classList.remove("disabled");
+            next.removeAttribute("disabled");
+          } else {
+            next.classList.add("disabled");
+            next.setAttribute("disabled", "true");
+          }
+        }
+      });
+      requestAnimationFrame(() => input.focus());
+    }
   }
 
   private renderRelays(container: HTMLElement): void {
-    const heading = el("h1", "wizard-heading");
-    heading.textContent = "Where do you sync from?";
+    const heading = document.createElement("h3");
+    heading.className = "wiz-title";
+    heading.textContent = "Where do you want to sync from?";
     container.appendChild(heading);
 
-    const sub = el("p", "wizard-subtext");
+    const sub = document.createElement("p");
+    sub.className = "wiz-subtitle";
     sub.textContent = "Pick by name. We handle the rest.";
     container.appendChild(sub);
 
-    const grid = el("div", "relay-grid");
+    const grid = document.createElement("div");
+    grid.className = "relay-grid";
+
     RELAYS.forEach((relay) => {
       const isOn = this.selectedRelays.has(relay.id);
-      const card = el("div", `relay-card${isOn ? " on" : ""}`);
+      const card = document.createElement("div");
+      card.className = `relay-card${isOn ? " selected" : ""}`;
+      card.setAttribute("data-relay", relay.id);
       card.innerHTML = `
-        <span class="relay-name">${escapeHtml(relay.name)}</span>
-        <span class="relay-desc">${escapeHtml(relay.description)}</span>
-        <span class="relay-toggle">${isOn ? "ON" : "OFF"}</span>
+        <div class="relay-card-info">
+          <span class="relay-card-name">${escapeHtml(relay.name)}</span>
+          <span class="relay-card-desc">${escapeHtml(relay.description)}</span>
+        </div>
+        <div class="relay-check">${isOn ? "✓" : ""}</div>
       `;
       card.addEventListener("click", () => {
         if (this.selectedRelays.has(relay.id)) {
@@ -248,7 +301,21 @@ export class WizardScreen {
         } else {
           this.selectedRelays.add(relay.id);
         }
-        this.draw();
+        // Update UI without full redraw
+        card.classList.toggle("selected");
+        const check = card.querySelector(".relay-check")!;
+        check.textContent = this.selectedRelays.has(relay.id) ? "✓" : "";
+        // Update next button
+        const next = this.container.querySelector(".btn-primary") as HTMLButtonElement | null;
+        if (next) {
+          if (this.selectedRelays.size === 0) {
+            next.classList.add("disabled");
+            next.setAttribute("disabled", "true");
+          } else {
+            next.classList.remove("disabled");
+            next.removeAttribute("disabled");
+          }
+        }
       });
       grid.appendChild(card);
     });
@@ -257,91 +324,106 @@ export class WizardScreen {
 
   private renderStorage(container: HTMLElement): void {
     container.innerHTML = `
-      <h1 class="wizard-heading">How much space can nostrito use?</h1>
+      <h3 class="wiz-title">Storage</h3>
+      <p class="wiz-subtitle">Control what gets stored and how much space to use.</p>
 
       <div class="storage-section">
-        <div class="storage-bar-own">
-          <div class="storage-bar-fill"></div>
-          <span class="storage-bar-label">🔒 Your events & media — Always kept. No exceptions.</span>
+        <div class="storage-row locked">
+          <div class="storage-row-info">
+            <span class="storage-row-label">Your events & media</span>
+            <span class="storage-row-meta">🔒 Always stored. No exceptions.</span>
+          </div>
+          <div class="storage-bar-wrap">
+            <div class="storage-bar"><div class="storage-bar-fill"></div></div>
+            <span class="storage-bar-label">100%</span>
+          </div>
         </div>
       </div>
 
       <div class="storage-section">
-        <label class="storage-slider-label">
-          Others' events: <strong id="events-val">${this.othersEventsGb} GB</strong>
-        </label>
-        <input type="range" id="events-slider" class="wizard-slider" min="1" max="50" value="${this.othersEventsGb}" />
-      </div>
-
-      <div class="storage-section">
-        <label class="storage-slider-label">
-          Others' media: <strong id="media-val">${this.othersMediaGb} GB</strong>
-        </label>
-        <input type="range" id="media-slider" class="wizard-slider" min="0" max="20" value="${this.othersMediaGb}" />
-      </div>
-
-      <div class="storage-section">
-        <div class="media-types-row">
-          <button class="media-pill${this.mediaTypes.images ? " active" : ""}" data-type="images">Images ✓</button>
-          <button class="media-pill${this.mediaTypes.videos ? " active" : ""}" data-type="videos">Videos ✓</button>
-          <button class="media-pill${this.mediaTypes.audio ? " active" : ""}" data-type="audio">Audio ✗</button>
+        <div class="storage-row">
+          <div class="storage-row-info">
+            <span class="storage-row-label">Others' events</span>
+            <span class="storage-row-meta">From your Web of Trust</span>
+          </div>
+          <div class="storage-slider-wrap">
+            <input type="range" class="storage-slider" min="1" max="50" value="${this.othersEventsGb}" id="othersEventsSlider">
+            <span class="storage-slider-value" id="othersEventsVal">${this.othersEventsGb} GB</span>
+          </div>
         </div>
       </div>
 
       <div class="storage-section">
-        <p class="storage-slider-label">Cleanup policy</p>
-        <div class="radio-group">
-          <label class="radio-option${this.cleanupPolicy === "oldest" ? " selected" : ""}">
-            <input type="radio" name="cleanup" value="oldest" ${this.cleanupPolicy === "oldest" ? "checked" : ""} />
-            Oldest first
-          </label>
-          <label class="radio-option${this.cleanupPolicy === "least-interacted" ? " selected" : ""}">
-            <input type="radio" name="cleanup" value="least-interacted" ${this.cleanupPolicy === "least-interacted" ? "checked" : ""} />
-            Least interacted
-          </label>
+        <div class="storage-row">
+          <div class="storage-row-info">
+            <span class="storage-row-label">Others' media (Blossom)</span>
+            <span class="storage-row-meta">Images, videos, audio from your network</span>
+          </div>
+          <div class="storage-slider-wrap">
+            <input type="range" class="storage-slider" min="1" max="50" value="${this.othersMediaGb}" id="othersMediaSlider">
+            <span class="storage-slider-value" id="othersMediaVal">${this.othersMediaGb} GB</span>
+          </div>
+        </div>
+        <div class="media-toggles" id="mediaToggles">
+          <div class="media-toggle${this.mediaTypes.images ? " active" : ""}" data-media="images">🖼️ Images</div>
+          <div class="media-toggle${this.mediaTypes.videos ? " active" : ""}" data-media="videos">🎬 Videos</div>
+          <div class="media-toggle${this.mediaTypes.audio ? " active" : ""}" data-media="audio">🔊 Audio</div>
+        </div>
+      </div>
+
+      <div class="storage-section">
+        <div class="storage-row">
+          <div class="storage-row-info">
+            <span class="storage-row-label">Auto-cleanup</span>
+            <span class="storage-row-meta">When storage limit is reached</span>
+          </div>
+          <div class="cleanup-group" id="cleanupGroup">
+            <div class="cleanup-radio${this.cleanupPolicy === "oldest" ? " active" : ""}" data-cleanup="oldest">Oldest first</div>
+            <div class="cleanup-radio${this.cleanupPolicy === "least-interacted" ? " active" : ""}" data-cleanup="least-interacted">Least interacted</div>
+          </div>
         </div>
       </div>
     `;
 
     // Sliders
-    const evSlider = container.querySelector("#events-slider") as HTMLInputElement;
-    const evVal = container.querySelector("#events-val") as HTMLElement;
+    const evSlider = container.querySelector("#othersEventsSlider") as HTMLInputElement;
+    const evVal = container.querySelector("#othersEventsVal") as HTMLElement;
     evSlider.addEventListener("input", () => {
       this.othersEventsGb = parseInt(evSlider.value);
       evVal.textContent = `${this.othersEventsGb} GB`;
     });
 
-    const mdSlider = container.querySelector("#media-slider") as HTMLInputElement;
-    const mdVal = container.querySelector("#media-val") as HTMLElement;
+    const mdSlider = container.querySelector("#othersMediaSlider") as HTMLInputElement;
+    const mdVal = container.querySelector("#othersMediaVal") as HTMLElement;
     mdSlider.addEventListener("input", () => {
       this.othersMediaGb = parseInt(mdSlider.value);
       mdVal.textContent = `${this.othersMediaGb} GB`;
     });
 
-    // Media pills
-    container.querySelectorAll(".media-pill").forEach((pill) => {
-      pill.addEventListener("click", () => {
-        const type = (pill as HTMLElement).dataset.type as keyof typeof this.mediaTypes;
+    // Media toggles
+    container.querySelectorAll(".media-toggle").forEach((toggle) => {
+      toggle.addEventListener("click", () => {
+        const type = (toggle as HTMLElement).dataset.media as keyof typeof this.mediaTypes;
         this.mediaTypes[type] = !this.mediaTypes[type];
-        pill.classList.toggle("active");
-        pill.textContent = `${type.charAt(0).toUpperCase() + type.slice(1)} ${this.mediaTypes[type] ? "✓" : "✗"}`;
+        toggle.classList.toggle("active");
       });
     });
 
-    // Radio
-    container.querySelectorAll('input[name="cleanup"]').forEach((radio) => {
-      radio.addEventListener("change", () => {
-        this.cleanupPolicy = (radio as HTMLInputElement).value as "oldest" | "least-interacted";
-        container.querySelectorAll(".radio-option").forEach((opt) => {
-          opt.classList.toggle("selected", (opt.querySelector("input") as HTMLInputElement).checked);
-        });
-      });
+    // Cleanup radios
+    container.querySelector("#cleanupGroup")?.addEventListener("click", (e) => {
+      const radio = (e.target as HTMLElement).closest(".cleanup-radio");
+      if (!radio) return;
+      this.cleanupPolicy = (radio as HTMLElement).dataset.cleanup as "oldest" | "least-interacted";
+      container.querySelectorAll(".cleanup-radio").forEach((el) => el.classList.remove("active"));
+      radio.classList.add("active");
     });
   }
 
   private async finish(): Promise<void> {
     const config: WizardConfig = {
+      identityMode: this.identityMode,
       npub: this.npub,
+      signerType: this.signerType || undefined,
       relays: Array.from(this.selectedRelays),
       storage: {
         othersEventsGb: this.othersEventsGb,
@@ -351,8 +433,8 @@ export class WizardScreen {
       },
     };
 
-    // Disable button to prevent double-clicks
-    const finishBtn = this.container.querySelector(".btn-finish") as HTMLButtonElement | null;
+    // Disable finish button
+    const finishBtn = this.container.querySelector(".btn-primary") as HTMLButtonElement | null;
     if (finishBtn) {
       finishBtn.disabled = true;
       finishBtn.textContent = "Initializing...";
@@ -377,20 +459,18 @@ export class WizardScreen {
       showAppShell();
     } catch (e) {
       console.error("[nostrito] Failed to initialize:", e);
-      // Show error in UI
-      const content = this.container.querySelector(".wizard-content");
-      if (content) {
-        const existing = content.querySelector(".wizard-error");
+      const errEl = document.createElement("p");
+      errEl.className = "wiz-error";
+      errEl.textContent = `Failed to initialize: ${e}`;
+      const panel = this.container.querySelector(".wiz-panel");
+      if (panel) {
+        const existing = panel.querySelector(".wiz-error");
         if (existing) existing.remove();
-        const errEl = document.createElement("p");
-        errEl.className = "wizard-error";
-        errEl.textContent = `Failed to initialize: ${e}`;
-        content.appendChild(errEl);
+        panel.appendChild(errEl);
       }
-      // Re-enable button
       if (finishBtn) {
         finishBtn.disabled = false;
-        finishBtn.textContent = "Launch nostrito 🚀";
+        finishBtn.textContent = "Finish →";
       }
     }
   }
@@ -400,12 +480,6 @@ export class WizardScreen {
 export function renderWizard(container: HTMLElement): void {
   const wizard = new WizardScreen();
   wizard.render(container);
-}
-
-function el(tag: string, className?: string): HTMLElement {
-  const e = document.createElement(tag);
-  if (className) e.className = className;
-  return e;
 }
 
 function escapeHtml(str: string): string {

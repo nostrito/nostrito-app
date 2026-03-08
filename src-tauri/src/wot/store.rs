@@ -237,6 +237,15 @@ impl WotGraph {
     pub fn lock_metrics(&self) -> LockMetricsSnapshot {
         self.lock_metrics.snapshot()
     }
+
+    /// Clear all graph data (used on app reset)
+    pub fn clear(&self) {
+        self.pubkey_to_id.clear();
+        *self.id_to_pubkey.write() = Vec::new();
+        *self.follows.write() = Vec::new();
+        *self.followers.write() = Vec::new();
+        *self.node_info.write() = Vec::new();
+    }
 }
 
 impl Default for WotGraph {

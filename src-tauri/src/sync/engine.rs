@@ -2,6 +2,7 @@ use anyhow::Result;
 use nostr_sdk::prelude::*;
 use nostr_sdk::client::options::EventSource;
 use serde::{Deserialize, Serialize};
+use serde_json;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -301,36 +302,52 @@ impl SyncEngine {
 
         let primary = self.primary_relay_url();
         let client = Client::default();
-        match client.add_relay(&primary).await {
-            Ok(_) => {
-                if let Some(policy) = policies.get_mut(&primary) {
-                    policy.on_connection_success();
+
+        // Connect to all relays for Tier 1 (profile + follows are critical)
+        let mut connected_any = false;
+        for url in self.all_relay_urls() {
+            match client.add_relay(&url).await {
+                Ok(_) => {
+                    info!("Tier 1: Added relay {}", url);
+                    if let Some(policy) = policies.get_mut(&url) {
+                        policy.on_connection_success();
+                    }
+                    connected_any = true;
                 }
-            }
-            Err(e) => {
-                warn!("Tier 1: Failed to connect to {}: {}", primary, e);
-                if let Some(policy) = policies.get_mut(&primary) {
-                    policy.on_connection_failure();
+                Err(e) => {
+                    warn!("Tier 1: Failed to add relay {}: {}", url, e);
+                    if let Some(policy) = policies.get_mut(&url) {
+                        policy.on_connection_failure();
+                    }
                 }
-                return Ok(());
             }
         }
+
+        if !connected_any {
+            warn!("Tier 1: Could not add any relay, skipping");
+            return Ok(());
+        }
+
         client.connect().await;
 
+        // Give relay connections time to establish before querying
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
         let pk = PublicKey::from_hex(&self.hex_pubkey)?;
+        info!("Tier 1: Querying {} for pubkey {}", primary, pk.to_hex());
 
         // Fetch kind:0 (profile metadata) + kind:3 (follow list)
         let filter = Filter::new()
             .author(pk)
             .kinds(vec![Kind::Metadata, Kind::ContactList])
-            .limit(2);
+            .limit(10);
 
         let mut fetched: u64 = 0;
         self.emit_progress(1, 0, 2, &primary);
 
         match tokio::time::timeout(
-            Duration::from_secs(15),
-            client.get_events_of(vec![filter], EventSource::relays(Some(Duration::from_secs(10)))),
+            Duration::from_secs(20),
+            client.get_events_of(vec![filter], EventSource::relays(Some(Duration::from_secs(15)))),
         )
         .await
         {
@@ -454,9 +471,22 @@ impl SyncEngine {
             .await
             {
                 Ok(Ok(events)) => {
+                    for event in events.iter() {
+                        let tags_json = serde_json::to_string(
+                            &event.tags.iter().map(|t| t.as_slice().iter().map(|s| s.to_string()).collect::<Vec<_>>()).collect::<Vec<_>>()
+                        ).unwrap_or_default();
+                        self.db.store_event(
+                            &event.id.to_hex(),
+                            &event.pubkey.to_hex(),
+                            event.created_at.as_u64() as i64,
+                            event.kind.as_u16() as u32,
+                            &tags_json,
+                            &event.content.to_string(),
+                            &event.sig.to_string(),
+                        ).ok();
+                    }
                     fetched += events.len() as u64;
-                    debug!("Tier 2: batch fetched {} events", events.len());
-                    // TODO: store events in nostr_events table
+                    debug!("Tier 2: batch fetched and stored {} events", events.len());
                 }
                 Ok(Err(e)) => {
                     warn!("Tier 2: fetch error: {}", e);

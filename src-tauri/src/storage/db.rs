@@ -323,4 +323,153 @@ impl Database {
             Err(e) => Err(e.into()),
         }
     }
+
+    /// Store a nostr event. Returns Ok(true) if inserted, Ok(false) if duplicate.
+    pub fn store_event(
+        &self,
+        id: &str,
+        pubkey: &str,
+        created_at: i64,
+        kind: u32,
+        tags_json: &str,
+        content: &str,
+        sig: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.execute(
+            "INSERT OR IGNORE INTO nostr_events (id, pubkey, created_at, kind, tags, content, sig) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, pubkey, created_at, kind as i64, tags_json, content, sig],
+        )?;
+        Ok(result > 0)
+    }
+
+    /// Query nostr events with optional filters. Returns (id, pubkey, created_at, kind, tags_json, content, sig).
+    pub fn query_events(
+        &self,
+        ids: Option<&[String]>,
+        authors: Option<&[String]>,
+        kinds: Option<&[u32]>,
+        since: Option<u64>,
+        until: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<(String, String, i64, i64, String, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+
+        let mut sql = String::from(
+            "SELECT id, pubkey, created_at, kind, tags, content, sig FROM nostr_events WHERE 1=1",
+        );
+        let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        if let Some(ids) = ids {
+            if !ids.is_empty() {
+                let placeholders: Vec<String> = ids.iter().enumerate().map(|(i, _)| format!("?{}", param_values.len() + i + 1)).collect();
+                sql.push_str(&format!(" AND id IN ({})", placeholders.join(",")));
+                for id in ids {
+                    param_values.push(Box::new(id.clone()));
+                }
+            }
+        }
+
+        if let Some(authors) = authors {
+            if !authors.is_empty() {
+                let placeholders: Vec<String> = (0..authors.len()).map(|i| format!("?{}", param_values.len() + i + 1)).collect();
+                sql.push_str(&format!(" AND pubkey IN ({})", placeholders.join(",")));
+                for a in authors {
+                    param_values.push(Box::new(a.clone()));
+                }
+            }
+        }
+
+        if let Some(kinds) = kinds {
+            if !kinds.is_empty() {
+                let placeholders: Vec<String> = (0..kinds.len()).map(|i| format!("?{}", param_values.len() + i + 1)).collect();
+                sql.push_str(&format!(" AND kind IN ({})", placeholders.join(",")));
+                for k in kinds {
+                    param_values.push(Box::new(*k as i64));
+                }
+            }
+        }
+
+        if let Some(since) = since {
+            let idx = param_values.len() + 1;
+            sql.push_str(&format!(" AND created_at >= ?{}", idx));
+            param_values.push(Box::new(since as i64));
+        }
+
+        if let Some(until) = until {
+            let idx = param_values.len() + 1;
+            sql.push_str(&format!(" AND created_at <= ?{}", idx));
+            param_values.push(Box::new(until as i64));
+        }
+
+        sql.push_str(" ORDER BY created_at DESC");
+
+        {
+            let idx = param_values.len() + 1;
+            sql.push_str(&format!(" LIMIT ?{}", idx));
+            param_values.push(Box::new(limit as i64));
+        }
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(rows)
+    }
+
+    /// Get event count
+    pub fn event_count(&self) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM nostr_events", [], |row| row.get(0))?;
+        Ok(count as u64)
+    }
+
+    /// Get database file size in bytes
+    pub fn db_size_bytes(&self) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let page_count: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        let page_size: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        Ok((page_count * page_size) as u64)
+    }
+
+    /// Get oldest and newest event timestamps
+    pub fn event_time_range(&self) -> Result<(u64, u64)> {
+        let conn = self.conn.lock().unwrap();
+        let oldest: i64 = conn
+            .query_row("SELECT COALESCE(MIN(created_at), 0) FROM nostr_events", [], |row| row.get(0))?;
+        let newest: i64 = conn
+            .query_row("SELECT COALESCE(MAX(created_at), 0) FROM nostr_events", [], |row| row.get(0))?;
+        Ok((oldest as u64, newest as u64))
+    }
+
+    /// Clear all data from the database (reset to fresh state)
+    pub fn clear_all(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch(
+            r#"
+            DELETE FROM edges;
+            DELETE FROM nodes;
+            DELETE FROM nostr_events;
+            DELETE FROM sync_state;
+            DELETE FROM app_config;
+        "#,
+        )?;
+        info!("Database cleared — all data deleted");
+        Ok(())
+    }
 }

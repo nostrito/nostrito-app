@@ -1,0 +1,262 @@
+/* Dashboard — matches reference design */
+
+@keyframes pulse-live {
+  0%,100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+/* Header */
+.dash-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border);
+}
+.dash-header-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.dash-header-name {
+  font-size: 1.1rem;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+}
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 100px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.status-badge.live {
+  background: rgba(52, 211, 153, 0.15);
+  color: var(--green);
+}
+.status-badge.offline {
+  background: rgba(122, 122, 144, 0.15);
+  color: var(--text-dim);
+}
+.status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--green);
+  animation: pulse-live 2s ease-in-out infinite;
+}
+
+/* Stats row */
+.dash-stats {
+  display: flex;
+  border-bottom: 1px solid var(--border);
+}
+.dash-stat {
+  flex: 1;
+  padding: 14px 16px;
+  border-right: 1px solid var(--border);
+  text-align: center;
+}
+.dash-stat:last-child { border-right: none; }
+.dash-stat-val {
+  font-size: 1.15rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.dash-stat-label {
+  font-size: 0.68rem;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-top: 2px;
+}
+
+/* Activity chart */
+.dash-activity {
+  padding: 12px 20px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.dash-activity-label {
+  font-size: 0.68rem;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 8px;
+}
+.dash-activity-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 40px;
+}
+.dash-activity-bar {
+  flex: 1;
+  border-radius: 2px;
+  min-width: 0;
+  background: rgba(124, 58, 237, 0.25);
+}
+.dash-activity-bar.recent {
+  background: var(--accent) !important;
+}
+
+/* Body: feed + sidebar */
+.dash-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+.dash-feed {
+  flex: 1;
+  overflow-y: auto;
+}
+.dash-sidebar {
+  width: 200px;
+  border-left: 1px solid var(--border);
+  background: rgba(255,255,255,0.01);
+  flex-shrink: 0;
+  overflow-y: auto;
+}
+
+/* Sync engine panel */
+.sync-engine-header {
+  padding: 14px 16px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--border);
+}
+.sync-tier {
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.sync-tier:last-child { border-bottom: none; }
+.sync-tier.dimmed { opacity: 0.45; }
+.sync-tier-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 3px;
+}
+.sync-tier-label {
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+.sync-tier-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 0.6rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+.sync-tier-badge.fast {
+  background: rgba(52, 211, 153, 0.15);
+  color: var(--green);
+}
+.sync-tier-badge.done {
+  background: rgba(52, 211, 153, 0.15);
+  color: var(--green);
+}
+.sync-tier-badge.idle {
+  background: rgba(255,255,255,0.04);
+  color: var(--text-dim);
+}
+.sync-tier-detail {
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  font-family: var(--mono);
+}
+.pulse-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--green);
+  animation: pulse-live 1.5s ease-in-out infinite;
+}
+.blossom-section {
+  padding: 10px 16px;
+  border-top: 1px solid var(--border);
+}
+.blossom-title {
+  font-size: 0.72rem;
+  font-weight: 600;
+  margin-bottom: 4px;
+  color: var(--text-dim);
+}
+.blossom-detail {
+  font-size: 0.68rem;
+  color: var(--text-dim);
+}
+
+/* Event cards */
+.event-card {
+  display: flex;
+  gap: 12px;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border);
+  transition: background 0.15s;
+}
+.event-card:hover { background: rgba(255,255,255,0.015); }
+.event-card:last-child { border-bottom: none; }
+.ev-avatar {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1rem;
+  font-weight: 700;
+  color: #fff;
+}
+.ev-content { flex: 1; min-width: 0; }
+.ev-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.ev-name { font-weight: 600; font-size: 0.88rem; }
+.ev-npub { font-family: var(--mono); font-size: 0.7rem; color: var(--text-dim); }
+.ev-time { font-size: 0.7rem; color: var(--text-dim); margin-left: auto; }
+.ev-text {
+  font-size: 0.85rem;
+  color: var(--text-dim);
+  line-height: 1.55;
+  word-break: break-word;
+}
+.ev-kind-tag {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 0.65rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.ev-kind-note { background: rgba(124,58,237,0.1); color: var(--accent-light); }
+.ev-kind-long { background: rgba(96,165,250,0.1); color: #60a5fa; }
+
+/* WoT hop badges */
+.wot-hop-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 100px;
+  font-size: 0.62rem;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+.wot-hop-1 { background: rgba(167,139,250,0.15); color: #a78bfa; }
+.wot-hop-2 { background: rgba(96,165,250,0.15); color: #60a5fa; }

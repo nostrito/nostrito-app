@@ -2440,6 +2440,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "dirs 5.0.1",
+ "futures-util",
  "lru",
  "moka",
  "nostr-sdk",
