@@ -78,6 +78,18 @@ export function renderSettings(container: HTMLElement): void {
           <div class="settings-field"><div class="settings-field-info"><span class="settings-field-label">Auto-start</span><span class="settings-field-desc">Start nostrito on login</span></div><label class="toggle"><input type="checkbox" id="settings-autostart"><span class="toggle-slider"></span></label></div>
           <div class="settings-field"><div class="settings-field-info"><span class="settings-field-label">Max storage</span><span class="settings-field-desc">Database size limit</span></div><span style="font-family:var(--mono);font-size:0.85rem;color:var(--text-dim)" id="settings-max-storage">—</span></div>
 
+          <div class="settings-field" style="border-bottom:none;padding-bottom:8px"><div class="settings-field-info"><span class="settings-field-label">Browser Integration</span><span class="settings-field-desc">Enable wss:// for web Nostr clients (Coracle, Snort, Primal)</span></div></div>
+          <div style="background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:14px 18px;margin-bottom:16px">
+            <div style="display:flex;align-items:center;justify-content:space-between">
+              <div>
+                <div id="browser-integration-status" style="font-size:0.85rem;color:var(--text-dim);margin-bottom:2px">Checking...</div>
+                <div id="browser-integration-detail" style="font-size:0.75rem;color:var(--text-muted)"></div>
+              </div>
+              <button class="btn btn-primary" id="btn-enable-browser" style="font-size:0.8rem;padding:8px 16px">Enable</button>
+            </div>
+            <div id="browser-integration-result" style="margin-top:10px"></div>
+          </div>
+
           <div class="danger-zone">
             <div class="danger-zone-title">⚠️ Danger Zone</div>
             <div class="danger-zone-row">
@@ -218,6 +230,50 @@ async function loadSettings(): Promise<void> {
           ? `${(settings.max_storage_mb / 1024).toFixed(1)} GB`
           : `${settings.max_storage_mb} MB`;
     }
+    // Browser integration
+    try {
+      const browserEnabled = await invoke<boolean>("check_browser_integration");
+      const statusEl = document.getElementById("browser-integration-status");
+      const detailEl = document.getElementById("browser-integration-detail");
+      const btnEl = document.getElementById("btn-enable-browser") as HTMLButtonElement | null;
+
+      if (statusEl && detailEl && btnEl) {
+        if (browserEnabled) {
+          statusEl.textContent = "✅ Enabled";
+          detailEl.textContent = "wss://localhost:" + settings.relay_port + " available for web clients";
+          btnEl.textContent = "Regenerate";
+        } else {
+          statusEl.textContent = "Not enabled";
+          detailEl.textContent = "Web clients cannot connect without wss:// support";
+        }
+
+        const resultEl = document.getElementById("browser-integration-result");
+        btnEl.addEventListener("click", async () => {
+          btnEl.disabled = true;
+          btnEl.textContent = "Setting up...";
+          if (resultEl) resultEl.innerHTML = "";
+          try {
+            await invoke("setup_browser_integration");
+            if (statusEl) statusEl.textContent = "✅ Enabled";
+            if (detailEl) detailEl.textContent = "wss://localhost:" + settings.relay_port + " available for web clients";
+            btnEl.textContent = "Regenerate";
+            btnEl.disabled = false;
+            if (resultEl) {
+              resultEl.innerHTML = `<div style="font-size:0.78rem;color:#34d399;margin-top:6px">Certificates generated. Restart relay to use TLS.</div>`;
+            }
+          } catch (e) {
+            btnEl.disabled = false;
+            btnEl.textContent = "Retry";
+            if (resultEl) {
+              resultEl.innerHTML = `<div style="font-size:0.78rem;color:#ef4444;margin-top:6px">Failed: ${e}</div>`;
+            }
+          }
+        });
+      }
+    } catch (e) {
+      console.error("[settings] Browser integration check failed:", e);
+    }
+
   } catch (e) {
     console.error("[settings] Failed to load:", e);
   }

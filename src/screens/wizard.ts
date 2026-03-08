@@ -36,7 +36,7 @@ const RELAYS: RelayOption[] = [
   { id: "yakihonne", name: "yakihonne", description: "Long-form content", defaultOn: true },
 ];
 
-const STEP_LABELS = ["Identity", "Relays", "Storage"];
+const STEP_LABELS = ["Identity", "Relays", "Storage", "Browser"];
 
 export class WizardScreen {
   private step = 1; // 1-indexed to match landing page
@@ -99,7 +99,7 @@ export class WizardScreen {
     // Progress bar
     const progress = document.createElement("div");
     progress.className = "wizard-progress";
-    for (let i = 1; i <= 3; i++) {
+    for (let i = 1; i <= 4; i++) {
       const dotWrap = document.createElement("div");
       dotWrap.className = "wiz-dot-wrap";
       if (i < this.step) dotWrap.classList.add("done");
@@ -117,7 +117,7 @@ export class WizardScreen {
 
       progress.appendChild(dotWrap);
 
-      if (i < 3) {
+      if (i < 4) {
         const line = document.createElement("div");
         line.className = "wiz-line";
         if (i < this.step) line.classList.add("done");
@@ -140,6 +140,9 @@ export class WizardScreen {
       case 3:
         this.renderStorage(panel);
         break;
+      case 4:
+        this.renderBrowserIntegration(panel);
+        break;
     }
     wizContainer.appendChild(panel);
 
@@ -161,7 +164,7 @@ export class WizardScreen {
 
     const nextBtn = document.createElement("button");
     nextBtn.className = "btn btn-primary";
-    nextBtn.textContent = this.step === 3 ? "Finish →" : "Next →";
+    nextBtn.textContent = this.step === 4 ? "Finish →" : "Next →";
 
     if (this.step === 1 && this.identityMode === "readonly" && !this.isNpubValid()) {
       nextBtn.classList.add("disabled");
@@ -185,7 +188,7 @@ export class WizardScreen {
         }
       }
       if (this.step === 2 && this.selectedRelays.size === 0) return;
-      if (this.step < 3) {
+      if (this.step < 4) {
         this.step++;
         this.draw();
       } else {
@@ -417,6 +420,72 @@ export class WizardScreen {
       this.cleanupPolicy = (radio as HTMLElement).dataset.cleanup as "oldest" | "least-interacted";
       container.querySelectorAll(".cleanup-radio").forEach((el) => el.classList.remove("active"));
       radio.classList.add("active");
+    });
+  }
+
+  private renderBrowserIntegration(container: HTMLElement): void {
+    container.innerHTML = `
+      <h3 class="wiz-title">🌐 Browser Integration</h3>
+      <p class="wiz-subtitle">Connect web clients to your local relay</p>
+
+      <div style="max-width:480px;margin:0 auto">
+        <div style="background:var(--bg, #111113);border:1px solid var(--border, #1e1e24);border-radius:10px;padding:20px;margin-bottom:16px">
+          <div style="font-size:0.9rem;font-weight:600;margin-bottom:8px;color:#e8e8f0">Why?</div>
+          <div style="font-size:0.82rem;color:#888;line-height:1.5">
+            Web Nostr clients like <strong style="color:#a78bfa">Coracle</strong>, <strong style="color:#a78bfa">Snort</strong>, and <strong style="color:#a78bfa">Primal</strong> require <code style="background:rgba(124,58,237,.15);color:#a78bfa;padding:2px 6px;border-radius:4px;font-size:0.78rem">wss://</code> (secure WebSocket) connections. This sets up a trusted local certificate so browsers accept your relay.
+          </div>
+        </div>
+
+        <div style="background:var(--bg, #111113);border:1px solid var(--border, #1e1e24);border-radius:10px;padding:16px;margin-bottom:20px;font-size:0.8rem;color:#888">
+          🔒 Requires one system permission dialog — safe, local only. No data leaves your machine.
+        </div>
+
+        <div id="browser-integration-result" style="margin-bottom:16px"></div>
+
+        <div style="display:flex;gap:12px">
+          <button class="btn btn-primary" id="btn-enable-browser-wiz" style="flex:1">Enable Browser Integration</button>
+          <button class="btn btn-secondary" id="btn-skip-browser-wiz">Skip</button>
+        </div>
+      </div>
+    `;
+
+    const resultEl = container.querySelector("#browser-integration-result") as HTMLElement;
+    const enableBtn = container.querySelector("#btn-enable-browser-wiz") as HTMLButtonElement;
+    const skipBtn = container.querySelector("#btn-skip-browser-wiz") as HTMLButtonElement;
+
+    enableBtn.addEventListener("click", async () => {
+      enableBtn.disabled = true;
+      enableBtn.textContent = "Setting up...";
+      resultEl.innerHTML = "";
+
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        await invoke("setup_browser_integration");
+        resultEl.innerHTML = `
+          <div style="background:rgba(52,211,153,.1);border:1px solid rgba(52,211,153,.3);border-radius:8px;padding:14px;font-size:0.85rem;color:#34d399;text-align:center">
+            ✅ <strong>wss://localhost:4869</strong> ready — web clients can now connect!
+          </div>
+        `;
+        enableBtn.textContent = "✓ Enabled";
+        enableBtn.style.opacity = "0.6";
+      } catch (e) {
+        resultEl.innerHTML = `
+          <div style="background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);border-radius:8px;padding:14px;font-size:0.85rem;color:#ef4444">
+            Failed: ${e}
+          </div>
+        `;
+        enableBtn.disabled = false;
+        enableBtn.textContent = "Retry";
+      }
+    });
+
+    skipBtn.addEventListener("click", () => {
+      if (this.step < 4) {
+        this.step++;
+        this.draw();
+      } else {
+        this.finish();
+      }
     });
   }
 
