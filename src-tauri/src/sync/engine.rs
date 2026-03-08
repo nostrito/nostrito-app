@@ -510,8 +510,9 @@ impl SyncEngine {
     }
 
     // ── Tier 2: Important ─────────────────────────────────────────
-    // Fetch recent notes from follows. Chunks of 10 follows, limit 50 per request,
-    // 5s pause between batches, staggered across relays.
+    // Fetch recent notes from follows. ONE persistent client per sync session.
+    // Connect once, send all subscription batches on that connection with pauses,
+    // disconnect once at the end.
 
     async fn run_tier2(&self, policies: &mut HashMap<String, RelayPolicy>) -> Result<()> {
         self.set_tier(SyncTier::Important);
@@ -539,11 +540,23 @@ impl SyncEngine {
         let total = follows.len() as u64;
         let mut fetched: u64 = 0;
 
-        // Round-robin across relays, one at a time
-        let mut relay_idx = 0;
+        // ONE persistent client for the entire tier
+        let client = Client::default();
+        for url in &relay_urls {
+            if let Err(e) = client.add_relay(url.as_str()).await {
+                warn!("Tier 2: Failed to add relay {}: {}", url, e);
+            }
+        }
+        client.connect().await;
+        // Let all WebSocket handshakes settle
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        info!("Tier 2: Connected to {} relays (persistent session)", relay_urls.len());
+
+        // Use a single policy for the shared client — pick the first relay for tracking
+        let policy_url = relay_urls.first().cloned().unwrap_or_default();
 
         // Small batches: 10 follows at a time, limit 50 events per request
-        for chunk in follows.chunks(10) {
+        for (batch_idx, chunk) in follows.chunks(10).enumerate() {
             if self.cancel.is_cancelled() {
                 break;
             }
@@ -563,21 +576,9 @@ impl SyncEngine {
                 .since(since)
                 .limit(50);
 
-            // Pick relay (round-robin)
-            let url = &relay_urls[relay_idx % relay_urls.len()];
-            relay_idx += 1;
-
             let policy = policies
-                .entry(url.clone())
+                .entry(policy_url.clone())
                 .or_insert_with(RelayPolicy::new);
-
-            let client = Client::default();
-            if client.add_relay(url.as_str()).await.is_err() {
-                policy.on_connection_failure();
-                continue;
-            }
-            client.connect().await;
-            tokio::time::sleep(Duration::from_millis(1500)).await;
 
             match subscribe_and_collect(&client, vec![filter], 10, policy).await {
                 Ok(events) => {
@@ -602,24 +603,30 @@ impl SyncEngine {
                     }
                     fetched += events.len() as u64;
                     debug!(
-                        "Tier 2: batch of {} follows → {} events from {}",
+                        "Tier 2: batch {}: {} follows → {} events",
+                        batch_idx + 1,
                         chunk.len(),
                         events.len(),
-                        url
                     );
                 }
                 Err(e) => {
-                    warn!("Tier 2: subscribe error on {}: {}", url, e);
+                    warn!("Tier 2: subscribe error on batch {}: {}", batch_idx + 1, e);
+                    let policy = policies
+                        .entry(policy_url.clone())
+                        .or_insert_with(RelayPolicy::new);
                     policy.on_connection_failure();
                 }
             }
 
-            client.disconnect().await.ok();
-            self.emit_progress(2, fetched, total, url);
+            self.emit_progress(2, fetched, total, &policy_url);
 
-            // Polite pause: 5 seconds between batches
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            // Polite pause: 7 seconds between batches on the same connection
+            tokio::time::sleep(Duration::from_secs(7)).await;
         }
+
+        // Disconnect once at the end
+        client.disconnect().await.ok();
+        info!("Tier 2: Disconnected persistent client");
 
         {
             let mut stats = self.sync_stats.write().await;
@@ -629,11 +636,19 @@ impl SyncEngine {
 
         self.emit_tier_complete(2);
         info!("Tier 2 complete: {} events fetched", fetched);
+
+        // Cool-down: give relays a break before Tier 3
+        if !self.cancel.is_cancelled() {
+            info!("Cooling down 10s before Tier 3...");
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        }
+
         Ok(())
     }
 
     // ── Tier 3: Background ────────────────────────────────────────
-    // WoT crawl. Very polite: 5 follows per batch, limit 10, 5s between batches.
+    // WoT crawl. ONE persistent client per sync session.
+    // Connect once, send all subscription batches, disconnect once.
 
     async fn run_tier3(&self, policies: &mut HashMap<String, RelayPolicy>) -> Result<()> {
         self.set_tier(SyncTier::Background);
@@ -679,10 +694,22 @@ impl SyncEngine {
         let relay_urls = self.all_relay_urls();
         let total = remaining.len() as u64;
         let mut fetched: u64 = 0;
-        let mut relay_idx = 0;
+
+        // ONE persistent client for the entire tier
+        let client = Client::default();
+        for url in &relay_urls {
+            if let Err(e) = client.add_relay(url.as_str()).await {
+                warn!("Tier 3: Failed to add relay {}: {}", url, e);
+            }
+        }
+        client.connect().await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        info!("Tier 3: Connected to {} relays (persistent session)", relay_urls.len());
+
+        let policy_url = relay_urls.first().cloned().unwrap_or_default();
 
         // Small batches: 5 pubkeys at a time
-        for chunk in remaining.chunks(5) {
+        for (batch_idx, chunk) in remaining.chunks(5).enumerate() {
             if self.cancel.is_cancelled() {
                 break;
             }
@@ -701,21 +728,9 @@ impl SyncEngine {
                 .kind(Kind::ContactList)
                 .limit(10);
 
-            // Pick relay (round-robin)
-            let url = &relay_urls[relay_idx % relay_urls.len()];
-            relay_idx += 1;
-
             let policy = policies
-                .entry(url.clone())
+                .entry(policy_url.clone())
                 .or_insert_with(RelayPolicy::new);
-
-            let client = Client::default();
-            if client.add_relay(url.as_str()).await.is_err() {
-                policy.on_connection_failure();
-                continue;
-            }
-            client.connect().await;
-            tokio::time::sleep(Duration::from_millis(1500)).await;
 
             match subscribe_and_collect(&client, vec![filter], 10, policy).await {
                 Ok(events) => {
@@ -735,12 +750,13 @@ impl SyncEngine {
                     }
                 }
                 Err(e) => {
-                    warn!("Tier 3: subscribe error on {}: {}", url, e);
+                    warn!("Tier 3: subscribe error on batch {}: {}", batch_idx + 1, e);
+                    let policy = policies
+                        .entry(policy_url.clone())
+                        .or_insert_with(RelayPolicy::new);
                     policy.on_connection_failure();
                 }
             }
-
-            client.disconnect().await.ok();
 
             // Mark processed and checkpoint
             for pk in chunk {
@@ -756,11 +772,15 @@ impl SyncEngine {
                     .ok();
             }
 
-            self.emit_progress(3, fetched, total, url);
+            self.emit_progress(3, fetched, total, &policy_url);
 
-            // Polite pause: 5 seconds between batches
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            // Polite pause: 7 seconds between batches on the same connection
+            tokio::time::sleep(Duration::from_secs(7)).await;
         }
+
+        // Disconnect once at the end
+        client.disconnect().await.ok();
+        info!("Tier 3: Disconnected persistent client");
 
         // Final checkpoint — clear on completion
         self.db.set_config("sync_tier3_checkpoint", "").ok();
