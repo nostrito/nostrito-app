@@ -126,7 +126,9 @@ function renderRelayItems(relays: RelayStatusInfo[]): string {
 
 async function loadActivityChart(): Promise<void> {
   try {
+    console.log("[dashboard] Calling get_activity_data...");
     const data = await invoke<number[]>("get_activity_data");
+    console.log("[dashboard] get_activity_data response:", data.length, "buckets, total:", data.reduce((a, b) => a + b, 0));
     const barsEl = document.querySelector(".dash-activity-bars");
     if (barsEl) {
       barsEl.innerHTML = renderActivityBars(data);
@@ -141,7 +143,9 @@ async function loadActivityChart(): Promise<void> {
 
 async function loadRelayStatus(): Promise<void> {
   try {
+    console.log("[dashboard] Calling get_relay_status...");
     const relays = await invoke<RelayStatusInfo[]>("get_relay_status");
+    console.log("[dashboard] get_relay_status response:", relays.length, "relays");
     const container = document.getElementById("sync-tier-3-detail");
     if (container) {
       container.innerHTML = renderRelayItems(relays);
@@ -151,10 +155,13 @@ async function loadRelayStatus(): Promise<void> {
 
 async function loadStats(): Promise<void> {
   try {
+    console.log("[dashboard] Calling get_status...");
     const status = await invoke<AppStatus>("get_status");
+    console.log("[dashboard] get_status response:", JSON.stringify(status));
     let uptime = 0;
     try {
       uptime = await invoke<number>("get_uptime");
+      console.log("[dashboard] get_uptime:", uptime, "s");
     } catch (_) {}
 
     const uptimeStr =
@@ -230,9 +237,11 @@ async function loadStats(): Promise<void> {
 
 async function loadFeed(): Promise<void> {
   try {
+    console.log("[dashboard] Calling get_feed...");
     const events = await invoke<NostrEvent[]>("get_feed", {
       filter: { limit: 20 },
     });
+    console.log("[dashboard] get_feed response:", events.length, "events");
     const feedEl = document.getElementById("dash-feed-list");
     if (feedEl) {
       if (events.length === 0) {
@@ -330,8 +339,12 @@ export async function renderDashboard(container: HTMLElement): Promise<void> {
     </div>
   `;
 
-  unlistenProgress = await listen<SyncProgress>("sync:progress", () => loadStats());
-  unlistenTierComplete = await listen<{ tier: number }>("sync:tier_complete", () => {
+  unlistenProgress = await listen<SyncProgress>("sync:progress", (event) => {
+    console.log("[dashboard] sync:progress event:", event.payload);
+    loadStats();
+  });
+  unlistenTierComplete = await listen<{ tier: number }>("sync:tier_complete", (event) => {
+    console.log("[dashboard] sync:tier_complete event:", event.payload);
     loadStats();
     loadFeed();
   });

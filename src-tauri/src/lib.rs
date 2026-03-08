@@ -148,6 +148,7 @@ pub struct WotDistanceResponse {
 
 #[tauri::command]
 async fn get_status(state: State<'_, AppState>) -> Result<AppStatus, String> {
+    tracing::debug!("[cmd:get_status] called");
     let config = state.config.read().await;
     let stats = state.wot_graph.stats();
     let sync_running = state.sync_cancel.read().await.is_some();
@@ -155,6 +156,8 @@ async fn get_status(state: State<'_, AppState>) -> Result<AppStatus, String> {
     let current_tier = state.sync_tier.load(Ordering::Relaxed);
     let sync_stats = state.sync_stats.read().await.clone();
     let events_stored = state.db.event_count().unwrap_or(0);
+
+    tracing::info!("[cmd:get_status] relay_running={}, events={}, wot_nodes={}, sync_tier={}", relay_running, events_stored, stats.node_count, current_tier);
 
     Ok(AppStatus {
         initialized: config.npub.is_some(),
@@ -282,8 +285,11 @@ async fn init_nostrito(
 
 #[tauri::command]
 async fn get_wot(state: State<'_, AppState>) -> Result<WotStatus, String> {
+    tracing::debug!("[cmd:get_wot] called");
     let config = state.config.read().await;
     let stats = state.wot_graph.stats();
+
+    tracing::info!("[cmd:get_wot] nodes={}, edges={}, with_follows={}", stats.node_count, stats.edge_count, stats.nodes_with_follows);
 
     Ok(WotStatus {
         root_pubkey: config.hex_pubkey.clone().unwrap_or_default(),
@@ -298,6 +304,7 @@ async fn get_wot_distance(
     request: WotDistanceRequest,
     state: State<'_, AppState>,
 ) -> Result<WotDistanceResponse, String> {
+    tracing::info!("[cmd:get_wot_distance] from={}..., to={}..., max_hops={:?}", &request.from[..std::cmp::min(8, request.from.len())], &request.to[..std::cmp::min(8, request.to.len())], request.max_hops);
     let query = wot::bfs::DistanceQuery {
         from: Arc::from(request.from.as_str()),
         to: Arc::from(request.to.as_str()),
@@ -324,8 +331,10 @@ async fn start_sync(
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    tracing::info!("[cmd:start_sync] called");
     let existing = state.sync_cancel.read().await;
     if existing.is_some() {
+        tracing::warn!("[cmd:start_sync] sync already running, rejecting");
         return Err("Sync already running".into());
     }
     drop(existing);
@@ -354,6 +363,7 @@ async fn start_sync(
 
 #[tauri::command]
 async fn stop_sync(state: State<'_, AppState>) -> Result<(), String> {
+    tracing::info!("[cmd:stop_sync] called");
     let cancel = state.sync_cancel.write().await.take();
     if let Some(cancel) = cancel {
         cancel.cancel();
@@ -365,13 +375,19 @@ async fn stop_sync(state: State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 async fn get_feed(filter: FeedFilter, state: State<'_, AppState>) -> Result<Vec<NostrEvent>, String> {
+    tracing::debug!("[cmd:get_feed] called with filter: kinds={:?}, limit={:?}, since={:?}, wot_only={:?}", filter.kinds, filter.limit, filter.since, filter.wot_only);
     let kinds = filter.kinds.as_deref();
     let limit = filter.limit.unwrap_or(50);
 
     let events = state
         .db
         .query_events(None, None, kinds, filter.since, None, limit)
-        .map_err(|e| format!("Failed to query events: {}", e))?;
+        .map_err(|e| {
+            tracing::error!("[cmd:get_feed] query failed: {}", e);
+            format!("Failed to query events: {}", e)
+        })?;
+
+    tracing::info!("[cmd:get_feed] returning {} events", events.len());
 
     Ok(events
         .into_iter()
@@ -392,9 +408,12 @@ async fn get_feed(filter: FeedFilter, state: State<'_, AppState>) -> Result<Vec<
 
 #[tauri::command]
 async fn get_storage_stats(state: State<'_, AppState>) -> Result<StorageStats, String> {
+    tracing::debug!("[cmd:get_storage_stats] called");
     let total_events = state.db.event_count().map_err(|e| e.to_string())?;
     let db_size_bytes = state.db.db_size_bytes().map_err(|e| e.to_string())?;
     let (oldest_event, newest_event) = state.db.event_time_range().map_err(|e| e.to_string())?;
+
+    tracing::info!("[cmd:get_storage_stats] events={}, db_size={} bytes, range={}..{}", total_events, db_size_bytes, oldest_event, newest_event);
 
     Ok(StorageStats {
         total_events,
@@ -406,8 +425,10 @@ async fn get_storage_stats(state: State<'_, AppState>) -> Result<StorageStats, S
 
 #[tauri::command]
 async fn start_relay(state: State<'_, AppState>) -> Result<(), String> {
+    tracing::info!("[cmd:start_relay] called");
     let existing = state.relay_cancel.read().await;
     if existing.is_some() {
+        tracing::warn!("[cmd:start_relay] relay already running, rejecting");
         return Err("Relay already running".into());
     }
     drop(existing);
@@ -434,6 +455,7 @@ async fn start_relay(state: State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 async fn stop_relay(state: State<'_, AppState>) -> Result<(), String> {
+    tracing::info!("[cmd:stop_relay] called");
     let cancel = state.relay_cancel.write().await.take();
     if let Some(cancel) = cancel {
         cancel.cancel();
@@ -444,7 +466,9 @@ async fn stop_relay(state: State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 async fn get_uptime(state: State<'_, AppState>) -> Result<u64, String> {
-    Ok(state.start_time.elapsed().as_secs())
+    let secs = state.start_time.elapsed().as_secs();
+    tracing::debug!("[cmd:get_uptime] {}s", secs);
+    Ok(secs)
 }
 
 #[tauri::command]
@@ -510,12 +534,18 @@ pub struct KindCounts {
 
 #[tauri::command]
 async fn get_activity_data(state: State<'_, AppState>) -> Result<Vec<u64>, String> {
-    state.db.get_hourly_counts(24).map_err(|e| e.to_string())
+    tracing::debug!("[cmd:get_activity_data] called");
+    let counts = state.db.get_hourly_counts(24).map_err(|e| e.to_string())?;
+    let total: u64 = counts.iter().sum();
+    tracing::debug!("[cmd:get_activity_data] 24h total={}", total);
+    Ok(counts)
 }
 
 #[tauri::command]
 async fn get_relay_status(state: State<'_, AppState>) -> Result<Vec<RelayStatusInfo>, String> {
+    tracing::debug!("[cmd:get_relay_status] called");
     let config = state.config.read().await;
+    tracing::debug!("[cmd:get_relay_status] returning {} relays", config.outbound_relays.len());
     Ok(config
         .outbound_relays
         .iter()
@@ -538,13 +568,17 @@ async fn get_relay_status(state: State<'_, AppState>) -> Result<Vec<RelayStatusI
 
 #[tauri::command]
 async fn get_kind_counts(state: State<'_, AppState>) -> Result<KindCounts, String> {
+    tracing::debug!("[cmd:get_kind_counts] called");
     let counts = state.db.get_kind_counts().map_err(|e| e.to_string())?;
+    tracing::info!("[cmd:get_kind_counts] {} distinct kinds found", counts.len());
     Ok(KindCounts { counts })
 }
 
 #[tauri::command]
 async fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
+    tracing::debug!("[cmd:get_settings] called");
     let config = state.config.read().await;
+    tracing::info!("[cmd:get_settings] port={}, relays={}, wot_depth={}", config.relay_port, config.outbound_relays.len(), config.wot_max_depth);
     Ok(Settings {
         npub: config.npub.clone().unwrap_or_default(),
         relay_port: config.relay_port,
@@ -558,7 +592,7 @@ async fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
 
 #[tauri::command]
 async fn save_settings(settings: Settings, state: State<'_, AppState>) -> Result<(), String> {
-    tracing::info!("Saving settings");
+    tracing::info!("[cmd:save_settings] called — port={}, relays={:?}, wot_depth={}, sync_interval={}s", settings.relay_port, settings.outbound_relays, settings.wot_max_depth, settings.sync_interval_secs);
     let mut config = state.config.write().await;
     config.relay_port = settings.relay_port;
     config.max_storage_mb = settings.max_storage_mb;
@@ -572,7 +606,12 @@ async fn save_settings(settings: Settings, state: State<'_, AppState>) -> Result
 // ── App Entry ──────────────────────────────────────────────────────
 
 pub fn run() {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_target(true)
+        .init();
+
+    tracing::info!("[init] Starting nostrito");
 
     // Determine DB path
     let db_path = dirs::data_dir()
@@ -585,8 +624,11 @@ pub fn run() {
         std::fs::create_dir_all(parent).expect("Failed to create data directory");
     }
 
+    tracing::info!("[init] db_path={}", db_path.display());
+
     // Initialize database
     let db = Arc::new(Database::open(&db_path).expect("Failed to open database"));
+    tracing::info!("[init] Database opened successfully");
 
     // Initialize WoT graph
     let wot_graph = Arc::new(WotGraph::new());
@@ -606,17 +648,21 @@ pub fn run() {
     // Load saved config
     let mut config = AppConfig::default();
     if let Ok(Some(npub)) = db.get_config("npub") {
+        tracing::info!("[init] Loaded npub from DB: {}", &npub);
         config.npub = Some(npub);
     }
     if let Ok(Some(hex)) = db.get_config("hex_pubkey") {
+        tracing::info!("[init] Loaded hex_pubkey from DB: {}...", &hex[..std::cmp::min(8, hex.len())]);
         config.hex_pubkey = Some(hex);
     }
     if let Ok(Some(relays_csv)) = db.get_config("outbound_relays") {
         let relays: Vec<String> = relays_csv.split(',').map(|s| s.to_string()).collect();
         if !relays.is_empty() {
+            tracing::info!("[init] Loaded {} relays from DB: {:?}", relays.len(), relays);
             config.outbound_relays = relays;
         }
     }
+    tracing::info!("[init] Config: npub={:?}, relays={:?}, port={}", config.npub, config.outbound_relays, config.relay_port);
 
     let app_state = AppState {
         wot_graph,

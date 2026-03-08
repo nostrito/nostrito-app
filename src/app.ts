@@ -23,6 +23,7 @@ const screens: Record<Screen, (container: HTMLElement) => void | Promise<void>> 
 };
 
 export function navigateTo(screen: Screen): void {
+  console.log(`[app] navigateTo: ${screen}`);
   currentScreen = screen;
   const content = document.getElementById("main-content");
   if (content) {
@@ -92,11 +93,16 @@ export async function initApp(root: HTMLElement): Promise<void> {
   // Check initialization state from Rust backend
   let isInitialized = false;
   try {
+    console.log("[app] Calling get_status to check initialization...");
     const status = await invoke<{ initialized: boolean }>("get_status");
+    console.log("[app] get_status response:", status);
     isInitialized = status.initialized;
   } catch (_e) {
+    console.warn("[app] get_status failed, falling back to localStorage:", _e);
     isInitialized = localStorage.getItem("nostrito_initialized") === "true";
   }
+
+  console.log("[app] isInitialized:", isInitialized);
 
   if (isInitialized) {
     showAppShell();
@@ -109,6 +115,7 @@ export async function initApp(root: HTMLElement): Promise<void> {
 
   // Listen for frontend reset fallback
   window.addEventListener("nostrito:reset", () => {
+    console.log("[app] nostrito:reset event received");
     const sidebar = document.getElementById("sidebar");
     if (sidebar) sidebar.style.display = "none";
     const tb = document.querySelector(".titlebar") as HTMLElement;
@@ -118,6 +125,7 @@ export async function initApp(root: HTMLElement): Promise<void> {
 
   // Listen for app reset event from backend (e.g. after reset_app_data)
   listen("app:reset", () => {
+    console.log("[app] app:reset event from backend");
     localStorage.removeItem("nostrito_initialized");
     localStorage.removeItem("nostrito_config");
     const sidebar = document.getElementById("sidebar");
@@ -130,6 +138,7 @@ export async function initApp(root: HTMLElement): Promise<void> {
 
 /** Call after wizard completes to show full app shell */
 export function showAppShell(): void {
+  console.log("[app] showAppShell — switching to dashboard");
   const sidebar = document.getElementById("sidebar");
   if (sidebar) sidebar.style.display = "flex";
   const titlebar = document.querySelector(".titlebar") as HTMLElement;

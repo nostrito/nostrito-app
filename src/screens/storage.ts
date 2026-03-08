@@ -59,7 +59,9 @@ function formatBytes(bytes: number): string {
 async function loadStorageStats(): Promise<void> {
   try {
     // Get real storage stats
+    console.log("[storage] Calling get_storage_stats...");
     const stats = await invoke<StorageStats>("get_storage_stats");
+    console.log("[storage] get_storage_stats response:", JSON.stringify(stats));
 
     const titleEl = document.getElementById("storage-title");
     if (titleEl) {
@@ -68,7 +70,9 @@ async function loadStorageStats(): Promise<void> {
 
     // Get real kind counts
     try {
+      console.log("[storage] Calling get_kind_counts...");
       const kindData = await invoke<KindCounts>("get_kind_counts");
+      console.log("[storage] get_kind_counts response:", JSON.stringify(kindData));
       const counts = kindData.counts;
 
       // Populate kind cards

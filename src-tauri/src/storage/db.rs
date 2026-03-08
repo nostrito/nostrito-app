@@ -3,7 +3,7 @@ use rusqlite::{params, Connection};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
-use tracing::{debug, info};
+use tracing::{debug, error, info, warn};
 
 use crate::wot::WotGraph;
 
@@ -341,7 +341,11 @@ impl Database {
             "INSERT OR IGNORE INTO nostr_events (id, pubkey, created_at, kind, tags, content, sig) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![id, pubkey, created_at, kind as i64, tags_json, content, sig],
         )?;
-        Ok(result > 0)
+        let inserted = result > 0;
+        if inserted {
+            debug!("[db] store_event: id={}… kind={} pubkey={}…", &id[..std::cmp::min(12, id.len())], kind, &pubkey[..std::cmp::min(8, pubkey.len())]);
+        }
+        Ok(inserted)
     }
 
     /// Query nostr events with optional filters. Returns (id, pubkey, created_at, kind, tags_json, content, sig).
@@ -411,6 +415,8 @@ impl Database {
             param_values.push(Box::new(limit as i64));
         }
 
+        debug!("[db] query_events: ids={:?}, authors={}, kinds={:?}, since={:?}, until={:?}, limit={}", ids.map(|i| i.len()), authors.map(|a| a.len()).unwrap_or(0), kinds, since, until, limit);
+
         let params_refs: Vec<&dyn rusqlite::ToSql> =
             param_values.iter().map(|p| p.as_ref()).collect();
 
@@ -437,6 +443,7 @@ impl Database {
     pub fn event_count(&self) -> Result<u64> {
         let conn = self.conn.lock().unwrap();
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM nostr_events", [], |row| row.get(0))?;
+        debug!("[db] event_count: {}", count);
         Ok(count as u64)
     }
 
@@ -445,7 +452,9 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let page_count: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
         let page_size: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
-        Ok((page_count * page_size) as u64)
+        let size = (page_count * page_size) as u64;
+        debug!("[db] db_size: {} bytes", size);
+        Ok(size)
     }
 
     /// Get oldest and newest event timestamps

@@ -44,7 +44,9 @@ export function renderWot(container: HTMLElement): void {
 
 async function loadWotStats(): Promise<void> {
   try {
+    console.log("[wot] Calling get_wot...");
     const wot = await invoke<WotStatus>("get_wot");
+    console.log("[wot] get_wot response:", JSON.stringify(wot));
 
     const nodesEl = document.getElementById("wot-nodes");
     const edgesEl = document.getElementById("wot-edges");

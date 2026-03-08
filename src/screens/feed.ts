@@ -110,7 +110,9 @@ export function renderFeed(container: HTMLElement): void {
 
 async function loadEvents(container: HTMLElement): Promise<void> {
   try {
+    console.log("[feed] Calling get_feed with limit=50...");
     const events = await invoke<NostrEvent[]>("get_feed", { filter: { limit: 50 } });
+    console.log("[feed] get_feed response:", events.length, "events");
     const feedEl = container.querySelector("#feedList");
     if (feedEl) {
       if (events.length === 0) {

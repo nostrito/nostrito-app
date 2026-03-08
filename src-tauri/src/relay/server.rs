@@ -9,6 +9,7 @@
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
+use std::cmp;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -195,7 +196,7 @@ async fn handle_connection(
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     let ws_stream = tokio_tungstenite::accept_async(stream).await?;
-    info!("New WebSocket connection from {}", addr);
+    info!("[relay] New connection from {}", addr);
 
     let (mut ws_tx, mut ws_rx) = ws_stream.split();
     let subscriptions: Arc<RwLock<HashMap<String, Subscription>>> =
@@ -261,7 +262,7 @@ async fn handle_connection(
     }
 
     forward_task.abort();
-    info!("Connection from {} closed", addr);
+    info!("[relay] Connection from {} closed", addr);
     Ok(())
 }
 
@@ -293,11 +294,15 @@ async fn handle_message(
         }
     };
 
+    debug!("[relay] Message type={}", msg_type);
     match msg_type {
         "EVENT" => handle_event(arr, db, allowed_pubkey, broadcast_tx).await,
         "REQ" => handle_req(arr, db, subscriptions).await,
         "CLOSE" => handle_close(arr, subscriptions).await,
-        _ => vec![serde_json::json!(["NOTICE", format!("unknown message type: {}", msg_type)]).to_string()],
+        _ => {
+            warn!("[relay] Unknown message type: {}", msg_type);
+            vec![serde_json::json!(["NOTICE", format!("unknown message type: {}", msg_type)]).to_string()]
+        }
     }
 }
 
@@ -319,9 +324,12 @@ async fn handle_event(
         }
     };
 
+    info!("[relay] EVENT received: id={}… kind={} pubkey={}…", &event.id[..std::cmp::min(12, event.id.len())], event.kind, &event.pubkey[..std::cmp::min(8, event.pubkey.len())]);
+
     // Check write permission
     if let Some(ref allowed) = allowed_pubkey {
         if event.pubkey != *allowed {
+            warn!("[relay] EVENT rejected: pubkey not allowed");
             return vec![serde_json::json!(["OK", event.id, false, "restricted: write not allowed"]).to_string()];
         }
     }
@@ -330,14 +338,17 @@ async fn handle_event(
     let event_id = event.id.clone();
     match store_event(db, &event) {
         Ok(true) => {
+            info!("[relay] EVENT stored: id={}…", &event_id[..std::cmp::min(12, event_id.len())]);
             // Broadcast to subscribers
             broadcast_tx.send(event).ok();
             vec![serde_json::json!(["OK", event_id, true, ""]).to_string()]
         }
         Ok(false) => {
+            debug!("[relay] EVENT duplicate: id={}…", &event_id[..std::cmp::min(12, event_id.len())]);
             vec![serde_json::json!(["OK", event_id, true, "duplicate: already have this event"]).to_string()]
         }
         Err(e) => {
+            error!("[relay] EVENT store error: {}", e);
             vec![serde_json::json!(["OK", event_id, false, format!("error: {}", e)]).to_string()]
         }
     }
@@ -370,9 +381,16 @@ async fn handle_req(
         return vec![serde_json::json!(["NOTICE", "no valid filters"]).to_string()];
     }
 
+    info!("[relay] REQ: sub_id={}, {} filters", sub_id, filters.len());
+    for (i, f) in filters.iter().enumerate() {
+        debug!("[relay] REQ filter[{}]: authors={:?}, kinds={:?}, since={:?}, until={:?}, limit={:?}", i, f.authors.as_ref().map(|a| a.len()), f.kinds, f.since, f.until, f.limit);
+    }
+
     // Query events from DB
     let mut responses = Vec::new();
     let events = query_events(db, &filters);
+
+    info!("[relay] Sending {} events for subscription {}", events.len(), sub_id);
 
     for event in events {
         let msg = serde_json::json!(["EVENT", sub_id, event.to_json()]);
@@ -399,7 +417,7 @@ async fn handle_close(
 
     if let Some(sub_id) = arr[1].as_str() {
         subscriptions.write().await.remove(sub_id);
-        debug!("Closed subscription: {}", sub_id);
+        info!("[relay] CLOSE: sub_id={}", sub_id);
     }
 
     vec![]

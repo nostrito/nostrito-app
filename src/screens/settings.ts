@@ -148,7 +148,9 @@ export function renderSettings(container: HTMLElement): void {
 
 async function loadSettings(): Promise<void> {
   try {
+    console.log("[settings] Calling get_settings...");
     const settings = await invoke<Settings>("get_settings");
+    console.log("[settings] get_settings response:", JSON.stringify(settings));
 
     // Identity
     const npubEl = document.getElementById("settings-npub");
@@ -165,7 +167,9 @@ async function loadSettings(): Promise<void> {
         // Try to get relay status for latency info
         let relayStatus: RelayStatusInfo[] = [];
         try {
+          console.log("[settings] Calling get_relay_status...");
           relayStatus = await invoke<RelayStatusInfo[]>("get_relay_status");
+          console.log("[settings] get_relay_status response:", relayStatus.length, "relays");
         } catch (_) {}
 
         const statusMap = new Map(relayStatus.map((r) => [r.url, r]));
