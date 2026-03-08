@@ -1,4 +1,4 @@
-/** Feed — event feed view matching the landing page demo */
+/** Feed — event feed view. All data from get_feed backend command. */
 
 import { invoke } from "@tauri-apps/api/core";
 
@@ -51,7 +51,6 @@ function kindLabel(kind: number): { tag: string; cls: string } {
 function renderEventCard(event: NostrEvent): string {
   const initial = event.pubkey.charAt(0).toUpperCase();
   const k = kindLabel(event.kind);
-  const hop = Math.random() > 0.5 ? 1 : 2;
 
   return `
     <div class="event-card" data-kind="${k.tag}">
@@ -59,7 +58,6 @@ function renderEventCard(event: NostrEvent): string {
       <div class="ev-content">
         <div class="ev-meta">
           <span class="ev-npub">${shortPubkey(event.pubkey)}</span>
-          <span class="wot-hop-badge wot-hop-${hop}">${hop}-hop</span>
           <span class="ev-kind-tag ${k.cls}">${k.tag}</span>
           <span class="ev-time">${timeAgo(event.created_at)}</span>
         </div>
@@ -90,23 +88,23 @@ export function renderFeed(container: HTMLElement): void {
 
   // Wire filters
   const filters = container.querySelectorAll(".feed-filter");
-  filters.forEach(f => {
+  filters.forEach((f) => {
     f.addEventListener("click", () => {
       const filter = (f as HTMLElement).dataset.filter!;
-      filters.forEach(el => el.classList.remove("active"));
+      filters.forEach((el) => el.classList.remove("active"));
       f.classList.add("active");
       const items = container.querySelectorAll("#feedList .event-card[data-kind]");
-      items.forEach(item => {
+      items.forEach((item) => {
         if (filter === "all") {
           (item as HTMLElement).style.display = "flex";
         } else {
-          (item as HTMLElement).style.display = (item as HTMLElement).dataset.kind === filter ? "flex" : "none";
+          (item as HTMLElement).style.display =
+            (item as HTMLElement).dataset.kind === filter ? "flex" : "none";
         }
       });
     });
   });
 
-  // Load events
   loadEvents(container);
 }
 

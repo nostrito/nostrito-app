@@ -1,7 +1,6 @@
-/** Settings — app configuration matching reference design */
+/** Settings — app configuration. Loads real data via get_settings/save_settings. */
 
 import { invoke } from "@tauri-apps/api/core";
-import { navigateTo } from "../app";
 
 interface Settings {
   npub: string;
@@ -13,189 +12,158 @@ interface Settings {
   auto_start: boolean;
 }
 
-type SettingsTab = "identity" | "relays" | "storage" | "wot" | "advanced";
-
-let activeTab: SettingsTab = "identity";
-let currentSettings: Settings | null = null;
-
-function renderPane(tab: SettingsTab): string {
-  if (!currentSettings) return "";
-  const s = currentSettings;
-
-  switch (tab) {
-    case "identity":
-      return `
-        <div class="settings-pane-title">Identity</div>
-        <div class="settings-pane-desc">Your Nostr identity configuration.</div>
-        <div class="settings-field">
-          <div class="settings-field-info"><span class="settings-field-label">Public Key</span><span class="settings-field-desc">Your npub</span></div>
-        </div>
-        <div class="settings-mono">${s.npub || "Not set"}</div>
-        <div class="settings-field" style="border-bottom:none;padding-bottom:8px;">
-          <div class="settings-field-info"><span class="settings-field-label">Signing Mode</span><span class="settings-field-desc">How events are signed</span></div>
-        </div>
-        <div style="background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:14px 18px;">
-          <div style="font-size:0.85rem;color:var(--text-dim);">🔒 Read-only mode</div>
-          <div style="font-size:0.75rem;color:var(--text-dim);margin-top:2px;">Connect a signer to unlock DMs and publishing.</div>
-        </div>
-      `;
-
-    case "relays":
-      return `
-        <div class="settings-pane-title">Relays</div>
-        <div class="settings-pane-desc">Manage relay connections.</div>
-        ${s.outbound_relays.map((r) => `
-          <div class="settings-field">
-            <div class="settings-field-info">
-              <span class="settings-field-label">${r}</span>
-            </div>
-            <label class="toggle"><input type="checkbox" checked><span class="toggle-slider"></span></label>
-          </div>
-        `).join("")}
-      `;
-
-    case "storage":
-      return `
-        <div class="settings-pane-title">Storage</div>
-        <div class="settings-pane-desc">Control storage limits.</div>
-        <div class="settings-field">
-          <div class="settings-field-info"><span class="settings-field-label">Max Storage</span><span class="settings-field-desc">Maximum database size</span></div>
-          <span style="font-family:var(--mono);font-size:0.85rem;color:var(--accent-light);">${s.max_storage_mb} MB</span>
-        </div>
-        <div class="settings-field">
-          <div class="settings-field-info"><span class="settings-field-label">Auto Cleanup</span><span class="settings-field-desc">Remove old events when full</span></div>
-          <label class="toggle"><input type="checkbox" checked><span class="toggle-slider"></span></label>
-        </div>
-      `;
-
-    case "wot":
-      return `
-        <div class="settings-pane-title">Web of Trust</div>
-        <div class="settings-pane-desc">Configure trust graph computation.</div>
-        <div class="settings-field">
-          <div class="settings-field-info"><span class="settings-field-label">Max depth</span><span class="settings-field-desc">How many hops to compute</span></div>
-          <span style="font-family:var(--mono);font-size:0.85rem;color:var(--accent-light);">${s.wot_max_depth}</span>
-        </div>
-        <div class="settings-field">
-          <div class="settings-field-info"><span class="settings-field-label">Auto-refresh</span><span class="settings-field-desc">Recompute WoT periodically</span></div>
-          <label class="toggle"><input type="checkbox" checked><span class="toggle-slider"></span></label>
-        </div>
-      `;
-
-    case "advanced":
-      return `
-        <div class="settings-pane-title">Advanced</div>
-        <div class="settings-pane-desc">Developer settings and diagnostics.</div>
-        <div class="settings-field">
-          <div class="settings-field-info"><span class="settings-field-label">Relay Port</span><span class="settings-field-desc">WebSocket server port</span></div>
-          <span style="font-family:var(--mono);font-size:0.85rem;color:var(--accent-light);">${s.relay_port}</span>
-        </div>
-        <div class="settings-field">
-          <div class="settings-field-info"><span class="settings-field-label">Sync Interval</span><span class="settings-field-desc">Seconds between sync rounds</span></div>
-          <span style="font-family:var(--mono);font-size:0.85rem;color:var(--text-dim);">${s.sync_interval_secs}s</span>
-        </div>
-        <div class="settings-field">
-          <div class="settings-field-info"><span class="settings-field-label">Auto Start</span><span class="settings-field-desc">Start relay with app</span></div>
-          <label class="toggle"><input type="checkbox" ${s.auto_start ? "checked" : ""}><span class="toggle-slider"></span></label>
-        </div>
-        <div class="settings-field">
-          <div class="settings-field-info"><span class="settings-field-label">Data Directory</span><span class="settings-field-desc">Where nostrito stores data</span></div>
-        </div>
-        <div class="settings-mono">~/.local/share/nostrito/</div>
-
-        <div style="margin-top:32px;padding-top:24px;border-top:1px solid rgba(220,38,38,0.2);">
-          <div class="settings-pane-title" style="color:#ef4444;">⚠️ Danger Zone</div>
-          <div class="settings-pane-desc">These actions are irreversible.</div>
-          <div style="display:flex;gap:12px;margin-top:16px;">
-            <button id="btn-reset-data" style="
-              background:rgba(220,38,38,0.15);color:#ef4444;border:1px solid rgba(220,38,38,0.3);
-              padding:10px 20px;border-radius:8px;cursor:pointer;font-size:14px;
-            ">Reset App Data</button>
-            <button id="btn-change-account" style="
-              background:rgba(245,158,11,0.15);color:#f59e0b;border:1px solid rgba(245,158,11,0.3);
-              padding:10px 20px;border-radius:8px;cursor:pointer;font-size:14px;
-            ">Change Account</button>
-          </div>
-          <div id="reset-status" style="margin-top:12px;font-size:13px;"></div>
-        </div>
-      `;
-  }
+interface RelayStatusInfo {
+  url: string;
+  name: string;
+  connected: boolean;
+  latency_ms: number | null;
 }
 
-function draw(container: HTMLElement): void {
-  const panel = container.querySelector(".settings-panel") as HTMLElement;
-  if (panel) panel.innerHTML = renderPane(activeTab);
-
-  container.querySelectorAll(".settings-sub-item").forEach((el) => {
-    el.classList.toggle("active", (el as HTMLElement).dataset.tab === activeTab);
-  });
-
-  // Wire danger zone buttons (only present on advanced tab)
-  if (activeTab === "advanced") {
-    const resetHandler = async () => {
-      const confirmed = confirm("This will delete ALL app data (events, WoT graph, settings) and return to the setup wizard.\n\nAre you sure?");
-      if (!confirmed) return;
-      const status = document.getElementById("reset-status");
-      if (status) status.textContent = "Resetting...";
-      try {
-        await invoke("reset_app_data");
-        localStorage.removeItem("nostrito_initialized");
-        localStorage.removeItem("nostrito_config");
-        const sidebar = document.getElementById("sidebar");
-        if (sidebar) sidebar.style.display = "none";
-        navigateTo("wizard");
-      } catch (e) {
-        if (status) { status.textContent = `Reset failed: ${e}`; status.style.color = "#ef4444"; }
-      }
-    };
-
-    document.getElementById("btn-reset-data")?.addEventListener("click", resetHandler);
-    document.getElementById("btn-change-account")?.addEventListener("click", async () => {
-      const confirmed = confirm("This will clear your identity and return to the setup wizard.\n\nContinue?");
-      if (!confirmed) return;
-      await resetHandler();
-    });
-  }
+function escapeHtml(str: string): string {
+  const div = document.createElement("div");
+  div.textContent = str;
+  return div.innerHTML;
 }
 
-export async function renderSettings(container: HTMLElement): Promise<void> {
+export function renderSettings(container: HTMLElement): void {
+  container.className = "main-content";
   container.style.padding = "0";
   container.innerHTML = `
     <div class="settings-container">
       <div class="settings-sub-nav">
-        <div class="settings-sub-item active" data-tab="identity">🔑 Identity</div>
-        <div class="settings-sub-item" data-tab="relays">📡 Relays</div>
-        <div class="settings-sub-item" data-tab="storage">💾 Storage</div>
-        <div class="settings-sub-item" data-tab="wot">🕸️ WoT</div>
-        <div class="settings-sub-item" data-tab="advanced">⚙️ Advanced</div>
+        <div class="settings-sub-item active" data-settings="identity">🔑 Identity</div>
+        <div class="settings-sub-item" data-settings="relays">📡 Relays</div>
+        <div class="settings-sub-item" data-settings="wot-settings">🕸️ WoT</div>
+        <div class="settings-sub-item" data-settings="advanced">⚙️ Advanced</div>
       </div>
       <div class="settings-panel">
-        <div style="color:var(--text-dim);padding:24px;">Loading...</div>
+        <!-- Identity -->
+        <div class="settings-pane active" id="pane-identity">
+          <div class="settings-pane-title">Identity</div>
+          <div class="settings-pane-desc">Your Nostr identity configuration.</div>
+          <div class="settings-field"><div class="settings-field-info"><span class="settings-field-label">Public Key</span><span class="settings-field-desc">Your npub used for WoT computation</span></div></div>
+          <div class="settings-mono" id="settings-npub">Loading...</div>
+
+          <div class="settings-field" style="border-bottom:none;padding-bottom:8px"><div class="settings-field-info"><span class="settings-field-label">Signing Mode</span><span class="settings-field-desc">How events are signed</span></div></div>
+          <div style="background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:14px 18px;margin-bottom:16px">
+            <div style="font-size:0.85rem;color:var(--text-dim);margin-bottom:2px">🔒 Read-only mode</div>
+            <div style="font-size:0.75rem;color:var(--text-muted)">DMs disabled. Connect a signer to unlock full access.</div>
+          </div>
+
+          <div class="settings-field" style="border-bottom:none;padding-bottom:8px"><div class="settings-field-info"><span class="settings-field-label">Connect Signer</span><span class="settings-field-desc">Upgrade to full access</span></div></div>
+          <div style="display:flex;flex-direction:column;gap:8px">
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:var(--bg);border:1px solid var(--border);border-radius:10px;cursor:pointer;transition:border-color 0.2s"><span style="font-size:0.85rem;font-weight:500">🔑 Paste nsec</span><span style="font-size:0.72rem;color:var(--text-muted)">Full access</span></div>
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:var(--bg);border:1px solid var(--border);border-radius:10px;cursor:pointer;transition:border-color 0.2s"><span style="font-size:0.85rem;font-weight:500">🏰 NBunker</span><span style="font-size:0.72rem;color:var(--text-muted)">Remote signer</span></div>
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:var(--bg);border:1px solid var(--border);border-radius:10px;cursor:pointer;transition:border-color 0.2s"><span style="font-size:0.85rem;font-weight:500">🔌 Nostr Connect</span><span style="font-size:0.72rem;color:var(--text-muted)">NIP-46</span></div>
+          </div>
+        </div>
+        <!-- Relays -->
+        <div class="settings-pane" id="pane-relays">
+          <div class="settings-pane-title">Relays</div>
+          <div class="settings-pane-desc">Manage relay connections.</div>
+          <div id="settings-relay-list">Loading relays...</div>
+        </div>
+        <!-- WoT Settings -->
+        <div class="settings-pane" id="pane-wot-settings">
+          <div class="settings-pane-title">Web of Trust</div>
+          <div class="settings-pane-desc">Configure trust graph computation.</div>
+          <div class="settings-field"><div class="settings-field-info"><span class="settings-field-label">Max depth</span><span class="settings-field-desc">How many hops to compute</span></div><span style="font-family:var(--mono);font-size:0.85rem;color:var(--accent-light)" id="settings-wot-depth">—</span></div>
+          <div class="settings-field"><div class="settings-field-info"><span class="settings-field-label">Sync interval</span><span class="settings-field-desc">Seconds between sync cycles</span></div><span style="font-family:var(--mono);font-size:0.85rem;color:var(--text-dim)" id="settings-sync-interval">—</span></div>
+        </div>
+        <!-- Advanced -->
+        <div class="settings-pane" id="pane-advanced">
+          <div class="settings-pane-title">Advanced</div>
+          <div class="settings-pane-desc">Low-level configuration options.</div>
+          <div class="settings-field"><div class="settings-field-info"><span class="settings-field-label">Relay port</span><span class="settings-field-desc">Local WebSocket relay port</span></div><span style="font-family:var(--mono);font-size:0.85rem;color:var(--text-dim)" id="settings-port">—</span></div>
+          <div class="settings-field"><div class="settings-field-info"><span class="settings-field-label">Auto-start</span><span class="settings-field-desc">Start nostrito on login</span></div><label class="toggle"><input type="checkbox" id="settings-autostart"><span class="toggle-slider"></span></label></div>
+          <div class="settings-field"><div class="settings-field-info"><span class="settings-field-label">Max storage</span><span class="settings-field-desc">Database size limit</span></div><span style="font-family:var(--mono);font-size:0.85rem;color:var(--text-dim)" id="settings-max-storage">—</span></div>
+        </div>
       </div>
     </div>
   `;
 
-  container.querySelectorAll(".settings-sub-item").forEach((el) => {
-    el.addEventListener("click", () => {
-      activeTab = (el as HTMLElement).dataset.tab as SettingsTab;
-      draw(container);
+  // Wire settings sub-nav
+  const items = container.querySelectorAll(".settings-sub-item");
+  const panes = container.querySelectorAll(".settings-pane");
+  items.forEach((item) => {
+    item.addEventListener("click", () => {
+      const pane = (item as HTMLElement).dataset.settings!;
+      items.forEach((s) => s.classList.remove("active"));
+      item.classList.add("active");
+      panes.forEach((p) => p.classList.remove("active"));
+      const target = container.querySelector(`#pane-${pane}`);
+      if (target) target.classList.add("active");
     });
   });
 
-  try {
-    currentSettings = await invoke<Settings>("get_settings");
-  } catch (e) {
-    console.error("[settings]", e);
-    currentSettings = {
-      npub: "",
-      relay_port: 4869,
-      max_storage_mb: 500,
-      wot_max_depth: 3,
-      sync_interval_secs: 300,
-      outbound_relays: [],
-      auto_start: true,
-    };
-  }
+  loadSettings();
+}
 
-  draw(container);
+async function loadSettings(): Promise<void> {
+  try {
+    const settings = await invoke<Settings>("get_settings");
+
+    // Identity
+    const npubEl = document.getElementById("settings-npub");
+    if (npubEl) {
+      npubEl.textContent = settings.npub || "Not configured";
+    }
+
+    // Relays — from real config
+    const relayListEl = document.getElementById("settings-relay-list");
+    if (relayListEl) {
+      if (settings.outbound_relays.length === 0) {
+        relayListEl.innerHTML = `<div style="color:var(--text-muted);font-size:0.85rem">No relays configured</div>`;
+      } else {
+        // Try to get relay status for latency info
+        let relayStatus: RelayStatusInfo[] = [];
+        try {
+          relayStatus = await invoke<RelayStatusInfo[]>("get_relay_status");
+        } catch (_) {}
+
+        const statusMap = new Map(relayStatus.map((r) => [r.url, r]));
+
+        relayListEl.innerHTML = settings.outbound_relays
+          .map((url) => {
+            const info = statusMap.get(url);
+            const name = info?.name || url.replace("wss://", "").replace("ws://", "");
+            const latency = info?.latency_ms != null ? `${info.latency_ms}ms` : "";
+            return `
+              <div class="settings-field">
+                <div class="settings-field-info">
+                  <span class="settings-field-label">${escapeHtml(name)}</span>
+                  <span class="settings-field-desc">${escapeHtml(url)}${latency ? ` · ${latency}` : ""}</span>
+                </div>
+                <label class="toggle"><input type="checkbox" checked><span class="toggle-slider"></span></label>
+              </div>
+            `;
+          })
+          .join("");
+      }
+    }
+
+    // WoT
+    const depthEl = document.getElementById("settings-wot-depth");
+    if (depthEl) depthEl.textContent = settings.wot_max_depth.toString();
+
+    const intervalEl = document.getElementById("settings-sync-interval");
+    if (intervalEl) intervalEl.textContent = `${settings.sync_interval_secs}s`;
+
+    // Advanced
+    const portEl = document.getElementById("settings-port");
+    if (portEl) portEl.textContent = settings.relay_port.toString();
+
+    const autostartEl = document.getElementById("settings-autostart") as HTMLInputElement | null;
+    if (autostartEl) autostartEl.checked = settings.auto_start;
+
+    const maxStorageEl = document.getElementById("settings-max-storage");
+    if (maxStorageEl) {
+      maxStorageEl.textContent =
+        settings.max_storage_mb >= 1024
+          ? `${(settings.max_storage_mb / 1024).toFixed(1)} GB`
+          : `${settings.max_storage_mb} MB`;
+    }
+  } catch (e) {
+    console.error("[settings] Failed to load:", e);
+  }
 }
