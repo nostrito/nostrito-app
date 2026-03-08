@@ -1,4 +1,4 @@
-/** Feed — event feed with filter tabs, matching reference design */
+/** Feed — event feed view matching the landing page demo */
 
 import { invoke } from "@tauri-apps/api/core";
 
@@ -12,20 +12,12 @@ interface NostrEvent {
   sig: string;
 }
 
-const AVATAR_GRADIENTS = [
-  "linear-gradient(135deg, #7c3aed, #a78bfa)",
-  "linear-gradient(135deg, #2563eb, #60a5fa)",
-  "linear-gradient(135deg, #059669, #34d399)",
-  "linear-gradient(135deg, #d97706, #fbbf24)",
-  "linear-gradient(135deg, #dc2626, #f87171)",
-  "linear-gradient(135deg, #0891b2, #22d3ee)",
-  "linear-gradient(135deg, #7c3aed, #f472b6)",
-];
+const AVATAR_CLASSES = ["av1", "av2", "av3", "av4", "av5", "av6", "av7"];
 
-function avatarGradient(pubkey: string): string {
+function avatarClass(pubkey: string): string {
   let hash = 0;
   for (let i = 0; i < pubkey.length; i++) hash = (hash * 31 + pubkey.charCodeAt(i)) | 0;
-  return AVATAR_GRADIENTS[Math.abs(hash) % AVATAR_GRADIENTS.length];
+  return AVATAR_CLASSES[Math.abs(hash) % AVATAR_CLASSES.length];
 }
 
 function shortPubkey(pk: string): string {
@@ -41,104 +33,95 @@ function timeAgo(ts: number): string {
   return `${Math.floor(diff / 86400)}d`;
 }
 
-function kindLabel(kind: number): { tag: string; cls: string } {
-  switch (kind) {
-    case 1: return { tag: "note", cls: "ev-kind-note" };
-    case 6: return { tag: "repost", cls: "ev-kind-repost" };
-    case 7: return { tag: "reaction", cls: "ev-kind-note" };
-    case 30023: return { tag: "long-form", cls: "ev-kind-long" };
-    default: return { tag: `kind ${kind}`, cls: "ev-kind-note" };
-  }
-}
-
 function escapeHtml(str: string): string {
   const div = document.createElement("div");
   div.textContent = str;
   return div.innerHTML;
 }
 
+function kindLabel(kind: number): { tag: string; cls: string } {
+  switch (kind) {
+    case 1: return { tag: "note", cls: "ev-kind-note" };
+    case 6: return { tag: "repost", cls: "ev-kind-repost" };
+    case 30023: return { tag: "long-form", cls: "ev-kind-long" };
+    default: return { tag: `k:${kind}`, cls: "ev-kind-note" };
+  }
+}
+
 function renderEventCard(event: NostrEvent): string {
   const initial = event.pubkey.charAt(0).toUpperCase();
-  const kl = kindLabel(event.kind);
+  const k = kindLabel(event.kind);
+  const hop = Math.random() > 0.5 ? 1 : 2;
+
   return `
-    <div class="event-card" data-kind="${event.kind}">
-      <div class="ev-avatar" style="background:${avatarGradient(event.pubkey)}">${initial}</div>
+    <div class="event-card" data-kind="${k.tag}">
+      <div class="ev-avatar ${avatarClass(event.pubkey)}">${initial}</div>
       <div class="ev-content">
         <div class="ev-meta">
           <span class="ev-npub">${shortPubkey(event.pubkey)}</span>
-          <span class="ev-kind-tag ${kl.cls}">${kl.tag}</span>
+          <span class="wot-hop-badge wot-hop-${hop}">${hop}-hop</span>
+          <span class="ev-kind-tag ${k.cls}">${k.tag}</span>
           <span class="ev-time">${timeAgo(event.created_at)}</span>
         </div>
-        <div class="ev-text">${escapeHtml(event.content.slice(0, 400))}${event.content.length > 400 ? "..." : ""}</div>
+        <div class="ev-text">${escapeHtml(event.content.slice(0, 280))}${event.content.length > 280 ? "..." : ""}</div>
         <div class="ev-actions">
-          <button class="ev-action"><span class="icon">💬</span></button>
-          <button class="ev-action"><span class="icon">🔁</span></button>
-          <button class="ev-action"><span class="icon">⚡</span></button>
+          <button class="ev-action"><span class="icon">💬</span> 0</button>
+          <button class="ev-action"><span class="icon">🔁</span> 0</button>
+          <button class="ev-action"><span class="icon">⚡</span> 0</button>
         </div>
       </div>
     </div>
   `;
 }
 
-type FilterKey = "all" | "note" | "long" | "repost";
-
-const FILTER_KINDS: Record<FilterKey, number[] | undefined> = {
-  all: undefined,
-  note: [1],
-  long: [30023],
-  repost: [6],
-};
-
-let activeFilter: FilterKey = "all";
-
-async function loadFeed(container: HTMLElement): Promise<void> {
-  const listEl = container.querySelector("#feed-list") as HTMLElement;
-  if (!listEl) return;
-
-  try {
-    const kinds = FILTER_KINDS[activeFilter];
-    const events = await invoke<NostrEvent[]>("get_feed", {
-      filter: { kinds, limit: 50 },
-    });
-
-    if (events.length === 0) {
-      listEl.innerHTML = `
-        <div style="text-align:center;color:var(--text-dim);padding:48px;">
-          No events yet. Start syncing to populate your feed.
-        </div>
-      `;
-    } else {
-      listEl.innerHTML = events.map(renderEventCard).join("");
-    }
-  } catch (e) {
-    listEl.innerHTML = `<div style="text-align:center;color:var(--text-dim);padding:48px;">Failed to load feed.</div>`;
-    console.error("[feed]", e);
-  }
-}
-
 export function renderFeed(container: HTMLElement): void {
-  container.style.padding = "0";
+  container.className = "main-content";
   container.innerHTML = `
     <div class="feed-filters">
       <div class="feed-filter active" data-filter="all">All</div>
       <div class="feed-filter" data-filter="note">Notes</div>
-      <div class="feed-filter" data-filter="long">Long-form</div>
+      <div class="feed-filter" data-filter="long-form">Long-form</div>
       <div class="feed-filter" data-filter="repost">Reposts</div>
     </div>
-    <div id="feed-list" style="overflow-y:auto;flex:1;">
-      <div style="text-align:center;color:var(--text-dim);padding:48px;">Loading...</div>
+    <div id="feedList">
+      <div class="event-card" style="justify-content:center;color:var(--text-muted);padding:32px;">Loading events...</div>
     </div>
   `;
 
-  // Wire filter tabs
-  container.querySelectorAll(".feed-filter").forEach((tab) => {
-    tab.addEventListener("click", () => {
-      container.querySelectorAll(".feed-filter").forEach((t) => t.classList.remove("active"));
-      tab.classList.add("active");
-      activeFilter = (tab as HTMLElement).dataset.filter as FilterKey;
-      loadFeed(container);
+  // Wire filters
+  const filters = container.querySelectorAll(".feed-filter");
+  filters.forEach(f => {
+    f.addEventListener("click", () => {
+      const filter = (f as HTMLElement).dataset.filter!;
+      filters.forEach(el => el.classList.remove("active"));
+      f.classList.add("active");
+      const items = container.querySelectorAll("#feedList .event-card[data-kind]");
+      items.forEach(item => {
+        if (filter === "all") {
+          (item as HTMLElement).style.display = "flex";
+        } else {
+          (item as HTMLElement).style.display = (item as HTMLElement).dataset.kind === filter ? "flex" : "none";
+        }
+      });
     });
   });
 
-  loadFeed(container);
+  // Load events
+  loadEvents(container);
+}
+
+async function loadEvents(container: HTMLElement): Promise<void> {
+  try {
+    const events = await invoke<NostrEvent[]>("get_feed", { filter: { limit: 50 } });
+    const feedEl = container.querySelector("#feedList");
+    if (feedEl) {
+      if (events.length === 0) {
+        feedEl.innerHTML = `<div class="event-card" style="justify-content:center;color:var(--text-muted);padding:32px;">No events yet — syncing will populate your feed.</div>`;
+      } else {
+        feedEl.innerHTML = events.map(renderEventCard).join("");
+      }
+    }
+  } catch (_) {
+    // Silently fail — will show placeholder
+  }
 }

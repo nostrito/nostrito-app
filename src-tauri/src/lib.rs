@@ -599,7 +599,6 @@ pub fn run() {
             // Auto-resume sync and relay if previously configured
             let relay_cancel_setup = state.relay_cancel.clone();
             let db_relay = state.db.clone();
-            let config_relay = state.config.clone();
 
             tauri::async_runtime::spawn(async move {
                 let cfg = config.read().await;
