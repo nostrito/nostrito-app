@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info};
 
 use crate::wot::WotGraph;
 
@@ -95,8 +95,6 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_events_pubkey ON nostr_events(pubkey);
             CREATE INDEX IF NOT EXISTS idx_events_kind ON nostr_events(kind);
             CREATE INDEX IF NOT EXISTS idx_events_created ON nostr_events(created_at);
-            CREATE INDEX IF NOT EXISTS idx_events_stored ON nostr_events(stored_at);
-
             CREATE TABLE IF NOT EXISTS app_config (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -112,11 +110,13 @@ impl Database {
             conn.execute_batch(
                 "ALTER TABLE nostr_events ADD COLUMN stored_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'));"
             )?;
-            conn.execute_batch(
-                "CREATE INDEX IF NOT EXISTS idx_events_stored ON nostr_events(stored_at);"
-            )?;
             info!("Migrated nostr_events: added stored_at column");
         }
+
+        // Create stored_at index AFTER migration ensures the column exists
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_events_stored ON nostr_events(stored_at);"
+        )?;
 
         info!("Database schema initialized");
         Ok(())

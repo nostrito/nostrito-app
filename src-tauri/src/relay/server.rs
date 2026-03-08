@@ -10,7 +10,6 @@
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
-use std::cmp;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
