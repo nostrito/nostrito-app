@@ -66,6 +66,7 @@ export class WizardScreen {
   }
 
   private draw(): void {
+    console.log(`[wizard] Drawing step ${this.step}/${STEP_LABELS.length}: ${STEP_LABELS[this.step - 1]}`);
     const c = this.container;
     c.innerHTML = "";
     c.className = "wizard-root";
@@ -433,6 +434,8 @@ export class WizardScreen {
       },
     };
 
+    console.log("[wizard] Finishing with config:", JSON.stringify(config));
+
     // Disable finish button
     const finishBtn = this.container.querySelector(".btn-primary") as HTMLButtonElement | null;
     if (finishBtn) {
@@ -442,6 +445,7 @@ export class WizardScreen {
 
     try {
       const { invoke } = await import("@tauri-apps/api/core");
+      console.log("[wizard] Calling init_nostrito...");
       await invoke("init_nostrito", {
         npub: config.npub,
         relays: config.relays,
@@ -449,6 +453,7 @@ export class WizardScreen {
         storageMediaGb: config.storage.othersMediaGb,
       });
 
+      console.log("[wizard] init_nostrito succeeded");
       localStorage.setItem("nostrito_initialized", "true");
       localStorage.setItem("nostrito_config", JSON.stringify(config));
 

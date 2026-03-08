@@ -118,7 +118,9 @@ export function renderSettings(container: HTMLElement): void {
   document.getElementById("btn-reset-app")?.addEventListener("click", async () => {
     if (confirm("Are you sure? This will delete ALL data and return to the setup wizard.")) {
       try {
+        console.log("[settings] Calling reset_app_data...");
         await invoke("reset_app_data");
+        console.log("[settings] reset_app_data complete");
         // Backend emits app:reset which app.ts listens to → navigates to wizard
         // Fallback: clear local state and reload
         localStorage.removeItem("nostrito_initialized");
@@ -133,7 +135,9 @@ export function renderSettings(container: HTMLElement): void {
   document.getElementById("btn-change-account")?.addEventListener("click", async () => {
     if (confirm("Remove your npub and start over? Event data will be kept.")) {
       try {
+        console.log("[settings] Calling reset_app_data (change account)...");
         await invoke("reset_app_data");
+        console.log("[settings] reset_app_data (change account) complete");
         localStorage.removeItem("nostrito_initialized");
         localStorage.removeItem("nostrito_config");
         window.dispatchEvent(new CustomEvent("nostrito:reset"));
