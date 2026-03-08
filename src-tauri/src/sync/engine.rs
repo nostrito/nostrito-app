@@ -2,7 +2,6 @@ use anyhow::Result;
 use nostr_sdk::prelude::*;
 use nostr_sdk::client::options::EventSource;
 use serde::{Deserialize, Serialize};
-use serde_json;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -472,17 +471,21 @@ impl SyncEngine {
             {
                 Ok(Ok(events)) => {
                     for event in events.iter() {
-                        let tags_json = serde_json::to_string(
-                            &event.tags.iter().map(|t| t.as_slice().iter().map(|s| s.to_string()).collect::<Vec<_>>()).collect::<Vec<_>>()
-                        ).unwrap_or_default();
+                        let tags: Vec<Vec<String>> = event.tags
+                            .iter()
+                            .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
+                            .collect();
+                        let tags_json = serde_json::to_string(&tags).unwrap_or_default();
+                        let content: String = event.content().to_string();
+                        let sig: String = event.sig.to_string();
                         self.db.store_event(
                             &event.id.to_hex(),
                             &event.pubkey.to_hex(),
                             event.created_at.as_u64() as i64,
                             event.kind.as_u16() as u32,
                             &tags_json,
-                            &event.content.to_string(),
-                            &event.sig.to_string(),
+                            &content,
+                            &sig,
                         ).ok();
                     }
                     fetched += events.len() as u64;
