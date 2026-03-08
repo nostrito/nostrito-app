@@ -108,7 +108,7 @@ impl Database {
             .is_ok();
         if !has_stored_at {
             conn.execute_batch(
-                "ALTER TABLE nostr_events ADD COLUMN stored_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'));"
+                "ALTER TABLE nostr_events ADD COLUMN stored_at INTEGER NOT NULL DEFAULT 0;"
             )?;
             info!("Migrated nostr_events: added stored_at column");
         }
