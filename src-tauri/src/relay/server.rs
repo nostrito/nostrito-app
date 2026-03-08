@@ -1,9 +1,10 @@
-//! NIP-01 compliant WebSocket relay server.
+//! NIP-01 + NIP-11 compliant WebSocket relay server.
 //!
 //! Personal relay that:
-//! - Serves events from SQLite
+//! - Serves events from SQLite via WebSocket (NIP-01)
 //! - Accepts EVENT, REQ, CLOSE messages
 //! - Sends EVENT, EOSE, NOTICE, OK responses
+//! - Serves relay information document over HTTP (NIP-11)
 //! - Optionally restricts writes to configured npub
 
 use anyhow::Result;
@@ -13,6 +14,7 @@ use std::cmp;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, RwLock};
 use tokio_tungstenite::tungstenite::Message;
@@ -170,8 +172,30 @@ pub async fn run_relay(
                         let rx = broadcast_tx.subscribe();
                         let cancel = cancel.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(stream, addr, db, allowed, tx, rx, cancel).await {
-                                debug!("Connection {} closed: {}", addr, e);
+                            // Peek at raw bytes to detect WebSocket upgrade vs plain HTTP
+                            let mut header_buf = vec![0u8; 2048];
+                            match stream.peek(&mut header_buf).await {
+                                Ok(n) => {
+                                    let header_str = String::from_utf8_lossy(&header_buf[..n]);
+                                    let is_ws = header_str.contains("Upgrade: websocket")
+                                        || header_str.contains("upgrade: websocket")
+                                        || header_str.contains("Upgrade: WebSocket");
+                                    if is_ws {
+                                        if let Err(e) = handle_connection(stream, addr, db, allowed, tx, rx, cancel).await {
+                                            debug!("Connection {} closed: {}", addr, e);
+                                        }
+                                    } else {
+                                        // NIP-11: serve HTTP info page
+                                        let accept_nostr = header_str.contains("application/nostr+json");
+                                        let hex_pubkey = allowed.unwrap_or_default();
+                                        if let Err(e) = serve_http(stream, port, &hex_pubkey, accept_nostr).await {
+                                            debug!("HTTP response to {} failed: {}", addr, e);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!("Peek error from {}: {}", addr, e);
+                                }
                             }
                         });
                     }
@@ -183,6 +207,126 @@ pub async fn run_relay(
         }
     }
 
+    Ok(())
+}
+
+/// NIP-11: Serve relay information document (JSON) or HTML info page over plain HTTP.
+async fn serve_http(
+    mut stream: TcpStream,
+    port: u16,
+    hex_pubkey: &str,
+    accept_nostr_json: bool,
+) -> Result<()> {
+    // Drain the request from the socket (we already peeked, now consume it)
+    let mut drain = vec![0u8; 4096];
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        tokio::io::AsyncReadExt::read(&mut stream, &mut drain),
+    )
+    .await;
+
+    if accept_nostr_json {
+        // NIP-11 JSON relay information document
+        let body = serde_json::json!({
+            "name": "nostrito relay",
+            "description": "Your personal Nostr relay. Running locally.",
+            "pubkey": hex_pubkey,
+            "contact": "",
+            "supported_nips": [1, 11],
+            "software": "nostrito",
+            "version": "0.1.0"
+        })
+        .to_string();
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: application/nostr+json\r\n\
+             Access-Control-Allow-Origin: *\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).await?;
+    } else {
+        // HTML info page
+        let pubkey_display = if hex_pubkey.is_empty() {
+            "not configured".to_string()
+        } else {
+            hex_pubkey.to_string()
+        };
+
+        let body = format!(
+            r#"<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>nostrito — Your Personal Relay</title>
+  <style>
+    *{{box-sizing:border-box;margin:0;padding:0}}
+    body{{background:#0a0a0a;color:#e8e8f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center}}
+    .card{{max-width:480px;width:100%;padding:40px;background:#111113;border:1px solid #1e1e24;border-radius:12px}}
+    .logo{{font-size:28px;font-weight:800;color:#fff;margin-bottom:4px}}
+    .logo span{{color:#7c3aed}}
+    .badge{{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#34d399;margin-bottom:28px}}
+    .badge::before{{content:'';width:8px;height:8px;border-radius:50%;background:#34d399;display:inline-block}}
+    h2{{font-size:13px;color:#888;text-transform:uppercase;letter-spacing:.5px;margin:20px 0 8px}}
+    .row{{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #1e1e24;font-size:13px}}
+    .row .label{{color:#888}}
+    .row .value{{color:#e8e8f0;font-weight:500;max-width:60%;text-align:right;word-break:break-all}}
+    .nips{{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}}
+    .nip{{padding:3px 10px;background:rgba(124,58,237,.15);color:#a78bfa;border-radius:20px;font-size:12px;font-weight:600}}
+    .cta{{margin-top:28px;padding:14px;background:rgba(124,58,237,.1);border:1px solid rgba(124,58,237,.3);border-radius:8px;font-size:13px;color:#a78bfa;text-align:center}}
+    .cta a{{color:#7c3aed}}
+    .mono{{font-family:'JetBrains Mono',monospace;font-size:11px}}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">🌶️ nos<span>trito</span></div>
+    <div class="badge">Live — ws://localhost:{port}</div>
+
+    <h2>Relay Info</h2>
+    <div class="row"><span class="label">Name</span><span class="value">nostrito relay</span></div>
+    <div class="row"><span class="label">Description</span><span class="value">Your personal Nostr relay, running locally.</span></div>
+    <div class="row"><span class="label">Pubkey</span><span class="value mono">{pubkey_display}</span></div>
+    <div class="row"><span class="label">Port</span><span class="value">{port}</span></div>
+
+    <h2>Protocol</h2>
+    <div class="nips">
+      <span class="nip">NIP-01</span>
+      <span class="nip">NIP-11</span>
+    </div>
+
+    <div class="cta">
+      Connect with <strong>ws://localhost:{port}</strong> in Damus, Amethyst, or any Nostr client.<br><br>
+      <a href="https://nostrito.fabri.lat">Learn more about nostrito →</a>
+    </div>
+  </div>
+</body>
+</html>"#,
+            port = port,
+            pubkey_display = pubkey_display,
+        );
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: text/html; charset=utf-8\r\n\
+             Access-Control-Allow-Origin: *\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).await?;
+    }
+
+    stream.shutdown().await?;
+    info!("[relay] Served NIP-11 info page");
     Ok(())
 }
 
