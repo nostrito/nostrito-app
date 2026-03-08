@@ -49,10 +49,59 @@ function kindLabel(kind: number): { tag: string; cls: string } {
   }
 }
 
+/** Kinds that belong in the feed — content only, no metadata */
+const FEED_KINDS = [1, 6, 30023];
+
+/**
+ * For kind:6 reposts (NIP-18), try to parse the embedded original event from content.
+ * Returns the original note content if valid, or null.
+ */
+function parseRepostContent(event: NostrEvent): { content: string; pubkey: string } | null {
+  if (event.kind !== 6 || !event.content.trim()) return null;
+  try {
+    const original = JSON.parse(event.content);
+    if (original && typeof original.content === "string" && original.content.trim()) {
+      return { content: original.content, pubkey: original.pubkey || event.pubkey };
+    }
+  } catch {
+    // Not valid JSON — skip
+  }
+  return null;
+}
+
 function renderEventCard(event: NostrEvent, profile?: ProfileInfo): string {
   const initial = event.pubkey.charAt(0).toUpperCase();
   const k = kindLabel(event.kind);
   const displayName = profileDisplayName(profile, event.pubkey);
+
+  // Handle kind:6 reposts — show original content or skip if empty
+  if (event.kind === 6) {
+    const original = parseRepostContent(event);
+    if (!original) return ""; // Empty repost, skip it
+
+    const avatarHtml = profile?.picture
+      ? `<img src="${escapeHtml(profile.picture)}" class="ev-avatar ev-avatar-img" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'" /><div class="ev-avatar ${avatarClass(event.pubkey)}" style="display:none">${initial}</div>`
+      : `<div class="ev-avatar ${avatarClass(event.pubkey)}">${initial}</div>`;
+
+    return `
+      <div class="event-card" data-kind="${k.tag}">
+        ${avatarHtml}
+        <div class="ev-content">
+          <div class="ev-meta">
+            <span class="ev-npub">${escapeHtml(displayName)}</span>
+            <span class="ev-kind-tag ${k.cls}">🔁 repost</span>
+            <span class="ev-time">${timeAgo(event.created_at)}</span>
+          </div>
+          <div class="ev-text">${escapeHtml(original.content.slice(0, 280))}${original.content.length > 280 ? "..." : ""}</div>
+          <div class="ev-actions">
+            <button class="ev-action"><span class="icon">💬</span> 0</button>
+            <button class="ev-action"><span class="icon">🔁</span> 0</button>
+            <button class="ev-action"><span class="icon">⚡</span> 0</button>
+          </div>
+        </div>
+      </div>
+    `;
+  }
 
   const avatarHtml = profile?.picture
     ? `<img src="${escapeHtml(profile.picture)}" class="ev-avatar ev-avatar-img" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'" /><div class="ev-avatar ${avatarClass(event.pubkey)}" style="display:none">${initial}</div>`
@@ -117,8 +166,11 @@ export function renderFeed(container: HTMLElement): void {
 async function loadEvents(container: HTMLElement): Promise<void> {
   try {
     console.log("[feed] Calling get_feed with limit=50...");
-    const events = await invoke<NostrEvent[]>("get_feed", { filter: { limit: 50 } });
-    console.log("[feed] get_feed response:", events.length, "events");
+    const rawEvents = await invoke<NostrEvent[]>("get_feed", { filter: { limit: 50 } });
+    console.log("[feed] get_feed response:", rawEvents.length, "events");
+    // Defense in depth: filter to feed-worthy kinds even if backend already does
+    const events = rawEvents.filter((e) => FEED_KINDS.includes(e.kind));
+    console.log("[feed] after kind filter:", events.length, "feed events");
     const feedEl = container.querySelector("#feedList");
     if (feedEl) {
       if (events.length === 0) {
@@ -128,6 +180,7 @@ async function loadEvents(container: HTMLElement): Promise<void> {
         const profileMap = await getProfiles(pubkeys);
         feedEl.innerHTML = events
           .map((e) => renderEventCard(e, profileMap.get(e.pubkey)))
+          .filter((html) => html.trim() !== "") // skip empty repost cards
           .join("");
       }
     }

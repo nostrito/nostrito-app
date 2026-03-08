@@ -376,7 +376,13 @@ async fn stop_sync(state: State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 async fn get_feed(filter: FeedFilter, state: State<'_, AppState>) -> Result<Vec<NostrEvent>, String> {
     tracing::debug!("[cmd:get_feed] called with filter: kinds={:?}, limit={:?}, since={:?}, wot_only={:?}", filter.kinds, filter.limit, filter.since, filter.wot_only);
-    let kinds = filter.kinds.as_deref();
+    // If no kinds specified, default to feed-worthy kinds (no metadata like reactions, zaps, etc.)
+    let feed_kinds = if filter.kinds.is_none() {
+        Some(vec![1u32, 6, 30023])
+    } else {
+        filter.kinds
+    };
+    let kinds = feed_kinds.as_deref();
     let limit = filter.limit.unwrap_or(50);
 
     let events = state
