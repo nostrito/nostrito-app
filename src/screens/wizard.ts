@@ -339,7 +339,7 @@ export class WizardScreen {
     });
   }
 
-  private finish(): void {
+  private async finish(): Promise<void> {
     const config: WizardConfig = {
       npub: this.npub,
       relays: Array.from(this.selectedRelays),
@@ -351,21 +351,48 @@ export class WizardScreen {
       },
     };
 
-    // Mock Tauri invoke
-    if ((window as any).__nostrito?.finishWizard) {
-      (window as any).__nostrito.finishWizard(config);
-    } else {
-      console.log("[nostrito] Wizard complete:", config);
+    // Disable button to prevent double-clicks
+    const finishBtn = this.container.querySelector(".btn-finish") as HTMLButtonElement | null;
+    if (finishBtn) {
+      finishBtn.disabled = true;
+      finishBtn.textContent = "Initializing...";
     }
 
-    localStorage.setItem("nostrito_initialized", "true");
-    localStorage.setItem("nostrito_config", JSON.stringify(config));
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke("init_nostrito", {
+        npub: config.npub,
+        relays: config.relays,
+        storageOthersGb: config.storage.othersEventsGb,
+        storageMediaGb: config.storage.othersMediaGb,
+      });
 
-    if (this.completeCallback) {
-      this.completeCallback(config);
+      localStorage.setItem("nostrito_initialized", "true");
+      localStorage.setItem("nostrito_config", JSON.stringify(config));
+
+      if (this.completeCallback) {
+        this.completeCallback(config);
+      }
+
+      showAppShell();
+    } catch (e) {
+      console.error("[nostrito] Failed to initialize:", e);
+      // Show error in UI
+      const content = this.container.querySelector(".wizard-content");
+      if (content) {
+        const existing = content.querySelector(".wizard-error");
+        if (existing) existing.remove();
+        const errEl = document.createElement("p");
+        errEl.className = "wizard-error";
+        errEl.textContent = `Failed to initialize: ${e}`;
+        content.appendChild(errEl);
+      }
+      // Re-enable button
+      if (finishBtn) {
+        finishBtn.disabled = false;
+        finishBtn.textContent = "Launch nostrito 🚀";
+      }
     }
-
-    showAppShell();
   }
 }
 

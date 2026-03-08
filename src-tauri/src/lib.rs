@@ -5,13 +5,14 @@ mod wot;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use tauri::State;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use storage::Database;
-use sync::SyncEngine;
+use sync::{SyncEngine, SyncStats, SyncTier};
 use wot::WotGraph;
 
 // ── App State ──────────────────────────────────────────────────────
@@ -22,6 +23,8 @@ pub struct AppState {
     pub config: Arc<RwLock<AppConfig>>,
     pub db_path: PathBuf,
     pub sync_cancel: Arc<RwLock<Option<CancellationToken>>>,
+    pub sync_tier: Arc<AtomicU8>,
+    pub sync_stats: Arc<RwLock<SyncStats>>,
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +37,8 @@ pub struct AppConfig {
     pub sync_interval_secs: u32,
     pub outbound_relays: Vec<String>,
     pub auto_start: bool,
+    pub storage_others_gb: f64,
+    pub storage_media_gb: f64,
 }
 
 impl Default for AppConfig {
@@ -51,6 +56,8 @@ impl Default for AppConfig {
                 "wss://relay.nostr.band".into(),
             ],
             auto_start: true,
+            storage_others_gb: 5.0,
+            storage_media_gb: 2.0,
         }
     }
 }
@@ -67,6 +74,8 @@ pub struct AppStatus {
     pub wot_nodes: usize,
     pub wot_edges: usize,
     pub sync_status: String,
+    pub sync_tier: u8,
+    pub sync_stats: SyncStats,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -140,6 +149,8 @@ async fn get_status(state: State<'_, AppState>) -> Result<AppStatus, String> {
     let config = state.config.read().await;
     let stats = state.wot_graph.stats();
     let sync_running = state.sync_cancel.read().await.is_some();
+    let current_tier = state.sync_tier.load(Ordering::Relaxed);
+    let sync_stats = state.sync_stats.read().await.clone();
 
     Ok(AppStatus {
         initialized: config.npub.is_some(),
@@ -150,20 +161,34 @@ async fn get_status(state: State<'_, AppState>) -> Result<AppStatus, String> {
         wot_nodes: stats.node_count,
         wot_edges: stats.edge_count,
         sync_status: if sync_running {
-            "running".into()
+            match SyncTier::from(current_tier) {
+                SyncTier::Critical => "syncing (tier 1: critical)".into(),
+                SyncTier::Important => "syncing (tier 2: recent events)".into(),
+                SyncTier::Background => "syncing (tier 3: WoT crawl)".into(),
+                SyncTier::Archive => "syncing (tier 4: archive)".into(),
+                SyncTier::Idle => "idle".into(),
+            }
         } else {
             "idle".into()
         },
+        sync_tier: current_tier,
+        sync_stats,
     })
 }
 
 #[tauri::command]
-async fn init_nostrito(npub: String, state: State<'_, AppState>) -> Result<(), String> {
+async fn init_nostrito(
+    npub: String,
+    relays: Vec<String>,
+    storage_others_gb: Option<f64>,
+    storage_media_gb: Option<f64>,
+    app_handle: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     tracing::info!("Initializing nostrito with npub: {}", npub);
 
     // Parse npub to hex pubkey
     let hex_pubkey = if npub.starts_with("npub1") {
-        // Decode bech32 npub
         use nostr_sdk::prelude::*;
         let pk = PublicKey::from_bech32(&npub).map_err(|e| format!("Invalid npub: {}", e))?;
         pk.to_hex()
@@ -178,6 +203,15 @@ async fn init_nostrito(npub: String, state: State<'_, AppState>) -> Result<(), S
         let mut config = state.config.write().await;
         config.npub = Some(npub.clone());
         config.hex_pubkey = Some(hex_pubkey.clone());
+        if !relays.is_empty() {
+            config.outbound_relays = relays.clone();
+        }
+        if let Some(gb) = storage_others_gb {
+            config.storage_others_gb = gb;
+        }
+        if let Some(gb) = storage_media_gb {
+            config.storage_media_gb = gb;
+        }
     }
 
     // Persist to DB
@@ -189,6 +223,12 @@ async fn init_nostrito(npub: String, state: State<'_, AppState>) -> Result<(), S
         .db
         .set_config("hex_pubkey", &hex_pubkey)
         .map_err(|e| format!("Failed to save config: {}", e))?;
+    if !relays.is_empty() {
+        state
+            .db
+            .set_config("outbound_relays", &relays.join(","))
+            .map_err(|e| format!("Failed to save relays: {}", e))?;
+    }
 
     // Load existing graph from DB
     state
@@ -196,12 +236,16 @@ async fn init_nostrito(npub: String, state: State<'_, AppState>) -> Result<(), S
         .load_graph(&state.wot_graph)
         .map_err(|e| format!("Failed to load graph: {}", e))?;
 
-    // Start sync engine
+    // Start tiered sync engine
     let config = state.config.read().await;
     let sync_engine = Arc::new(SyncEngine::new(
         state.wot_graph.clone(),
         state.db.clone(),
         config.outbound_relays.clone(),
+        hex_pubkey.clone(),
+        state.sync_tier.clone(),
+        state.sync_stats.clone(),
+        app_handle,
     ));
 
     let cancel = sync_engine.start();
@@ -251,7 +295,10 @@ async fn get_wot_distance(
 }
 
 #[tauri::command]
-async fn start_sync(state: State<'_, AppState>) -> Result<(), String> {
+async fn start_sync(
+    app_handle: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     let existing = state.sync_cancel.read().await;
     if existing.is_some() {
         return Err("Sync already running".into());
@@ -259,10 +306,19 @@ async fn start_sync(state: State<'_, AppState>) -> Result<(), String> {
     drop(existing);
 
     let config = state.config.read().await;
+    let hex_pubkey = config
+        .hex_pubkey
+        .clone()
+        .ok_or("Not initialized — no pubkey set")?;
+
     let sync_engine = Arc::new(SyncEngine::new(
         state.wot_graph.clone(),
         state.db.clone(),
         config.outbound_relays.clone(),
+        hex_pubkey,
+        state.sync_tier.clone(),
+        state.sync_stats.clone(),
+        app_handle,
     ));
 
     let cancel = sync_engine.start();
@@ -276,6 +332,7 @@ async fn stop_sync(state: State<'_, AppState>) -> Result<(), String> {
     let cancel = state.sync_cancel.write().await.take();
     if let Some(cancel) = cancel {
         cancel.cancel();
+        state.sync_tier.store(SyncTier::Idle as u8, Ordering::Relaxed);
         tracing::info!("Sync engine stopped");
     }
     Ok(())
@@ -342,9 +399,7 @@ pub fn run() {
     }
 
     // Initialize database
-    let db = Arc::new(
-        Database::open(&db_path).expect("Failed to open database"),
-    );
+    let db = Arc::new(Database::open(&db_path).expect("Failed to open database"));
 
     // Initialize WoT graph
     let wot_graph = Arc::new(WotGraph::new());
@@ -369,6 +424,12 @@ pub fn run() {
     if let Ok(Some(hex)) = db.get_config("hex_pubkey") {
         config.hex_pubkey = Some(hex);
     }
+    if let Ok(Some(relays_csv)) = db.get_config("outbound_relays") {
+        let relays: Vec<String> = relays_csv.split(',').map(|s| s.to_string()).collect();
+        if !relays.is_empty() {
+            config.outbound_relays = relays;
+        }
+    }
 
     let app_state = AppState {
         wot_graph,
@@ -376,6 +437,8 @@ pub fn run() {
         config: Arc::new(RwLock::new(config)),
         db_path,
         sync_cancel: Arc::new(RwLock::new(None)),
+        sync_tier: Arc::new(AtomicU8::new(0)),
+        sync_stats: Arc::new(RwLock::new(SyncStats::default())),
     };
 
     tauri::Builder::default()

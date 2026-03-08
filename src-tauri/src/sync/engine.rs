@@ -1,24 +1,160 @@
 use anyhow::Result;
-use lru::LruCache;
 use nostr_sdk::prelude::*;
-use std::num::NonZeroUsize;
+use nostr_sdk::client::options::EventSource;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::mpsc;
+use std::time::{Duration, Instant};
+use tauri::Emitter;
+use tokio::sync::{mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::storage::{Database, FollowUpdateBatch};
 use crate::wot::WotGraph;
 
-const SEEN_CACHE_CAPACITY: usize = 100_000;
+// ── Tier Definitions ───────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
-struct SeenEvent {
-    created_at: u64,
-    #[allow(dead_code)]
-    event_id: EventId,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum SyncTier {
+    Idle = 0,
+    Critical = 1,    // your profile + your follows
+    Important = 2,   // recent events from your follows
+    Background = 3,  // WoT crawl (follows-of-follows)
+    Archive = 4,     // media, historical, deep WoT
 }
+
+impl From<u8> for SyncTier {
+    fn from(v: u8) -> Self {
+        match v {
+            1 => SyncTier::Critical,
+            2 => SyncTier::Important,
+            3 => SyncTier::Background,
+            4 => SyncTier::Archive,
+            _ => SyncTier::Idle,
+        }
+    }
+}
+
+// ── Sync Progress Events ───────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncProgress {
+    pub tier: u8,
+    pub fetched: u64,
+    pub total: u64,
+    pub relay: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TierComplete {
+    pub tier: u8,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SyncStats {
+    pub tier1_fetched: u64,
+    pub tier2_fetched: u64,
+    pub tier3_fetched: u64,
+    pub tier4_fetched: u64,
+    pub current_tier: u8,
+}
+
+// ── Relay Policy ───────────────────────────────────────────────────
+
+#[allow(dead_code)]
+struct RelayPolicy {
+    requests_per_minute: u32,
+    backoff_secs: u64,
+    last_notice: Option<String>,
+    request_times: Vec<Instant>,
+    paused_until: Option<Instant>,
+    consecutive_failures: u32,
+}
+
+#[allow(dead_code)]
+impl RelayPolicy {
+    fn new() -> Self {
+        Self {
+            requests_per_minute: 10,
+            backoff_secs: 5,
+            last_notice: None,
+            request_times: Vec::new(),
+            paused_until: None,
+            consecutive_failures: 0,
+        }
+    }
+
+    fn can_request(&mut self) -> bool {
+        if let Some(paused_until) = self.paused_until {
+            if Instant::now() < paused_until {
+                return false;
+            }
+            self.paused_until = None;
+        }
+
+        let now = Instant::now();
+        let one_min_ago = now - Duration::from_secs(60);
+        self.request_times.retain(|&t| t > one_min_ago);
+        self.request_times.len() < self.requests_per_minute as usize
+    }
+
+    fn record_request(&mut self) {
+        self.request_times.push(Instant::now());
+    }
+
+    fn on_notice(&mut self, msg: &str) {
+        let lower = msg.to_lowercase();
+        if lower.contains("rate") || lower.contains("limit") {
+            info!("Rate limit notice from relay, pausing 60s");
+            self.paused_until = Some(Instant::now() + Duration::from_secs(60));
+        }
+        self.last_notice = Some(msg.to_string());
+    }
+
+    fn on_connection_failure(&mut self) {
+        self.consecutive_failures += 1;
+        let backoff = match self.consecutive_failures {
+            1 => 5,
+            2 => 10,
+            3 => 30,
+            4 => 60,
+            5 => 120,
+            _ => 300,
+        };
+        self.backoff_secs = backoff;
+        self.paused_until = Some(Instant::now() + Duration::from_secs(backoff));
+        warn!(
+            "Connection failure #{}, backing off {}s",
+            self.consecutive_failures, backoff
+        );
+    }
+
+    fn on_connection_success(&mut self) {
+        self.consecutive_failures = 0;
+        self.backoff_secs = 5;
+    }
+}
+
+// ── Relay URL Resolution ───────────────────────────────────────────
+
+fn resolve_relay_url(alias: &str) -> &str {
+    match alias {
+        "primal" => "wss://relay.primal.net",
+        "damus" => "wss://relay.damus.io",
+        "nos" => "wss://relay.nos.social",
+        "snort" => "wss://relay.snort.social",
+        "coracle" => "wss://relay.coracle.social",
+        "nostr.wine" => "wss://nostr.wine",
+        "amethyst" => "wss://nostr.band",
+        "yakihonne" => "wss://relay.yakihonne.com",
+        _ => alias,
+    }
+}
+
+// ── Internal Types ─────────────────────────────────────────────────
 
 #[derive(Debug)]
 struct FollowUpdate {
@@ -28,20 +164,38 @@ struct FollowUpdate {
     created_at: i64,
 }
 
+// ── Sync Engine ────────────────────────────────────────────────────
+
 pub struct SyncEngine {
     graph: Arc<WotGraph>,
     db: Arc<Database>,
-    relays: Vec<String>,
+    relay_aliases: Vec<String>,
     cancel: CancellationToken,
+    hex_pubkey: String,
+    pub sync_tier: Arc<AtomicU8>,
+    pub sync_stats: Arc<RwLock<SyncStats>>,
+    app_handle: tauri::AppHandle,
 }
 
 impl SyncEngine {
-    pub fn new(graph: Arc<WotGraph>, db: Arc<Database>, relays: Vec<String>) -> Self {
+    pub fn new(
+        graph: Arc<WotGraph>,
+        db: Arc<Database>,
+        relay_aliases: Vec<String>,
+        hex_pubkey: String,
+        sync_tier: Arc<AtomicU8>,
+        sync_stats: Arc<RwLock<SyncStats>>,
+        app_handle: tauri::AppHandle,
+    ) -> Self {
         Self {
             graph,
             db,
-            relays,
+            relay_aliases,
             cancel: CancellationToken::new(),
+            hex_pubkey,
+            sync_tier,
+            sync_stats,
+            app_handle,
         }
     }
 
@@ -64,119 +218,454 @@ impl SyncEngine {
         self.cancel.cancel();
     }
 
+    fn set_tier(&self, tier: SyncTier) {
+        self.sync_tier.store(tier as u8, Ordering::Relaxed);
+    }
+
+    fn primary_relay_url(&self) -> String {
+        self.relay_aliases
+            .first()
+            .map(|a| resolve_relay_url(a).to_string())
+            .unwrap_or_else(|| "wss://relay.damus.io".to_string())
+    }
+
+    fn all_relay_urls(&self) -> Vec<String> {
+        self.relay_aliases
+            .iter()
+            .map(|a| resolve_relay_url(a).to_string())
+            .collect()
+    }
+
+    fn emit_progress(&self, tier: u8, fetched: u64, total: u64, relay: &str) {
+        self.app_handle
+            .emit(
+                "sync:progress",
+                SyncProgress {
+                    tier,
+                    fetched,
+                    total,
+                    relay: relay.to_string(),
+                },
+            )
+            .ok();
+    }
+
+    fn emit_tier_complete(&self, tier: u8) {
+        self.app_handle
+            .emit("sync:tier_complete", TierComplete { tier })
+            .ok();
+    }
+
     async fn run(&self) -> Result<()> {
-        info!("Starting sync from {} relays", self.relays.len());
+        info!(
+            "Starting tiered sync from {} relays for pubkey {}",
+            self.relay_aliases.len(),
+            &self.hex_pubkey[..8]
+        );
 
-        let (persist_tx, persist_rx) = mpsc::channel::<FollowUpdate>(10000);
-
-        let db = self.db.clone();
-        let cancel = self.cancel.clone();
-        tokio::spawn(async move {
-            persistence_worker(db, persist_rx, cancel).await;
-        });
-
-        let client = Client::default();
-
-        for relay_url in &self.relays {
-            match client.add_relay(relay_url).await {
-                Ok(_) => info!("Added relay: {}", relay_url),
-                Err(e) => warn!("Failed to add relay {}: {}", relay_url, e),
-            }
+        let mut relay_policies: HashMap<String, RelayPolicy> = HashMap::new();
+        for url in self.all_relay_urls() {
+            relay_policies.insert(url, RelayPolicy::new());
         }
 
+        // Tier 1: Critical
+        if !self.cancel.is_cancelled() {
+            self.run_tier1(&mut relay_policies).await?;
+        }
+
+        // Tier 2: Important
+        if !self.cancel.is_cancelled() {
+            self.run_tier2(&mut relay_policies).await?;
+        }
+
+        // Tier 3: Background
+        if !self.cancel.is_cancelled() {
+            self.run_tier3(&mut relay_policies).await?;
+        }
+
+        // Tier 4: Archive
+        if !self.cancel.is_cancelled() {
+            self.run_tier4(&mut relay_policies).await?;
+        }
+
+        self.set_tier(SyncTier::Idle);
+        info!("All sync tiers complete");
+        Ok(())
+    }
+
+    // ── Tier 1: Critical ──────────────────────────────────────────
+
+    async fn run_tier1(&self, policies: &mut HashMap<String, RelayPolicy>) -> Result<()> {
+        self.set_tier(SyncTier::Critical);
+        info!("Tier 1: Fetching own profile + follow list");
+
+        let primary = self.primary_relay_url();
+        let client = Client::default();
+        match client.add_relay(&primary).await {
+            Ok(_) => {
+                if let Some(policy) = policies.get_mut(&primary) {
+                    policy.on_connection_success();
+                }
+            }
+            Err(e) => {
+                warn!("Tier 1: Failed to connect to {}: {}", primary, e);
+                if let Some(policy) = policies.get_mut(&primary) {
+                    policy.on_connection_failure();
+                }
+                return Ok(());
+            }
+        }
         client.connect().await;
 
-        let filter = Filter::new().kind(Kind::ContactList);
-        info!("Subscribing to kind:3 events...");
+        let pk = PublicKey::from_hex(&self.hex_pubkey)?;
 
-        client.subscribe(vec![filter], None).await?;
+        // Fetch kind:0 (profile metadata) + kind:3 (follow list)
+        let filter = Filter::new()
+            .author(pk)
+            .kinds(vec![Kind::Metadata, Kind::ContactList])
+            .limit(2);
 
-        let seen_events: Arc<tokio::sync::RwLock<LruCache<[u8; 32], SeenEvent>>> =
-            Arc::new(tokio::sync::RwLock::new(LruCache::new(
-                NonZeroUsize::new(SEEN_CACHE_CAPACITY).unwrap(),
-            )));
+        let mut fetched: u64 = 0;
+        self.emit_progress(1, 0, 2, &primary);
 
-        let mut notifications = client.notifications();
-        let mut event_count: u64 = 0;
-        let mut dedup_skip_count: u64 = 0;
-        let mut last_log_time = std::time::Instant::now();
-
-        loop {
-            tokio::select! {
-                _ = self.cancel.cancelled() => {
-                    info!("Sync engine shutting down");
-                    client.disconnect().await?;
-                    break;
-                }
-                Ok(notification) = notifications.recv() => {
-                    if let RelayPoolNotification::Event { event, .. } = notification {
-                        let pubkey_bytes = event.pubkey.to_bytes();
-                        let event_created_at = event.created_at.as_u64();
-
-                        let dominated = {
-                            let seen = seen_events.read().await;
-                            if let Some(existing) = seen.peek(&pubkey_bytes) {
-                                event_created_at <= existing.created_at
-                            } else {
-                                false
-                            }
-                        };
-                        if dominated {
-                            dedup_skip_count += 1;
-                            continue;
-                        }
-
-                        if let Some(update) = process_event(&event) {
-                            let updated = self.graph.update_follows(
+        match tokio::time::timeout(
+            Duration::from_secs(15),
+            client.get_events_of(vec![filter], EventSource::relays(Some(Duration::from_secs(10)))),
+        )
+        .await
+        {
+            Ok(Ok(events)) => {
+                for event in events.iter() {
+                    if event.kind == Kind::ContactList {
+                        if let Some(update) = process_contact_event(event) {
+                            self.graph.update_follows(
                                 &update.pubkey,
                                 &update.follows,
                                 Some(update.event_id.clone()),
                                 Some(update.created_at),
                             );
 
-                            if updated {
-                                event_count += 1;
+                            // Persist
+                            let batch = vec![FollowUpdateBatch {
+                                pubkey: &update.pubkey,
+                                follows: &update.follows,
+                                event_id: Some(&update.event_id),
+                                created_at: Some(update.created_at),
+                            }];
+                            self.db.update_follows_batch(&batch).ok();
 
-                                {
-                                    let mut seen = seen_events.write().await;
-                                    seen.put(pubkey_bytes, SeenEvent {
-                                        created_at: event_created_at,
-                                        event_id: event.id,
-                                    });
-                                }
-
-                                if let Err(e) = persist_tx.try_send(update) {
-                                    warn!("Persistence queue full: {}", e);
-                                }
-                            }
-                        }
-
-                        if last_log_time.elapsed() > Duration::from_secs(10) {
-                            let stats = self.graph.stats();
-                            let seen_size = seen_events.read().await.len();
                             info!(
-                                "Sync progress: {} events, {} dedup skips, {} nodes, {} edges, seen_cache={}",
-                                event_count, dedup_skip_count, stats.node_count, stats.edge_count, seen_size
+                                "Tier 1: Loaded {} follows from own contact list",
+                                update.follows.len()
                             );
-                            last_log_time = std::time::Instant::now();
+                        }
+                    }
+                    fetched += 1;
+                    self.emit_progress(1, fetched, 2, &primary);
+                }
+            }
+            Ok(Err(e)) => warn!("Tier 1: fetch error: {}", e),
+            Err(_) => warn!("Tier 1: timeout fetching profile"),
+        }
+
+        client.disconnect().await?;
+
+        {
+            let mut stats = self.sync_stats.write().await;
+            stats.tier1_fetched = fetched;
+            stats.current_tier = 1;
+        }
+
+        self.emit_tier_complete(1);
+        info!("Tier 1 complete: {} events fetched", fetched);
+        Ok(())
+    }
+
+    // ── Tier 2: Important ─────────────────────────────────────────
+
+    async fn run_tier2(&self, policies: &mut HashMap<String, RelayPolicy>) -> Result<()> {
+        self.set_tier(SyncTier::Important);
+        info!("Tier 2: Fetching recent events from follows");
+
+        let follows = match self.graph.get_follows(&self.hex_pubkey) {
+            Some(f) => f,
+            None => {
+                warn!("Tier 2: No follows found, skipping");
+                self.emit_tier_complete(2);
+                return Ok(());
+            }
+        };
+
+        let primary = self.primary_relay_url();
+        let client = Client::default();
+        for url in self.all_relay_urls() {
+            if let Err(e) = client.add_relay(&url).await {
+                warn!("Tier 2: Failed to add relay {}: {}", url, e);
+            }
+        }
+        client.connect().await;
+
+        let since = Timestamp::from(
+            chrono::Utc::now()
+                .checked_sub_signed(chrono::Duration::days(7))
+                .unwrap()
+                .timestamp() as u64,
+        );
+
+        let total = follows.len() as u64;
+        let mut fetched: u64 = 0;
+
+        // Process 20 pubkeys per batch
+        for chunk in follows.chunks(20) {
+            if self.cancel.is_cancelled() {
+                break;
+            }
+
+            // Rate limit check
+            if let Some(policy) = policies.get_mut(&primary) {
+                while !policy.can_request() {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    if self.cancel.is_cancelled() {
+                        break;
+                    }
+                }
+                policy.record_request();
+            }
+
+            let authors: Vec<PublicKey> = chunk
+                .iter()
+                .filter_map(|hex| PublicKey::from_hex(hex).ok())
+                .collect();
+
+            if authors.is_empty() {
+                continue;
+            }
+
+            let filter = Filter::new()
+                .authors(authors)
+                .kind(Kind::TextNote)
+                .since(since)
+                .limit(500);
+
+            match tokio::time::timeout(
+                Duration::from_secs(10),
+                client.get_events_of(vec![filter], EventSource::relays(Some(Duration::from_secs(10)))),
+            )
+            .await
+            {
+                Ok(Ok(events)) => {
+                    fetched += events.len() as u64;
+                    debug!("Tier 2: batch fetched {} events", events.len());
+                    // TODO: store events in nostr_events table
+                }
+                Ok(Err(e)) => {
+                    warn!("Tier 2: fetch error: {}", e);
+                    if let Some(policy) = policies.get_mut(&primary) {
+                        policy.on_connection_failure();
+                    }
+                }
+                Err(_) => {
+                    warn!("Tier 2: timeout on batch");
+                }
+            }
+
+            self.emit_progress(2, fetched, total, &primary);
+
+            // Polite pause between batches
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+
+        client.disconnect().await?;
+
+        {
+            let mut stats = self.sync_stats.write().await;
+            stats.tier2_fetched = fetched;
+            stats.current_tier = 2;
+        }
+
+        self.emit_tier_complete(2);
+        info!("Tier 2 complete: {} events fetched", fetched);
+        Ok(())
+    }
+
+    // ── Tier 3: Background ────────────────────────────────────────
+
+    async fn run_tier3(&self, policies: &mut HashMap<String, RelayPolicy>) -> Result<()> {
+        self.set_tier(SyncTier::Background);
+        info!("Tier 3: WoT crawl — fetching follows-of-follows");
+
+        let follows = match self.graph.get_follows(&self.hex_pubkey) {
+            Some(f) => f,
+            None => {
+                warn!("Tier 3: No follows found, skipping");
+                self.emit_tier_complete(3);
+                return Ok(());
+            }
+        };
+
+        // Check checkpoint: which pubkeys have we already crawled?
+        let mut processed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let Ok(Some(checkpoint)) = self.db.get_config("sync_tier3_checkpoint") {
+            for pk in checkpoint.split(',') {
+                if !pk.is_empty() {
+                    processed.insert(pk.to_string());
+                }
+            }
+            info!("Tier 3: Resuming from checkpoint ({} already processed)", processed.len());
+        }
+
+        let remaining: Vec<String> = follows
+            .into_iter()
+            .filter(|pk| !processed.contains(pk))
+            .collect();
+
+        let primary = self.primary_relay_url();
+        let client = Client::default();
+        for url in self.all_relay_urls() {
+            client.add_relay(&url).await.ok();
+        }
+        client.connect().await;
+
+        let (persist_tx, persist_rx) = mpsc::channel::<FollowUpdate>(10000);
+        let db = self.db.clone();
+        let cancel = self.cancel.clone();
+        tokio::spawn(async move {
+            persistence_worker(db, persist_rx, cancel).await;
+        });
+
+        let total = remaining.len() as u64;
+        let mut fetched: u64 = 0;
+
+        // Process 10 pubkeys per batch
+        for chunk in remaining.chunks(10) {
+            if self.cancel.is_cancelled() {
+                break;
+            }
+
+            // Rate limit
+            if let Some(policy) = policies.get_mut(&primary) {
+                while !policy.can_request() {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    if self.cancel.is_cancelled() {
+                        break;
+                    }
+                }
+                policy.record_request();
+            }
+
+            let authors: Vec<PublicKey> = chunk
+                .iter()
+                .filter_map(|hex| PublicKey::from_hex(hex).ok())
+                .collect();
+
+            if authors.is_empty() {
+                continue;
+            }
+
+            let filter = Filter::new()
+                .authors(authors)
+                .kind(Kind::ContactList)
+                .limit(10);
+
+            match tokio::time::timeout(
+                Duration::from_secs(10),
+                client.get_events_of(vec![filter], EventSource::relays(Some(Duration::from_secs(10)))),
+            )
+            .await
+            {
+                Ok(Ok(events)) => {
+                    for event in events.iter() {
+                        if let Some(update) = process_contact_event(event) {
+                            let updated = self.graph.update_follows(
+                                &update.pubkey,
+                                &update.follows,
+                                Some(update.event_id.clone()),
+                                Some(update.created_at),
+                            );
+                            if updated {
+                                fetched += 1;
+                                persist_tx.try_send(update).ok();
+                            }
                         }
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_secs(60)) => {
-                    let stats = self.graph.stats();
-                    info!(
-                        "Sync status: {} events, {} nodes, {} edges",
-                        event_count, stats.node_count, stats.edge_count
-                    );
+                Ok(Err(e)) => {
+                    warn!("Tier 3: fetch error: {}", e);
+                    if let Some(policy) = policies.get_mut(&primary) {
+                        policy.on_connection_failure();
+                    }
+                }
+                Err(_) => {
+                    warn!("Tier 3: timeout on batch");
                 }
             }
+
+            // Mark processed and checkpoint
+            for pk in chunk {
+                processed.insert(pk.clone());
+            }
+
+            // Checkpoint every 50 pubkeys
+            if processed.len() % 50 == 0 {
+                let checkpoint: String = processed.iter().cloned().collect::<Vec<_>>().join(",");
+                self.db.set_config("sync_tier3_checkpoint", &checkpoint).ok();
+            }
+
+            self.emit_progress(3, fetched, total, &primary);
+
+            // Polite pause — 2 seconds between batches
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
 
+        // Final checkpoint
+        self.db.set_config("sync_tier3_checkpoint", "").ok(); // clear on completion
+
+        client.disconnect().await?;
+
+        {
+            let mut stats = self.sync_stats.write().await;
+            stats.tier3_fetched = fetched;
+            stats.current_tier = 3;
+        }
+
+        self.emit_tier_complete(3);
+        info!("Tier 3 complete: {} follow lists fetched", fetched);
+        Ok(())
+    }
+
+    // ── Tier 4: Archive ───────────────────────────────────────────
+
+    async fn run_tier4(&self, _policies: &mut HashMap<String, RelayPolicy>) -> Result<()> {
+        self.set_tier(SyncTier::Archive);
+        info!("Tier 4: Archive sync (media, historical, deep WoT)");
+
+        // Tier 4 is a placeholder — media download, historical events, deep WoT
+        // will be implemented as the storage layer matures.
+        // For now, emit completion.
+
+        // TODO: Blossom media downloads
+        // TODO: Historical events (older than 7 days)
+        // TODO: Deep WoT (hop-3+ pubkeys)
+
+        // Simulate slow background work with 5s pauses
+        let fetched: u64 = 0;
+        self.emit_progress(4, fetched, 0, "");
+
+        {
+            let mut stats = self.sync_stats.write().await;
+            stats.tier4_fetched = fetched;
+            stats.current_tier = 4;
+        }
+
+        self.emit_tier_complete(4);
+        info!("Tier 4 complete (stub): {} items processed", fetched);
         Ok(())
     }
 }
 
-fn process_event(event: &Event) -> Option<FollowUpdate> {
+// ── Helpers ────────────────────────────────────────────────────────
+
+fn process_contact_event(event: &Event) -> Option<FollowUpdate> {
     if event.kind != Kind::ContactList {
         return None;
     }
@@ -204,7 +693,7 @@ fn process_event(event: &Event) -> Option<FollowUpdate> {
         .collect();
 
     debug!(
-        "Processed event from {} with {} follows",
+        "Processed contact list from {} with {} follows",
         &pubkey[..8],
         follows.len()
     );
@@ -225,7 +714,7 @@ async fn persistence_worker(
     info!("Persistence worker started");
 
     let mut batch: Vec<FollowUpdate> = Vec::with_capacity(100);
-    let mut last_flush = std::time::Instant::now();
+    let mut last_flush = Instant::now();
 
     loop {
         tokio::select! {
@@ -240,13 +729,13 @@ async fn persistence_worker(
                 batch.push(update);
                 if batch.len() >= 100 || last_flush.elapsed() > Duration::from_secs(5) {
                     flush_batch(&db, &mut batch).await;
-                    last_flush = std::time::Instant::now();
+                    last_flush = Instant::now();
                 }
             }
             _ = tokio::time::sleep(Duration::from_secs(5)) => {
                 if !batch.is_empty() {
                     flush_batch(&db, &mut batch).await;
-                    last_flush = std::time::Instant::now();
+                    last_flush = Instant::now();
                 }
             }
         }

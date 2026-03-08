@@ -9,7 +9,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 
 let currentScreen: Screen = "wizard";
 
-const screens: Record<Screen, (container: HTMLElement) => void> = {
+const screens: Record<Screen, (container: HTMLElement) => void | Promise<void>> = {
   wizard: renderWizard,
   dashboard: renderDashboard,
   feed: renderFeed,
