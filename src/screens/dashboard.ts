@@ -50,6 +50,7 @@ interface RelayStatusInfo {
 let pollInterval: ReturnType<typeof setInterval> | null = null;
 let unlistenProgress: UnlistenFn | null = null;
 let unlistenTierComplete: UnlistenFn | null = null;
+let dashFeedLoading = false;
 
 const AVATAR_CLASSES = ["av1", "av2", "av3", "av4", "av5", "av6", "av7"];
 
@@ -95,15 +96,15 @@ function renderEventCard(event: NostrEvent, profile?: ProfileInfo): string {
     if (!originalContent) return ""; // Empty repost, skip
 
     const avatarHtml = profile?.picture
-      ? `<img src="${escapeHtml(profile.picture)}" class="ev-avatar ev-avatar-img" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'" /><div class="ev-avatar ${avatarClass(event.pubkey)}" style="display:none">${initial}</div>`
-      : `<div class="ev-avatar ${avatarClass(event.pubkey)}">${initial}</div>`;
+      ? `<img src="${escapeHtml(profile.picture)}" class="ev-avatar ev-avatar-img" onclick="window.showProfilePopup('${event.pubkey}')" style="cursor:pointer" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'" /><div class="ev-avatar ${avatarClass(event.pubkey)}" onclick="window.showProfilePopup('${event.pubkey}')" style="cursor:pointer;display:none">${initial}</div>`
+      : `<div class="ev-avatar ${avatarClass(event.pubkey)}" onclick="window.showProfilePopup('${event.pubkey}')" style="cursor:pointer">${initial}</div>`;
 
     return `
       <div class="event-card">
         ${avatarHtml}
         <div class="ev-content">
           <div class="ev-meta">
-            <span class="ev-npub">${escapeHtml(displayName)}</span>
+            <span class="ev-npub" onclick="window.showProfilePopup('${event.pubkey}')" style="cursor:pointer">${escapeHtml(displayName)}</span>
             <span class="ev-kind-tag ev-kind-repost">🔁 repost</span>
             <span class="ev-time">${timeAgo(event.created_at)}</span>
           </div>
@@ -122,15 +123,15 @@ function renderEventCard(event: NostrEvent, profile?: ProfileInfo): string {
   const kindClass = event.kind === 1 ? "ev-kind-note" : event.kind === 30023 ? "ev-kind-long" : "ev-kind-note";
 
   const avatarHtml = profile?.picture
-    ? `<img src="${escapeHtml(profile.picture)}" class="ev-avatar ev-avatar-img" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'" /><div class="ev-avatar ${avatarClass(event.pubkey)}" style="display:none">${initial}</div>`
-    : `<div class="ev-avatar ${avatarClass(event.pubkey)}">${initial}</div>`;
+    ? `<img src="${escapeHtml(profile.picture)}" class="ev-avatar ev-avatar-img" onclick="window.showProfilePopup('${event.pubkey}')" style="cursor:pointer" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'" /><div class="ev-avatar ${avatarClass(event.pubkey)}" onclick="window.showProfilePopup('${event.pubkey}')" style="cursor:pointer;display:none">${initial}</div>`
+    : `<div class="ev-avatar ${avatarClass(event.pubkey)}" onclick="window.showProfilePopup('${event.pubkey}')" style="cursor:pointer">${initial}</div>`;
 
   return `
     <div class="event-card">
       ${avatarHtml}
       <div class="ev-content">
         <div class="ev-meta">
-          <span class="ev-npub">${escapeHtml(displayName)}</span>
+          <span class="ev-npub" onclick="window.showProfilePopup('${event.pubkey}')" style="cursor:pointer">${escapeHtml(displayName)}</span>
           <span class="ev-kind-tag ${kindClass}">${kindTag}</span>
           <span class="ev-time">${timeAgo(event.created_at)}</span>
         </div>
@@ -285,6 +286,8 @@ async function loadStats(): Promise<void> {
 }
 
 async function loadFeed(): Promise<void> {
+  if (dashFeedLoading) return;
+  dashFeedLoading = true;
   try {
     console.log("[dashboard] Calling get_feed...");
     const rawEvents = await invoke<NostrEvent[]>("get_feed", {
@@ -292,8 +295,15 @@ async function loadFeed(): Promise<void> {
     });
     console.log("[dashboard] get_feed response:", rawEvents.length, "events");
     // Defense in depth: filter to feed-worthy kinds
-    const events = rawEvents.filter((e) => FEED_KINDS.includes(e.kind));
-    console.log("[dashboard] after kind filter:", events.length, "feed events");
+    const kindFiltered = rawEvents.filter((e) => FEED_KINDS.includes(e.kind));
+    // Deduplicate by event ID
+    const seen = new Set<string>();
+    const events = kindFiltered.filter((e) => {
+      if (seen.has(e.id)) return false;
+      seen.add(e.id);
+      return true;
+    });
+    console.log("[dashboard] after kind filter + dedup:", events.length, "feed events");
     const feedEl = document.getElementById("dash-feed-list");
     if (feedEl) {
       if (events.length === 0) {
@@ -307,7 +317,10 @@ async function loadFeed(): Promise<void> {
           .join("");
       }
     }
-  } catch (_) {}
+  } catch (_) {
+  } finally {
+    dashFeedLoading = false;
+  }
 }
 
 function setTextContent(id: string, text: string): void {

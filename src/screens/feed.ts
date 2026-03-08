@@ -80,15 +80,15 @@ function renderEventCard(event: NostrEvent, profile?: ProfileInfo): string {
     if (!original) return ""; // Empty repost, skip it
 
     const avatarHtml = profile?.picture
-      ? `<img src="${escapeHtml(profile.picture)}" class="ev-avatar ev-avatar-img" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'" /><div class="ev-avatar ${avatarClass(event.pubkey)}" style="display:none">${initial}</div>`
-      : `<div class="ev-avatar ${avatarClass(event.pubkey)}">${initial}</div>`;
+      ? `<img src="${escapeHtml(profile.picture)}" class="ev-avatar ev-avatar-img" onclick="window.showProfilePopup('${event.pubkey}')" style="cursor:pointer" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'" /><div class="ev-avatar ${avatarClass(event.pubkey)}" onclick="window.showProfilePopup('${event.pubkey}')" style="cursor:pointer;display:none">${initial}</div>`
+      : `<div class="ev-avatar ${avatarClass(event.pubkey)}" onclick="window.showProfilePopup('${event.pubkey}')" style="cursor:pointer">${initial}</div>`;
 
     return `
       <div class="event-card" data-kind="${k.tag}">
         ${avatarHtml}
         <div class="ev-content">
           <div class="ev-meta">
-            <span class="ev-npub">${escapeHtml(displayName)}</span>
+            <span class="ev-npub" onclick="window.showProfilePopup('${event.pubkey}')" style="cursor:pointer">${escapeHtml(displayName)}</span>
             <span class="ev-kind-tag ${k.cls}">🔁 repost</span>
             <span class="ev-time">${timeAgo(event.created_at)}</span>
           </div>
@@ -104,15 +104,15 @@ function renderEventCard(event: NostrEvent, profile?: ProfileInfo): string {
   }
 
   const avatarHtml = profile?.picture
-    ? `<img src="${escapeHtml(profile.picture)}" class="ev-avatar ev-avatar-img" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'" /><div class="ev-avatar ${avatarClass(event.pubkey)}" style="display:none">${initial}</div>`
-    : `<div class="ev-avatar ${avatarClass(event.pubkey)}">${initial}</div>`;
+    ? `<img src="${escapeHtml(profile.picture)}" class="ev-avatar ev-avatar-img" onclick="window.showProfilePopup('${event.pubkey}')" style="cursor:pointer" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'" /><div class="ev-avatar ${avatarClass(event.pubkey)}" onclick="window.showProfilePopup('${event.pubkey}')" style="cursor:pointer;display:none">${initial}</div>`
+    : `<div class="ev-avatar ${avatarClass(event.pubkey)}" onclick="window.showProfilePopup('${event.pubkey}')" style="cursor:pointer">${initial}</div>`;
 
   return `
     <div class="event-card" data-kind="${k.tag}">
       ${avatarHtml}
       <div class="ev-content">
         <div class="ev-meta">
-          <span class="ev-npub">${escapeHtml(displayName)}</span>
+          <span class="ev-npub" onclick="window.showProfilePopup('${event.pubkey}')" style="cursor:pointer">${escapeHtml(displayName)}</span>
           <span class="ev-kind-tag ${k.cls}">${k.tag}</span>
           <span class="ev-time">${timeAgo(event.created_at)}</span>
         </div>
@@ -126,6 +126,8 @@ function renderEventCard(event: NostrEvent, profile?: ProfileInfo): string {
     </div>
   `;
 }
+
+let feedLoading = false;
 
 export function renderFeed(container: HTMLElement): void {
   container.className = "main-content";
@@ -164,13 +166,22 @@ export function renderFeed(container: HTMLElement): void {
 }
 
 async function loadEvents(container: HTMLElement): Promise<void> {
+  if (feedLoading) return;
+  feedLoading = true;
   try {
     console.log("[feed] Calling get_feed with limit=50...");
     const rawEvents = await invoke<NostrEvent[]>("get_feed", { filter: { limit: 50 } });
     console.log("[feed] get_feed response:", rawEvents.length, "events");
     // Defense in depth: filter to feed-worthy kinds even if backend already does
-    const events = rawEvents.filter((e) => FEED_KINDS.includes(e.kind));
-    console.log("[feed] after kind filter:", events.length, "feed events");
+    const kindFiltered = rawEvents.filter((e) => FEED_KINDS.includes(e.kind));
+    // Deduplicate by event ID
+    const seen = new Set<string>();
+    const events = kindFiltered.filter((e) => {
+      if (seen.has(e.id)) return false;
+      seen.add(e.id);
+      return true;
+    });
+    console.log("[feed] after kind filter + dedup:", events.length, "feed events");
     const feedEl = container.querySelector("#feedList");
     if (feedEl) {
       if (events.length === 0) {
@@ -186,5 +197,7 @@ async function loadEvents(container: HTMLElement): Promise<void> {
     }
   } catch (_) {
     // Silently fail — will show placeholder
+  } finally {
+    feedLoading = false;
   }
 }
