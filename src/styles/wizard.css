@@ -2,12 +2,12 @@
 
 .wizard-root {
   display: flex;
-  align-items: center;
-  justify-content: center;
+  flex-direction: column;
   height: 100vh;
   width: 100vw;
   background: var(--bg);
   padding: 0;
+  overflow: hidden;
 }
 
 .wizard-wrapper {
@@ -16,17 +16,18 @@
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 24px;
+  flex: 1;
+  min-height: 0;
+  gap: 16px;
   padding: 0 24px;
+  margin: 0 auto;
 }
 
 /* Titlebar */
 .wizard-titlebar {
-  position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
+  width: 100%;
   height: 40px;
+  flex-shrink: 0;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -66,7 +67,8 @@
   display: flex;
   align-items: center;
   gap: 10px;
-  margin-top: 20px;
+  margin-top: 4px;
+  flex-shrink: 0;
 }
 
 .wizard-logo-icon {
@@ -87,6 +89,7 @@
   gap: 0;
   width: 280px;
   justify-content: center;
+  flex-shrink: 0;
 }
 
 .wizard-progress-dot {
@@ -126,7 +129,8 @@
   display: flex;
   width: 320px;
   justify-content: space-between;
-  margin-top: -12px;
+  margin-top: -8px;
+  flex-shrink: 0;
 }
 
 .wizard-progress-label {
@@ -143,9 +147,13 @@
 /* Step content */
 .wizard-content {
   width: 100%;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
   opacity: 0;
   transform: translateY(12px);
   transition: opacity 0.35s ease, transform 0.35s ease;
+  padding-bottom: 8px;
 }
 
 .wizard-content.visible {
@@ -165,7 +173,7 @@
   font-size: 15px;
   color: var(--text-dim);
   text-align: center;
-  margin-bottom: 28px;
+  margin-bottom: 16px;
   line-height: 1.5;
 }
 
@@ -210,8 +218,8 @@
 .relay-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 12px;
-  margin-top: 8px;
+  gap: 10px;
+  margin-top: 4px;
 }
 
 .relay-card {
@@ -219,9 +227,9 @@
   flex-direction: column;
   justify-content: center;
   align-items: center;
-  gap: 6px;
-  height: 160px;
-  padding: 20px 16px;
+  gap: 4px;
+  height: 110px;
+  padding: 12px 12px;
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: 12px;
@@ -246,14 +254,14 @@
 .relay-name {
   font-family: var(--mono);
   font-weight: 700;
-  font-size: 16px;
+  font-size: 14px;
   color: var(--text);
 }
 
 .relay-desc {
-  font-size: 13px;
+  font-size: 12px;
   color: var(--text-dim);
-  line-height: 1.4;
+  line-height: 1.3;
 }
 
 .relay-toggle {
@@ -426,7 +434,8 @@
   display: flex;
   justify-content: center;
   gap: 12px;
-  margin-top: 8px;
+  flex-shrink: 0;
+  padding: 12px 0 20px;
 }
 
 .btn.disabled,

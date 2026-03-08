@@ -63,10 +63,7 @@ export class WizardScreen {
     c.innerHTML = "";
     c.className = "wizard-root";
 
-    // Wrapper
-    const wrapper = el("div", "wizard-wrapper");
-
-    // Title bar
+    // Title bar (appended to root, outside wrapper)
     const titlebar = el("div", "wizard-titlebar");
     titlebar.innerHTML = `
       <div class="wizard-dots-decorative">
@@ -81,7 +78,10 @@ export class WizardScreen {
         <span class="dot-green"></span>
       </div>
     `;
-    wrapper.appendChild(titlebar);
+    c.appendChild(titlebar);
+
+    // Wrapper
+    const wrapper = el("div", "wizard-wrapper");
 
     // Logo
     const logo = el("div", "wizard-logo");
