@@ -228,7 +228,7 @@ async function loadStats(): Promise<void> {
     setTextContent("dash-uptime", uptimeStr);
 
     // Relay badge — show URL when running
-    const relayUrl = `ws://localhost:${status.relay_port}`;
+    const relayUrl = `wss://localhost:${status.relay_port}`;
     const badge = document.getElementById("dash-relay-badge");
     if (badge) {
       if (status.relay_running) {

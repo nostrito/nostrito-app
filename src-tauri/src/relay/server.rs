@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, RwLock};
 use tokio_rustls::TlsAcceptor;
@@ -145,6 +145,74 @@ impl StoredEvent {
 /// Broadcast channel for new events
 type EventBroadcast = broadcast::Sender<StoredEvent>;
 
+/// A stream that prepends already-read bytes before delegating to the inner stream.
+/// Used when we consume bytes from a TLS stream to detect HTTP vs WebSocket,
+/// then need to replay those bytes for the WebSocket handshake.
+struct PrefixedIo<S> {
+    prefix: Option<std::io::Cursor<Vec<u8>>>,
+    inner: S,
+}
+
+impl<S> PrefixedIo<S> {
+    fn new(prefix: Vec<u8>, inner: S) -> Self {
+        Self {
+            prefix: if prefix.is_empty() {
+                None
+            } else {
+                Some(std::io::Cursor::new(prefix))
+            },
+            inner,
+        }
+    }
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for PrefixedIo<S> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if let Some(ref mut cursor) = this.prefix {
+            let pos = cursor.position() as usize;
+            let data = cursor.get_ref();
+            if pos < data.len() {
+                let remaining = &data[pos..];
+                let to_copy = std::cmp::min(remaining.len(), buf.remaining());
+                buf.put_slice(&remaining[..to_copy]);
+                cursor.set_position((pos + to_copy) as u64);
+                return std::task::Poll::Ready(Ok(()));
+            }
+            this.prefix = None;
+        }
+        std::pin::Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for PrefixedIo<S> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 /// Run the relay server
 pub async fn run_relay(
     port: u16,
@@ -270,19 +338,79 @@ pub async fn run_relay_tls(
                         let acceptor = tls_acceptor.clone();
                         tokio::spawn(async move {
                             match acceptor.accept(stream).await {
-                                Ok(tls_stream) => {
-                                    match tokio_tungstenite::accept_async(tls_stream).await {
-                                        Ok(ws_stream) => {
-                                            if let Err(e) = handle_tls_connection(
-                                                ws_stream, addr, db, allowed, tx, rx, cancel,
-                                            )
-                                            .await
-                                            {
-                                                debug!("TLS connection {} closed: {}", addr, e);
+                                Ok(mut tls_stream) => {
+                                    // Read first bytes to detect HTTP vs WebSocket upgrade.
+                                    // TLS streams don't support peek, so we read and replay
+                                    // via PrefixedIo for the WebSocket path.
+                                    let mut header_buf = vec![0u8; 2048];
+                                    match tls_stream.read(&mut header_buf).await {
+                                        Ok(n) if n > 0 => {
+                                            let header_str =
+                                                String::from_utf8_lossy(&header_buf[..n]);
+                                            let is_ws =
+                                                header_str.contains("Upgrade: websocket")
+                                                    || header_str
+                                                        .contains("upgrade: websocket")
+                                                    || header_str
+                                                        .contains("Upgrade: WebSocket");
+
+                                            if is_ws {
+                                                // Replay consumed bytes for tungstenite handshake
+                                                let prefixed = PrefixedIo::new(
+                                                    header_buf[..n].to_vec(),
+                                                    tls_stream,
+                                                );
+                                                match tokio_tungstenite::accept_async(prefixed)
+                                                    .await
+                                                {
+                                                    Ok(ws_stream) => {
+                                                        if let Err(e) =
+                                                            handle_tls_connection(
+                                                                ws_stream, addr, db,
+                                                                allowed, tx, rx, cancel,
+                                                            )
+                                                            .await
+                                                        {
+                                                            debug!(
+                                                                "TLS connection {} closed: {}",
+                                                                addr, e
+                                                            );
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        debug!(
+                                                            "TLS WebSocket upgrade failed from {}: {}",
+                                                            addr, e
+                                                        );
+                                                    }
+                                                }
+                                            } else {
+                                                // NIP-11: serve HTTP info page over TLS
+                                                let accept_nostr = header_str
+                                                    .contains("application/nostr+json");
+                                                let hex_pubkey =
+                                                    allowed.unwrap_or_default();
+                                                if let Err(e) = write_nip11_response(
+                                                    &mut tls_stream,
+                                                    port,
+                                                    &hex_pubkey,
+                                                    accept_nostr,
+                                                    true,
+                                                )
+                                                .await
+                                                {
+                                                    debug!(
+                                                        "HTTPS response to {} failed: {}",
+                                                        addr, e
+                                                    );
+                                                }
                                             }
                                         }
+                                        Ok(_) => {
+                                            debug!("Empty TLS read from {}", addr);
+                                        }
                                         Err(e) => {
-                                            debug!("TLS WebSocket upgrade failed from {}: {}", addr, e);
+                                            debug!("TLS read error from {}: {}", addr, e);
                                         }
                                     }
                                 }
@@ -304,17 +432,18 @@ pub async fn run_relay_tls(
 }
 
 /// Handle a TLS WebSocket connection (same logic as plain, different stream type)
-async fn handle_tls_connection(
-    ws_stream: tokio_tungstenite::WebSocketStream<
-        tokio_rustls::server::TlsStream<TcpStream>,
-    >,
+async fn handle_tls_connection<S>(
+    ws_stream: tokio_tungstenite::WebSocketStream<S>,
     addr: SocketAddr,
     db: Arc<Database>,
     allowed_pubkey: Option<String>,
     broadcast_tx: EventBroadcast,
     mut broadcast_rx: broadcast::Receiver<StoredEvent>,
     cancel: tokio_util::sync::CancellationToken,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
     info!("[relay-tls] New connection from {}", addr);
 
     let (mut ws_tx, mut ws_rx) = ws_stream.split();
@@ -456,7 +585,7 @@ async fn serve_http(
 <body>
   <div class="card">
     <div class="logo">🌶️ nos<span>trito</span></div>
-    <div class="badge">Live — ws://localhost:{port}</div>
+    <div class="badge">Live — wss://localhost:{port}</div>
 
     <h2>Relay Info</h2>
     <div class="row"><span class="label">Name</span><span class="value">nostrito relay</span></div>
@@ -471,7 +600,7 @@ async fn serve_http(
     </div>
 
     <div class="cta">
-      Connect with <strong>ws://localhost:{port}</strong> in Damus, Amethyst, or any Nostr client.<br><br>
+      Connect with <strong>wss://localhost:{port}</strong> in Damus, Amethyst, or any Nostr client.<br><br>
       <a href="https://nostrito.fabri.lat">Learn more about nostrito →</a>
     </div>
   </div>

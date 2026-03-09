@@ -71,7 +71,7 @@ export async function initApp(root: HTMLElement): Promise<void> {
         <div class="app-nav-item" data-screen="settings">⚙️ Settings</div>
         <div class="sidebar-spacer"></div>
         <div class="own-profile" id="own-profile" style="display:none"></div>
-        <div class="sidebar-status"><span class="pulse-dot"></span> Live · ws://localhost:4869</div>
+        <div class="sidebar-status"><span class="pulse-dot"></span> Live · wss://localhost:4869</div>
       </aside>
       <main class="main-content" id="main-content"></main>
     </div>
