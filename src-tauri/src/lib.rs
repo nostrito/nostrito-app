@@ -120,6 +120,8 @@ pub struct Settings {
     pub npub: String,
     pub relay_port: u16,
     pub max_storage_mb: u32,
+    pub storage_others_gb: f64,
+    pub storage_media_gb: f64,
     pub wot_max_depth: u32,
     pub sync_interval_secs: u32,
     pub outbound_relays: Vec<String>,
@@ -677,6 +679,8 @@ async fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
         npub: config.npub.clone().unwrap_or_default(),
         relay_port: config.relay_port,
         max_storage_mb: config.max_storage_mb,
+        storage_others_gb: config.storage_others_gb,
+        storage_media_gb: config.storage_media_gb,
         wot_max_depth: config.wot_max_depth,
         sync_interval_secs: config.sync_interval_secs,
         outbound_relays: config.outbound_relays.clone(),
@@ -690,6 +694,8 @@ async fn save_settings(settings: Settings, state: State<'_, AppState>) -> Result
     let mut config = state.config.write().await;
     config.relay_port = settings.relay_port;
     config.max_storage_mb = settings.max_storage_mb;
+    config.storage_others_gb = settings.storage_others_gb;
+    config.storage_media_gb = settings.storage_media_gb;
     config.wot_max_depth = settings.wot_max_depth;
     config.sync_interval_secs = settings.sync_interval_secs;
     config.outbound_relays = settings.outbound_relays;

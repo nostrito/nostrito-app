@@ -6,6 +6,8 @@ interface Settings {
   npub: string;
   relay_port: number;
   max_storage_mb: number;
+  storage_others_gb: number;
+  storage_media_gb: number;
   wot_max_depth: number;
   sync_interval_secs: number;
   outbound_relays: string[];
@@ -34,6 +36,7 @@ export function renderSettings(container: HTMLElement): void {
         <div class="settings-sub-item active" data-settings="identity">🔑 Identity</div>
         <div class="settings-sub-item" data-settings="relays">📡 Relays</div>
         <div class="settings-sub-item" data-settings="wot-settings">🕸️ WoT</div>
+        <div class="settings-sub-item" data-settings="storage">💾 Storage</div>
         <div class="settings-sub-item" data-settings="advanced">⚙️ Advanced</div>
       </div>
       <div class="settings-panel">
@@ -69,6 +72,66 @@ export function renderSettings(container: HTMLElement): void {
           <div class="settings-pane-desc">Configure trust graph computation.</div>
           <div class="settings-field"><div class="settings-field-info"><span class="settings-field-label">Max depth</span><span class="settings-field-desc">How many hops to compute</span></div><span style="font-family:var(--mono);font-size:0.85rem;color:var(--accent-light)" id="settings-wot-depth">—</span></div>
           <div class="settings-field"><div class="settings-field-info"><span class="settings-field-label">Sync interval</span><span class="settings-field-desc">Seconds between sync cycles</span></div><span style="font-family:var(--mono);font-size:0.85rem;color:var(--text-dim)" id="settings-sync-interval">—</span></div>
+        </div>
+        <!-- Storage -->
+        <div class="settings-pane" id="pane-storage">
+          <div class="settings-pane-title">Storage</div>
+          <div class="settings-pane-desc">Control what gets stored and how much space to use.</div>
+
+          <div class="storage-section">
+            <div class="storage-row locked">
+              <div class="storage-row-info">
+                <span class="storage-row-label">Your events & media</span>
+                <span class="storage-row-meta">🔒 Always stored. No exceptions.</span>
+              </div>
+              <div class="storage-bar-wrap">
+                <div class="storage-bar"><div class="storage-bar-fill"></div></div>
+                <span class="storage-bar-label">100%</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="storage-section">
+            <div class="storage-row">
+              <div class="storage-row-info">
+                <span class="storage-row-label">Others' events</span>
+                <span class="storage-row-meta">From your Web of Trust</span>
+              </div>
+              <div class="storage-slider-wrap">
+                <input type="range" class="storage-slider" min="1" max="50" value="5" id="settings-others-events-slider">
+                <span class="storage-slider-value" id="settings-others-events-val">5 GB</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="storage-section">
+            <div class="storage-row">
+              <div class="storage-row-info">
+                <span class="storage-row-label">Others' media (Blossom)</span>
+                <span class="storage-row-meta">Images, videos, audio from your network</span>
+              </div>
+              <div class="storage-slider-wrap">
+                <input type="range" class="storage-slider" min="1" max="50" value="2" id="settings-others-media-slider">
+                <span class="storage-slider-value" id="settings-others-media-val">2 GB</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="storage-section">
+            <div class="storage-row">
+              <div class="storage-row-info">
+                <span class="storage-row-label">Auto-cleanup</span>
+                <span class="storage-row-meta">When storage limit is reached</span>
+              </div>
+              <div class="cleanup-group" id="settings-cleanup-group">
+                <div class="cleanup-radio active" data-cleanup="oldest">Oldest first</div>
+                <div class="cleanup-radio" data-cleanup="least-interacted">Least interacted</div>
+              </div>
+            </div>
+          </div>
+
+          <button class="btn btn-primary" id="btn-save-storage" style="margin-top:16px;width:100%">Save Storage Settings</button>
+          <div id="storage-save-result" style="margin-top:8px;font-size:0.78rem;text-align:center"></div>
         </div>
         <!-- Advanced -->
         <div class="settings-pane" id="pane-advanced">
@@ -126,6 +189,34 @@ export function renderSettings(container: HTMLElement): void {
     });
   });
 
+  // Wire storage sliders
+  const evSlider = document.getElementById("settings-others-events-slider") as HTMLInputElement | null;
+  const evVal = document.getElementById("settings-others-events-val");
+  if (evSlider && evVal) {
+    evSlider.addEventListener("input", () => {
+      evVal.textContent = `${evSlider.value} GB`;
+    });
+  }
+
+  const mdSlider = document.getElementById("settings-others-media-slider") as HTMLInputElement | null;
+  const mdVal = document.getElementById("settings-others-media-val");
+  if (mdSlider && mdVal) {
+    mdSlider.addEventListener("input", () => {
+      mdVal.textContent = `${mdSlider.value} GB`;
+    });
+  }
+
+  // Wire cleanup radios
+  const cleanupGroup = document.getElementById("settings-cleanup-group");
+  if (cleanupGroup) {
+    cleanupGroup.querySelectorAll(".cleanup-radio").forEach((radio) => {
+      radio.addEventListener("click", () => {
+        cleanupGroup.querySelectorAll(".cleanup-radio").forEach((r) => r.classList.remove("active"));
+        radio.classList.add("active");
+      });
+    });
+  }
+
   // Wire danger zone buttons
   document.getElementById("btn-reset-app")?.addEventListener("click", async () => {
     if (confirm("Are you sure? This will delete ALL data and return to the setup wizard.")) {
@@ -160,7 +251,41 @@ export function renderSettings(container: HTMLElement): void {
   });
 
   loadSettings();
+
+  // Wire storage save button (needs to be after loadSettings call to use _currentSettings)
+  document.getElementById("btn-save-storage")?.addEventListener("click", async () => {
+    const resultEl = document.getElementById("storage-save-result");
+    const btn = document.getElementById("btn-save-storage") as HTMLButtonElement | null;
+    if (!_currentSettings || !btn) return;
+
+    const evSliderEl = document.getElementById("settings-others-events-slider") as HTMLInputElement;
+    const mdSliderEl = document.getElementById("settings-others-media-slider") as HTMLInputElement;
+
+    const updated = {
+      ..._currentSettings,
+      storage_others_gb: parseFloat(evSliderEl.value),
+      storage_media_gb: parseFloat(mdSliderEl.value),
+    };
+
+    btn.disabled = true;
+    btn.textContent = "Saving...";
+    if (resultEl) resultEl.innerHTML = "";
+
+    try {
+      await invoke("save_settings", { settings: updated });
+      _currentSettings = updated;
+      btn.textContent = "Save Storage Settings";
+      btn.disabled = false;
+      if (resultEl) resultEl.innerHTML = `<span style="color:#34d399">✅ Storage settings saved</span>`;
+    } catch (e) {
+      btn.textContent = "Save Storage Settings";
+      btn.disabled = false;
+      if (resultEl) resultEl.innerHTML = `<span style="color:#ef4444">Failed: ${e}</span>`;
+    }
+  });
 }
+
+let _currentSettings: Settings | null = null;
 
 async function loadSettings(): Promise<void> {
   try {
@@ -229,6 +354,21 @@ async function loadSettings(): Promise<void> {
         settings.max_storage_mb >= 1024
           ? `${(settings.max_storage_mb / 1024).toFixed(1)} GB`
           : `${settings.max_storage_mb} MB`;
+    }
+
+    // Storage sliders
+    _currentSettings = settings;
+    const evSliderEl = document.getElementById("settings-others-events-slider") as HTMLInputElement | null;
+    const evValEl = document.getElementById("settings-others-events-val");
+    if (evSliderEl && evValEl) {
+      evSliderEl.value = String(Math.round(settings.storage_others_gb));
+      evValEl.textContent = `${Math.round(settings.storage_others_gb)} GB`;
+    }
+    const mdSliderEl = document.getElementById("settings-others-media-slider") as HTMLInputElement | null;
+    const mdValEl = document.getElementById("settings-others-media-val");
+    if (mdSliderEl && mdValEl) {
+      mdSliderEl.value = String(Math.round(settings.storage_media_gb));
+      mdValEl.textContent = `${Math.round(settings.storage_media_gb)} GB`;
     }
     // Browser integration
     try {
