@@ -99,6 +99,18 @@ impl Database {
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS media_cache (
+                hash        TEXT PRIMARY KEY,
+                url         TEXT NOT NULL,
+                mime_type   TEXT NOT NULL,
+                size_bytes  INTEGER NOT NULL,
+                pubkey      TEXT NOT NULL,
+                downloaded_at INTEGER NOT NULL,
+                last_accessed INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_media_lru ON media_cache(last_accessed);
+            CREATE INDEX IF NOT EXISTS idx_media_pubkey ON media_cache(pubkey);
         "#,
         )?;
 
@@ -646,9 +658,85 @@ impl Database {
             DELETE FROM nostr_events;
             DELETE FROM sync_state;
             DELETE FROM app_config;
+            DELETE FROM media_cache;
         "#,
         )?;
         info!("Database cleared — all data deleted");
+        Ok(())
+    }
+
+    // ── Media Cache Methods ────────────────────────────────────────
+
+    /// Check if a media blob is already cached
+    pub fn media_exists(&self, hash: &str) -> bool {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM media_cache WHERE hash = ?1",
+                params![hash],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        count > 0
+    }
+
+    /// Record a downloaded media item (file already written to disk)
+    pub fn store_media_record(
+        &self,
+        hash: &str,
+        url: &str,
+        mime_type: &str,
+        size_bytes: u64,
+        pubkey: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT OR REPLACE INTO media_cache (hash, url, mime_type, size_bytes, pubkey, downloaded_at, last_accessed) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![hash, url, mime_type, size_bytes as i64, pubkey, now, now],
+        )?;
+        debug!("[db] store_media_record: hash={}… size={}", &hash[..std::cmp::min(12, hash.len())], size_bytes);
+        Ok(())
+    }
+
+    /// Total bytes used by cached media
+    pub fn media_total_bytes(&self) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let total: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(size_bytes), 0) FROM media_cache",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(total as u64)
+    }
+
+    /// List media ordered by last_accessed ASC (oldest first = evict first), limited to `limit` rows
+    /// Returns Vec<(hash, size_bytes)>
+    pub fn media_list_lru(&self, limit: usize) -> Result<Vec<(String, u64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT hash, size_bytes FROM media_cache ORDER BY last_accessed ASC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Delete media records by hash (caller must also delete the file)
+    pub fn media_delete_records(&self, hashes: &[String]) -> Result<()> {
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap();
+        for hash in hashes {
+            conn.execute("DELETE FROM media_cache WHERE hash = ?1", params![hash])?;
+        }
+        debug!("[db] media_delete_records: deleted {} records", hashes.len());
         Ok(())
     }
 }

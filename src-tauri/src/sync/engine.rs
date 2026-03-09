@@ -255,6 +255,7 @@ pub struct SyncEngine {
     pub sync_tier: Arc<AtomicU8>,
     pub sync_stats: Arc<RwLock<SyncStats>>,
     app_handle: tauri::AppHandle,
+    storage_media_gb: f64,
 }
 
 impl SyncEngine {
@@ -266,6 +267,7 @@ impl SyncEngine {
         sync_tier: Arc<AtomicU8>,
         sync_stats: Arc<RwLock<SyncStats>>,
         app_handle: tauri::AppHandle,
+        storage_media_gb: f64,
     ) -> Self {
         Self {
             graph,
@@ -276,6 +278,7 @@ impl SyncEngine {
             sync_tier,
             sync_stats,
             app_handle,
+            storage_media_gb,
         }
     }
 
@@ -852,32 +855,357 @@ impl SyncEngine {
         Ok(())
     }
 
-    // ── Tier 4: Archive ───────────────────────────────────────────
+    // ── Tier 4: Archive (Blossom Media Backup) ──────────────────
 
     async fn run_tier4(&self, _policies: &mut HashMap<String, RelayPolicy>) -> Result<()> {
         self.set_tier(SyncTier::Archive);
-        info!("Tier 4: Archive sync (media, historical, deep WoT)");
+        info!("Tier 4: Blossom media backup");
 
-        // Tier 4 is a placeholder — media download, historical events, deep WoT
-        // will be implemented as the storage layer matures.
+        let limit_bytes = (self.storage_media_gb * 1024.0 * 1024.0 * 1024.0) as u64;
 
-        // TODO: Blossom media downloads
-        // TODO: Historical events (older than 7 days)
-        // TODO: Deep WoT (hop-3+ pubkeys)
+        // 1. Enforce limit: evict LRU items if already over
+        self.enforce_media_limit(limit_bytes).await;
 
-        let fetched: u64 = 0;
-        self.emit_progress(4, fetched, 0, "");
+        // 2. Collect media URLs from recently-stored events
+        let urls = self.extract_media_urls_from_events(500).await;
+        info!("Tier 4: {} candidate media URLs from events", urls.len());
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .user_agent("nostrito/0.1.0")
+            .build()
+            .unwrap_or_default();
+
+        let mut downloaded: u64 = 0;
+        let mut skipped: u64 = 0;
+        let total = urls.len() as u64;
+
+        for (url, pubkey) in urls.iter() {
+            if self.cancel.is_cancelled() {
+                break;
+            }
+
+            // Re-check limit before each download
+            let used = self.db.media_total_bytes().unwrap_or(u64::MAX);
+            if used >= limit_bytes {
+                info!(
+                    "Tier 4: Storage limit reached ({} GB used), stopping",
+                    self.storage_media_gb
+                );
+                break;
+            }
+
+            // Only cache Blossom URLs (must have a 64-char hex sha256 segment)
+            let hash = match extract_sha256_from_url(url) {
+                Some(h) => h,
+                None => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+
+            if self.db.media_exists(&hash) {
+                skipped += 1;
+                continue;
+            }
+
+            // Download
+            match self
+                .download_media(&client, url, &hash, pubkey, limit_bytes)
+                .await
+            {
+                Ok(true) => {
+                    downloaded += 1;
+                }
+                Ok(false) => {
+                    skipped += 1;
+                }
+                Err(e) => {
+                    warn!("Tier 4: download failed for {}: {}", url, e);
+                    skipped += 1;
+                }
+            }
+
+            self.emit_progress(4, downloaded, total, url);
+
+            // Polite: 500ms between downloads
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
 
         {
             let mut stats = self.sync_stats.write().await;
-            stats.tier4_fetched = fetched;
+            stats.tier4_fetched = downloaded;
             stats.current_tier = 4;
         }
 
         self.emit_tier_complete(4);
-        info!("Tier 4 complete (stub): {} items processed", fetched);
+        info!(
+            "Tier 4 complete: {} downloaded, {} skipped",
+            downloaded, skipped
+        );
         Ok(())
     }
+
+    /// Extract media URLs from recent DB events (kinds 1, 6, 30023)
+    async fn extract_media_urls_from_events(&self, limit: u32) -> Vec<(String, String)> {
+        let events = self
+            .db
+            .query_events(None, None, Some(&[1, 6, 30023]), None, None, limit)
+            .unwrap_or_default();
+
+        let mut urls: Vec<(String, String)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for (_id, pubkey, _created_at, _kind, _tags, content, _sig) in &events {
+            for url in extract_urls_from_text(content) {
+                // Only include URLs with a Blossom sha256 hash or known media extension
+                let dominated = extract_sha256_from_url(&url).is_some()
+                    || mime_type_from_url(&url).is_some();
+                if dominated && seen.insert(url.clone()) {
+                    urls.push((url, pubkey.clone()));
+                }
+            }
+        }
+
+        urls
+    }
+
+    /// Download and store one media item. Returns Ok(true) if downloaded, Ok(false) if skipped.
+    async fn download_media(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        hash: &str,
+        pubkey: &str,
+        limit_bytes: u64,
+    ) -> Result<bool> {
+        const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024; // 50 MB hard cap
+
+        // HEAD request first to check size and type
+        let head = client.head(url).send().await?;
+        if !head.status().is_success() {
+            return Ok(false);
+        }
+
+        let content_length = head
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+
+        // Skip files over 50 MB
+        if content_length > MAX_FILE_SIZE {
+            debug!("Tier 4: skipping {} — too large ({} bytes)", url, content_length);
+            return Ok(false);
+        }
+
+        // Check if adding this would exceed limit
+        let current_used = self.db.media_total_bytes().unwrap_or(0);
+        if content_length > 0 && current_used + content_length > limit_bytes {
+            return Ok(false);
+        }
+
+        // Determine MIME type from Content-Type header or URL extension
+        let header_mime = head
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.split(';').next().unwrap_or(s).trim().to_string());
+
+        let mime = header_mime
+            .as_deref()
+            .or_else(|| mime_type_from_url(url))
+            .unwrap_or("image/jpeg") // fallback for Blossom URLs without extension
+            .to_string();
+
+        // Only download images and videos (skip audio for now)
+        if !mime.starts_with("image/") && !mime.starts_with("video/") {
+            return Ok(false);
+        }
+
+        // GET request — download the file
+        let response = client.get(url).send().await?;
+        if !response.status().is_success() {
+            return Ok(false);
+        }
+
+        let bytes = response.bytes().await?;
+        let size_bytes = bytes.len() as u64;
+
+        if size_bytes > MAX_FILE_SIZE {
+            return Ok(false);
+        }
+
+        // Write to disk: ~/.nostrito/media/<hash[0..2]>/<hash>
+        let file_path = media_file_path(hash);
+        if let Some(parent) = file_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(&file_path, &bytes).await?;
+
+        // Record in DB
+        self.db
+            .store_media_record(hash, url, &mime, size_bytes, pubkey)?;
+
+        debug!(
+            "Tier 4: downloaded {} ({} bytes) → {:?}",
+            &hash[..12],
+            size_bytes,
+            file_path
+        );
+        Ok(true)
+    }
+
+    /// Enforce media storage limit — evict LRU items if over 95% of limit
+    async fn enforce_media_limit(&self, limit_bytes: u64) {
+        let current = self.db.media_total_bytes().unwrap_or(0);
+        let threshold = (limit_bytes as f64 * 0.95) as u64;
+
+        if current <= threshold {
+            return;
+        }
+
+        let target = (limit_bytes as f64 * 0.80) as u64;
+        info!(
+            "Tier 4: Media cache over 95% ({} / {} bytes), evicting to 80%",
+            current, limit_bytes
+        );
+
+        let lru_items = self.db.media_list_lru(1000).unwrap_or_default();
+        let mut freed: u64 = 0;
+        let mut to_delete: Vec<String> = Vec::new();
+
+        for (hash, size) in &lru_items {
+            if current - freed <= target {
+                break;
+            }
+            // Delete file from disk
+            let path = media_file_path(hash);
+            if let Err(e) = tokio::fs::remove_file(&path).await {
+                warn!("Tier 4: failed to delete media file {:?}: {}", path, e);
+            }
+            to_delete.push(hash.clone());
+            freed += size;
+        }
+
+        if !to_delete.is_empty() {
+            self.db.media_delete_records(&to_delete).ok();
+            info!(
+                "Tier 4: Evicted {} items, freed {} bytes",
+                to_delete.len(),
+                freed
+            );
+        }
+    }
+}
+
+// ── Media Helpers ──────────────────────────────────────────────────
+
+/// Blossom URLs contain a 64-char hex sha256 segment in the path.
+/// Extract it if present.
+fn extract_sha256_from_url(url: &str) -> Option<String> {
+    let path = url.split('?').next()?;
+    for segment in path.split('/') {
+        let stem = segment.split('.').next().unwrap_or(segment);
+        if stem.len() == 64 && stem.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Some(stem.to_lowercase());
+        }
+    }
+    None
+}
+
+/// Detect MIME type from URL file extension
+fn mime_type_from_url(url: &str) -> Option<&'static str> {
+    let path = url.split('?').next().unwrap_or(url).to_lowercase();
+    if path.ends_with(".jpg") || path.ends_with(".jpeg") {
+        return Some("image/jpeg");
+    }
+    if path.ends_with(".png") {
+        return Some("image/png");
+    }
+    if path.ends_with(".gif") {
+        return Some("image/gif");
+    }
+    if path.ends_with(".webp") {
+        return Some("image/webp");
+    }
+    if path.ends_with(".mp4") {
+        return Some("video/mp4");
+    }
+    if path.ends_with(".webm") {
+        return Some("video/webm");
+    }
+    if path.ends_with(".mov") {
+        return Some("video/quicktime");
+    }
+    if path.ends_with(".mp3") {
+        return Some("audio/mpeg");
+    }
+    if path.ends_with(".ogg") {
+        return Some("audio/ogg");
+    }
+    if path.ends_with(".wav") {
+        return Some("audio/wav");
+    }
+    None
+}
+
+/// Extract URLs from text content (simple scanner, no regex crate needed)
+fn extract_urls_from_text(text: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    let mut i = 0;
+    let bytes = text.as_bytes();
+
+    while i < bytes.len() {
+        // Look for http:// or https://
+        let remaining = &text[i..];
+        let start = if remaining.starts_with("https://") {
+            Some(i)
+        } else if remaining.starts_with("http://") {
+            Some(i)
+        } else {
+            None
+        };
+
+        if let Some(start) = start {
+            // Collect until whitespace, quote, bracket, or end
+            let mut end = start;
+            for &b in &bytes[start..] {
+                if b == b' '
+                    || b == b'\n'
+                    || b == b'\r'
+                    || b == b'\t'
+                    || b == b'"'
+                    || b == b'\''
+                    || b == b'<'
+                    || b == b'>'
+                    || b == b']'
+                    || b == b')'
+                {
+                    break;
+                }
+                end += 1;
+            }
+            if end > start + 10 {
+                urls.push(text[start..end].to_string());
+            }
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+
+    urls
+}
+
+/// Media file path: ~/.nostrito/media/<hash[0..2]>/<hash>
+fn media_file_path(hash: &str) -> std::path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join(".nostrito/media")
+        .join(&hash[..2])
+        .join(hash)
 }
 
 // ── Helpers ────────────────────────────────────────────────────────

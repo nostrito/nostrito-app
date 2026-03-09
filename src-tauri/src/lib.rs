@@ -255,6 +255,7 @@ async fn init_nostrito(
         state.sync_tier.clone(),
         state.sync_stats.clone(),
         app_handle.clone(),
+        config.storage_media_gb,
     ));
 
     let cancel = sync_engine.start();
@@ -391,6 +392,7 @@ async fn start_sync(
         state.sync_tier.clone(),
         state.sync_stats.clone(),
         app_handle,
+        config.storage_media_gb,
     ));
 
     let cancel = sync_engine.start();
@@ -938,6 +940,7 @@ pub fn run() {
 
                     tracing::info!("Auto-resuming sync for {}...", &hex[..8]);
 
+                    let media_gb = config.read().await.storage_media_gb;
                     let sync_engine = Arc::new(SyncEngine::new(
                         wot_graph,
                         db,
@@ -946,6 +949,7 @@ pub fn run() {
                         sync_tier,
                         sync_stats,
                         app_handle.clone(),
+                        media_gb,
                     ));
 
                     let cancel = sync_engine.start();
