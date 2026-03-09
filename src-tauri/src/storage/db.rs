@@ -776,6 +776,22 @@ impl Database {
         Ok(deleted as u64)
     }
 
+    /// Get the latest created_at timestamp from stored nostr events.
+    /// Used by Tier 2 sync to avoid re-fetching already-stored events.
+    pub fn get_latest_event_timestamp(&self) -> Result<Option<u64>> {
+        let conn = self.conn.lock().unwrap();
+        let result: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(created_at), 0) FROM nostr_events",
+            [],
+            |row| row.get(0),
+        )?;
+        if result == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(result as u64))
+        }
+    }
+
     /// Delete media records by hash (caller must also delete the file)
     pub fn media_delete_records(&self, hashes: &[String]) -> Result<()> {
         if hashes.is_empty() {

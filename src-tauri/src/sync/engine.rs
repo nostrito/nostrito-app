@@ -622,12 +622,25 @@ impl SyncEngine {
 
         info!("Tier 2: {} follows to fetch", follows.len());
 
-        let since = Timestamp::from(
-            chrono::Utc::now()
-                .checked_sub_signed(chrono::Duration::days(self.sync_config.lookback_days as i64))
-                .unwrap()
-                .timestamp() as u64,
-        );
+        // Use the latest stored event timestamp as `since` for incremental sync.
+        // Falls back to `now - lookback_days` on first run or empty DB.
+        let lookback_floor = chrono::Utc::now()
+            .checked_sub_signed(chrono::Duration::days(self.sync_config.lookback_days as i64))
+            .unwrap()
+            .timestamp() as u64;
+
+        let since_ts = match self.db.get_latest_event_timestamp() {
+            Ok(Some(latest)) if latest > lookback_floor => {
+                info!("Tier 2: Using incremental since={} (latest stored event)", latest);
+                latest
+            }
+            _ => {
+                info!("Tier 2: Using lookback floor since={} ({}d ago)", lookback_floor, self.sync_config.lookback_days);
+                lookback_floor
+            }
+        };
+
+        let since = Timestamp::from(since_ts);
 
         let relay_urls = self.all_relay_urls();
         let total = follows.len() as u64;
