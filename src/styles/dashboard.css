@@ -207,7 +207,8 @@
   background: rgba(255,255,255,0.01);
   flex-shrink: 0;
   overflow-y: auto;
-  align-self: flex-start;
+  display: flex;
+  flex-direction: column;
 }
 
 /* Sync engine panel */
@@ -307,6 +308,7 @@
 .blossom-section {
   padding: 10px 16px;
   border-top: 1px solid var(--border);
+  margin-top: auto;
 }
 .blossom-title {
   font-size: 0.72rem;
