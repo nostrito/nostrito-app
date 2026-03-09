@@ -555,7 +555,7 @@ impl SyncEngine {
                 .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
                 .collect();
             let tags_json = serde_json::to_string(&tags).unwrap_or_default();
-            self.db
+            let inserted = self.db
                 .store_event(
                     &event.id.to_hex(),
                     &event.pubkey.to_hex(),
@@ -565,7 +565,11 @@ impl SyncEngine {
                     &event.content.to_string(),
                     &event.sig.to_string(),
                 )
-                .ok();
+                .unwrap_or(false);
+
+            if inserted {
+                self.queue_media_for_event(&event.pubkey.to_hex(), &event.content.to_string(), &tags_json);
+            }
 
             fetched += 1;
             self.emit_progress(1, fetched, 2, "");
@@ -609,7 +613,7 @@ impl SyncEngine {
                             .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
                             .collect();
                         let tags_json = serde_json::to_string(&tags).unwrap_or_default();
-                        self.db.store_event(
+                        let inserted = self.db.store_event(
                             &event.id.to_hex(),
                             &event.pubkey.to_hex(),
                             event.created_at.as_u64() as i64,
@@ -617,7 +621,10 @@ impl SyncEngine {
                             &tags_json,
                             &event.content.to_string(),
                             &event.sig.to_string(),
-                        ).ok();
+                        ).unwrap_or(false);
+                        if inserted {
+                            self.queue_media_for_event(&event.pubkey.to_hex(), &event.content.to_string(), &tags_json);
+                        }
                     }
                     fetched += events.len() as u64;
                     // Stop after first relay that gives us events
@@ -780,6 +787,7 @@ impl SyncEngine {
 
                         if inserted {
                             batch_new += 1;
+                            self.queue_media_for_event(&event.pubkey.to_hex(), &event.content.to_string(), &tags_json);
                         } else {
                             batch_dupe += 1;
                         }
@@ -976,7 +984,7 @@ impl SyncEngine {
                             .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
                             .collect();
                         let tags_json = serde_json::to_string(&tags).unwrap_or_default();
-                        self.db
+                        let inserted = self.db
                             .store_event(
                                 &event.id.to_hex(),
                                 &event.pubkey.to_hex(),
@@ -986,7 +994,11 @@ impl SyncEngine {
                                 &event.content.to_string(),
                                 &event.sig.to_string(),
                             )
-                            .ok();
+                            .unwrap_or(false);
+
+                        if inserted {
+                            self.queue_media_for_event(&event.pubkey.to_hex(), &event.content.to_string(), &tags_json);
+                        }
 
                         // Process kind:3 → update WoT graph
                         if let Some(update) = process_contact_event(event) {
@@ -1061,24 +1073,9 @@ impl SyncEngine {
         // 1. Enforce limit: evict LRU items if already over
         self.enforce_media_limit(limit_bytes).await;
 
-        // 2. Collect media URLs from recently-stored events
-        let urls = self.extract_media_urls_from_events(2000).await;
-        info!("Tier 4: {} candidate media URLs from recent events", urls.len());
-
-        // Also extract from ALL own events (full history, not just recent 500)
-        let own_urls = self.extract_own_media_urls().await;
-        info!("Tier 4: {} candidate media URLs from own events", own_urls.len());
-
-        // Merge, dedup by URL
-        let mut all_urls = urls;
-        let seen_urls: std::collections::HashSet<String> = all_urls.iter().map(|(u, _)| u.clone()).collect();
-        for (url, pubkey) in own_urls {
-            if !seen_urls.contains(&url) {
-                all_urls.push((url, pubkey));
-            }
-        }
-        let urls = all_urls;
-        info!("Tier 4: {} total unique media URLs after merge", urls.len());
+        // 2. Drain media URLs from the queue (populated at event store time)
+        let urls = self.db.dequeue_media_urls(500).unwrap_or_default();
+        info!("Tier 4: {} media URLs dequeued for download", urls.len());
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -1153,7 +1150,28 @@ impl SyncEngine {
         Ok(())
     }
 
+    /// Queue media URLs found in a single event's content+tags for later download.
+    fn queue_media_for_event(&self, pubkey: &str, content: &str, tags_json: &str) {
+        for url in extract_urls_from_text(content) {
+            let is_media = extract_sha256_from_url(&url).is_some()
+                || mime_type_from_url(&url).is_some()
+                || is_nostr_media_cdn(&url);
+            if is_media {
+                self.db.queue_media_url(&url, pubkey).ok();
+            }
+        }
+        for url in extract_urls_from_tags(tags_json) {
+            let is_media = extract_sha256_from_url(&url).is_some()
+                || mime_type_from_url(&url).is_some()
+                || is_nostr_media_cdn(&url);
+            if is_media {
+                self.db.queue_media_url(&url, pubkey).ok();
+            }
+        }
+    }
+
     /// Extract media URLs from ALL own events (full history, no limit cap)
+    #[allow(dead_code)]
     async fn extract_own_media_urls(&self) -> Vec<(String, String)> {
         let own_pubkey = vec![self.hex_pubkey.clone()];
         let events = self.db.query_events(
@@ -1193,6 +1211,7 @@ impl SyncEngine {
     }
 
     /// Extract media URLs from recent DB events (kinds 1, 6, 30023)
+    #[allow(dead_code)]
     async fn extract_media_urls_from_events(&self, limit: u32) -> Vec<(String, String)> {
         let events = self
             .db

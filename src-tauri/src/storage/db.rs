@@ -111,6 +111,12 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_media_lru ON media_cache(last_accessed);
             CREATE INDEX IF NOT EXISTS idx_media_pubkey ON media_cache(pubkey);
+
+            CREATE TABLE IF NOT EXISTS media_queue (
+                url TEXT PRIMARY KEY,
+                pubkey TEXT NOT NULL,
+                queued_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+            );
         "#,
         )?;
 
@@ -816,5 +822,47 @@ impl Database {
         }
         debug!("[db] media_delete_records: deleted {} records", hashes.len());
         Ok(())
+    }
+
+    // ── Media queue ─────────────────────────────────────────────
+
+    /// Queue a media URL for later download (INSERT OR IGNORE to dedup).
+    pub fn queue_media_url(&self, url: &str, pubkey: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO media_queue (url, pubkey) VALUES (?1, ?2)",
+            params![url, pubkey],
+        )?;
+        Ok(())
+    }
+
+    /// Dequeue up to `limit` media URLs (FIFO by queued_at). Deletes them from the queue.
+    pub fn dequeue_media_urls(&self, limit: usize) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT url, pubkey FROM media_queue ORDER BY queued_at ASC LIMIT ?1",
+        )?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if !rows.is_empty() {
+            let placeholders: Vec<String> = rows.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+            let sql = format!("DELETE FROM media_queue WHERE url IN ({})", placeholders.join(","));
+            let param_refs: Vec<&dyn rusqlite::ToSql> = rows.iter().map(|(u, _)| u as &dyn rusqlite::ToSql).collect();
+            conn.execute(&sql, param_refs.as_slice())?;
+        }
+
+        Ok(rows)
+    }
+
+    /// Count pending items in media queue.
+    pub fn media_queue_count(&self) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM media_queue", [], |row| row.get(0))?;
+        Ok(count as u64)
     }
 }
