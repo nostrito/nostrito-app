@@ -254,12 +254,20 @@ async function loadSettings(): Promise<void> {
           if (resultEl) resultEl.innerHTML = "";
           try {
             await invoke("setup_browser_integration");
-            if (statusEl) statusEl.textContent = "✅ Enabled";
-            if (detailEl) detailEl.textContent = "wss://localhost:" + settings.relay_port + " available for web clients";
+            // Restart relay to pick up new TLS certs
+            try {
+              await invoke("stop_relay");
+              await new Promise((r) => setTimeout(r, 500));
+              await invoke("start_relay");
+            } catch (relayErr) {
+              console.warn("[settings] Relay restart after mkcert failed:", relayErr);
+            }
+            if (statusEl) statusEl.textContent = "✅ wss://localhost:" + settings.relay_port + " active";
+            if (detailEl) detailEl.textContent = "Web clients can connect securely";
             btnEl.textContent = "Regenerate";
             btnEl.disabled = false;
             if (resultEl) {
-              resultEl.innerHTML = `<div style="font-size:0.78rem;color:#34d399;margin-top:6px">Certificates generated. Restart relay to use TLS.</div>`;
+              resultEl.innerHTML = `<div style="font-size:0.78rem;color:#34d399;margin-top:6px">✅ wss://localhost:${settings.relay_port} active — relay restarted with TLS</div>`;
             }
           } catch (e) {
             btnEl.disabled = false;

@@ -258,6 +258,22 @@ async fn init_nostrito(
     let cancel = sync_engine.start();
     *state.sync_cancel.write().await = Some(cancel);
 
+    // Auto-setup mkcert if certs don't exist (first launch)
+    {
+        let cert_path = dirs::home_dir()
+            .unwrap_or_default()
+            .join(".nostrito/certs/localhost.pem");
+        if !cert_path.exists() {
+            tracing::info!("[mkcert] First launch — setting up browser integration automatically");
+            let app_clone = app_handle.clone();
+            match tokio::task::spawn_blocking(move || run_mkcert_setup(&app_clone)).await {
+                Ok(Ok(_)) => tracing::info!("[mkcert] Browser integration ready"),
+                Ok(Err(e)) => tracing::warn!("[mkcert] Setup failed (non-fatal): {}", e),
+                Err(e) => tracing::warn!("[mkcert] Task panicked (non-fatal): {}", e),
+            }
+        }
+    }
+
     // Auto-start relay (TLS if certs available)
     {
         let config = state.config.read().await;
@@ -713,8 +729,8 @@ async fn get_own_profile(state: State<'_, AppState>) -> Result<Option<ProfileInf
 
 // ── Browser Integration (mkcert TLS) ───────────────────────────────
 
-#[tauri::command]
-async fn setup_browser_integration(app: tauri::AppHandle) -> Result<String, String> {
+/// Core mkcert setup logic — synchronous, reusable by both auto-setup and manual command.
+fn run_mkcert_setup(app: &tauri::AppHandle) -> Result<String, String> {
     use std::process::Command;
 
     // Find bundled mkcert
@@ -789,6 +805,19 @@ async fn setup_browser_integration(app: tauri::AppHandle) -> Result<String, Stri
 
     tracing::info!("[mkcert] Browser integration set up — certs at {:?}", cert_dir);
     Ok(cert_dir.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+async fn setup_browser_integration(app: tauri::AppHandle) -> Result<String, String> {
+    let app_clone = app.clone();
+    let result = tokio::task::spawn_blocking(move || run_mkcert_setup(&app_clone))
+        .await
+        .map_err(|e| format!("Task failed: {}", e))??;
+
+    // Signal frontend to restart relay with TLS
+    app.emit("relay:restart_required", ()).ok();
+
+    Ok(result)
 }
 
 #[tauri::command]
@@ -907,11 +936,27 @@ pub fn run() {
                         hex,
                         sync_tier,
                         sync_stats,
-                        app_handle,
+                        app_handle.clone(),
                     ));
 
                     let cancel = sync_engine.start();
                     *sync_cancel.write().await = Some(cancel);
+
+                    // Auto-setup mkcert if certs don't exist
+                    {
+                        let cert_check = dirs::home_dir()
+                            .unwrap_or_default()
+                            .join(".nostrito/certs/localhost.pem");
+                        if !cert_check.exists() {
+                            tracing::info!("[mkcert] Certs missing — setting up browser integration automatically");
+                            let app_clone = app_handle.clone();
+                            match tokio::task::spawn_blocking(move || run_mkcert_setup(&app_clone)).await {
+                                Ok(Ok(_)) => tracing::info!("[mkcert] Browser integration ready"),
+                                Ok(Err(e)) => tracing::warn!("[mkcert] Setup failed (non-fatal): {}", e),
+                                Err(e) => tracing::warn!("[mkcert] Task panicked (non-fatal): {}", e),
+                            }
+                        }
+                    }
 
                     // Auto-start relay (TLS if certs available)
                     let relay_ct = CancellationToken::new();
