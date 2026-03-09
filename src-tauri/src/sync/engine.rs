@@ -285,6 +285,7 @@ pub struct SyncEngine {
     pub sync_stats: Arc<RwLock<SyncStats>>,
     app_handle: tauri::AppHandle,
     storage_media_gb: f64,
+    storage_others_gb: f64,
     sync_config: SyncConfig,
 }
 
@@ -298,6 +299,7 @@ impl SyncEngine {
         sync_stats: Arc<RwLock<SyncStats>>,
         app_handle: tauri::AppHandle,
         storage_media_gb: f64,
+        storage_others_gb: f64,
         sync_config: SyncConfig,
     ) -> Self {
         Self {
@@ -310,6 +312,7 @@ impl SyncEngine {
             sync_stats,
             app_handle,
             storage_media_gb,
+            storage_others_gb,
             sync_config,
         }
     }
@@ -657,6 +660,20 @@ impl SyncEngine {
         self.set_tier(SyncTier::Important);
         info!("Tier 2: Fetching recent events from follows");
 
+        // ── Storage pruning: enforce event storage limit ──
+        let storage_others_bytes = (self.storage_others_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+        // Rough estimate: avg event is ~500 bytes
+        let max_events = (storage_others_bytes / 500).max(1000) as u32;
+        let current_count = self.db.event_count().unwrap_or(0);
+        if current_count > max_events as u64 {
+            let to_delete = (current_count - max_events as u64) as u32;
+            info!(
+                "Storage limit: {} events exceed max {} ({}GB), pruning {} oldest others' events",
+                current_count, max_events, self.storage_others_gb, to_delete + 100
+            );
+            self.db.delete_oldest_others_events(&self.hex_pubkey, to_delete + 100).ok(); // +100 buffer
+        }
+
         let follows = match self.graph.get_follows(&self.hex_pubkey) {
             Some(f) => f,
             None => {
@@ -674,20 +691,26 @@ impl SyncEngine {
         }
 
         // Use a wall-clock sync cursor for incremental sync.
-        // The cursor records when the last successful Tier 2 sync completed,
-        // NOT the event creation time (which can be arbitrary).
-        // Falls back to `now - lookback_days` on first run or stale cursor.
+        // Always look back at least `lookback_days` to catch events from newly
+        // added WoT follows whose historical events haven't been fetched yet.
         let now_epoch = chrono::Utc::now().timestamp() as u64;
-        let lookback_floor = now_epoch - (self.sync_config.lookback_days as u64 * 86400);
+        let lookback_floor = now_epoch.saturating_sub(self.sync_config.lookback_days as u64 * 86400);
 
         let cursor = self.db.get_sync_cursor().unwrap_or(None);
+        // Use the OLDER of (cursor - 60s) or (now - lookback_days)
+        // This ensures we always look back at least lookback_days for newly added follows
         let since_ts = match cursor {
-            Some(ts) if ts > lookback_floor => {
-                info!("Tier 2: Using sync cursor since={} (last sync wall-clock)", ts);
-                ts
+            Some(ts) => {
+                let cursor_ts = ts.saturating_sub(60);
+                let chosen = cursor_ts.min(lookback_floor); // use whichever is OLDER
+                info!(
+                    "Tier 2: cursor={}, lookback_floor={}, using since={} (older of both)",
+                    ts, lookback_floor, chosen
+                );
+                chosen
             }
-            _ => {
-                info!("Tier 2: Using lookback floor since={} ({}d ago)", lookback_floor, self.sync_config.lookback_days);
+            None => {
+                info!("Tier 2: No cursor, using lookback floor since={} ({}d ago)", lookback_floor, self.sync_config.lookback_days);
                 lookback_floor
             }
         };
@@ -1072,6 +1095,22 @@ impl SyncEngine {
 
         // 1. Enforce limit: evict LRU items if already over
         self.enforce_media_limit(limit_bytes).await;
+
+        // 1b. Backfill: if queue is empty but events exist, scan existing events
+        // and populate the media queue (one-time migration for events stored before
+        // the media_queue table was added)
+        let queue_count = self.db.media_queue_count().unwrap_or(0);
+        if queue_count == 0 {
+            let event_count = self.db.event_count().unwrap_or(0);
+            if event_count > 0 {
+                info!("Tier 4: media queue empty but {} events exist, backfilling...", event_count);
+                let events = self.db.query_events(None, None, Some(&[1, 6, 30023]), None, None, 5000).unwrap_or_default();
+                for (_id, pubkey, _created_at, _kind, tags_json, content, _sig) in &events {
+                    self.queue_media_for_event(pubkey, content, tags_json);
+                }
+                info!("Tier 4: backfill complete, queue now has {} items", self.db.media_queue_count().unwrap_or(0));
+            }
+        }
 
         // 2. Drain media URLs from the queue (populated at event store time)
         let urls = self.db.dequeue_media_urls(500).unwrap_or_default();
