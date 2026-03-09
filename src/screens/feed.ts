@@ -2,6 +2,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { getProfiles, profileDisplayName, type ProfileInfo } from "../utils/profiles";
+import { renderMediaHtml, stripMediaUrls, initMediaViewer } from "../utils/media";
 
 interface NostrEvent {
   id: string;
@@ -69,6 +70,12 @@ function parseRepostContent(event: NostrEvent): { content: string; pubkey: strin
   return null;
 }
 
+function renderEventContent(content: string): { cleaned: string; mediaHtml: string } {
+  const mediaHtml = renderMediaHtml(content);
+  const cleaned = stripMediaUrls(content).slice(0, 280);
+  return { cleaned, mediaHtml };
+}
+
 function renderEventCard(event: NostrEvent, profile?: ProfileInfo): string {
   const initial = event.pubkey.charAt(0).toUpperCase();
   const k = kindLabel(event.kind);
@@ -83,6 +90,8 @@ function renderEventCard(event: NostrEvent, profile?: ProfileInfo): string {
       ? `<img src="${escapeHtml(profile.picture)}" class="ev-avatar ev-avatar-img" onclick="window.showProfilePopup('${event.pubkey}')" style="cursor:pointer" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'" /><div class="ev-avatar ${avatarClass(event.pubkey)}" onclick="window.showProfilePopup('${event.pubkey}')" style="cursor:pointer;display:none">${initial}</div>`
       : `<div class="ev-avatar ${avatarClass(event.pubkey)}" onclick="window.showProfilePopup('${event.pubkey}')" style="cursor:pointer">${initial}</div>`;
 
+    const repostContent = renderEventContent(original.content);
+
     return `
       <div class="event-card" data-kind="${k.tag}">
         ${avatarHtml}
@@ -92,7 +101,8 @@ function renderEventCard(event: NostrEvent, profile?: ProfileInfo): string {
             <span class="ev-kind-tag ${k.cls}">🔁 repost</span>
             <span class="ev-time">${timeAgo(event.created_at)}</span>
           </div>
-          <div class="ev-text">${escapeHtml(original.content.slice(0, 280))}${original.content.length > 280 ? "..." : ""}</div>
+          <div class="ev-text">${escapeHtml(repostContent.cleaned)}</div>
+          ${repostContent.mediaHtml}
           <div class="ev-actions">
             <button class="ev-action"><span class="icon">💬</span> 0</button>
             <button class="ev-action"><span class="icon">🔁</span> 0</button>
@@ -107,6 +117,8 @@ function renderEventCard(event: NostrEvent, profile?: ProfileInfo): string {
     ? `<img src="${escapeHtml(profile.picture)}" class="ev-avatar ev-avatar-img" onclick="window.showProfilePopup('${event.pubkey}')" style="cursor:pointer" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'" /><div class="ev-avatar ${avatarClass(event.pubkey)}" onclick="window.showProfilePopup('${event.pubkey}')" style="cursor:pointer;display:none">${initial}</div>`
     : `<div class="ev-avatar ${avatarClass(event.pubkey)}" onclick="window.showProfilePopup('${event.pubkey}')" style="cursor:pointer">${initial}</div>`;
 
+  const eventContent = renderEventContent(event.content);
+
   return `
     <div class="event-card" data-kind="${k.tag}">
       ${avatarHtml}
@@ -116,7 +128,8 @@ function renderEventCard(event: NostrEvent, profile?: ProfileInfo): string {
           <span class="ev-kind-tag ${k.cls}">${k.tag}</span>
           <span class="ev-time">${timeAgo(event.created_at)}</span>
         </div>
-        <div class="ev-text">${escapeHtml(event.content.slice(0, 280))}${event.content.length > 280 ? "..." : ""}</div>
+        <div class="ev-text">${escapeHtml(eventContent.cleaned)}</div>
+        ${eventContent.mediaHtml}
         <div class="ev-actions">
           <button class="ev-action"><span class="icon">💬</span> 0</button>
           <button class="ev-action"><span class="icon">🔁</span> 0</button>
@@ -128,8 +141,11 @@ function renderEventCard(event: NostrEvent, profile?: ProfileInfo): string {
 }
 
 let feedLoading = false;
+const renderedEventIds = new Set<string>();
 
 export function renderFeed(container: HTMLElement): void {
+  renderedEventIds.clear();
+  initMediaViewer();
   container.className = "main-content";
   container.innerHTML = `
     <div class="feed-filters">
@@ -169,34 +185,38 @@ async function loadEvents(container: HTMLElement): Promise<void> {
   if (feedLoading) return;
   feedLoading = true;
   try {
-    console.log("[feed] Calling get_feed with limit=50...");
     const rawEvents = await invoke<NostrEvent[]>("get_feed", { filter: { limit: 50 } });
-    console.log("[feed] get_feed response:", rawEvents.length, "events");
-    // Defense in depth: filter to feed-worthy kinds even if backend already does
     const kindFiltered = rawEvents.filter((e) => FEED_KINDS.includes(e.kind));
-    // Deduplicate by event ID
-    const seen = new Set<string>();
-    const events = kindFiltered.filter((e) => {
-      if (seen.has(e.id)) return false;
-      seen.add(e.id);
-      return true;
-    });
-    console.log("[feed] after kind filter + dedup:", events.length, "feed events");
+    const newEvents = kindFiltered.filter((e) => !renderedEventIds.has(e.id));
+    if (newEvents.length === 0) return;
+
+    const pubkeys = [...new Set(newEvents.map((e) => e.pubkey))];
+    const profileMap = await getProfiles(pubkeys);
+
     const feedEl = container.querySelector("#feedList");
-    if (feedEl) {
-      if (events.length === 0) {
-        feedEl.innerHTML = `<div class="event-card" style="justify-content:center;color:var(--text-muted);padding:32px;">No events yet — syncing will populate your feed.</div>`;
-      } else {
-        const pubkeys = [...new Set(events.map((e) => e.pubkey))];
-        const profileMap = await getProfiles(pubkeys);
-        feedEl.innerHTML = events
-          .map((e) => renderEventCard(e, profileMap.get(e.pubkey)))
-          .filter((html) => html.trim() !== "") // skip empty repost cards
-          .join("");
+    if (!feedEl) return;
+
+    // Remove loading placeholder if present
+    const placeholder = feedEl.querySelector('.event-card:not([data-kind])');
+    if (placeholder) placeholder.remove();
+
+    const newHtml = newEvents
+      .map((e) => { renderedEventIds.add(e.id); return renderEventCard(e, profileMap.get(e.pubkey)); })
+      .filter((h) => h.trim() !== '')
+      .join('');
+
+    if (newHtml) {
+      feedEl.insertAdjacentHTML('afterbegin', newHtml);
+    }
+
+    // Cap at 100 items to avoid memory bloat
+    const allCards = feedEl.querySelectorAll('.event-card[data-kind]');
+    if (allCards.length > 100) {
+      for (let i = 100; i < allCards.length; i++) {
+        allCards[i].remove();
       }
     }
   } catch (_) {
-    // Silently fail — will show placeholder
   } finally {
     feedLoading = false;
   }

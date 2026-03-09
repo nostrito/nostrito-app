@@ -3,7 +3,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getProfiles, profileDisplayName, type ProfileInfo } from "../utils/profiles";
-import { renderMediaHtml, initMediaViewer } from "../utils/media";
+// Media viewer no longer needed on dashboard (compact live table instead of full cards)
 
 interface AppStatus {
   initialized: boolean;
@@ -74,80 +74,7 @@ function timeAgo(ts: number): string {
   return `${Math.floor(diff / 86400)}d ago`;
 }
 
-/** Kinds that belong in the feed — content only, no metadata */
-const FEED_KINDS = [1, 6, 30023];
-
-function renderEventCard(event: NostrEvent, profile?: ProfileInfo): string {
-  const initial = event.pubkey.charAt(0).toUpperCase();
-  const displayName = profileDisplayName(profile, event.pubkey);
-
-  // Handle kind:6 reposts — show original content or skip if empty
-  if (event.kind === 6) {
-    let originalContent: string | null = null;
-    if (event.content.trim()) {
-      try {
-        const original = JSON.parse(event.content);
-        if (original && typeof original.content === "string" && original.content.trim()) {
-          originalContent = original.content;
-        }
-      } catch {
-        // Not valid JSON
-      }
-    }
-    if (!originalContent) return ""; // Empty repost, skip
-
-    const avatarHtml = profile?.picture
-      ? `<img src="${escapeHtml(profile.picture)}" class="ev-avatar ev-avatar-img" onclick="window.showProfilePopup('${event.pubkey}')" style="cursor:pointer" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'" /><div class="ev-avatar ${avatarClass(event.pubkey)}" onclick="window.showProfilePopup('${event.pubkey}')" style="cursor:pointer;display:none">${initial}</div>`
-      : `<div class="ev-avatar ${avatarClass(event.pubkey)}" onclick="window.showProfilePopup('${event.pubkey}')" style="cursor:pointer">${initial}</div>`;
-
-    return `
-      <div class="event-card">
-        ${avatarHtml}
-        <div class="ev-content">
-          <div class="ev-meta">
-            <span class="ev-npub" onclick="window.showProfilePopup('${event.pubkey}')" style="cursor:pointer">${escapeHtml(displayName)}</span>
-            <span class="ev-kind-tag ev-kind-repost">🔁 repost</span>
-            <span class="ev-time">${timeAgo(event.created_at)}</span>
-          </div>
-          <div class="ev-text">${escapeHtml(originalContent.slice(0, 280))}${originalContent.length > 280 ? "..." : ""}</div>
-          ${renderMediaHtml(originalContent)}
-          <div class="ev-actions">
-            <button class="ev-action"><span class="icon">💬</span> 0</button>
-            <button class="ev-action"><span class="icon">🔁</span> 0</button>
-            <button class="ev-action"><span class="icon">⚡</span> 0</button>
-          </div>
-        </div>
-      </div>
-    `;
-  }
-
-  const kindTag = event.kind === 1 ? "note" : event.kind === 30023 ? "long-form" : `k:${event.kind}`;
-  const kindClass = event.kind === 1 ? "ev-kind-note" : event.kind === 30023 ? "ev-kind-long" : "ev-kind-note";
-
-  const avatarHtml = profile?.picture
-    ? `<img src="${escapeHtml(profile.picture)}" class="ev-avatar ev-avatar-img" onclick="window.showProfilePopup('${event.pubkey}')" style="cursor:pointer" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'" /><div class="ev-avatar ${avatarClass(event.pubkey)}" onclick="window.showProfilePopup('${event.pubkey}')" style="cursor:pointer;display:none">${initial}</div>`
-    : `<div class="ev-avatar ${avatarClass(event.pubkey)}" onclick="window.showProfilePopup('${event.pubkey}')" style="cursor:pointer">${initial}</div>`;
-
-  return `
-    <div class="event-card">
-      ${avatarHtml}
-      <div class="ev-content">
-        <div class="ev-meta">
-          <span class="ev-npub" onclick="window.showProfilePopup('${event.pubkey}')" style="cursor:pointer">${escapeHtml(displayName)}</span>
-          <span class="ev-kind-tag ${kindClass}">${kindTag}</span>
-          <span class="ev-time">${timeAgo(event.created_at)}</span>
-        </div>
-        <div class="ev-text">${escapeHtml(event.content.slice(0, 280))}${event.content.length > 280 ? "..." : ""}</div>
-        ${renderMediaHtml(event.content)}
-        <div class="ev-actions">
-          <button class="ev-action"><span class="icon">💬</span> 0</button>
-          <button class="ev-action"><span class="icon">🔁</span> 0</button>
-          <button class="ev-action"><span class="icon">⚡</span> 0</button>
-        </div>
-      </div>
-    </div>
-  `;
-}
+// renderEventCard removed — dashboard now uses compact live event table
 
 /** Build activity bars from real hourly data (24 entries from backend) */
 function renderActivityBars(data: number[]): string {
@@ -313,34 +240,46 @@ async function loadFeed(): Promise<void> {
   if (dashFeedLoading) return;
   dashFeedLoading = true;
   try {
-    console.log("[dashboard] Calling get_feed...");
-    const rawEvents = await invoke<NostrEvent[]>("get_feed", {
-      filter: { limit: 20 },
-    });
-    console.log("[dashboard] get_feed response:", rawEvents.length, "events");
-    // Defense in depth: filter to feed-worthy kinds
-    const kindFiltered = rawEvents.filter((e) => FEED_KINDS.includes(e.kind));
-    // Deduplicate by event ID
+    const rawEvents = await invoke<NostrEvent[]>("get_feed", { filter: { limit: 30 } });
     const seen = new Set<string>();
-    const events = kindFiltered.filter((e) => {
+    const events = rawEvents.filter((e) => {
       if (seen.has(e.id)) return false;
       seen.add(e.id);
       return true;
-    });
-    console.log("[dashboard] after kind filter + dedup:", events.length, "feed events");
-    const feedEl = document.getElementById("dash-feed-list");
-    if (feedEl) {
-      if (events.length === 0) {
-        feedEl.innerHTML = `<div class="event-card" style="justify-content:center;color:var(--text-muted);padding:32px;">No events yet — syncing will populate your feed.</div>`;
-      } else {
-        const pubkeys = [...new Set(events.map((e) => e.pubkey))];
-        const profileMap = await getProfiles(pubkeys);
-        feedEl.innerHTML = events
-          .map((e) => renderEventCard(e, profileMap.get(e.pubkey)))
-          .filter((html) => html.trim() !== "") // skip empty repost cards
-          .join("");
-      }
+    }).slice(0, 30);
+
+    const tableEl = document.getElementById("dash-live-table");
+    const countEl = document.getElementById("dash-live-count");
+    if (!tableEl) return;
+
+    if (events.length === 0) {
+      tableEl.innerHTML = `<div class="dash-live-empty">Waiting for events...</div>`;
+      return;
     }
+
+    const pubkeys = [...new Set(events.map((e) => e.pubkey))];
+    const profileMap = await getProfiles(pubkeys);
+
+    if (countEl) countEl.textContent = `${events.length} events`;
+
+    tableEl.innerHTML = events.map((e) => {
+      const profile = profileMap.get(e.pubkey);
+      const name = profileDisplayName(profile, e.pubkey);
+      const avatar = profile?.picture
+        ? `<img class="live-avatar" src="${escapeHtml(profile.picture)}" onerror="this.style.display='none'">`
+        : `<div class="live-avatar live-avatar-fallback ${avatarClass(e.pubkey)}">${e.pubkey.charAt(0).toUpperCase()}</div>`;
+      const kindLabel = e.kind === 1 ? 'note' : e.kind === 6 ? 'repost' : e.kind === 7 ? 'reaction' : e.kind === 4 ? 'dm' : e.kind === 0 ? 'profile' : e.kind === 3 ? 'contacts' : `k:${e.kind}`;
+      const preview = e.content.replace(/https?:\/\/\S+/g, '').trim().slice(0, 60) || '—';
+      return `
+        <div class="dash-live-row">
+          ${avatar}
+          <span class="live-name">${escapeHtml(name)}</span>
+          <span class="live-kind live-kind-${e.kind === 1 ? 'note' : e.kind === 6 ? 'repost' : 'other'}">${kindLabel}</span>
+          <span class="live-preview">${escapeHtml(preview)}</span>
+          <span class="live-time">${timeAgo(e.created_at)}</span>
+        </div>
+      `;
+    }).join('');
   } catch (_) {
   } finally {
     dashFeedLoading = false;
@@ -359,7 +298,6 @@ function escapeHtml(str: string): string {
 }
 
 export async function renderDashboard(container: HTMLElement): Promise<void> {
-  initMediaViewer();
   if (pollInterval) clearInterval(pollInterval);
   if (unlistenProgress) unlistenProgress();
   if (unlistenTierComplete) unlistenTierComplete();
@@ -391,8 +329,14 @@ export async function renderDashboard(container: HTMLElement): Promise<void> {
 
     <!-- Body: feed + sidebar -->
     <div class="dash-body">
-      <div class="dash-feed" id="dash-feed-list">
-        <div class="event-card" style="justify-content:center;color:var(--text-muted);padding:32px;">Loading...</div>
+      <div class="dash-live-events">
+        <div class="dash-live-header">
+          <span class="dash-live-title">Latest Events</span>
+          <span class="dash-live-count" id="dash-live-count">—</span>
+        </div>
+        <div class="dash-live-table" id="dash-live-table">
+          <div class="dash-live-empty">Waiting for events...</div>
+        </div>
       </div>
       <div class="dash-sidebar">
         <div class="sync-engine-header">Sync Engine</div>

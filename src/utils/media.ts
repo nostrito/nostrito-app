@@ -30,6 +30,19 @@ export function extractMediaUrls(content: string): MediaUrls {
   return { images, videos };
 }
 
+/** Strip media URLs from content text (so they don't appear as raw URLs alongside rendered images) */
+export function stripMediaUrls(content: string): string {
+  const { images, videos } = extractMediaUrls(content);
+  const allUrls = [...images, ...videos];
+  let cleaned = content;
+  for (const url of allUrls) {
+    cleaned = cleaned.replace(url, '');
+  }
+  // Also strip any remaining bare URLs that look like media (common CDN patterns)
+  cleaned = cleaned.replace(/https?:\/\/\S+\.(jpg|jpeg|png|gif|webp|mp4|webm|mov)(\?\S*)?/gi, '');
+  return cleaned.trim();
+}
+
 /**
  * Render media HTML for an event card.
  * Returns empty string if no media found.
