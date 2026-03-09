@@ -532,6 +532,65 @@ impl SyncEngine {
             self.emit_progress(1, fetched, 2, "");
         }
 
+        // ── Tier 1b: Fetch ALL own events (full history backup) ──
+        info!("Tier 1b: Fetching ALL own events (full history backup)");
+
+        let all_own_filter = Filter::new()
+            .author(pk)
+            .kinds(vec![
+                Kind::Metadata,               // 0
+                Kind::TextNote,               // 1
+                Kind::ContactList,            // 3
+                Kind::EncryptedDirectMessage, // 4
+                Kind::Repost,                 // 6
+                Kind::Reaction,               // 7
+                Kind::ZapReceipt,             // 9735
+                Kind::LongFormTextNote,        // 30023
+            ])
+            // NO .since() — fetch everything from all time
+            .limit(1000);
+
+        for url in relay_urls.iter() {
+            if self.cancel.is_cancelled() { break; }
+
+            let policy = policies
+                .entry(url.clone())
+                .or_insert_with(|| RelayPolicy::new(self.sync_config.relay_min_interval_secs as u64));
+
+            let client = Client::default();
+            if client.add_relay(url.as_str()).await.is_err() { continue; }
+            client.connect().await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            match subscribe_and_collect(&client, vec![all_own_filter.clone()], 30, policy).await {
+                Ok(events) => {
+                    info!("Tier 1b: Got {} own events from {}", events.len(), url);
+                    for event in &events {
+                        let tags: Vec<Vec<String>> = event.tags.iter()
+                            .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
+                            .collect();
+                        let tags_json = serde_json::to_string(&tags).unwrap_or_default();
+                        self.db.store_event(
+                            &event.id.to_hex(),
+                            &event.pubkey.to_hex(),
+                            event.created_at.as_u64() as i64,
+                            event.kind.as_u16() as u32,
+                            &tags_json,
+                            &event.content.to_string(),
+                            &event.sig.to_string(),
+                        ).ok();
+                    }
+                    fetched += events.len() as u64;
+                    // Stop after first relay that gives us events
+                    if !events.is_empty() { client.disconnect().await.ok(); break; }
+                }
+                Err(e) => warn!("Tier 1b: Failed on {}: {}", url, e),
+            }
+
+            client.disconnect().await.ok();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+
         {
             let mut stats = self.sync_stats.write().await;
             stats.tier1_fetched = fetched;
@@ -899,7 +958,22 @@ impl SyncEngine {
 
         // 2. Collect media URLs from recently-stored events
         let urls = self.extract_media_urls_from_events(500).await;
-        info!("Tier 4: {} candidate media URLs from events", urls.len());
+        info!("Tier 4: {} candidate media URLs from recent events", urls.len());
+
+        // Also extract from ALL own events (full history, not just recent 500)
+        let own_urls = self.extract_own_media_urls().await;
+        info!("Tier 4: {} candidate media URLs from own events", own_urls.len());
+
+        // Merge, dedup by URL
+        let mut all_urls = urls;
+        let seen_urls: std::collections::HashSet<String> = all_urls.iter().map(|(u, _)| u.clone()).collect();
+        for (url, pubkey) in own_urls {
+            if !seen_urls.contains(&url) {
+                all_urls.push((url, pubkey));
+            }
+        }
+        let urls = all_urls;
+        info!("Tier 4: {} total unique media URLs after merge", urls.len());
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -916,14 +990,16 @@ impl SyncEngine {
                 break;
             }
 
-            // Re-check limit before each download
-            let used = self.db.media_total_bytes().unwrap_or(u64::MAX);
-            if used >= limit_bytes {
-                info!(
-                    "Tier 4: Storage limit reached ({} GB used), stopping",
-                    self.storage_media_gb
-                );
-                break;
+            let is_own = pubkey == &self.hex_pubkey;
+
+            // Only enforce storage limit for others' media — own media always downloads
+            if !is_own {
+                let used = self.db.media_others_bytes(&self.hex_pubkey).unwrap_or(u64::MAX);
+                if used >= limit_bytes {
+                    // Skip non-own media that exceeds limit, but keep going for own media
+                    skipped += 1;
+                    continue;
+                }
             }
 
             // Use sha256 from URL path (Blossom) or sha256 of the URL string as cache key
@@ -970,6 +1046,35 @@ impl SyncEngine {
             downloaded, skipped
         );
         Ok(())
+    }
+
+    /// Extract media URLs from ALL own events (full history, no limit cap)
+    async fn extract_own_media_urls(&self) -> Vec<(String, String)> {
+        let own_pubkey = vec![self.hex_pubkey.clone()];
+        let events = self.db.query_events(
+            None,
+            Some(&own_pubkey),
+            None,  // all kinds
+            None,  // no since
+            None,  // no until
+            5000,  // large limit for own events
+        ).unwrap_or_default();
+
+        let mut urls = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for (_id, pubkey, _created_at, _kind, _tags, content, _sig) in &events {
+            for url in extract_urls_from_text(content) {
+                let is_media = extract_sha256_from_url(&url).is_some()
+                    || mime_type_from_url(&url).is_some()
+                    || is_nostr_media_cdn(&url);
+                if is_media && seen.insert(url.clone()) {
+                    urls.push((url, pubkey.clone()));
+                }
+            }
+        }
+
+        urls
     }
 
     /// Extract media URLs from recent DB events (kinds 1, 6, 30023)
@@ -1125,44 +1230,45 @@ impl SyncEngine {
         Ok(true)
     }
 
-    /// Enforce media storage limit — evict LRU items if over 95% of limit
+    /// Enforce media storage limit — evict LRU items if over 95% of limit.
+    /// Only counts and evicts OTHERS' media — own media is never evicted.
     async fn enforce_media_limit(&self, limit_bytes: u64) {
-        let current = self.db.media_total_bytes().unwrap_or(0);
-        let threshold = (limit_bytes as f64 * 0.95) as u64;
+        let used = match self.db.media_others_bytes(&self.hex_pubkey) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
 
-        if current <= threshold {
-            return;
+        if used < (limit_bytes as f64 * 0.95) as u64 {
+            return; // Under 95% — no eviction needed
         }
 
         let target = (limit_bytes as f64 * 0.80) as u64;
         info!(
-            "Tier 4: Media cache over 95% ({} / {} bytes), evicting to 80%",
-            current, limit_bytes
+            "Tier 4: Others' media over 95% ({} / {} bytes), evicting to 80%",
+            used, limit_bytes
         );
 
-        let lru_items = self.db.media_list_lru(1000).unwrap_or_default();
+        let candidates = self.db.media_list_lru_excluding_pubkey(500, &self.hex_pubkey).unwrap_or_default();
         let mut freed: u64 = 0;
-        let mut to_delete: Vec<String> = Vec::new();
+        let mut evicted: Vec<String> = Vec::new();
+        let mut current = used;
 
-        for (hash, size) in &lru_items {
-            if current - freed <= target {
-                break;
-            }
-            // Delete file from disk
-            let path = media_file_path(hash);
+        for (hash, size) in candidates {
+            if current <= target { break; }
+            let path = media_file_path(&hash);
             if let Err(e) = tokio::fs::remove_file(&path).await {
-                warn!("Tier 4: failed to delete media file {:?}: {}", path, e);
+                warn!("Tier 4: failed to delete {:?}: {}", path, e);
             }
-            to_delete.push(hash.clone());
+            evicted.push(hash);
             freed += size;
+            current = current.saturating_sub(size);
         }
 
-        if !to_delete.is_empty() {
-            self.db.media_delete_records(&to_delete).ok();
+        if !evicted.is_empty() {
+            self.db.media_delete_records(&evicted).ok();
             info!(
-                "Tier 4: Evicted {} items, freed {} bytes",
-                to_delete.len(),
-                freed
+                "Tier 4: Evicted {} items, freed {} bytes (own media preserved)",
+                evicted.len(), freed
             );
         }
     }

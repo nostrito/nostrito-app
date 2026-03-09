@@ -735,6 +735,47 @@ impl Database {
         Ok(rows)
     }
 
+    /// List media ordered by last_accessed ASC, EXCLUDING items from a specific pubkey (never evict own media)
+    pub fn media_list_lru_excluding_pubkey(&self, limit: usize, exclude_pubkey: &str) -> Result<Vec<(String, u64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT hash, size_bytes FROM media_cache WHERE pubkey != ?1 ORDER BY last_accessed ASC LIMIT ?2"
+        )?;
+        let rows = stmt
+            .query_map(params![exclude_pubkey, limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Total bytes used by others' media (excluding own pubkey)
+    pub fn media_others_bytes(&self, exclude_pubkey: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let total: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(size_bytes), 0) FROM media_cache WHERE pubkey != ?1",
+            params![exclude_pubkey],
+            |row| row.get(0),
+        )?;
+        Ok(total as u64)
+    }
+
+    /// Delete oldest events from others (NOT from own pubkey) — used for storage enforcement
+    pub fn delete_oldest_others_events(&self, own_pubkey: &str, count: u32) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let deleted: usize = conn.execute(
+            "DELETE FROM nostr_events WHERE id IN (
+                SELECT id FROM nostr_events
+                WHERE pubkey != ?1
+                ORDER BY created_at ASC
+                LIMIT ?2
+            )",
+            params![own_pubkey, count as i64],
+        )?;
+        Ok(deleted as u64)
+    }
+
     /// Delete media records by hash (caller must also delete the file)
     pub fn media_delete_records(&self, hashes: &[String]) -> Result<()> {
         if hashes.is_empty() {
