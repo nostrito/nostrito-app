@@ -133,8 +133,7 @@
   font-family: var(--mono);
 }
 .dash-live-table {
-  overflow-y: auto;
-  flex: 1;
+  overflow-y: hidden;
 }
 .dash-live-empty {
   padding: 24px;

@@ -246,7 +246,7 @@ async function loadFeed(): Promise<void> {
       if (seen.has(e.id)) return false;
       seen.add(e.id);
       return true;
-    }).slice(0, 30);
+    }).sort((a, b) => b.created_at - a.created_at).slice(0, 10);
 
     const tableEl = document.getElementById("dash-live-table");
     const countEl = document.getElementById("dash-live-count");
