@@ -1118,7 +1118,7 @@ impl SyncEngine {
 
             // Download
             match self
-                .download_media(&client, url, &hash, pubkey, limit_bytes)
+                .download_media(&client, url, &hash, pubkey, limit_bytes, is_own)
                 .await
             {
                 Ok(true) => {
@@ -1168,8 +1168,18 @@ impl SyncEngine {
         let mut urls = Vec::new();
         let mut seen = std::collections::HashSet::new();
 
-        for (_id, pubkey, _created_at, _kind, _tags, content, _sig) in &events {
+        for (_id, pubkey, _created_at, _kind, tags_json, content, _sig) in &events {
+            // Extract from content text
             for url in extract_urls_from_text(content) {
+                let is_media = extract_sha256_from_url(&url).is_some()
+                    || mime_type_from_url(&url).is_some()
+                    || is_nostr_media_cdn(&url);
+                if is_media && seen.insert(url.clone()) {
+                    urls.push((url, pubkey.clone()));
+                }
+            }
+            // Extract from tags (imeta, url, r, image, thumb, media tags)
+            for url in extract_urls_from_tags(tags_json) {
                 let is_media = extract_sha256_from_url(&url).is_some()
                     || mime_type_from_url(&url).is_some()
                     || is_nostr_media_cdn(&url);
@@ -1192,13 +1202,23 @@ impl SyncEngine {
         let mut urls: Vec<(String, String)> = Vec::new();
         let mut seen = std::collections::HashSet::new();
 
-        for (_id, pubkey, _created_at, _kind, _tags, content, _sig) in &events {
+        for (_id, pubkey, _created_at, _kind, tags_json, content, _sig) in &events {
+            // Extract from content text
             for url in extract_urls_from_text(content) {
                 // Only include URLs with a Blossom sha256 hash, known media extension, or known CDN
-                let dominated = extract_sha256_from_url(&url).is_some()
+                let is_media = extract_sha256_from_url(&url).is_some()
                     || mime_type_from_url(&url).is_some()
                     || is_nostr_media_cdn(&url);
-                if dominated && seen.insert(url.clone()) {
+                if is_media && seen.insert(url.clone()) {
+                    urls.push((url, pubkey.clone()));
+                }
+            }
+            // Extract from tags (imeta, url, r, image, thumb, media tags)
+            for url in extract_urls_from_tags(tags_json) {
+                let is_media = extract_sha256_from_url(&url).is_some()
+                    || mime_type_from_url(&url).is_some()
+                    || is_nostr_media_cdn(&url);
+                if is_media && seen.insert(url.clone()) {
                     urls.push((url, pubkey.clone()));
                 }
             }
@@ -1215,6 +1235,7 @@ impl SyncEngine {
         hash: &str,
         pubkey: &str,
         limit_bytes: u64,
+        is_own: bool,
     ) -> Result<bool> {
         const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024; // 50 MB hard cap
 
@@ -1242,15 +1263,17 @@ impl SyncEngine {
             }
         }
 
-        // Pre-flight size check (if we have a hint)
+        // Pre-flight size check (if we have a hint) — skip limit checks for own media
         if let Some(cl) = content_length_hint {
             if cl > MAX_FILE_SIZE {
                 debug!("Tier 4: skipping {} — too large ({} bytes)", url, cl);
                 return Ok(false);
             }
-            let current_used = self.db.media_total_bytes().unwrap_or(0);
-            if current_used + cl > limit_bytes {
-                return Ok(false);
+            if !is_own {
+                let current_used = self.db.media_total_bytes().unwrap_or(0);
+                if current_used + cl > limit_bytes {
+                    return Ok(false);
+                }
             }
         }
 
@@ -1306,10 +1329,12 @@ impl SyncEngine {
             return Ok(false);
         }
 
-        // Final size check against limit
-        let current_used = self.db.media_total_bytes().unwrap_or(0);
-        if current_used + size_bytes > limit_bytes {
-            return Ok(false);
+        // Final size check against limit — own media always downloads
+        if !is_own {
+            let current_used = self.db.media_total_bytes().unwrap_or(0);
+            if current_used + size_bytes > limit_bytes {
+                return Ok(false);
+            }
         }
 
         // Write to disk: ~/.nostrito/media/<hash[0..2]>/<hash>
@@ -1463,6 +1488,53 @@ fn mime_type_from_url(url: &str) -> Option<&'static str> {
         return Some("audio/wav");
     }
     None
+}
+
+/// Extract media URLs from Nostr event tags (JSON array of arrays).
+/// Handles: imeta (with "url" key-value), url, r, image, thumb, media tag types.
+fn extract_urls_from_tags(tags_json: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+
+    // Parse tags as JSON array of arrays: [["tag", "val1", "val2"], ...]
+    let parsed: Result<Vec<Vec<String>>, _> = serde_json::from_str(tags_json);
+    let tags = match parsed {
+        Ok(t) => t,
+        Err(_) => return urls,
+    };
+
+    for tag in &tags {
+        if tag.is_empty() {
+            continue;
+        }
+        let tag_name = tag[0].as_str();
+        match tag_name {
+            "imeta" => {
+                // imeta tags: ["imeta", "url https://...", "m image/jpeg", "dim 1920x1080", ...]
+                // Each element after the tag name is "key value" or "key value1 value2"
+                for element in &tag[1..] {
+                    let trimmed = element.trim();
+                    if let Some(url_val) = trimmed.strip_prefix("url ") {
+                        let url = url_val.trim();
+                        if url.starts_with("http://") || url.starts_with("https://") {
+                            urls.push(url.to_string());
+                        }
+                    }
+                }
+            }
+            "url" | "r" | "image" | "thumb" | "media" => {
+                // Simple tags: ["url", "https://..."] or ["r", "https://..."]
+                if tag.len() >= 2 {
+                    let val = tag[1].trim();
+                    if val.starts_with("http://") || val.starts_with("https://") {
+                        urls.push(val.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    urls
 }
 
 /// Extract URLs from text content (simple scanner, no regex crate needed)
