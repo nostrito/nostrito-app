@@ -47,6 +47,15 @@ let panStartX = 0, panStartY = 0;
 let panStartPanX = 0, panStartPanY = 0;
 let mouseDownPos = { x: 0, y: 0 };
 
+// ── Caching layer ──────────────────────────────────────────────────────
+// Avoid full teardown+rebuild on every screen open. We keep the canvas,
+// nodes, edges, and avatars alive between navigations.
+let _initialized = false;
+let _cachedContainer: HTMLElement | null = null;
+let _cachedWotStatus: { root_pubkey: string; node_count: number; edge_count: number; nodes_with_follows: number } | null = null;
+let _cacheTimestamp = 0;
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
 function shortName(node: WotNode): string {
   if (node.name) return node.name.slice(0, 12);
   return node.pubkey.slice(0, 6) + "\u2026";
@@ -433,18 +442,21 @@ function updateNodeInfo(node: WotNode | null): void {
   }
 }
 
-export async function renderWot(container: HTMLElement): Promise<void> {
+/** Force a full reset on next renderWot (used by reset button). */
+function invalidateWotCache(): void {
+  _initialized = false;
+  _cachedContainer = null;
+  _cachedWotStatus = null;
+  _cacheTimestamp = 0;
   nodes.clear();
   edges = [];
   selectedPubkey = null;
   avatarCache.clear();
   expandedByHop.clear();
-  // Start zoomed out and centered so the whole graph fits on screen
-  zoom = 0.35;
-  panX = LOGICAL_W * 0.5 * (1 - zoom);
-  panY = LOGICAL_H * 0.5 * (1 - zoom);
-  isPanning = false;
+}
 
+/** Build the DOM shell and return the canvas-wrap element. */
+function buildWotDOM(container: HTMLElement): HTMLDivElement {
   container.className = "main-content";
   container.style.padding = "0";
   container.innerHTML = `
@@ -489,77 +501,11 @@ export async function renderWot(container: HTMLElement): Promise<void> {
       </div>
     </div>
   `;
+  return document.getElementById("wot-canvas-wrap") as HTMLDivElement;
+}
 
-  // Create canvas with DPR support
-  const dpr = window.devicePixelRatio || 1;
-  canvas = document.createElement("canvas");
-  canvas.width = LOGICAL_W * dpr;
-  canvas.height = LOGICAL_H * dpr;
-  canvas.style.cssText =
-    "width:100%;height:auto;cursor:grab;border-radius:8px;";
-  ctx = canvas.getContext("2d")!;
-  ctx.scale(dpr, dpr);
-  document.getElementById("wot-canvas-wrap")!.appendChild(canvas);
-
-  // Load root pubkey
-  let wotStatus: {
-    root_pubkey: string;
-    node_count: number;
-    edge_count: number;
-    nodes_with_follows: number;
-  };
-  try {
-    wotStatus = await invoke("get_wot");
-  } catch {
-    container.innerHTML =
-      '<div style="padding:32px;color:var(--text-muted)">WoT data not available yet \u2014 sync first.</div>';
-    return;
-  }
-
-  myPubkey = wotStatus.root_pubkey;
-  if (!myPubkey) {
-    container.innerHTML =
-      '<div style="padding:32px;color:var(--text-muted)">No identity configured.</div>';
-    return;
-  }
-
-  // Show global stats
-  const globalEl = document.getElementById("wot-global-stats");
-  if (globalEl) {
-    globalEl.innerHTML = `Total graph:<br>${wotStatus.node_count.toLocaleString()} nodes \u00b7 ${wotStatus.edge_count.toLocaleString()} edges`;
-  }
-
-  // Fetch your profile
-  const myProfiles: Array<{
-    pubkey: string;
-    name: string | null;
-    display_name: string | null;
-    picture: string | null;
-  }> = await invoke("get_profiles_batch", { pubkeys: [myPubkey] });
-  const myProfile = myProfiles[0];
-
-  // Root node (You)
-  nodes.set(myPubkey, {
-    pubkey: myPubkey,
-    name: myProfile?.display_name || myProfile?.name || "You",
-    picture: myProfile?.picture || undefined,
-    x: CX,
-    y: CY,
-    radius: 18,
-    color: nodeColor(0),
-    hop: 0,
-    expanded: false,
-    followCount: 0,
-    parentPubkey: undefined,
-  });
-
-  draw();
-
-  // Auto-expand root (load direct follows immediately)
-  await expandNode(nodes.get(myPubkey)!);
-
-  // --- Mouse events for pan, zoom, click ---
-
+/** Attach all mouse/wheel/click handlers to the canvas. Only call once per canvas. */
+function attachCanvasEvents(container: HTMLElement): void {
   canvas.addEventListener("mousedown", (e) => {
     mouseDownPos = { x: e.clientX, y: e.clientY };
     const hit = hitTest(e.clientX, e.clientY);
@@ -598,7 +544,6 @@ export async function renderWot(container: HTMLElement): Promise<void> {
     isPanning = false;
   });
 
-  // Zoom with scroll wheel (toward cursor)
   canvas.addEventListener("wheel", (e) => {
     e.preventDefault();
     const zoomFactor = e.deltaY > 0 ? 0.9 : 1.1;
@@ -608,7 +553,6 @@ export async function renderWot(container: HTMLElement): Promise<void> {
     const mouseX = (e.clientX - rect.left) / rect.width * LOGICAL_W;
     const mouseY = (e.clientY - rect.top) / rect.height * LOGICAL_H;
 
-    // Adjust pan so the point under the cursor stays fixed
     panX = mouseX - (mouseX - panX) * (newZoom / zoom);
     panY = mouseY - (mouseY - panY) * (newZoom / zoom);
     zoom = newZoom;
@@ -616,11 +560,10 @@ export async function renderWot(container: HTMLElement): Promise<void> {
     draw();
   }, { passive: false });
 
-  // Click — only if not a drag
   canvas.addEventListener("click", async (e) => {
     const dx = e.clientX - mouseDownPos.x;
     const dy = e.clientY - mouseDownPos.y;
-    if (dx * dx + dy * dy > 25) return; // was a drag, not a click
+    if (dx * dx + dy * dy > 25) return;
 
     const hit = hitTest(e.clientX, e.clientY);
     if (!hit) return;
@@ -632,10 +575,127 @@ export async function renderWot(container: HTMLElement): Promise<void> {
     }
   });
 
-  // Reset button
   document
     .getElementById("wot-reset-btn")
     ?.addEventListener("click", async () => {
+      invalidateWotCache();
       await renderWot(container);
     });
+}
+
+/** Update the global-stats sidebar element with current WoT status. */
+function updateGlobalStats(wotStatus: { node_count: number; edge_count: number }): void {
+  const globalEl = document.getElementById("wot-global-stats");
+  if (globalEl) {
+    globalEl.innerHTML = `Total graph:<br>${wotStatus.node_count.toLocaleString()} nodes \u00b7 ${wotStatus.edge_count.toLocaleString()} edges`;
+  }
+}
+
+export async function renderWot(container: HTMLElement): Promise<void> {
+  // ── Fast path: screen already built — just re-attach and redraw ──
+  if (_initialized && _cachedContainer === container && canvas && nodes.size > 0) {
+    // Re-build the DOM shell (the router clears container.innerHTML on navigate)
+    const wrap = buildWotDOM(container);
+    wrap.appendChild(canvas);
+    // Restore stats & sidebar immediately from cached state
+    updateStats();
+    updateNodeInfo(selectedPubkey ? nodes.get(selectedPubkey) ?? null : null);
+    if (_cachedWotStatus) updateGlobalStats(_cachedWotStatus);
+    draw();
+
+    // Re-attach event listeners (old DOM was replaced)
+    attachCanvasEvents(container);
+
+    // Background refresh if cache is stale
+    if (Date.now() - _cacheTimestamp > CACHE_TTL_MS) {
+      invoke("get_wot").then((status: unknown) => {
+        _cachedWotStatus = status as typeof _cachedWotStatus;
+        _cacheTimestamp = Date.now();
+        updateGlobalStats(_cachedWotStatus!);
+      }).catch(() => {});
+    }
+    return;
+  }
+
+  // ── Cold start: full initialization ──────────────────────────────
+  invalidateWotCache();
+
+  zoom = 0.35;
+  panX = LOGICAL_W * 0.5 * (1 - zoom);
+  panY = LOGICAL_H * 0.5 * (1 - zoom);
+  isPanning = false;
+
+  const wrap = buildWotDOM(container);
+
+  // Create canvas with DPR support
+  const dpr = window.devicePixelRatio || 1;
+  canvas = document.createElement("canvas");
+  canvas.width = LOGICAL_W * dpr;
+  canvas.height = LOGICAL_H * dpr;
+  canvas.style.cssText =
+    "width:100%;height:auto;cursor:grab;border-radius:8px;";
+  ctx = canvas.getContext("2d")!;
+  ctx.scale(dpr, dpr);
+  wrap.appendChild(canvas);
+
+  // Load root pubkey
+  let wotStatus: {
+    root_pubkey: string;
+    node_count: number;
+    edge_count: number;
+    nodes_with_follows: number;
+  };
+  try {
+    wotStatus = await invoke("get_wot");
+  } catch {
+    container.innerHTML =
+      '<div style="padding:32px;color:var(--text-muted)">WoT data not available yet \u2014 sync first.</div>';
+    return;
+  }
+
+  myPubkey = wotStatus.root_pubkey;
+  if (!myPubkey) {
+    container.innerHTML =
+      '<div style="padding:32px;color:var(--text-muted)">No identity configured.</div>';
+    return;
+  }
+
+  // Cache status
+  _cachedWotStatus = wotStatus;
+  _cacheTimestamp = Date.now();
+  updateGlobalStats(wotStatus);
+
+  // Fetch your profile
+  const myProfiles: Array<{
+    pubkey: string;
+    name: string | null;
+    display_name: string | null;
+    picture: string | null;
+  }> = await invoke("get_profiles_batch", { pubkeys: [myPubkey] });
+  const myProfile = myProfiles[0];
+
+  // Root node (You)
+  nodes.set(myPubkey, {
+    pubkey: myPubkey,
+    name: myProfile?.display_name || myProfile?.name || "You",
+    picture: myProfile?.picture || undefined,
+    x: CX,
+    y: CY,
+    radius: 18,
+    color: nodeColor(0),
+    hop: 0,
+    expanded: false,
+    followCount: 0,
+    parentPubkey: undefined,
+  });
+
+  draw();
+
+  // Auto-expand root (load direct follows immediately)
+  await expandNode(nodes.get(myPubkey)!);
+
+  // Attach events & mark as initialized
+  attachCanvasEvents(container);
+  _initialized = true;
+  _cachedContainer = container;
 }
