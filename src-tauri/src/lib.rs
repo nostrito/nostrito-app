@@ -252,7 +252,7 @@ async fn init_nostrito(
         hex_pubkey.clone(),
         state.sync_tier.clone(),
         state.sync_stats.clone(),
-        app_handle,
+        app_handle.clone(),
     ));
 
     let cancel = sync_engine.start();
