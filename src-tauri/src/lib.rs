@@ -901,6 +901,9 @@ pub fn run() {
         start_time: std::time::Instant::now(),
     };
 
+    // Install rustls ring crypto provider before any TLS code runs
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .manage(app_state)
