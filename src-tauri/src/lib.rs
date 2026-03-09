@@ -828,6 +828,27 @@ async fn setup_browser_integration(app: tauri::AppHandle) -> Result<String, Stri
     Ok(result)
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MediaStats {
+    pub total_bytes: u64,
+    pub file_count: u64,
+    pub limit_bytes: u64,
+}
+
+#[tauri::command]
+async fn get_media_stats(state: State<'_, AppState>) -> Result<MediaStats, String> {
+    let db = &state.db;
+    let config = state.config.read().await;
+    let total_bytes = db.media_total_bytes().map_err(|e| e.to_string())?;
+    let file_count = db.media_file_count().map_err(|e| e.to_string())?;
+    let limit_bytes = (config.storage_media_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+    Ok(MediaStats {
+        total_bytes,
+        file_count,
+        limit_bytes,
+    })
+}
+
 #[tauri::command]
 async fn check_browser_integration() -> Result<bool, String> {
     let cert_path = dirs::home_dir()
@@ -1034,6 +1055,7 @@ pub fn run() {
             get_own_profile,
             setup_browser_integration,
             check_browser_integration,
+            get_media_stats,
         ])
         .run(tauri::generate_context!())
         .expect("error while running nostrito");

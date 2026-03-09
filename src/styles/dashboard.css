@@ -222,6 +222,40 @@
   font-size: 0.68rem;
   color: var(--text-muted);
 }
+.blossom-stats {
+  display: flex;
+  gap: 16px;
+  margin: 6px 0;
+}
+.blossom-stat {
+  display: flex;
+  flex-direction: column;
+}
+.blossom-stat-val {
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--text);
+  font-family: var(--mono);
+}
+.blossom-stat-label {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+.blossom-bar-wrap {
+  margin-top: 4px;
+}
+.blossom-bar {
+  height: 4px;
+  background: var(--bg);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.blossom-bar-fill {
+  height: 100%;
+  background: var(--purple);
+  border-radius: 2px;
+  transition: width 0.3s ease;
+}
 
 /* Event cards */
 .event-card {

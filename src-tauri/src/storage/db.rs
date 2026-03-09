@@ -700,6 +700,14 @@ impl Database {
         Ok(())
     }
 
+    /// Number of cached media files
+    pub fn media_file_count(&self) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM media_cache", [], |row| row.get(0))?;
+        Ok(count as u64)
+    }
+
     /// Total bytes used by cached media
     pub fn media_total_bytes(&self) -> Result<u64> {
         let conn = self.conn.lock().unwrap();

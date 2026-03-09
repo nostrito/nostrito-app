@@ -3,6 +3,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getProfiles, profileDisplayName, type ProfileInfo } from "../utils/profiles";
+import { renderMediaHtml, initMediaViewer } from "../utils/media";
 
 interface AppStatus {
   initialized: boolean;
@@ -109,6 +110,7 @@ function renderEventCard(event: NostrEvent, profile?: ProfileInfo): string {
             <span class="ev-time">${timeAgo(event.created_at)}</span>
           </div>
           <div class="ev-text">${escapeHtml(originalContent.slice(0, 280))}${originalContent.length > 280 ? "..." : ""}</div>
+          ${renderMediaHtml(originalContent)}
           <div class="ev-actions">
             <button class="ev-action"><span class="icon">💬</span> 0</button>
             <button class="ev-action"><span class="icon">🔁</span> 0</button>
@@ -136,6 +138,7 @@ function renderEventCard(event: NostrEvent, profile?: ProfileInfo): string {
           <span class="ev-time">${timeAgo(event.created_at)}</span>
         </div>
         <div class="ev-text">${escapeHtml(event.content.slice(0, 280))}${event.content.length > 280 ? "..." : ""}</div>
+        ${renderMediaHtml(event.content)}
         <div class="ev-actions">
           <button class="ev-action"><span class="icon">💬</span> 0</button>
           <button class="ev-action"><span class="icon">🔁</span> 0</button>
@@ -201,6 +204,13 @@ async function loadRelayStatus(): Promise<void> {
       container.innerHTML = renderRelayItems(relays);
     }
   } catch (_) {}
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(1024));
+  return (bytes / Math.pow(1024, i)).toFixed(1) + " " + units[i];
 }
 
 async function loadStats(): Promise<void> {
@@ -280,6 +290,20 @@ async function loadStats(): Promise<void> {
         el.textContent = details[t] || (t <= ct ? "complete" : "—");
       }
     }
+    // Blossom media stats
+    try {
+      const media = await invoke<{ total_bytes: number; file_count: number; limit_bytes: number }>("get_media_stats");
+      const countEl = document.getElementById("blossom-count");
+      const sizeEl = document.getElementById("blossom-size");
+      const pctEl = document.getElementById("blossom-pct");
+      const fillEl = document.getElementById("blossom-bar-fill");
+
+      if (countEl) countEl.textContent = media.file_count.toLocaleString();
+      if (sizeEl) sizeEl.textContent = formatBytes(media.total_bytes);
+      const pct = media.limit_bytes > 0 ? Math.min(100, (media.total_bytes / media.limit_bytes) * 100) : 0;
+      if (pctEl) pctEl.textContent = `${pct.toFixed(1)}%`;
+      if (fillEl) fillEl.style.width = `${pct}%`;
+    } catch (_) {}
   } catch (e) {
     console.error("[dashboard] Failed to load stats:", e);
   }
@@ -335,6 +359,7 @@ function escapeHtml(str: string): string {
 }
 
 export async function renderDashboard(container: HTMLElement): Promise<void> {
+  initMediaViewer();
   if (pollInterval) clearInterval(pollInterval);
   if (unlistenProgress) unlistenProgress();
   if (unlistenTierComplete) unlistenTierComplete();
@@ -403,7 +428,23 @@ export async function renderDashboard(container: HTMLElement): Promise<void> {
         </div>
         <div class="blossom-section">
           <div class="blossom-title">🌸 Blossom</div>
-          <div class="blossom-detail">Media caching coming soon</div>
+          <div class="blossom-stats">
+            <div class="blossom-stat">
+              <span class="blossom-stat-val" id="blossom-count">—</span>
+              <span class="blossom-stat-label">files</span>
+            </div>
+            <div class="blossom-stat">
+              <span class="blossom-stat-val" id="blossom-size">—</span>
+              <span class="blossom-stat-label">cached</span>
+            </div>
+            <div class="blossom-stat">
+              <span class="blossom-stat-val" id="blossom-pct">—</span>
+              <span class="blossom-stat-label">of limit</span>
+            </div>
+          </div>
+          <div class="blossom-bar-wrap">
+            <div class="blossom-bar"><div class="blossom-bar-fill" id="blossom-bar-fill" style="width:0%"></div></div>
+          </div>
         </div>
       </div>
     </div>
