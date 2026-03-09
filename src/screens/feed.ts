@@ -335,7 +335,13 @@ async function loadEvents(container: HTMLElement): Promise<void> {
   if (feedLoading) return;
   feedLoading = true;
   try {
-    const rawEvents = await invoke<NostrEvent[]>("get_feed", { filter: { limit: 50 } });
+    // Fetch notes/reposts and long-form articles separately so articles
+    // aren't buried by the much larger volume of kind:1 notes.
+    const [rawNotes, rawArticles] = await Promise.all([
+      invoke<NostrEvent[]>("get_feed", { filter: { kinds: [1, 6], limit: 50 } }),
+      invoke<NostrEvent[]>("get_feed", { filter: { kinds: [30023], limit: 20 } }),
+    ]);
+    const rawEvents = [...rawArticles, ...rawNotes];
     const kindFiltered = rawEvents.filter((e) => FEED_KINDS.includes(e.kind));
     const newEvents = kindFiltered.filter((e) => !renderedEventIds.has(e.id));
     if (newEvents.length === 0) return;
