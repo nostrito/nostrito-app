@@ -27,7 +27,7 @@ const LOGICAL_W = 800,
   LOGICAL_H = 700;
 const HOP_RADIUS = [0, 160, 280];
 const NODE_COLORS = ["#7c3aed", "#4f46e5", "#0ea5e9", "#10b981"];
-const MAX_NODES_PER_EXPAND = 40;
+const MAX_NODES_PER_EXPAND = 500;
 
 let nodes: Map<string, WotNode> = new Map();
 let edges: WotEdge[] = [];
