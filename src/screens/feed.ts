@@ -3,6 +3,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getProfiles, profileDisplayName, type ProfileInfo } from "../utils/profiles";
 import { renderMediaHtml, stripMediaUrls, initMediaViewer } from "../utils/media";
+import { renderMarkdown } from "../utils/markdown";
 
 interface NostrEvent {
   id: string;
@@ -35,6 +36,11 @@ function timeAgo(ts: number): string {
   return `${Math.floor(diff / 86400)}d`;
 }
 
+function formatDate(ts: number): string {
+  const d = new Date(ts * 1000);
+  return d.toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" });
+}
+
 function escapeHtml(str: string): string {
   const div = document.createElement("div");
   div.textContent = str;
@@ -53,10 +59,45 @@ function kindLabel(kind: number): { tag: string; cls: string } {
 /** Kinds that belong in the feed — content only, no metadata */
 const FEED_KINDS = [1, 6, 30023];
 
-/**
- * For kind:6 reposts (NIP-18), try to parse the embedded original event from content.
- * Returns the original note content if valid, or null.
- */
+// ── NIP-23 tag helpers ──────────────────────────────────────
+
+function getTagValue(tags: string[][], name: string): string | null {
+  const tag = tags.find((t) => t[0] === name);
+  return tag && tag.length > 1 ? tag[1] : null;
+}
+
+function getArticleTitle(event: NostrEvent): string {
+  return getTagValue(event.tags, "title") || "Untitled";
+}
+
+function getArticleSummary(event: NostrEvent): string {
+  const summary = getTagValue(event.tags, "summary");
+  if (summary) return summary.length > 200 ? summary.slice(0, 200) + "…" : summary;
+  // Fallback: first ~150 chars of content, stripped of markdown syntax
+  const plain = event.content
+    .replace(/^#+\s+/gm, "")
+    .replace(/[*_~`]/g, "")
+    .replace(/!\[.*?\]\(.*?\)/g, "")
+    .replace(/\[.*?\]\(.*?\)/g, "")
+    .trim();
+  return plain.length > 150 ? plain.slice(0, 150) + "…" : plain;
+}
+
+function getArticleImage(event: NostrEvent): string | null {
+  return getTagValue(event.tags, "image");
+}
+
+function getArticleTimestamp(event: NostrEvent): number {
+  const published = getTagValue(event.tags, "published_at");
+  if (published) {
+    const ts = parseInt(published, 10);
+    if (!isNaN(ts)) return ts;
+  }
+  return event.created_at;
+}
+
+// ── Repost helpers ──────────────────────────────────────────
+
 function parseRepostContent(event: NostrEvent): { content: string; pubkey: string } | null {
   if (event.kind !== 6 || !event.content.trim()) return null;
   try {
@@ -75,6 +116,44 @@ function renderEventContent(content: string): { cleaned: string; mediaHtml: stri
   const cleaned = stripMediaUrls(content).slice(0, 280);
   return { cleaned, mediaHtml };
 }
+
+// ── Article Card (kind:30023) ───────────────────────────────
+
+function renderArticleCard(event: NostrEvent, profile?: ProfileInfo): string {
+  const title = getArticleTitle(event);
+  const summary = getArticleSummary(event);
+  const image = getArticleImage(event);
+  const ts = getArticleTimestamp(event);
+  const displayName = profileDisplayName(profile, event.pubkey);
+  const initial = event.pubkey.charAt(0).toUpperCase();
+
+  const coverHtml = image
+    ? `<div class="article-card-cover"><img src="${escapeHtml(image)}" alt="" loading="lazy" onerror="this.parentElement.style.display='none'" /></div>`
+    : "";
+
+  const avatarHtml = profile?.picture
+    ? `<img src="${escapeHtml(profile.picture)}" class="article-card-avatar" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'" /><div class="article-card-avatar article-card-avatar-fallback ${avatarClass(event.pubkey)}" style="display:none">${initial}</div>`
+    : `<div class="article-card-avatar article-card-avatar-fallback ${avatarClass(event.pubkey)}">${initial}</div>`;
+
+  return `
+    <div class="article-card" data-kind="long-form" data-event-id="${event.id}">
+      ${coverHtml}
+      <div class="article-card-body">
+        <div class="article-card-title">${escapeHtml(title)}</div>
+        <div class="article-card-summary">${escapeHtml(summary)}</div>
+        <div class="article-card-footer">
+          <div class="article-card-author">
+            ${avatarHtml}
+            <span class="article-card-author-name">${escapeHtml(displayName)}</span>
+          </div>
+          <span class="article-card-date">${formatDate(ts)}</span>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+// ── Note/Repost Card (kind:1, kind:6) ──────────────────────
 
 function renderEventCard(event: NostrEvent, profile?: ProfileInfo): string {
   const initial = event.pubkey.charAt(0).toUpperCase();
@@ -140,8 +219,59 @@ function renderEventCard(event: NostrEvent, profile?: ProfileInfo): string {
   `;
 }
 
+// ── Article Reader View ─────────────────────────────────────
+
+function openArticleReader(event: NostrEvent, profile?: ProfileInfo): void {
+  const container = document.getElementById("main-content");
+  if (!container) return;
+
+  const title = getArticleTitle(event);
+  const ts = getArticleTimestamp(event);
+  const displayName = profileDisplayName(profile, event.pubkey);
+  const initial = event.pubkey.charAt(0).toUpperCase();
+  const image = getArticleImage(event);
+
+  const avatarHtml = profile?.picture
+    ? `<img src="${escapeHtml(profile.picture)}" class="reader-author-avatar" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'" /><div class="reader-author-avatar reader-author-avatar-fallback ${avatarClass(event.pubkey)}" style="display:none">${initial}</div>`
+    : `<div class="reader-author-avatar reader-author-avatar-fallback ${avatarClass(event.pubkey)}">${initial}</div>`;
+
+  const coverHtml = image
+    ? `<div class="reader-cover"><img src="${escapeHtml(image)}" alt="" loading="lazy" /></div>`
+    : "";
+
+  const renderedContent = renderMarkdown(event.content);
+
+  container.innerHTML = `
+    <div class="article-reader">
+      <div class="reader-header">
+        <button class="reader-back-btn" id="reader-back">← Back to feed</button>
+      </div>
+      <article class="reader-article">
+        ${coverHtml}
+        <h1 class="reader-title">${escapeHtml(title)}</h1>
+        <div class="reader-meta">
+          <div class="reader-author">
+            ${avatarHtml}
+            <span class="reader-author-name">${escapeHtml(displayName)}</span>
+          </div>
+          <span class="reader-date">${formatDate(ts)}</span>
+        </div>
+        <div class="reader-content">${renderedContent}</div>
+      </article>
+    </div>
+  `;
+
+  document.getElementById("reader-back")?.addEventListener("click", () => {
+    renderFeed(container);
+  });
+}
+
+// ── Feed State ──────────────────────────────────────────────
+
 let feedLoading = false;
 const renderedEventIds = new Set<string>();
+let feedEvents: NostrEvent[] = [];
+let feedProfileMap: Map<string, ProfileInfo> = new Map();
 
 export function renderFeed(container: HTMLElement): void {
   renderedEventIds.clear();
@@ -166,15 +296,35 @@ export function renderFeed(container: HTMLElement): void {
       const filter = (f as HTMLElement).dataset.filter!;
       filters.forEach((el) => el.classList.remove("active"));
       f.classList.add("active");
-      const items = container.querySelectorAll("#feedList .event-card[data-kind]");
+
+      const feedEl = container.querySelector("#feedList");
+      if (!feedEl) return;
+
+      // Select both regular event-cards and article-cards
+      const items = feedEl.querySelectorAll("[data-kind]");
       items.forEach((item) => {
         if (filter === "all") {
-          (item as HTMLElement).style.display = "flex";
+          (item as HTMLElement).style.display = "";
         } else {
           (item as HTMLElement).style.display =
-            (item as HTMLElement).dataset.kind === filter ? "flex" : "none";
+            (item as HTMLElement).dataset.kind === filter ? "" : "none";
         }
       });
+
+      // Toggle article grid wrapper visibility
+      const articleGrid = feedEl.querySelector(".article-cards-grid") as HTMLElement;
+      if (articleGrid) {
+        if (filter === "note" || filter === "repost") {
+          articleGrid.style.display = "none";
+        } else {
+          articleGrid.style.display = "";
+          // Also apply individual card visibility within grid
+          const cards = articleGrid.querySelectorAll("[data-kind]");
+          cards.forEach((c) => {
+            (c as HTMLElement).style.display = "";
+          });
+        }
+      }
     });
   });
 
@@ -192,6 +342,7 @@ async function loadEvents(container: HTMLElement): Promise<void> {
 
     const pubkeys = [...new Set(newEvents.map((e) => e.pubkey))];
     const profileMap = await getProfiles(pubkeys);
+    feedProfileMap = profileMap;
 
     const feedEl = container.querySelector("#feedList");
     if (!feedEl) return;
@@ -200,16 +351,64 @@ async function loadEvents(container: HTMLElement): Promise<void> {
     const placeholder = feedEl.querySelector('.event-card:not([data-kind])');
     if (placeholder) placeholder.remove();
 
-    const newHtml = newEvents
+    // Separate long-form articles from notes/reposts
+    const articles = newEvents.filter((e) => e.kind === 30023);
+    const notes = newEvents.filter((e) => e.kind !== 30023);
+
+    // Store events for reader view access
+    feedEvents = [...articles, ...feedEvents.filter((e) => !articles.find((a) => a.id === e.id))];
+    for (const e of notes) {
+      if (!feedEvents.find((fe) => fe.id === e.id)) feedEvents.push(e);
+    }
+
+    // Render article cards in a grid section at the top
+    if (articles.length > 0) {
+      let articleGrid = feedEl.querySelector(".article-cards-grid");
+      if (!articleGrid) {
+        const gridWrapper = document.createElement("div");
+        gridWrapper.className = "article-cards-grid";
+        feedEl.prepend(gridWrapper);
+        articleGrid = gridWrapper;
+      }
+
+      const articleHtml = articles
+        .map((e) => {
+          renderedEventIds.add(e.id);
+          return renderArticleCard(e, profileMap.get(e.pubkey));
+        })
+        .join("");
+
+      articleGrid.insertAdjacentHTML("afterbegin", articleHtml);
+
+      // Wire click handlers for article cards
+      articleGrid.querySelectorAll(".article-card").forEach((card) => {
+        card.addEventListener("click", () => {
+          const eventId = (card as HTMLElement).dataset.eventId;
+          const event = feedEvents.find((e) => e.id === eventId);
+          if (event) {
+            openArticleReader(event, feedProfileMap.get(event.pubkey));
+          }
+        });
+      });
+    }
+
+    // Render notes/reposts below
+    const noteHtml = notes
       .map((e) => { renderedEventIds.add(e.id); return renderEventCard(e, profileMap.get(e.pubkey)); })
       .filter((h) => h.trim() !== '')
       .join('');
 
-    if (newHtml) {
-      feedEl.insertAdjacentHTML('afterbegin', newHtml);
+    if (noteHtml) {
+      // Insert after article grid if present, otherwise at top
+      const articleGrid = feedEl.querySelector(".article-cards-grid");
+      if (articleGrid) {
+        articleGrid.insertAdjacentHTML("afterend", noteHtml);
+      } else {
+        feedEl.insertAdjacentHTML('afterbegin', noteHtml);
+      }
     }
 
-    // Cap at 100 items to avoid memory bloat
+    // Cap at 100 note items to avoid memory bloat
     const allCards = feedEl.querySelectorAll('.event-card[data-kind]');
     if (allCards.length > 100) {
       for (let i = 100; i < allCards.length; i++) {
