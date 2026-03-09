@@ -207,6 +207,7 @@
   background: rgba(255,255,255,0.01);
   flex-shrink: 0;
   overflow-y: auto;
+  align-self: flex-start;
 }
 
 /* Sync engine panel */
