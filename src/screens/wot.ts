@@ -23,6 +23,8 @@ interface WotEdge {
 
 const CX = 400,
   CY = 350;
+const LOGICAL_W = 800,
+  LOGICAL_H = 700;
 const HOP_RADIUS = [0, 160, 280];
 const NODE_COLORS = ["#7c3aed", "#4f46e5", "#0ea5e9", "#10b981"];
 const MAX_NODES_PER_EXPAND = 40;
@@ -34,6 +36,14 @@ let ctx: CanvasRenderingContext2D;
 let selectedPubkey: string | null = null;
 let myPubkey: string = "";
 let avatarCache: Map<string, HTMLImageElement> = new Map();
+
+// Pan & zoom state
+let panX = 0, panY = 0;
+let zoom = 1;
+let isPanning = false;
+let panStartX = 0, panStartY = 0;
+let panStartPanX = 0, panStartPanY = 0;
+let mouseDownPos = { x: 0, y: 0 };
 
 function shortName(node: WotNode): string {
   if (node.name) return node.name.slice(0, 12);
@@ -86,11 +96,20 @@ async function loadAvatars(nodeList: WotNode[]): Promise<void> {
 }
 
 function draw(): void {
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const dpr = window.devicePixelRatio || 1;
+
+  // Reset to DPR-only transform and clear
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, LOGICAL_W, LOGICAL_H);
 
   // Background
   ctx.fillStyle = "#0a0a0c";
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+
+  // Apply pan + zoom on top of DPR
+  ctx.save();
+  ctx.translate(panX, panY);
+  ctx.scale(zoom, zoom);
 
   // Draw edges
   ctx.lineWidth = 0.8;
@@ -110,6 +129,7 @@ function draw(): void {
   for (const node of nodes.values()) {
     const isSelected = node.pubkey === selectedPubkey;
     const isYou = node.pubkey === myPubkey;
+    const isNoData = node.expanded && node.followCount === 0 && !isYou;
     const r = node.radius;
 
     // Glow for selected
@@ -123,7 +143,7 @@ function draw(): void {
     // Node circle
     ctx.beginPath();
     ctx.arc(node.x, node.y, r, 0, Math.PI * 2);
-    ctx.fillStyle = node.color;
+    ctx.fillStyle = isNoData ? "rgba(30,30,40,0.6)" : node.color;
     ctx.fill();
 
     // Avatar (clip to circle)
@@ -137,16 +157,24 @@ function draw(): void {
       ctx.restore();
     }
 
-    // Border
+    // Border — dashed for "no data" nodes
     ctx.beginPath();
     ctx.arc(node.x, node.y, r, 0, Math.PI * 2);
-    ctx.strokeStyle = isSelected
-      ? "#a78bfa"
-      : isYou
-        ? "#7c3aed"
-        : "rgba(255,255,255,0.1)";
-    ctx.lineWidth = isSelected ? 2 : 1;
+    if (isNoData) {
+      ctx.setLineDash([3, 3]);
+      ctx.strokeStyle = "rgba(255,255,255,0.15)";
+      ctx.lineWidth = 1;
+    } else {
+      ctx.setLineDash([]);
+      ctx.strokeStyle = isSelected
+        ? "#a78bfa"
+        : isYou
+          ? "#7c3aed"
+          : "rgba(255,255,255,0.1)";
+      ctx.lineWidth = isSelected ? 2 : 1;
+    }
     ctx.stroke();
+    ctx.setLineDash([]);
 
     // "+" indicator for unexpanded nodes with follows
     if (!node.expanded && node.followCount > 0 && !isYou) {
@@ -162,37 +190,46 @@ function draw(): void {
     }
 
     // Label
-    ctx.fillStyle = isYou ? "#c4b5fd" : "rgba(200,200,220,0.8)";
+    ctx.fillStyle = isYou
+      ? "#c4b5fd"
+      : isNoData
+        ? "rgba(200,200,220,0.4)"
+        : "rgba(200,200,220,0.8)";
     ctx.font = isYou ? "bold 11px sans-serif" : "9px sans-serif";
     ctx.textAlign = "center";
     ctx.textBaseline = "top";
     ctx.fillText(shortName(node), node.x, node.y + r + 4);
   }
+
+  ctx.restore();
+  // Reset transform for next frame
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 }
 
 function hitTest(mx: number, my: number): WotNode | null {
   const rect = canvas.getBoundingClientRect();
-  const scaleX = canvas.width / rect.width;
-  const scaleY = canvas.height / rect.height;
-  const cx = (mx - rect.left) * scaleX;
-  const cy = (my - rect.top) * scaleY;
+  // Screen coords → logical coords → world coords (undo pan+zoom)
+  const cx = ((mx - rect.left) / rect.width * LOGICAL_W - panX) / zoom;
+  const cy = ((my - rect.top) / rect.height * LOGICAL_H - panY) / zoom;
   for (const node of nodes.values()) {
     const dx = cx - node.x,
       dy = cy - node.y;
-    if (dx * dx + dy * dy <= node.radius * node.radius + 100) return node;
+    if (dx * dx + dy * dy <= (node.radius + 4) * (node.radius + 4)) return node;
   }
   return null;
 }
 
 async function expandNode(node: WotNode): Promise<void> {
   if (node.expanded) return;
-  node.expanded = true;
 
   const follows: string[] = await invoke("get_follows", {
     pubkey: node.pubkey,
   });
+  node.expanded = true;
   node.followCount = follows.length;
+
   if (follows.length === 0) {
+    updateNodeInfo(node);
     draw();
     return;
   }
@@ -294,6 +331,7 @@ async function expandNode(node: WotNode): Promise<void> {
   // Load avatars then redraw
   await loadAvatars([...nodes.values()]);
   updateStats();
+  updateNodeInfo(node);
   draw();
 }
 
@@ -325,6 +363,17 @@ function updateNodeInfo(node: WotNode | null): void {
     ${!node.expanded && !isYou ? `<div class="wot-info-hint">Click node to expand follows</div>` : ""}
     ${node.expanded ? `<div class="wot-info-expanded">\u2713 Expanded</div>` : ""}
   `;
+
+  // "No data yet" for expanded nodes with zero follows
+  if (node.expanded && node.followCount === 0 && !isYou) {
+    infoEl.innerHTML += `
+      <div class="wot-info-no-data">
+        <span style="font-size:1.2rem">🔍</span>
+        <span>Not synced yet</span>
+        <span class="wot-info-no-data-hint">This account's follow list hasn't been discovered. It will appear after deeper WoT sync.</span>
+      </div>
+    `;
+  }
 }
 
 export async function renderWot(container: HTMLElement): Promise<void> {
@@ -332,10 +381,35 @@ export async function renderWot(container: HTMLElement): Promise<void> {
   edges = [];
   selectedPubkey = null;
   avatarCache.clear();
+  panX = 0;
+  panY = 0;
+  zoom = 1;
+  isPanning = false;
 
   container.className = "main-content";
   container.style.padding = "0";
   container.innerHTML = `
+    <style>
+      .wot-info-no-data {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 4px;
+        margin-top: 12px;
+        padding: 10px;
+        background: rgba(100,100,120,.08);
+        border-radius: 8px;
+        font-size: 0.78rem;
+        color: var(--text-muted);
+        text-align: center;
+      }
+      .wot-info-no-data-hint {
+        font-size: 0.7rem;
+        color: var(--text-muted);
+        opacity: 0.7;
+        line-height: 1.3;
+      }
+    </style>
     <div class="wot-explorer">
       <div class="wot-top-bar">
         <div class="wot-stat-row">
@@ -357,13 +431,15 @@ export async function renderWot(container: HTMLElement): Promise<void> {
     </div>
   `;
 
-  // Create canvas
+  // Create canvas with DPR support
+  const dpr = window.devicePixelRatio || 1;
   canvas = document.createElement("canvas");
-  canvas.width = 800;
-  canvas.height = 700;
+  canvas.width = LOGICAL_W * dpr;
+  canvas.height = LOGICAL_H * dpr;
   canvas.style.cssText =
-    "width:100%;height:auto;cursor:pointer;border-radius:8px;";
+    "width:100%;height:auto;cursor:grab;border-radius:8px;";
   ctx = canvas.getContext("2d")!;
+  ctx.scale(dpr, dpr);
   document.getElementById("wot-canvas-wrap")!.appendChild(canvas);
 
   // Load root pubkey
@@ -423,8 +499,70 @@ export async function renderWot(container: HTMLElement): Promise<void> {
   // Auto-expand root (load direct follows immediately)
   await expandNode(nodes.get(myPubkey)!);
 
-  // Wire events
+  // --- Mouse events for pan, zoom, click ---
+
+  canvas.addEventListener("mousedown", (e) => {
+    mouseDownPos = { x: e.clientX, y: e.clientY };
+    const hit = hitTest(e.clientX, e.clientY);
+    if (!hit) {
+      isPanning = true;
+      panStartX = e.clientX;
+      panStartY = e.clientY;
+      panStartPanX = panX;
+      panStartPanY = panY;
+      canvas.style.cursor = "grabbing";
+    }
+  });
+
+  canvas.addEventListener("mousemove", (e) => {
+    if (isPanning) {
+      const rect = canvas.getBoundingClientRect();
+      const scaleX = LOGICAL_W / rect.width;
+      const scaleY = LOGICAL_H / rect.height;
+      panX = panStartPanX + (e.clientX - panStartX) * scaleX;
+      panY = panStartPanY + (e.clientY - panStartY) * scaleY;
+      draw();
+      return;
+    }
+    const hit = hitTest(e.clientX, e.clientY);
+    canvas.style.cursor = hit ? "pointer" : "grab";
+  });
+
+  canvas.addEventListener("mouseup", () => {
+    if (isPanning) {
+      isPanning = false;
+      canvas.style.cursor = "grab";
+    }
+  });
+
+  canvas.addEventListener("mouseleave", () => {
+    isPanning = false;
+  });
+
+  // Zoom with scroll wheel (toward cursor)
+  canvas.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const zoomFactor = e.deltaY > 0 ? 0.9 : 1.1;
+    const newZoom = Math.max(0.2, Math.min(5, zoom * zoomFactor));
+
+    const rect = canvas.getBoundingClientRect();
+    const mouseX = (e.clientX - rect.left) / rect.width * LOGICAL_W;
+    const mouseY = (e.clientY - rect.top) / rect.height * LOGICAL_H;
+
+    // Adjust pan so the point under the cursor stays fixed
+    panX = mouseX - (mouseX - panX) * (newZoom / zoom);
+    panY = mouseY - (mouseY - panY) * (newZoom / zoom);
+    zoom = newZoom;
+
+    draw();
+  }, { passive: false });
+
+  // Click — only if not a drag
   canvas.addEventListener("click", async (e) => {
+    const dx = e.clientX - mouseDownPos.x;
+    const dy = e.clientY - mouseDownPos.y;
+    if (dx * dx + dy * dy > 25) return; // was a drag, not a click
+
     const hit = hitTest(e.clientX, e.clientY);
     if (!hit) return;
     selectedPubkey = hit.pubkey;
@@ -435,11 +573,7 @@ export async function renderWot(container: HTMLElement): Promise<void> {
     }
   });
 
-  canvas.addEventListener("mousemove", (e) => {
-    const hit = hitTest(e.clientX, e.clientY);
-    canvas.style.cursor = hit ? "pointer" : "default";
-  });
-
+  // Reset button
   document
     .getElementById("wot-reset-btn")
     ?.addEventListener("click", async () => {
