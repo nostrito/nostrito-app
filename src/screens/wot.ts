@@ -21,11 +21,11 @@ interface WotEdge {
   to: string;
 }
 
-const CX = 400,
-  CY = 350;
-const LOGICAL_W = 800,
-  LOGICAL_H = 700;
-const HOP_RADIUS = [0, 160, 280];
+const CX = 1200,
+  CY = 1000;
+const LOGICAL_W = 2400,
+  LOGICAL_H = 2000;
+const HOP_RADIUS = [0, 500, 950];
 const NODE_COLORS = ["#7c3aed", "#4f46e5", "#0ea5e9", "#10b981"];
 const MAX_NODES_PER_EXPAND = 500;
 
@@ -39,8 +39,9 @@ let avatarCache: Map<string, HTMLImageElement> = new Map();
 const expandedByHop: Map<number, string> = new Map(); // hop level → pubkey of expanded node
 
 // Pan & zoom state
-let panX = 0, panY = 0;
-let zoom = 1;
+let panX = LOGICAL_W * 0.5 * (1 - 0.35);
+let panY = LOGICAL_H * 0.5 * (1 - 0.35);
+let zoom = 0.35;
 let isPanning = false;
 let panStartX = 0, panStartY = 0;
 let panStartPanX = 0, panStartPanY = 0;
@@ -335,11 +336,11 @@ async function expandNode(node: WotNode): Promise<void> {
     const distFromCenter = Math.sqrt(
       (node.x - CX) ** 2 + (node.y - CY) ** 2,
     );
-    const ringRadius = distFromCenter + 120;
+    const ringRadius = distFromCenter + 380;
     const arcSpan =
       newPubkeys.length === 1
         ? 0
-        : Math.min(Math.PI * 0.8, newPubkeys.length * 0.15);
+        : Math.min(Math.PI * 1.6, newPubkeys.length * 0.12);
     const startAngle = parentAngle - arcSpan / 2;
     const positions = placeRing(
       newPubkeys,
@@ -438,9 +439,10 @@ export async function renderWot(container: HTMLElement): Promise<void> {
   selectedPubkey = null;
   avatarCache.clear();
   expandedByHop.clear();
-  panX = 0;
-  panY = 0;
-  zoom = 1;
+  // Start zoomed out and centered so the whole graph fits on screen
+  zoom = 0.35;
+  panX = LOGICAL_W * 0.5 * (1 - zoom);
+  panY = LOGICAL_H * 0.5 * (1 - zoom);
   isPanning = false;
 
   container.className = "main-content";
