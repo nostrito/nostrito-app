@@ -776,8 +776,21 @@ impl Database {
         Ok(deleted as u64)
     }
 
+    /// Get the Tier 2 sync cursor (wall-clock timestamp of last successful sync).
+    /// Stored in app_config under key "tier2_since".
+    pub fn get_sync_cursor(&self) -> Result<Option<u64>> {
+        match self.get_config("tier2_since")? {
+            Some(val) => Ok(val.parse::<u64>().ok()),
+            None => Ok(None),
+        }
+    }
+
+    /// Set the Tier 2 sync cursor to a wall-clock timestamp.
+    pub fn set_sync_cursor(&self, ts: u64) -> Result<()> {
+        self.set_config("tier2_since", &ts.to_string())
+    }
+
     /// Get the latest created_at timestamp from stored nostr events.
-    /// Used by Tier 2 sync to avoid re-fetching already-stored events.
     pub fn get_latest_event_timestamp(&self) -> Result<Option<u64>> {
         let conn = self.conn.lock().unwrap();
         let result: i64 = conn.query_row(

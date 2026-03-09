@@ -622,17 +622,18 @@ impl SyncEngine {
 
         info!("Tier 2: {} follows to fetch", follows.len());
 
-        // Use the latest stored event timestamp as `since` for incremental sync.
-        // Falls back to `now - lookback_days` on first run or empty DB.
-        let lookback_floor = chrono::Utc::now()
-            .checked_sub_signed(chrono::Duration::days(self.sync_config.lookback_days as i64))
-            .unwrap()
-            .timestamp() as u64;
+        // Use a wall-clock sync cursor for incremental sync.
+        // The cursor records when the last successful Tier 2 sync completed,
+        // NOT the event creation time (which can be arbitrary).
+        // Falls back to `now - lookback_days` on first run or stale cursor.
+        let now_epoch = chrono::Utc::now().timestamp() as u64;
+        let lookback_floor = now_epoch - (self.sync_config.lookback_days as u64 * 86400);
 
-        let since_ts = match self.db.get_latest_event_timestamp() {
-            Ok(Some(latest)) if latest > lookback_floor => {
-                info!("Tier 2: Using incremental since={} (latest stored event)", latest);
-                latest
+        let cursor = self.db.get_sync_cursor().unwrap_or(None);
+        let since_ts = match cursor {
+            Some(ts) if ts > lookback_floor => {
+                info!("Tier 2: Using sync cursor since={} (last sync wall-clock)", ts);
+                ts
             }
             _ => {
                 info!("Tier 2: Using lookback floor since={} ({}d ago)", lookback_floor, self.sync_config.lookback_days);
@@ -769,6 +770,13 @@ impl SyncEngine {
         // Disconnect once at the end
         client.disconnect().await.ok();
         info!("Tier 2: Disconnected persistent client");
+
+        // Update sync cursor to wall-clock now minus 60s overlap buffer.
+        // This ensures the next sync picks up from where we left off,
+        // with a small overlap to avoid missing edge-case events.
+        let cursor_ts = chrono::Utc::now().timestamp() as u64;
+        self.db.set_sync_cursor(cursor_ts.saturating_sub(60)).ok();
+        info!("Tier 2: Updated sync cursor to {}", cursor_ts.saturating_sub(60));
 
         {
             let mut stats = self.sync_stats.write().await;
