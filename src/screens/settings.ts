@@ -1,6 +1,7 @@
 /** Settings — app configuration. Loads real data via get_settings/save_settings. */
 
 import { invoke } from "@tauri-apps/api/core";
+import { RELAYS, resolveRelayUrl, urlToAlias } from "../relays";
 
 interface Settings {
   npub: string;
@@ -19,13 +20,6 @@ interface Settings {
   sync_relay_min_interval_secs: number;
   sync_wot_batch_size: number;
   sync_wot_events_per_batch: number;
-}
-
-interface RelayStatusInfo {
-  url: string;
-  name: string;
-  connected: boolean;
-  latency_ms: number | null;
 }
 
 function escapeHtml(str: string): string {
@@ -71,8 +65,10 @@ export function renderSettings(container: HTMLElement): void {
         <!-- Relays -->
         <div class="settings-pane" id="pane-relays">
           <div class="settings-pane-title">Relays</div>
-          <div class="settings-pane-desc">Manage relay connections.</div>
-          <div id="settings-relay-list">Loading relays...</div>
+          <div class="settings-pane-desc">Pick which relays to sync from. Changes take effect after saving.</div>
+          <div id="settings-relay-grid" class="relay-grid" style="margin-bottom:16px"></div>
+          <button class="btn btn-primary" id="btn-save-relays" style="width:100%">Save Relays</button>
+          <div id="relay-save-result" style="margin-top:8px;font-size:0.78rem;text-align:center"></div>
         </div>
         <!-- WoT Settings -->
         <div class="settings-pane" id="pane-wot-settings">
@@ -393,6 +389,38 @@ export function renderSettings(container: HTMLElement): void {
     }
   });
 
+  // Wire relay save button
+  document.getElementById("btn-save-relays")?.addEventListener("click", async () => {
+    const resultEl = document.getElementById("relay-save-result");
+    const btn = document.getElementById("btn-save-relays") as HTMLButtonElement | null;
+    if (!_currentSettings || !btn) return;
+
+    if (_selectedRelayAliases.size === 0) {
+      if (resultEl) resultEl.innerHTML = `<span style="color:#ef4444">Select at least one relay</span>`;
+      return;
+    }
+
+    const outboundRelays = Array.from(_selectedRelayAliases).map(resolveRelayUrl);
+    const updated: Settings = { ..._currentSettings, outbound_relays: outboundRelays };
+
+    btn.disabled = true;
+    btn.textContent = "Saving...";
+    if (resultEl) resultEl.innerHTML = "";
+
+    try {
+      await invoke("save_settings", { settings: updated });
+      _currentSettings = updated;
+      await invoke("restart_sync");
+      btn.textContent = "Save Relays";
+      btn.disabled = false;
+      if (resultEl) resultEl.innerHTML = `<span style="color:#34d399">✅ Relays saved — sync restarted</span>`;
+    } catch (e) {
+      btn.textContent = "Save Relays";
+      btn.disabled = false;
+      if (resultEl) resultEl.innerHTML = `<span style="color:#ef4444">Failed: ${e}</span>`;
+    }
+  });
+
   // ── Sync pane: sliders, presets, save ──
 
   const SYNC_PRESETS: Record<string, { lookback: number; batchSize: number; eventsPerBatch: number; batchPause: number; relayInterval: number; wotBatch: number; wotEvents: number }> = {
@@ -486,6 +514,7 @@ export function renderSettings(container: HTMLElement): void {
 }
 
 let _currentSettings: Settings | null = null;
+let _selectedRelayAliases: Set<string> = new Set();
 
 async function loadSettings(): Promise<void> {
   try {
@@ -499,38 +528,44 @@ async function loadSettings(): Promise<void> {
       npubEl.textContent = settings.npub || "Not configured";
     }
 
-    // Relays — from real config
-    const relayListEl = document.getElementById("settings-relay-list");
-    if (relayListEl) {
-      if (settings.outbound_relays.length === 0) {
-        relayListEl.innerHTML = `<div style="color:var(--text-muted);font-size:0.85rem">No relays configured</div>`;
-      } else {
-        // Try to get relay status for latency info
-        let relayStatus: RelayStatusInfo[] = [];
-        try {
-          console.log("[settings] Calling get_relay_status...");
-          relayStatus = await invoke<RelayStatusInfo[]>("get_relay_status");
-          console.log("[settings] get_relay_status response:", relayStatus.length, "relays");
-        } catch (_) {}
+    // Relays — card grid picker
+    const relayGridEl = document.getElementById("settings-relay-grid");
+    if (relayGridEl) {
+      // Convert stored wss:// URLs to alias set for pre-selection
+      const activeAliases = new Set<string>();
+      for (const url of settings.outbound_relays) {
+        const alias = urlToAlias(url);
+        if (alias) activeAliases.add(alias);
+      }
 
-        const statusMap = new Map(relayStatus.map((r) => [r.url, r]));
+      // Track selected relays in module scope for the save button
+      _selectedRelayAliases = new Set(activeAliases);
 
-        relayListEl.innerHTML = settings.outbound_relays
-          .map((url) => {
-            const info = statusMap.get(url);
-            const name = info?.name || url.replace("wss://", "").replace("ws://", "");
-            const latency = info?.latency_ms != null ? `${info.latency_ms}ms` : "";
-            return `
-              <div class="settings-field">
-                <div class="settings-field-info">
-                  <span class="settings-field-label">${escapeHtml(name)}</span>
-                  <span class="settings-field-desc">${escapeHtml(url)}${latency ? ` · ${latency}` : ""}</span>
-                </div>
-                <label class="toggle"><input type="checkbox" checked><span class="toggle-slider"></span></label>
-              </div>
-            `;
-          })
-          .join("");
+      relayGridEl.innerHTML = "";
+      for (const relay of RELAYS) {
+        const isOn = activeAliases.has(relay.id);
+        const card = document.createElement("div");
+        card.className = `relay-card${isOn ? " selected" : ""}`;
+        card.setAttribute("data-relay", relay.id);
+        card.innerHTML = `
+          <div class="relay-card-info">
+            <span class="relay-card-name">${escapeHtml(relay.name)}</span>
+            <span class="relay-card-desc">${escapeHtml(relay.description)}</span>
+          </div>
+          <div class="relay-check">${isOn ? "✓" : ""}</div>
+        `;
+        card.addEventListener("click", () => {
+          const selected = _selectedRelayAliases.has(relay.id);
+          if (selected) {
+            _selectedRelayAliases.delete(relay.id);
+          } else {
+            _selectedRelayAliases.add(relay.id);
+          }
+          card.classList.toggle("selected");
+          const check = card.querySelector(".relay-check")!;
+          check.textContent = _selectedRelayAliases.has(relay.id) ? "✓" : "";
+        });
+        relayGridEl.appendChild(card);
       }
     }
 

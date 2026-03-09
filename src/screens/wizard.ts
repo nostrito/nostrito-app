@@ -4,6 +4,7 @@
 
 import { showAppShell } from "../app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { RELAYS } from "../relays";
 
 export interface WizardConfig {
   identityMode: "readonly" | "full";
@@ -17,24 +18,6 @@ export interface WizardConfig {
     cleanupPolicy: "oldest" | "least-interacted";
   };
 }
-
-interface RelayOption {
-  id: string;
-  name: string;
-  description: string;
-  defaultOn: boolean;
-}
-
-const RELAYS: RelayOption[] = [
-  { id: "primal", name: "primal", description: "Fast global relay", defaultOn: true },
-  { id: "damus", name: "damus", description: "iOS community hub", defaultOn: true },
-  { id: "nos", name: "nos", description: "Curated social relay", defaultOn: false },
-  { id: "snort", name: "snort", description: "Web client relay", defaultOn: false },
-  { id: "coracle", name: "coracle", description: "Discovery-focused", defaultOn: false },
-  { id: "nostr.wine", name: "nostr.wine", description: "Premium paid relay", defaultOn: true },
-  { id: "amethyst", name: "amethyst", description: "Android community", defaultOn: false },
-  { id: "yakihonne", name: "yakihonne", description: "Long-form content", defaultOn: true },
-];
 
 const STEP_LABELS = ["Identity", "Relays", "Storage"];
 
