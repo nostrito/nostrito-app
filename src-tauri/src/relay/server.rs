@@ -524,6 +524,20 @@ async fn serve_http(
     )
     .await;
 
+    write_nip11_response(&mut stream, port, hex_pubkey, accept_nostr_json, false).await
+}
+
+/// Write a NIP-11 HTTP response (JSON or HTML) to any async stream.
+/// Shared by both plain HTTP (`serve_http`) and HTTPS/TLS code paths.
+async fn write_nip11_response(
+    stream: &mut (impl AsyncWriteExt + Unpin),
+    port: u16,
+    hex_pubkey: &str,
+    accept_nostr_json: bool,
+    use_tls: bool,
+) -> Result<()> {
+    let ws_scheme = if use_tls { "wss" } else { "ws" };
+
     if accept_nostr_json {
         // NIP-11 JSON relay information document
         let body = serde_json::json!({
@@ -585,7 +599,7 @@ async fn serve_http(
 <body>
   <div class="card">
     <div class="logo">🌶️ nos<span>trito</span></div>
-    <div class="badge">Live — wss://localhost:{port}</div>
+    <div class="badge">Live — {ws_scheme}://localhost:{port}</div>
 
     <h2>Relay Info</h2>
     <div class="row"><span class="label">Name</span><span class="value">nostrito relay</span></div>
@@ -600,12 +614,13 @@ async fn serve_http(
     </div>
 
     <div class="cta">
-      Connect with <strong>wss://localhost:{port}</strong> in Damus, Amethyst, or any Nostr client.<br><br>
+      Connect with <strong>{ws_scheme}://localhost:{port}</strong> in Damus, Amethyst, or any Nostr client.<br><br>
       <a href="https://nostrito.fabri.lat">Learn more about nostrito →</a>
     </div>
   </div>
 </body>
 </html>"#,
+            ws_scheme = ws_scheme,
             port = port,
             pubkey_display = pubkey_display,
         );
