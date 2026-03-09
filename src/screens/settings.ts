@@ -531,11 +531,17 @@ async function loadSettings(): Promise<void> {
     // Relays — card grid picker
     const relayGridEl = document.getElementById("settings-relay-grid");
     if (relayGridEl) {
-      // Convert stored wss:// URLs to alias set for pre-selection
+      // Convert stored relays to alias set for pre-selection
+      // Handles BOTH short aliases (e.g. "primal") and wss:// URLs
       const activeAliases = new Set<string>();
-      for (const url of settings.outbound_relays) {
-        const alias = urlToAlias(url);
-        if (alias) activeAliases.add(alias);
+      for (const relay of settings.outbound_relays) {
+        const isAlias = RELAYS.some(r => r.id === relay);
+        if (isAlias) {
+          activeAliases.add(relay);
+        } else {
+          const alias = urlToAlias(relay);
+          if (alias) activeAliases.add(alias);
+        }
       }
 
       // Track selected relays in module scope for the save button

@@ -61,9 +61,10 @@ impl Default for AppConfig {
             wot_max_depth: 3,
             sync_interval_secs: 300,
             outbound_relays: vec![
+                "wss://relay.primal.net".into(),
                 "wss://relay.damus.io".into(),
-                "wss://nos.lol".into(),
-                "wss://relay.nostr.band".into(),
+                "wss://nostr.wine".into(),
+                "wss://relay.yakihonne.com".into(),
             ],
             auto_start: true,
             storage_others_gb: 5.0,
