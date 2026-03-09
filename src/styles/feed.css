@@ -2,7 +2,6 @@
 .feed-filters {
   display: flex;
   gap: 0;
-  border-bottom: 1px solid var(--border);
 }
 .feed-filter {
   padding: 12px 20px;
@@ -18,6 +17,70 @@
 .feed-filter.active {
   color: var(--accent-light);
   border-bottom-color: var(--accent);
+}
+
+/* Feed header row — filters + search */
+.feed-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border);
+}
+
+/* Search bar */
+.feed-search-wrap {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  position: relative;
+  padding: 6px 12px 6px 0;
+}
+.feed-search-input {
+  width: 220px;
+  padding: 7px 32px 7px 12px;
+  font-size: 0.8rem;
+  font-family: var(--font);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  outline: none;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+.feed-search-input::placeholder {
+  color: var(--text-muted);
+}
+.feed-search-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-glow);
+}
+.feed-search-clear {
+  position: absolute;
+  right: 16px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 0.85rem;
+  padding: 2px 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 0.15s;
+}
+.feed-search-clear:hover {
+  color: var(--text);
+}
+
+/* Search status line */
+.feed-search-status {
+  padding: 8px 20px;
+  font-size: 0.78rem;
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--border);
+  background: var(--accent-glow);
 }
 
 /* Event actions */
@@ -425,6 +488,17 @@
 /* ── Responsive ─────────────────────────────────────────── */
 
 @media (max-width: 640px) {
+  .feed-header-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .feed-search-wrap {
+    padding: 6px 12px;
+  }
+  .feed-search-input {
+    width: 100%;
+  }
+
   .article-cards-grid {
     grid-template-columns: 1fr;
     padding: 12px;

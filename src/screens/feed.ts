@@ -272,18 +272,49 @@ let feedLoading = false;
 const renderedEventIds = new Set<string>();
 let feedEvents: NostrEvent[] = [];
 let feedProfileMap: Map<string, ProfileInfo> = new Map();
+let searchDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+let isSearchActive = false;
+
+/** Resolve NIP-05 identifier (name@domain) to hex pubkey */
+async function resolveNip05(nip05: string): Promise<string | null> {
+  const parts = nip05.split("@");
+  if (parts.length !== 2) return null;
+  const [name, domain] = parts;
+  try {
+    const resp = await fetch(`https://${domain}/.well-known/nostr.json?name=${encodeURIComponent(name)}`);
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    const pubkey = data?.names?.[name];
+    return typeof pubkey === "string" ? pubkey : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Check if input looks like a NIP-05 identifier */
+function isNip05(input: string): boolean {
+  return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(input);
+}
 
 export function renderFeed(container: HTMLElement): void {
   renderedEventIds.clear();
+  isSearchActive = false;
   initMediaViewer();
   container.className = "main-content";
   container.innerHTML = `
-    <div class="feed-filters">
-      <div class="feed-filter active" data-filter="all">All</div>
-      <div class="feed-filter" data-filter="note">Notes</div>
-      <div class="feed-filter" data-filter="long-form">Long-form</div>
-      <div class="feed-filter" data-filter="repost">Reposts</div>
+    <div class="feed-header-row">
+      <div class="feed-filters">
+        <div class="feed-filter active" data-filter="all">All</div>
+        <div class="feed-filter" data-filter="note">Notes</div>
+        <div class="feed-filter" data-filter="long-form">Long-form</div>
+        <div class="feed-filter" data-filter="repost">Reposts</div>
+      </div>
+      <div class="feed-search-wrap">
+        <input type="text" class="feed-search-input" placeholder="Search notes, npub, name@domain…" id="feed-search" />
+        <button class="feed-search-clear" id="feed-search-clear" style="display:none">✕</button>
+      </div>
     </div>
+    <div id="feed-search-status" class="feed-search-status" style="display:none"></div>
     <div id="feedList">
       <div class="event-card" style="justify-content:center;color:var(--text-muted);padding:32px;">Loading events...</div>
     </div>
@@ -328,8 +359,119 @@ export function renderFeed(container: HTMLElement): void {
     });
   });
 
+  // Wire search input
+  const searchInput = container.querySelector("#feed-search") as HTMLInputElement;
+  const searchClear = container.querySelector("#feed-search-clear") as HTMLButtonElement;
+  const searchStatus = container.querySelector("#feed-search-status") as HTMLElement;
+
+  if (searchInput) {
+    searchInput.addEventListener("input", () => {
+      const val = searchInput.value.trim();
+      searchClear.style.display = val ? "flex" : "none";
+
+      if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+
+      if (!val) {
+        // Revert to normal feed
+        isSearchActive = false;
+        searchStatus.style.display = "none";
+        renderedEventIds.clear();
+        const feedEl = container.querySelector("#feedList");
+        if (feedEl) feedEl.innerHTML = `<div class="event-card" style="justify-content:center;color:var(--text-muted);padding:32px;">Loading events...</div>`;
+        loadEvents(container);
+        return;
+      }
+
+      searchDebounceTimer = setTimeout(() => {
+        performSearch(val, container);
+      }, 300);
+    });
+
+    searchClear.addEventListener("click", () => {
+      searchInput.value = "";
+      searchClear.style.display = "none";
+      isSearchActive = false;
+      searchStatus.style.display = "none";
+      renderedEventIds.clear();
+      const feedEl = container.querySelector("#feedList");
+      if (feedEl) feedEl.innerHTML = `<div class="event-card" style="justify-content:center;color:var(--text-muted);padding:32px;">Loading events...</div>`;
+      loadEvents(container);
+    });
+  }
+
   loadEvents(container);
 }
+
+async function performSearch(query: string, container: HTMLElement): Promise<void> {
+  const searchStatus = container.querySelector("#feed-search-status") as HTMLElement;
+  const feedEl = container.querySelector("#feedList");
+  if (!feedEl) return;
+
+  isSearchActive = true;
+  searchStatus.style.display = "block";
+  searchStatus.textContent = "Searching…";
+
+  let searchQuery = query;
+
+  // NIP-05 resolution
+  if (isNip05(query)) {
+    searchStatus.textContent = `Resolving ${query}…`;
+    const resolved = await resolveNip05(query);
+    if (resolved) {
+      searchQuery = resolved; // Use hex pubkey
+    } else {
+      searchStatus.textContent = `Could not resolve ${query}`;
+      feedEl.innerHTML = `<div class="event-card" style="justify-content:center;color:var(--text-muted);padding:32px;">No results — NIP-05 resolution failed</div>`;
+      return;
+    }
+  }
+
+  try {
+    const results = await invoke<NostrEvent[]>("search_events", { query: searchQuery, limit: 50 });
+
+    searchStatus.textContent = `${results.length} result${results.length !== 1 ? "s" : ""} for "${query}"`;
+
+    if (results.length === 0) {
+      feedEl.innerHTML = `<div class="event-card" style="justify-content:center;color:var(--text-muted);padding:32px;">No events found</div>`;
+      return;
+    }
+
+    const pubkeys = [...new Set(results.map((e) => e.pubkey))];
+    const profileMap = await getProfiles(pubkeys);
+    feedProfileMap = profileMap;
+
+    const articles = results.filter((e) => e.kind === 30023);
+    const notes = results.filter((e) => e.kind !== 30023);
+
+    feedEvents = [...results];
+
+    let html = "";
+
+    if (articles.length > 0) {
+      html += `<div class="article-cards-grid">`;
+      html += articles.map((e) => renderArticleCard(e, profileMap.get(e.pubkey))).join("");
+      html += `</div>`;
+    }
+
+    html += notes
+      .map((e) => renderEventCard(e, profileMap.get(e.pubkey)))
+      .filter((h) => h.trim() !== "")
+      .join("");
+
+    feedEl.innerHTML = html;
+
+    // Wire article click handlers
+    feedEl.querySelectorAll(".article-card").forEach((card) => {
+      card.addEventListener("click", () => {
+        const eventId = (card as HTMLElement).dataset.eventId;
+        const event = feedEvents.find((e) => e.id === eventId);
+        if (event) openArticleReader(event, feedProfileMap.get(event.pubkey));
+      });
+    });
+  } catch (err) {
+    searchStatus.textContent = "Search failed";
+    feedEl.innerHTML = `<div class="event-card" style="justify-content:center;color:var(--text-muted);padding:32px;">Search error</div>`;
+  }
 
 async function loadEvents(container: HTMLElement): Promise<void> {
   if (feedLoading) return;
