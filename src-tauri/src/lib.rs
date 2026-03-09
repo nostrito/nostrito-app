@@ -49,6 +49,7 @@ pub struct AppConfig {
     pub sync_relay_min_interval_secs: u32,
     pub sync_wot_batch_size: u32,
     pub sync_wot_events_per_batch: u32,
+    pub max_event_age_days: u32,
 }
 
 impl Default for AppConfig {
@@ -76,6 +77,7 @@ impl Default for AppConfig {
             sync_relay_min_interval_secs: 3,
             sync_wot_batch_size: 5,
             sync_wot_events_per_batch: 15,
+            max_event_age_days: 30,
         }
     }
 }
@@ -121,6 +123,8 @@ pub struct FeedFilter {
     pub limit: Option<u32>,
     pub since: Option<u64>,
     pub wot_only: Option<bool>,
+    pub search: Option<String>,
+    pub author: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -149,6 +153,7 @@ pub struct Settings {
     pub sync_relay_min_interval_secs: u32,
     pub sync_wot_batch_size: u32,
     pub sync_wot_events_per_batch: u32,
+    pub max_event_age_days: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -291,6 +296,7 @@ async fn init_nostrito(
         config.storage_media_gb,
         config.storage_others_gb,
         sync_config,
+        config.max_event_age_days,
     ));
 
     let cancel = sync_engine.start();
@@ -469,6 +475,7 @@ async fn start_sync(
         config.storage_media_gb,
         config.storage_others_gb,
         sync_config,
+        config.max_event_age_days,
     ));
 
     let cancel = sync_engine.start();
@@ -528,6 +535,7 @@ async fn restart_sync(state: State<'_, AppState>, app_handle: tauri::AppHandle) 
         config.storage_media_gb,
         config.storage_others_gb,
         sync_config,
+        config.max_event_age_days,
     ));
     drop(config);
 
@@ -559,6 +567,59 @@ async fn get_feed(filter: FeedFilter, state: State<'_, AppState>) -> Result<Vec<
         })?;
 
     tracing::info!("[cmd:get_feed] returning {} events", events.len());
+
+    Ok(events
+        .into_iter()
+        .map(|(id, pubkey, created_at, kind, tags_json, content, sig)| {
+            let tags: Vec<Vec<String>> = serde_json::from_str(&tags_json).unwrap_or_default();
+            NostrEvent {
+                id,
+                pubkey,
+                created_at: created_at as u64,
+                kind: kind as u32,
+                tags,
+                content,
+                sig,
+            }
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn search_events(query: String, limit: Option<u32>, state: State<'_, AppState>) -> Result<Vec<NostrEvent>, String> {
+    tracing::info!("[cmd:search_events] query={:?}, limit={:?}", query, limit);
+    let lim = limit.unwrap_or(50);
+
+    // Determine if query is an npub/hex pubkey or a keyword search
+    let mut author_filter: Option<String> = None;
+    let mut keyword: Option<String> = None;
+
+    let trimmed = query.trim();
+
+    if trimmed.starts_with("npub1") {
+        // Decode npub to hex
+        use nostr_sdk::prelude::*;
+        match PublicKey::from_bech32(trimmed) {
+            Ok(pk) => { author_filter = Some(pk.to_hex()); },
+            Err(_) => { keyword = Some(trimmed.to_string()); },
+        }
+    } else if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        // Hex pubkey
+        author_filter = Some(trimmed.to_string());
+    } else {
+        // Keyword search
+        keyword = Some(trimmed.to_string());
+    }
+
+    let events = state
+        .db
+        .search_events(keyword.as_deref(), author_filter.as_deref(), lim)
+        .map_err(|e| {
+            tracing::error!("[cmd:search_events] query failed: {}", e);
+            format!("Search failed: {}", e)
+        })?;
+
+    tracing::info!("[cmd:search_events] returning {} events", events.len());
 
     Ok(events
         .into_iter()
@@ -819,6 +880,7 @@ async fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
         sync_relay_min_interval_secs: config.sync_relay_min_interval_secs,
         sync_wot_batch_size: config.sync_wot_batch_size,
         sync_wot_events_per_batch: config.sync_wot_events_per_batch,
+        max_event_age_days: config.max_event_age_days,
     })
 }
 
@@ -841,6 +903,7 @@ async fn save_settings(settings: Settings, state: State<'_, AppState>) -> Result
     config.sync_relay_min_interval_secs = settings.sync_relay_min_interval_secs;
     config.sync_wot_batch_size = settings.sync_wot_batch_size;
     config.sync_wot_events_per_batch = settings.sync_wot_events_per_batch;
+    config.max_event_age_days = settings.max_event_age_days;
 
     // Persist sync config to DB
     drop(config);
@@ -852,8 +915,34 @@ async fn save_settings(settings: Settings, state: State<'_, AppState>) -> Result
     db.set_config("sync_relay_min_interval_secs", &settings.sync_relay_min_interval_secs.to_string()).ok();
     db.set_config("sync_wot_batch_size", &settings.sync_wot_batch_size.to_string()).ok();
     db.set_config("sync_wot_events_per_batch", &settings.sync_wot_events_per_batch.to_string()).ok();
+    db.set_config("max_event_age_days", &settings.max_event_age_days.to_string()).ok();
 
     Ok(())
+}
+
+#[tauri::command]
+async fn track_profile(pubkey: String, note: Option<String>, state: State<'_, AppState>) -> Result<(), String> {
+    tracing::info!("[cmd:track_profile] pubkey={}...", &pubkey[..pubkey.len().min(12)]);
+    state.db.track_profile(&pubkey, note.as_deref()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn untrack_profile(pubkey: String, state: State<'_, AppState>) -> Result<(), String> {
+    tracing::info!("[cmd:untrack_profile] pubkey={}...", &pubkey[..pubkey.len().min(12)]);
+    state.db.untrack_profile(&pubkey).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_tracked_profiles(state: State<'_, AppState>) -> Result<Vec<serde_json::Value>, String> {
+    tracing::debug!("[cmd:get_tracked_profiles] called");
+    let profiles = state.db.get_tracked_profiles().map_err(|e| e.to_string())?;
+    Ok(profiles.into_iter().map(|(pubkey, tracked_at, note)| {
+        serde_json::json!({
+            "pubkey": pubkey,
+            "tracked_at": tracked_at,
+            "note": note,
+        })
+    }).collect())
 }
 
 #[tauri::command]
@@ -1075,6 +1164,7 @@ pub fn run() {
     if let Ok(Some(v)) = db.get_config("sync_relay_min_interval_secs") { if let Ok(n) = v.parse::<u32>() { config.sync_relay_min_interval_secs = n; } }
     if let Ok(Some(v)) = db.get_config("sync_wot_batch_size") { if let Ok(n) = v.parse::<u32>() { config.sync_wot_batch_size = n; } }
     if let Ok(Some(v)) = db.get_config("sync_wot_events_per_batch") { if let Ok(n) = v.parse::<u32>() { config.sync_wot_events_per_batch = n; } }
+    if let Ok(Some(v)) = db.get_config("max_event_age_days") { if let Ok(n) = v.parse::<u32>() { config.max_event_age_days = n; } }
 
     tracing::info!("[init] Config: npub={:?}, relays={:?}, port={}", config.npub, config.outbound_relays, config.relay_port);
 
@@ -1124,6 +1214,7 @@ pub fn run() {
                     let cfg2 = config.read().await;
                     let media_gb = cfg2.storage_media_gb;
                     let others_gb = cfg2.storage_others_gb;
+                    let max_age_days = cfg2.max_event_age_days;
                     let sync_config = SyncConfig {
                         lookback_days: cfg2.sync_lookback_days,
                         batch_size: cfg2.sync_batch_size,
@@ -1146,6 +1237,7 @@ pub fn run() {
                         media_gb,
                         others_gb,
                         sync_config,
+                        max_age_days,
                     ));
 
                     let cancel = sync_engine.start();
@@ -1215,6 +1307,7 @@ pub fn run() {
             get_profiles_batch,
             get_wot_distance,
             get_feed,
+            search_events,
             get_storage_stats,
             get_settings,
             save_settings,
@@ -1234,6 +1327,9 @@ pub fn run() {
             check_browser_integration,
             get_media_stats,
             restart_sync,
+            track_profile,
+            untrack_profile,
+            get_tracked_profiles,
         ])
         .run(tauri::generate_context!())
         .expect("error while running nostrito");

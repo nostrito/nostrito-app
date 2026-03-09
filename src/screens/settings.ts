@@ -134,6 +134,40 @@ export function renderSettings(container: HTMLElement): void {
             </div>
           </div>
 
+          <div class="storage-section">
+            <div class="storage-row">
+              <div class="storage-row-info">
+                <span class="storage-row-label">Event retention</span>
+                <span class="storage-row-meta">How long to keep others' events. Own events and tracked profiles are kept forever.</span>
+              </div>
+              <div class="storage-slider-wrap">
+                <input type="range" class="storage-slider" min="7" max="365" step="1" value="30" id="storage-max-age">
+                <span class="storage-slider-value" id="storage-max-age-val">30 days</span>
+              </div>
+              <div style="display:flex;gap:8px;margin-top:8px">
+                <button class="btn btn-secondary age-preset" data-days="7" style="font-size:0.75rem;padding:4px 10px">7d</button>
+                <button class="btn btn-secondary age-preset" data-days="14" style="font-size:0.75rem;padding:4px 10px">14d</button>
+                <button class="btn btn-secondary age-preset" data-days="30" style="font-size:0.75rem;padding:4px 10px">30d</button>
+                <button class="btn btn-secondary age-preset" data-days="90" style="font-size:0.75rem;padding:4px 10px">90d</button>
+                <button class="btn btn-secondary age-preset" data-days="365" style="font-size:0.75rem;padding:4px 10px">1yr</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="storage-section">
+            <div class="storage-row">
+              <div class="storage-row-info">
+                <span class="storage-row-label">Tracked Profiles</span>
+                <span class="storage-row-meta">These profiles are always kept — no age limit, never pruned. Perfect for important follows.</span>
+              </div>
+              <div id="tracked-profiles-list" style="margin:8px 0;font-size:0.82rem;color:var(--text-dim)">Loading...</div>
+              <div style="display:flex;gap:8px;margin-top:8px">
+                <input type="text" id="track-profile-input" placeholder="npub or hex pubkey" style="flex:1;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:0.82rem;font-family:var(--mono)">
+                <button class="btn btn-primary" id="btn-track-profile" style="font-size:0.82rem;padding:8px 16px">Track</button>
+              </div>
+            </div>
+          </div>
+
           <button class="btn btn-primary" id="btn-save-storage" style="margin-top:16px;width:100%">Save Storage Settings</button>
           <div id="storage-save-result" style="margin-top:8px;font-size:0.78rem;text-align:center"></div>
         </div>
@@ -322,6 +356,40 @@ export function renderSettings(container: HTMLElement): void {
     });
   }
 
+  // Wire event retention slider
+  const ageSlider = document.getElementById("storage-max-age") as HTMLInputElement | null;
+  const ageVal = document.getElementById("storage-max-age-val");
+  if (ageSlider && ageVal) {
+    ageSlider.addEventListener("input", () => {
+      ageVal.textContent = `${ageSlider.value} days`;
+    });
+  }
+
+  // Wire age preset buttons
+  container.querySelectorAll(".age-preset").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const days = (btn as HTMLElement).dataset.days;
+      if (days && ageSlider && ageVal) {
+        ageSlider.value = days;
+        ageVal.textContent = `${days} days`;
+      }
+    });
+  });
+
+  // Wire track profile button
+  document.getElementById("btn-track-profile")?.addEventListener("click", async () => {
+    const input = document.getElementById("track-profile-input") as HTMLInputElement | null;
+    if (!input || !input.value.trim()) return;
+    const pubkey = input.value.trim();
+    try {
+      await invoke("track_profile", { pubkey, note: null });
+      input.value = "";
+      loadTrackedProfiles();
+    } catch (e) {
+      console.error("[settings] track_profile failed:", e);
+    }
+  });
+
   // Wire danger zone buttons
   document.getElementById("btn-reset-app")?.addEventListener("click", async () => {
     if (confirm("Are you sure? This will delete ALL data and return to the setup wizard.")) {
@@ -366,10 +434,12 @@ export function renderSettings(container: HTMLElement): void {
     const evSliderEl = document.getElementById("settings-others-events-slider") as HTMLInputElement;
     const mdSliderEl = document.getElementById("settings-others-media-slider") as HTMLInputElement;
 
+    const ageSliderSave = document.getElementById("storage-max-age") as HTMLInputElement;
     const updated = {
       ..._currentSettings,
       storage_others_gb: parseFloat(evSliderEl.value),
       storage_media_gb: parseFloat(mdSliderEl.value),
+      max_event_age_days: parseInt(ageSliderSave?.value || "30", 10),
     };
 
     btn.disabled = true;
@@ -516,6 +586,41 @@ export function renderSettings(container: HTMLElement): void {
 let _currentSettings: Settings | null = null;
 let _selectedRelayAliases: Set<string> = new Set();
 
+async function loadTrackedProfiles(): Promise<void> {
+  const listEl = document.getElementById("tracked-profiles-list");
+  if (!listEl) return;
+  try {
+    const profiles = await invoke<Array<{ pubkey: string; tracked_at: number; note: string | null }>>("get_tracked_profiles");
+    if (profiles.length === 0) {
+      listEl.innerHTML = `<div style="color:var(--text-muted);font-size:0.78rem;padding:4px 0">No tracked profiles yet.</div>`;
+      return;
+    }
+    listEl.innerHTML = profiles.map(p => {
+      const short = p.pubkey.length > 16 ? p.pubkey.slice(0, 8) + "…" + p.pubkey.slice(-8) : p.pubkey;
+      const noteHtml = p.note ? ` <span style="color:var(--text-muted);font-size:0.72rem">(${p.note})</span>` : "";
+      return `<div style="display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border)">
+        <span style="font-family:var(--mono);font-size:0.78rem" title="${p.pubkey}">${short}${noteHtml}</span>
+        <button class="btn-untrack" data-pubkey="${p.pubkey}" style="font-size:0.72rem;padding:2px 8px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--text-dim);cursor:pointer">Untrack</button>
+      </div>`;
+    }).join("");
+    listEl.querySelectorAll(".btn-untrack").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const pk = (btn as HTMLElement).dataset.pubkey;
+        if (!pk) return;
+        try {
+          await invoke("untrack_profile", { pubkey: pk });
+          loadTrackedProfiles();
+        } catch (e) {
+          console.error("[settings] untrack_profile failed:", e);
+        }
+      });
+    });
+  } catch (e) {
+    listEl.innerHTML = `<div style="color:#ef4444;font-size:0.78rem">Failed to load tracked profiles</div>`;
+    console.error("[settings] get_tracked_profiles failed:", e);
+  }
+}
+
 async function loadSettings(): Promise<void> {
   try {
     console.log("[settings] Calling get_settings...");
@@ -603,6 +708,17 @@ async function loadSettings(): Promise<void> {
       mdSliderEl.value = String(Math.round(settings.storage_media_gb));
       mdValEl.textContent = `${Math.round(settings.storage_media_gb)} GB`;
     }
+
+    // Event retention slider
+    const ageSliderEl = document.getElementById("storage-max-age") as HTMLInputElement | null;
+    const ageValEl = document.getElementById("storage-max-age-val");
+    if (ageSliderEl && ageValEl) {
+      ageSliderEl.value = String(settings.max_event_age_days);
+      ageValEl.textContent = `${settings.max_event_age_days} days`;
+    }
+
+    // Load tracked profiles
+    loadTrackedProfiles();
 
     // Sync sliders
     const syncFields: [string, number, string][] = [

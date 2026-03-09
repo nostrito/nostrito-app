@@ -287,6 +287,7 @@ pub struct SyncEngine {
     storage_media_gb: f64,
     storage_others_gb: f64,
     sync_config: SyncConfig,
+    max_event_age_days: u32,
 }
 
 impl SyncEngine {
@@ -301,6 +302,7 @@ impl SyncEngine {
         storage_media_gb: f64,
         storage_others_gb: f64,
         sync_config: SyncConfig,
+        max_event_age_days: u32,
     ) -> Self {
         Self {
             graph,
@@ -314,6 +316,7 @@ impl SyncEngine {
             storage_media_gb,
             storage_others_gb,
             sync_config,
+            max_event_age_days,
         }
     }
 
@@ -809,18 +812,12 @@ impl SyncEngine {
         self.set_tier(SyncTier::Important);
         info!("Tier 2: Fetching recent events from follows");
 
-        // ── Storage pruning: enforce event storage limit ──
-        let storage_others_bytes = (self.storage_others_gb * 1024.0 * 1024.0 * 1024.0) as u64;
-        // Rough estimate: avg event is ~500 bytes
-        let max_events = (storage_others_bytes / 500).max(1000) as u32;
-        let current_count = self.db.event_count().unwrap_or(0);
-        if current_count > max_events as u64 {
-            let to_delete = (current_count - max_events as u64) as u32;
-            info!(
-                "Storage limit: {} events exceed max {} ({}GB), pruning {} oldest others' events",
-                current_count, max_events, self.storage_others_gb, to_delete + 100
-            );
-            self.db.delete_oldest_others_events(&self.hex_pubkey, to_delete + 100).ok(); // +100 buffer
+        // ── Storage pruning: time-based event retention ──
+        // Prune others' events older than max_event_age_days, respecting tracked profiles
+        let max_age_secs = self.max_event_age_days as u64 * 86400;
+        let pruned = self.db.prune_old_events(&self.hex_pubkey, max_age_secs).unwrap_or(0);
+        if pruned > 0 {
+            info!("Storage: pruned {} events older than {} days", pruned, self.max_event_age_days);
         }
 
         let follows = match self.graph.get_follows(&self.hex_pubkey) {

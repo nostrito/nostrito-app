@@ -117,6 +117,12 @@ impl Database {
                 pubkey TEXT NOT NULL,
                 queued_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             );
+
+            CREATE TABLE IF NOT EXISTS tracked_profiles (
+                pubkey TEXT PRIMARY KEY,
+                tracked_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                note TEXT
+            );
         "#,
         )?;
 
@@ -484,6 +490,65 @@ impl Database {
         Ok(rows)
     }
 
+    /// Search events by keyword in content and/or by author pubkey.
+    /// Returns feed-worthy kinds (1, 6, 30023) ordered by created_at DESC.
+    pub fn search_events(
+        &self,
+        keyword: Option<&str>,
+        author: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<(String, String, i64, i64, String, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+
+        let mut sql = String::from(
+            "SELECT id, pubkey, created_at, kind, tags, content, sig FROM nostr_events WHERE kind IN (1, 6, 30023)",
+        );
+        let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        if let Some(q) = keyword {
+            let idx = param_values.len() + 1;
+            sql.push_str(&format!(" AND content LIKE ?{}", idx));
+            param_values.push(Box::new(format!("%{}%", q)));
+        }
+
+        if let Some(author_pk) = author {
+            let idx = param_values.len() + 1;
+            sql.push_str(&format!(" AND pubkey = ?{}", idx));
+            param_values.push(Box::new(author_pk.to_string()));
+        }
+
+        sql.push_str(" ORDER BY created_at DESC");
+
+        {
+            let idx = param_values.len() + 1;
+            sql.push_str(&format!(" LIMIT ?{}", idx));
+            param_values.push(Box::new(limit as i64));
+        }
+
+        debug!("[db] search_events: keyword={:?}, author={:?}, limit={}", keyword, author, limit);
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(rows)
+    }
+
     /// Get event count
     pub fn event_count(&self) -> Result<u64> {
         let conn = self.conn.lock().unwrap();
@@ -669,6 +734,79 @@ impl Database {
         )?;
         info!("Database cleared — all data deleted");
         Ok(())
+    }
+
+    // ── Tracked Profiles ──────────────────────────────────────────
+
+    /// Track a profile — its events are never pruned.
+    pub fn track_profile(&self, pubkey: &str, note: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO tracked_profiles (pubkey, tracked_at, note) VALUES (?1, strftime('%s','now'), ?2)",
+            params![pubkey, note],
+        )?;
+        info!("[db] track_profile: {}", &pubkey[..std::cmp::min(12, pubkey.len())]);
+        Ok(())
+    }
+
+    /// Untrack a profile.
+    pub fn untrack_profile(&self, pubkey: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM tracked_profiles WHERE pubkey = ?1", params![pubkey])?;
+        info!("[db] untrack_profile: {}", &pubkey[..std::cmp::min(12, pubkey.len())]);
+        Ok(())
+    }
+
+    /// Check if a profile is tracked.
+    pub fn is_tracked(&self, pubkey: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM tracked_profiles WHERE pubkey = ?1",
+            params![pubkey],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Get all tracked profiles: (pubkey, tracked_at, note).
+    pub fn get_tracked_profiles(&self) -> Result<Vec<(String, i64, Option<String>)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT pubkey, tracked_at, note FROM tracked_profiles ORDER BY tracked_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Get just the tracked pubkeys (for pruning exclusion).
+    pub fn get_tracked_pubkeys(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT pubkey FROM tracked_profiles")?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Prune events older than max_age_secs, excluding own events and tracked profiles.
+    pub fn prune_old_events(&self, own_pubkey: &str, max_age_secs: u64) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let cutoff = chrono::Utc::now().timestamp() as i64 - max_age_secs as i64;
+        let deleted = conn.execute(
+            "DELETE FROM nostr_events WHERE created_at < ?1 AND pubkey != ?2 AND pubkey NOT IN (SELECT pubkey FROM tracked_profiles)",
+            params![cutoff, own_pubkey],
+        )?;
+        Ok(deleted as u64)
     }
 
     // ── Media Cache Methods ────────────────────────────────────────
