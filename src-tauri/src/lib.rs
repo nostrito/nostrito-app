@@ -12,7 +12,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use storage::{Database, ProfileInfo};
-use sync::{SyncEngine, SyncStats, SyncTier};
+use sync::{SyncConfig, SyncEngine, SyncStats, SyncTier};
 use wot::WotGraph;
 
 // ── App State ──────────────────────────────────────────────────────
@@ -41,6 +41,14 @@ pub struct AppConfig {
     pub auto_start: bool,
     pub storage_others_gb: f64,
     pub storage_media_gb: f64,
+    // Sync tuning
+    pub sync_lookback_days: u32,
+    pub sync_batch_size: u32,
+    pub sync_events_per_batch: u32,
+    pub sync_batch_pause_secs: u32,
+    pub sync_relay_min_interval_secs: u32,
+    pub sync_wot_batch_size: u32,
+    pub sync_wot_events_per_batch: u32,
 }
 
 impl Default for AppConfig {
@@ -60,6 +68,13 @@ impl Default for AppConfig {
             auto_start: true,
             storage_others_gb: 5.0,
             storage_media_gb: 2.0,
+            sync_lookback_days: 7,
+            sync_batch_size: 10,
+            sync_events_per_batch: 50,
+            sync_batch_pause_secs: 7,
+            sync_relay_min_interval_secs: 3,
+            sync_wot_batch_size: 5,
+            sync_wot_events_per_batch: 15,
         }
     }
 }
@@ -126,6 +141,13 @@ pub struct Settings {
     pub sync_interval_secs: u32,
     pub outbound_relays: Vec<String>,
     pub auto_start: bool,
+    pub sync_lookback_days: u32,
+    pub sync_batch_size: u32,
+    pub sync_events_per_batch: u32,
+    pub sync_batch_pause_secs: u32,
+    pub sync_relay_min_interval_secs: u32,
+    pub sync_wot_batch_size: u32,
+    pub sync_wot_events_per_batch: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -247,6 +269,15 @@ async fn init_nostrito(
 
     // Start tiered sync engine
     let config = state.config.read().await;
+    let sync_config = SyncConfig {
+        lookback_days: config.sync_lookback_days,
+        batch_size: config.sync_batch_size,
+        events_per_batch: config.sync_events_per_batch,
+        batch_pause_secs: config.sync_batch_pause_secs,
+        relay_min_interval_secs: config.sync_relay_min_interval_secs,
+        wot_batch_size: config.sync_wot_batch_size,
+        wot_events_per_batch: config.sync_wot_events_per_batch,
+    };
     let sync_engine = Arc::new(SyncEngine::new(
         state.wot_graph.clone(),
         state.db.clone(),
@@ -256,6 +287,7 @@ async fn init_nostrito(
         state.sync_stats.clone(),
         app_handle.clone(),
         config.storage_media_gb,
+        sync_config,
     ));
 
     let cancel = sync_engine.start();
@@ -323,6 +355,35 @@ async fn init_nostrito(
 }
 
 #[tauri::command]
+async fn get_follows(pubkey: String, state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    tracing::debug!("[cmd:get_follows] pubkey={}...", &pubkey[..pubkey.len().min(8)]);
+    match state.wot_graph.get_follows(&pubkey) {
+        Some(follows) => Ok(follows),
+        None => Ok(vec![]),
+    }
+}
+
+#[tauri::command]
+async fn get_profiles_batch(pubkeys: Vec<String>, state: State<'_, AppState>) -> Result<Vec<serde_json::Value>, String> {
+    tracing::debug!("[cmd:get_profiles_batch] called for {} pubkeys", pubkeys.len());
+    let profiles = state.db.get_profiles(&pubkeys).map_err(|e| e.to_string())?;
+    let map: std::collections::HashMap<String, _> = profiles.into_iter().map(|p| (p.pubkey.clone(), p)).collect();
+    let result = pubkeys.iter().map(|pk| {
+        if let Some(p) = map.get(pk) {
+            serde_json::json!({
+                "pubkey": pk,
+                "name": p.name,
+                "display_name": p.display_name,
+                "picture": p.picture,
+            })
+        } else {
+            serde_json::json!({ "pubkey": pk, "name": null, "display_name": null, "picture": null })
+        }
+    }).collect();
+    Ok(result)
+}
+
+#[tauri::command]
 async fn get_wot(state: State<'_, AppState>) -> Result<WotStatus, String> {
     tracing::debug!("[cmd:get_wot] called");
     let config = state.config.read().await;
@@ -384,6 +445,15 @@ async fn start_sync(
         .clone()
         .ok_or("Not initialized — no pubkey set")?;
 
+    let sync_config = SyncConfig {
+        lookback_days: config.sync_lookback_days,
+        batch_size: config.sync_batch_size,
+        events_per_batch: config.sync_events_per_batch,
+        batch_pause_secs: config.sync_batch_pause_secs,
+        relay_min_interval_secs: config.sync_relay_min_interval_secs,
+        wot_batch_size: config.sync_wot_batch_size,
+        wot_events_per_batch: config.sync_wot_events_per_batch,
+    };
     let sync_engine = Arc::new(SyncEngine::new(
         state.wot_graph.clone(),
         state.db.clone(),
@@ -393,6 +463,7 @@ async fn start_sync(
         state.sync_stats.clone(),
         app_handle,
         config.storage_media_gb,
+        sync_config,
     ));
 
     let cancel = sync_engine.start();
@@ -410,6 +481,53 @@ async fn stop_sync(state: State<'_, AppState>) -> Result<(), String> {
         state.sync_tier.store(SyncTier::Idle as u8, Ordering::Relaxed);
         tracing::info!("Sync engine stopped");
     }
+    Ok(())
+}
+
+#[tauri::command]
+async fn restart_sync(state: State<'_, AppState>, app_handle: tauri::AppHandle) -> Result<(), String> {
+    tracing::info!("[cmd:restart_sync] called");
+    // Cancel existing sync
+    if let Some(cancel) = state.sync_cancel.write().await.take() {
+        cancel.cancel();
+        state.sync_tier.store(SyncTier::Idle as u8, Ordering::Relaxed);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    // Read current config and restart
+    let config = state.config.read().await;
+    let hex_pubkey = match &config.hex_pubkey {
+        Some(pk) => pk.clone(),
+        None => return Ok(()), // not initialized yet
+    };
+
+    let sync_config = SyncConfig {
+        lookback_days: config.sync_lookback_days,
+        batch_size: config.sync_batch_size,
+        events_per_batch: config.sync_events_per_batch,
+        batch_pause_secs: config.sync_batch_pause_secs,
+        relay_min_interval_secs: config.sync_relay_min_interval_secs,
+        wot_batch_size: config.sync_wot_batch_size,
+        wot_events_per_batch: config.sync_wot_events_per_batch,
+    };
+
+    let sync_engine = Arc::new(SyncEngine::new(
+        state.wot_graph.clone(),
+        state.db.clone(),
+        config.outbound_relays.clone(),
+        hex_pubkey,
+        state.sync_tier.clone(),
+        state.sync_stats.clone(),
+        app_handle.clone(),
+        config.storage_media_gb,
+        sync_config,
+    ));
+    drop(config);
+
+    let cancel = sync_engine.start();
+    *state.sync_cancel.write().await = Some(cancel);
+
+    tracing::info!("[cmd:restart_sync] Sync restarted with new config");
     Ok(())
 }
 
@@ -687,6 +805,13 @@ async fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
         sync_interval_secs: config.sync_interval_secs,
         outbound_relays: config.outbound_relays.clone(),
         auto_start: config.auto_start,
+        sync_lookback_days: config.sync_lookback_days,
+        sync_batch_size: config.sync_batch_size,
+        sync_events_per_batch: config.sync_events_per_batch,
+        sync_batch_pause_secs: config.sync_batch_pause_secs,
+        sync_relay_min_interval_secs: config.sync_relay_min_interval_secs,
+        sync_wot_batch_size: config.sync_wot_batch_size,
+        sync_wot_events_per_batch: config.sync_wot_events_per_batch,
     })
 }
 
@@ -702,6 +827,25 @@ async fn save_settings(settings: Settings, state: State<'_, AppState>) -> Result
     config.sync_interval_secs = settings.sync_interval_secs;
     config.outbound_relays = settings.outbound_relays;
     config.auto_start = settings.auto_start;
+    config.sync_lookback_days = settings.sync_lookback_days;
+    config.sync_batch_size = settings.sync_batch_size;
+    config.sync_events_per_batch = settings.sync_events_per_batch;
+    config.sync_batch_pause_secs = settings.sync_batch_pause_secs;
+    config.sync_relay_min_interval_secs = settings.sync_relay_min_interval_secs;
+    config.sync_wot_batch_size = settings.sync_wot_batch_size;
+    config.sync_wot_events_per_batch = settings.sync_wot_events_per_batch;
+
+    // Persist sync config to DB
+    drop(config);
+    let db = &state.db;
+    db.set_config("sync_lookback_days", &settings.sync_lookback_days.to_string()).ok();
+    db.set_config("sync_batch_size", &settings.sync_batch_size.to_string()).ok();
+    db.set_config("sync_events_per_batch", &settings.sync_events_per_batch.to_string()).ok();
+    db.set_config("sync_batch_pause_secs", &settings.sync_batch_pause_secs.to_string()).ok();
+    db.set_config("sync_relay_min_interval_secs", &settings.sync_relay_min_interval_secs.to_string()).ok();
+    db.set_config("sync_wot_batch_size", &settings.sync_wot_batch_size.to_string()).ok();
+    db.set_config("sync_wot_events_per_batch", &settings.sync_wot_events_per_batch.to_string()).ok();
+
     Ok(())
 }
 
@@ -916,6 +1060,15 @@ pub fn run() {
             config.outbound_relays = relays;
         }
     }
+    // Load sync tuning config
+    if let Ok(Some(v)) = db.get_config("sync_lookback_days") { if let Ok(n) = v.parse::<u32>() { config.sync_lookback_days = n; } }
+    if let Ok(Some(v)) = db.get_config("sync_batch_size") { if let Ok(n) = v.parse::<u32>() { config.sync_batch_size = n; } }
+    if let Ok(Some(v)) = db.get_config("sync_events_per_batch") { if let Ok(n) = v.parse::<u32>() { config.sync_events_per_batch = n; } }
+    if let Ok(Some(v)) = db.get_config("sync_batch_pause_secs") { if let Ok(n) = v.parse::<u32>() { config.sync_batch_pause_secs = n; } }
+    if let Ok(Some(v)) = db.get_config("sync_relay_min_interval_secs") { if let Ok(n) = v.parse::<u32>() { config.sync_relay_min_interval_secs = n; } }
+    if let Ok(Some(v)) = db.get_config("sync_wot_batch_size") { if let Ok(n) = v.parse::<u32>() { config.sync_wot_batch_size = n; } }
+    if let Ok(Some(v)) = db.get_config("sync_wot_events_per_batch") { if let Ok(n) = v.parse::<u32>() { config.sync_wot_events_per_batch = n; } }
+
     tracing::info!("[init] Config: npub={:?}, relays={:?}, port={}", config.npub, config.outbound_relays, config.relay_port);
 
     let app_state = AppState {
@@ -961,7 +1114,18 @@ pub fn run() {
 
                     tracing::info!("Auto-resuming sync for {}...", &hex[..8]);
 
-                    let media_gb = config.read().await.storage_media_gb;
+                    let cfg2 = config.read().await;
+                    let media_gb = cfg2.storage_media_gb;
+                    let sync_config = SyncConfig {
+                        lookback_days: cfg2.sync_lookback_days,
+                        batch_size: cfg2.sync_batch_size,
+                        events_per_batch: cfg2.sync_events_per_batch,
+                        batch_pause_secs: cfg2.sync_batch_pause_secs,
+                        relay_min_interval_secs: cfg2.sync_relay_min_interval_secs,
+                        wot_batch_size: cfg2.sync_wot_batch_size,
+                        wot_events_per_batch: cfg2.sync_wot_events_per_batch,
+                    };
+                    drop(cfg2);
                     let sync_engine = Arc::new(SyncEngine::new(
                         wot_graph,
                         db,
@@ -971,6 +1135,7 @@ pub fn run() {
                         sync_stats,
                         app_handle.clone(),
                         media_gb,
+                        sync_config,
                     ));
 
                     let cancel = sync_engine.start();
@@ -1036,6 +1201,8 @@ pub fn run() {
             get_status,
             init_nostrito,
             get_wot,
+            get_follows,
+            get_profiles_batch,
             get_wot_distance,
             get_feed,
             get_storage_stats,
@@ -1056,6 +1223,7 @@ pub fn run() {
             setup_browser_integration,
             check_browser_integration,
             get_media_stats,
+            restart_sync,
         ])
         .run(tauri::generate_context!())
         .expect("error while running nostrito");

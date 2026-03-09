@@ -172,3 +172,40 @@
   padding: 10px 14px; background: var(--bg); border: 1px solid var(--border);
   border-radius: 8px; margin-top: 8px;
 }
+
+/* Sync config pane */
+.sync-presets {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 20px;
+  flex-wrap: wrap;
+}
+.sync-preset-btn {
+  padding: 6px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-dim);
+  font-size: 0.78rem;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.sync-preset-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent-light);
+}
+.sync-slider-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.sync-slider {
+  width: 140px;
+  accent-color: var(--accent);
+}
+.sync-slider-val {
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  color: var(--accent-light);
+  min-width: 40px;
+}

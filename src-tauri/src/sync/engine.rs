@@ -74,10 +74,10 @@ struct RelayPolicy {
 }
 
 impl RelayPolicy {
-    fn new() -> Self {
+    fn new(min_interval_secs: u64) -> Self {
         Self {
             last_request: None,
-            min_interval: Duration::from_secs(3),
+            min_interval: Duration::from_secs(min_interval_secs),
             paused_until: None,
             consecutive_failures: 0,
             last_notice: None,
@@ -244,6 +244,33 @@ async fn subscribe_and_collect(
     Ok(events)
 }
 
+// ── Sync Config ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct SyncConfig {
+    pub lookback_days: u32,
+    pub batch_size: u32,
+    pub events_per_batch: u32,
+    pub batch_pause_secs: u32,
+    pub relay_min_interval_secs: u32,
+    pub wot_batch_size: u32,
+    pub wot_events_per_batch: u32,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            lookback_days: 7,
+            batch_size: 10,
+            events_per_batch: 50,
+            batch_pause_secs: 7,
+            relay_min_interval_secs: 3,
+            wot_batch_size: 5,
+            wot_events_per_batch: 15,
+        }
+    }
+}
+
 // ── Sync Engine ────────────────────────────────────────────────────
 
 pub struct SyncEngine {
@@ -256,6 +283,7 @@ pub struct SyncEngine {
     pub sync_stats: Arc<RwLock<SyncStats>>,
     app_handle: tauri::AppHandle,
     storage_media_gb: f64,
+    sync_config: SyncConfig,
 }
 
 impl SyncEngine {
@@ -268,6 +296,7 @@ impl SyncEngine {
         sync_stats: Arc<RwLock<SyncStats>>,
         app_handle: tauri::AppHandle,
         storage_media_gb: f64,
+        sync_config: SyncConfig,
     ) -> Self {
         Self {
             graph,
@@ -279,6 +308,7 @@ impl SyncEngine {
             sync_stats,
             app_handle,
             storage_media_gb,
+            sync_config,
         }
     }
 
@@ -340,8 +370,9 @@ impl SyncEngine {
         );
 
         let mut relay_policies: HashMap<String, RelayPolicy> = HashMap::new();
+        let min_interval = self.sync_config.relay_min_interval_secs as u64;
         for url in self.all_relay_urls() {
-            relay_policies.insert(url, RelayPolicy::new());
+            relay_policies.insert(url, RelayPolicy::new(min_interval));
         }
 
         // Tier 1: Critical
@@ -401,7 +432,7 @@ impl SyncEngine {
 
             let policy = policies
                 .entry(url.clone())
-                .or_insert_with(RelayPolicy::new);
+                .or_insert_with(|| RelayPolicy::new(self.sync_config.relay_min_interval_secs as u64));
 
             let client = Client::default();
             match client.add_relay(url.as_str()).await {
@@ -534,7 +565,7 @@ impl SyncEngine {
 
         let since = Timestamp::from(
             chrono::Utc::now()
-                .checked_sub_signed(chrono::Duration::days(7))
+                .checked_sub_signed(chrono::Duration::days(self.sync_config.lookback_days as i64))
                 .unwrap()
                 .timestamp() as u64,
         );
@@ -559,7 +590,7 @@ impl SyncEngine {
         let policy_url = relay_urls.first().cloned().unwrap_or_default();
 
         // Small batches: 10 follows at a time, limit 50 events per request
-        for (batch_idx, chunk) in follows.chunks(10).enumerate() {
+        for (batch_idx, chunk) in follows.chunks(self.sync_config.batch_size as usize).enumerate() {
             if self.cancel.is_cancelled() {
                 break;
             }
@@ -586,11 +617,11 @@ impl SyncEngine {
                     Kind::LongFormTextNote,          // 30023
                 ])
                 .since(since)
-                .limit(50);
+                .limit(self.sync_config.events_per_batch as usize);
 
             let policy = policies
                 .entry(policy_url.clone())
-                .or_insert_with(RelayPolicy::new);
+                .or_insert_with(|| RelayPolicy::new(self.sync_config.relay_min_interval_secs as u64));
 
             match subscribe_and_collect(&client, vec![filter], 10, policy).await {
                 Ok(events) => {
@@ -652,15 +683,15 @@ impl SyncEngine {
                     warn!("Tier 2: subscribe error on batch {}: {}", batch_idx + 1, e);
                     let policy = policies
                         .entry(policy_url.clone())
-                        .or_insert_with(RelayPolicy::new);
+                        .or_insert_with(|| RelayPolicy::new(self.sync_config.relay_min_interval_secs as u64));
                     policy.on_connection_failure();
                 }
             }
 
             self.emit_progress(2, fetched, total, &policy_url);
 
-            // Polite pause: 7 seconds between batches on the same connection
-            tokio::time::sleep(Duration::from_secs(7)).await;
+            // Polite pause between batches on the same connection
+            tokio::time::sleep(Duration::from_secs(self.sync_config.batch_pause_secs as u64)).await;
         }
 
         // Disconnect once at the end
@@ -748,7 +779,7 @@ impl SyncEngine {
         let policy_url = relay_urls.first().cloned().unwrap_or_default();
 
         // Small batches: 5 pubkeys at a time
-        for (batch_idx, chunk) in remaining.chunks(5).enumerate() {
+        for (batch_idx, chunk) in remaining.chunks(self.sync_config.wot_batch_size as usize).enumerate() {
             if self.cancel.is_cancelled() {
                 break;
             }
@@ -765,11 +796,11 @@ impl SyncEngine {
             let filter = Filter::new()
                 .authors(authors)
                 .kinds(vec![Kind::Metadata, Kind::ContactList])
-                .limit(15);
+                .limit(self.sync_config.wot_events_per_batch as usize);
 
             let policy = policies
                 .entry(policy_url.clone())
-                .or_insert_with(RelayPolicy::new);
+                .or_insert_with(|| RelayPolicy::new(self.sync_config.relay_min_interval_secs as u64));
 
             match subscribe_and_collect(&client, vec![filter], 10, policy).await {
                 Ok(events) => {
@@ -812,7 +843,7 @@ impl SyncEngine {
                     warn!("Tier 3: subscribe error on batch {}: {}", batch_idx + 1, e);
                     let policy = policies
                         .entry(policy_url.clone())
-                        .or_insert_with(RelayPolicy::new);
+                        .or_insert_with(|| RelayPolicy::new(self.sync_config.relay_min_interval_secs as u64));
                     policy.on_connection_failure();
                 }
             }
@@ -833,8 +864,8 @@ impl SyncEngine {
 
             self.emit_progress(3, fetched, total, &policy_url);
 
-            // Polite pause: 7 seconds between batches on the same connection
-            tokio::time::sleep(Duration::from_secs(7)).await;
+            // Polite pause between batches on the same connection
+            tokio::time::sleep(Duration::from_secs(self.sync_config.batch_pause_secs as u64)).await;
         }
 
         // Disconnect once at the end

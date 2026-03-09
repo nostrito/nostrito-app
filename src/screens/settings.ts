@@ -12,6 +12,13 @@ interface Settings {
   sync_interval_secs: number;
   outbound_relays: string[];
   auto_start: boolean;
+  sync_lookback_days: number;
+  sync_batch_size: number;
+  sync_events_per_batch: number;
+  sync_batch_pause_secs: number;
+  sync_relay_min_interval_secs: number;
+  sync_wot_batch_size: number;
+  sync_wot_events_per_batch: number;
 }
 
 interface RelayStatusInfo {
@@ -37,6 +44,7 @@ export function renderSettings(container: HTMLElement): void {
         <div class="settings-sub-item" data-settings="relays">📡 Relays</div>
         <div class="settings-sub-item" data-settings="wot-settings">🕸️ WoT</div>
         <div class="settings-sub-item" data-settings="storage">💾 Storage</div>
+        <div class="settings-sub-item" data-settings="sync">⚡ Sync</div>
         <div class="settings-sub-item" data-settings="advanced">⚙️ Advanced</div>
       </div>
       <div class="settings-panel">
@@ -132,6 +140,97 @@ export function renderSettings(container: HTMLElement): void {
 
           <button class="btn btn-primary" id="btn-save-storage" style="margin-top:16px;width:100%">Save Storage Settings</button>
           <div id="storage-save-result" style="margin-top:8px;font-size:0.78rem;text-align:center"></div>
+        </div>
+        <!-- Sync -->
+        <div class="settings-pane" id="pane-sync">
+          <div class="settings-pane-title">Sync Configuration</div>
+          <div class="settings-pane-desc">Tune how the sync engine fetches events. Use aggressive settings to build the initial database, then switch to conservative for ongoing sync.</div>
+
+          <div class="sync-presets">
+            <button class="sync-preset-btn" data-preset="aggressive">🚀 Aggressive (initial build)</button>
+            <button class="sync-preset-btn" data-preset="balanced">⚖️ Balanced (default)</button>
+            <button class="sync-preset-btn" data-preset="polite">🐢 Polite (background)</button>
+          </div>
+
+          <div class="settings-field">
+            <div class="settings-field-info">
+              <span class="settings-field-label">Lookback window</span>
+              <span class="settings-field-desc">How many days back to fetch in Tier 2</span>
+            </div>
+            <div class="sync-slider-wrap">
+              <input type="range" class="sync-slider" id="sync-lookback" min="1" max="90" value="7">
+              <span class="sync-slider-val" id="sync-lookback-val">7 days</span>
+            </div>
+          </div>
+
+          <div class="settings-field">
+            <div class="settings-field-info">
+              <span class="settings-field-label">Authors per batch</span>
+              <span class="settings-field-desc">How many authors per subscription request (Tier 2). Higher = faster but more likely to get rate-limited.</span>
+            </div>
+            <div class="sync-slider-wrap">
+              <input type="range" class="sync-slider" id="sync-batch-size" min="1" max="50" value="10">
+              <span class="sync-slider-val" id="sync-batch-size-val">10</span>
+            </div>
+          </div>
+
+          <div class="settings-field">
+            <div class="settings-field-info">
+              <span class="settings-field-label">Events per request</span>
+              <span class="settings-field-desc">Max events per REQ (limit). Higher = more data per round trip.</span>
+            </div>
+            <div class="sync-slider-wrap">
+              <input type="range" class="sync-slider" id="sync-events-per-batch" min="10" max="500" step="10" value="50">
+              <span class="sync-slider-val" id="sync-events-per-batch-val">50</span>
+            </div>
+          </div>
+
+          <div class="settings-field">
+            <div class="settings-field-info">
+              <span class="settings-field-label">Pause between batches</span>
+              <span class="settings-field-desc">Seconds to wait between subscription batches. Lower = faster, higher = more polite.</span>
+            </div>
+            <div class="sync-slider-wrap">
+              <input type="range" class="sync-slider" id="sync-batch-pause" min="0" max="30" value="7">
+              <span class="sync-slider-val" id="sync-batch-pause-val">7s</span>
+            </div>
+          </div>
+
+          <div class="settings-field">
+            <div class="settings-field-info">
+              <span class="settings-field-label">Min relay interval</span>
+              <span class="settings-field-desc">Minimum seconds between requests to the same relay.</span>
+            </div>
+            <div class="sync-slider-wrap">
+              <input type="range" class="sync-slider" id="sync-relay-interval" min="0" max="10" value="3">
+              <span class="sync-slider-val" id="sync-relay-interval-val">3s</span>
+            </div>
+          </div>
+
+          <div class="settings-field">
+            <div class="settings-field-info">
+              <span class="settings-field-label">WoT authors per batch</span>
+              <span class="settings-field-desc">Authors per batch in Tier 3 (WoT crawl).</span>
+            </div>
+            <div class="sync-slider-wrap">
+              <input type="range" class="sync-slider" id="sync-wot-batch" min="1" max="30" value="5">
+              <span class="sync-slider-val" id="sync-wot-batch-val">5</span>
+            </div>
+          </div>
+
+          <div class="settings-field">
+            <div class="settings-field-info">
+              <span class="settings-field-label">WoT events per request</span>
+              <span class="settings-field-desc">Max events per REQ in Tier 3 WoT crawl.</span>
+            </div>
+            <div class="sync-slider-wrap">
+              <input type="range" class="sync-slider" id="sync-wot-events" min="5" max="100" value="15">
+              <span class="sync-slider-val" id="sync-wot-events-val">15</span>
+            </div>
+          </div>
+
+          <button class="btn btn-primary" id="sync-save-btn" style="margin-top:16px">Save & Restart Sync</button>
+          <div id="sync-save-result" style="margin-top:8px;font-size:0.78rem"></div>
         </div>
         <!-- Advanced -->
         <div class="settings-pane" id="pane-advanced">
@@ -283,6 +382,95 @@ export function renderSettings(container: HTMLElement): void {
       if (resultEl) resultEl.innerHTML = `<span style="color:#ef4444">Failed: ${e}</span>`;
     }
   });
+
+  // ── Sync pane: sliders, presets, save ──
+
+  const SYNC_PRESETS: Record<string, { lookback: number; batchSize: number; eventsPerBatch: number; batchPause: number; relayInterval: number; wotBatch: number; wotEvents: number }> = {
+    aggressive: { lookback: 30, batchSize: 30, eventsPerBatch: 200, batchPause: 2, relayInterval: 1, wotBatch: 15, wotEvents: 50 },
+    balanced:   { lookback: 7,  batchSize: 10, eventsPerBatch: 50,  batchPause: 7, relayInterval: 3, wotBatch: 5,  wotEvents: 15 },
+    polite:     { lookback: 3,  batchSize: 5,  eventsPerBatch: 20,  batchPause: 15, relayInterval: 5, wotBatch: 3,  wotEvents: 10 },
+  };
+
+  function applySyncPreset(p: typeof SYNC_PRESETS[string]) {
+    const set = (id: string, val: number, suffix?: string) => {
+      const el = document.getElementById(id) as HTMLInputElement | null;
+      const valEl = document.getElementById(id + "-val");
+      if (el) el.value = String(val);
+      if (valEl) valEl.textContent = suffix ? `${val}${suffix}` : String(val);
+    };
+    set("sync-lookback", p.lookback, " days");
+    set("sync-batch-size", p.batchSize);
+    set("sync-events-per-batch", p.eventsPerBatch);
+    set("sync-batch-pause", p.batchPause, "s");
+    set("sync-relay-interval", p.relayInterval, "s");
+    set("sync-wot-batch", p.wotBatch);
+    set("sync-wot-events", p.wotEvents);
+  }
+
+  // Wire preset buttons
+  container.querySelectorAll(".sync-preset-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const preset = (btn as HTMLElement).dataset.preset!;
+      if (SYNC_PRESETS[preset]) applySyncPreset(SYNC_PRESETS[preset]);
+    });
+  });
+
+  // Wire slider value displays
+  const syncSliderMap: [string, string][] = [
+    ["sync-lookback", " days"],
+    ["sync-batch-size", ""],
+    ["sync-events-per-batch", ""],
+    ["sync-batch-pause", "s"],
+    ["sync-relay-interval", "s"],
+    ["sync-wot-batch", ""],
+    ["sync-wot-events", ""],
+  ];
+  for (const [id, suffix] of syncSliderMap) {
+    const slider = document.getElementById(id) as HTMLInputElement | null;
+    const valEl = document.getElementById(id + "-val");
+    if (slider && valEl) {
+      slider.addEventListener("input", () => {
+        valEl.textContent = suffix ? `${slider.value}${suffix}` : slider.value;
+      });
+    }
+  }
+
+  // Wire save button
+  document.getElementById("sync-save-btn")?.addEventListener("click", async () => {
+    const resultEl = document.getElementById("sync-save-result");
+    const btn = document.getElementById("sync-save-btn") as HTMLButtonElement | null;
+    if (!_currentSettings || !btn) return;
+
+    const getVal = (id: string) => parseInt((document.getElementById(id) as HTMLInputElement)?.value || "0", 10);
+
+    const updated: Settings = {
+      ..._currentSettings,
+      sync_lookback_days: getVal("sync-lookback"),
+      sync_batch_size: getVal("sync-batch-size"),
+      sync_events_per_batch: getVal("sync-events-per-batch"),
+      sync_batch_pause_secs: getVal("sync-batch-pause"),
+      sync_relay_min_interval_secs: getVal("sync-relay-interval"),
+      sync_wot_batch_size: getVal("sync-wot-batch"),
+      sync_wot_events_per_batch: getVal("sync-wot-events"),
+    };
+
+    btn.disabled = true;
+    btn.textContent = "Saving...";
+    if (resultEl) resultEl.innerHTML = "";
+
+    try {
+      await invoke("save_settings", { settings: updated });
+      _currentSettings = updated;
+      await invoke("restart_sync");
+      btn.textContent = "Save & Restart Sync";
+      btn.disabled = false;
+      if (resultEl) resultEl.innerHTML = `<span style="color:#34d399">✅ Saved — sync restarted with new config</span>`;
+    } catch (e) {
+      btn.textContent = "Save & Restart Sync";
+      btn.disabled = false;
+      if (resultEl) resultEl.innerHTML = `<span style="color:#ef4444">Failed: ${e}</span>`;
+    }
+  });
 }
 
 let _currentSettings: Settings | null = null;
@@ -370,6 +558,24 @@ async function loadSettings(): Promise<void> {
       mdSliderEl.value = String(Math.round(settings.storage_media_gb));
       mdValEl.textContent = `${Math.round(settings.storage_media_gb)} GB`;
     }
+
+    // Sync sliders
+    const syncFields: [string, number, string][] = [
+      ["sync-lookback", settings.sync_lookback_days, " days"],
+      ["sync-batch-size", settings.sync_batch_size, ""],
+      ["sync-events-per-batch", settings.sync_events_per_batch, ""],
+      ["sync-batch-pause", settings.sync_batch_pause_secs, "s"],
+      ["sync-relay-interval", settings.sync_relay_min_interval_secs, "s"],
+      ["sync-wot-batch", settings.sync_wot_batch_size, ""],
+      ["sync-wot-events", settings.sync_wot_events_per_batch, ""],
+    ];
+    for (const [id, val, suffix] of syncFields) {
+      const sl = document.getElementById(id) as HTMLInputElement | null;
+      const valEl = document.getElementById(id + "-val");
+      if (sl) sl.value = String(val);
+      if (valEl) valEl.textContent = suffix ? `${val}${suffix}` : String(val);
+    }
+
     // Browser integration
     try {
       const browserEnabled = await invoke<boolean>("check_browser_integration");
