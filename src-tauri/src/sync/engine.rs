@@ -895,14 +895,9 @@ impl SyncEngine {
                 break;
             }
 
-            // Only cache Blossom URLs (must have a 64-char hex sha256 segment)
-            let hash = match extract_sha256_from_url(url) {
-                Some(h) => h,
-                None => {
-                    skipped += 1;
-                    continue;
-                }
-            };
+            // Use sha256 from URL path (Blossom) or sha256 of the URL string as cache key
+            let hash = extract_sha256_from_url(url)
+                .unwrap_or_else(|| sha256_of_string(url));
 
             if self.db.media_exists(&hash) {
                 skipped += 1;
@@ -1104,6 +1099,24 @@ impl SyncEngine {
 
 /// Blossom URLs contain a 64-char hex sha256 segment in the path.
 /// Extract it if present.
+/// Stable deterministic cache key for non-Blossom media URLs (FNV-1a, 64 hex chars).
+fn sha256_of_string(s: &str) -> String {
+    // Two-pass FNV-1a 64-bit — deterministic, no external crate, stable across runs
+    const FNV_PRIME: u64 = 1099511628211;
+    const FNV_BASIS: u64 = 14695981039346656037;
+    let mut h1: u64 = FNV_BASIS;
+    for b in s.bytes() {
+        h1 ^= b as u64;
+        h1 = h1.wrapping_mul(FNV_PRIME);
+    }
+    let mut h2: u64 = 0xcbf29ce484222325u64;
+    for b in s.bytes().rev() {
+        h2 ^= b as u64;
+        h2 = h2.wrapping_mul(FNV_PRIME);
+    }
+    format!("{:016x}{:016x}{:032x}", h1, h2, 0u128)
+}
+
 fn extract_sha256_from_url(url: &str) -> Option<String> {
     let path = url.split('?').next()?;
     for segment in path.split('/') {
