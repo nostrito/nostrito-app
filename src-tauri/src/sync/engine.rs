@@ -984,9 +984,10 @@ impl SyncEngine {
 
         for (_id, pubkey, _created_at, _kind, _tags, content, _sig) in &events {
             for url in extract_urls_from_text(content) {
-                // Only include URLs with a Blossom sha256 hash or known media extension
+                // Only include URLs with a Blossom sha256 hash, known media extension, or known CDN
                 let dominated = extract_sha256_from_url(&url).is_some()
-                    || mime_type_from_url(&url).is_some();
+                    || mime_type_from_url(&url).is_some()
+                    || is_nostr_media_cdn(&url);
                 if dominated && seen.insert(url.clone()) {
                     urls.push((url, pubkey.clone()));
                 }
@@ -1007,79 +1008,120 @@ impl SyncEngine {
     ) -> Result<bool> {
         const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024; // 50 MB hard cap
 
-        // HEAD request first to check size and type
-        let head = client.head(url).send().await?;
-        if !head.status().is_success() {
-            return Ok(false);
+        // Try HEAD first to get size/type — but don't fail hard if HEAD not supported
+        let content_length_hint: Option<u64>;
+        let mime_hint: Option<String>;
+
+        match client.head(url).send().await {
+            Ok(head) if head.status().is_success() => {
+                content_length_hint = head
+                    .headers()
+                    .get("content-length")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok());
+                mime_hint = head
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.split(';').next().unwrap_or(s).trim().to_lowercase());
+            }
+            _ => {
+                // HEAD not supported or failed — proceed to GET without hints
+                content_length_hint = None;
+                mime_hint = None;
+            }
         }
 
-        let content_length = head
-            .headers()
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0);
-
-        // Skip files over 50 MB
-        if content_length > MAX_FILE_SIZE {
-            debug!("Tier 4: skipping {} — too large ({} bytes)", url, content_length);
-            return Ok(false);
+        // Pre-flight size check (if we have a hint)
+        if let Some(cl) = content_length_hint {
+            if cl > MAX_FILE_SIZE {
+                debug!("Tier 4: skipping {} — too large ({} bytes)", url, cl);
+                return Ok(false);
+            }
+            let current_used = self.db.media_total_bytes().unwrap_or(0);
+            if current_used + cl > limit_bytes {
+                return Ok(false);
+            }
         }
 
-        // Check if adding this would exceed limit
-        let current_used = self.db.media_total_bytes().unwrap_or(0);
-        if content_length > 0 && current_used + content_length > limit_bytes {
-            return Ok(false);
-        }
+        // GET the content
+        let response = match client.get(url).send().await {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                debug!("Tier 4: GET {} returned {}", url, r.status());
+                return Ok(false);
+            }
+            Err(e) => {
+                debug!("Tier 4: GET {} failed: {}", url, e);
+                return Ok(false);
+            }
+        };
 
-        // Determine MIME type from Content-Type header or URL extension
-        let header_mime = head
+        // Determine MIME type from GET response headers or URL extension or CDN domain
+        let response_mime = response
             .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.split(';').next().unwrap_or(s).trim().to_string());
+            .map(|s| s.split(';').next().unwrap_or(s).trim().to_lowercase());
 
-        let mime = header_mime
-            .as_deref()
-            .or_else(|| mime_type_from_url(url))
-            .unwrap_or("image/jpeg") // fallback for Blossom URLs without extension
-            .to_string();
+        let mime = response_mime
+            .or(mime_hint)
+            .or_else(|| mime_type_from_url(url).map(|s| s.to_string()))
+            .unwrap_or_else(|| {
+                // For known CDN domains, assume image/jpeg if no type info
+                if is_nostr_media_cdn(url) {
+                    "image/jpeg".to_string()
+                } else {
+                    "application/octet-stream".to_string()
+                }
+            });
 
-        // Only download images and videos (skip audio for now)
+        // Only cache images and videos
         if !mime.starts_with("image/") && !mime.starts_with("video/") {
+            debug!("Tier 4: skipping {} — mime={}", url, mime);
             return Ok(false);
         }
 
-        // GET request — download the file
-        let response = client.get(url).send().await?;
-        if !response.status().is_success() {
-            return Ok(false);
-        }
-
-        let bytes = response.bytes().await?;
+        // Download bytes
+        let bytes = match response.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                debug!("Tier 4: failed to read body {}: {}", url, e);
+                return Ok(false);
+            }
+        };
         let size_bytes = bytes.len() as u64;
 
-        if size_bytes > MAX_FILE_SIZE {
+        if size_bytes == 0 || size_bytes > MAX_FILE_SIZE {
+            return Ok(false);
+        }
+
+        // Final size check against limit
+        let current_used = self.db.media_total_bytes().unwrap_or(0);
+        if current_used + size_bytes > limit_bytes {
             return Ok(false);
         }
 
         // Write to disk: ~/.nostrito/media/<hash[0..2]>/<hash>
         let file_path = media_file_path(hash);
         if let Some(parent) = file_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+            tokio::fs::create_dir_all(parent).await.map_err(|e| anyhow::anyhow!(e))?;
         }
-        tokio::fs::write(&file_path, &bytes).await?;
+        tokio::fs::write(&file_path, &bytes).await.map_err(|e| anyhow::anyhow!(e))?;
 
         // Record in DB
         self.db
-            .store_media_record(hash, url, &mime, size_bytes, pubkey)?;
+            .store_media_record(hash, url, &mime, size_bytes, pubkey)
+            .map_err(|e| anyhow::anyhow!(e))?;
 
         debug!(
-            "Tier 4: downloaded {} ({} bytes) → {:?}",
-            &hash[..12],
+            "Tier 4: downloaded {} ({} bytes, {}) → {:?}",
+            &hash[..12.min(hash.len())],
             size_bytes,
+            mime,
             file_path
         );
+
         Ok(true)
     }
 
@@ -1146,6 +1188,23 @@ fn sha256_of_string(s: &str) -> String {
         h2 = h2.wrapping_mul(FNV_PRIME);
     }
     format!("{:016x}{:016x}{:032x}", h1, h2, 0u128)
+}
+
+/// Returns true if the URL is from a known Nostr media CDN
+fn is_nostr_media_cdn(url: &str) -> bool {
+    let lower = url.to_lowercase();
+    lower.contains("void.cat/d/")
+        || lower.contains("nostr.build/")
+        || lower.contains("image.nostr.build/")
+        || lower.contains("cdn.nostr.build/")
+        || lower.contains("media.nostr.band/")
+        || lower.contains("nostrimg.com/")
+        || lower.contains("nostpic.com/")
+        || lower.contains("blossom.band/")
+        || lower.contains("blossom.primal.net/")
+        || lower.contains("files.v0l.io/")
+        || lower.contains("nostr.mtrr.me/")
+        || lower.contains("cdn.satellite.earth/")
 }
 
 fn extract_sha256_from_url(url: &str) -> Option<String> {
