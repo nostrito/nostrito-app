@@ -399,6 +399,15 @@ impl SyncEngine {
                 }
             }
 
+            // Tier 1.5: Metadata refresh — refresh profiles + contact lists for WoT peers
+            // Run every 3 cycles to keep display names, avatars, and follows fresh
+            if !self.cancel.is_cancelled() && cycle % 3 == 0 {
+                info!("Sync cycle {}: Running Tier 1.5 (WoT metadata refresh)", cycle);
+                if let Err(e) = self.run_metadata_refresh(&mut relay_policies).await {
+                    error!("Sync cycle {}: Tier 1.5 error: {}", cycle, e);
+                }
+            }
+
             // Tier 2: Important — always run (incremental via sync cursor)
             if !self.cancel.is_cancelled() {
                 if let Err(e) = self.run_tier2(&mut relay_policies).await {
@@ -648,6 +657,146 @@ impl SyncEngine {
 
         self.emit_tier_complete(1);
         info!("Tier 1 complete: {} events fetched", fetched);
+        Ok(())
+    }
+
+    // ── Tier 1.5: WoT Metadata Refresh ──────────────────────────
+    // Refresh kind:0 (profiles) and kind:3 (contact lists) for all known
+    // pubkeys in the WoT graph. Keeps display names, avatars, and follow
+    // lists fresh without waiting for Tier 3's full crawl.
+
+    async fn run_metadata_refresh(&self, policies: &mut HashMap<String, RelayPolicy>) -> Result<()> {
+        info!("Tier 1.5: Refreshing metadata for WoT peers");
+
+        let wot_pubkeys = self.graph.all_pubkeys();
+        if wot_pubkeys.is_empty() {
+            info!("Tier 1.5: No pubkeys in WoT graph, skipping");
+            return Ok(());
+        }
+
+        info!("Tier 1.5: {} pubkeys in WoT graph", wot_pubkeys.len());
+
+        let relay_urls = self.all_relay_urls();
+
+        // ONE persistent client for metadata refresh
+        let client = Client::default();
+        for url in &relay_urls {
+            client.add_relay(url.as_str()).await.ok();
+        }
+        client.connect().await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let policy_url = relay_urls.first().cloned().unwrap_or_default();
+        let mut total_fetched: u64 = 0;
+        let mut total_new: u64 = 0;
+
+        // Process in chunks of 50 pubkeys
+        for (batch_idx, chunk) in wot_pubkeys.chunks(50).enumerate() {
+            if self.cancel.is_cancelled() {
+                break;
+            }
+
+            let authors: Vec<PublicKey> = chunk
+                .iter()
+                .filter_map(|hex| PublicKey::from_hex(hex).ok())
+                .collect();
+
+            if authors.is_empty() {
+                continue;
+            }
+
+            let filter = Filter::new()
+                .authors(authors)
+                .kinds(vec![Kind::Metadata, Kind::ContactList])
+                .limit(100);
+
+            let policy = policies
+                .entry(policy_url.clone())
+                .or_insert_with(|| RelayPolicy::new(self.sync_config.relay_min_interval_secs as u64));
+
+            match subscribe_and_collect(&client, vec![filter], 10, policy).await {
+                Ok(events) => {
+                    let mut batch_new: u64 = 0;
+
+                    for event in &events {
+                        let tags: Vec<Vec<String>> = event
+                            .tags
+                            .iter()
+                            .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
+                            .collect();
+                        let tags_json = serde_json::to_string(&tags).unwrap_or_default();
+                        let inserted = self.db
+                            .store_event(
+                                &event.id.to_hex(),
+                                &event.pubkey.to_hex(),
+                                event.created_at.as_u64() as i64,
+                                event.kind.as_u16() as u32,
+                                &tags_json,
+                                &event.content.to_string(),
+                                &event.sig.to_string(),
+                            )
+                            .unwrap_or(false);
+
+                        if inserted {
+                            batch_new += 1;
+                        }
+
+                        // Update WoT graph with fresh contact lists
+                        if event.kind == Kind::ContactList {
+                            if let Some(update) = process_contact_event(event) {
+                                let updated = self.graph.update_follows(
+                                    &update.pubkey,
+                                    &update.follows,
+                                    Some(update.event_id.clone()),
+                                    Some(update.created_at),
+                                );
+                                if updated {
+                                    let batch = vec![FollowUpdateBatch {
+                                        pubkey: &update.pubkey,
+                                        follows: &update.follows,
+                                        event_id: Some(&update.event_id),
+                                        created_at: Some(update.created_at),
+                                    }];
+                                    self.db.update_follows_batch(&batch).ok();
+                                }
+                            }
+                        }
+                    }
+
+                    total_fetched += events.len() as u64;
+                    total_new += batch_new;
+
+                    if batch_idx % 10 == 0 && batch_idx > 0 {
+                        info!(
+                            "Tier 1.5: Progress — batch {}, {} events fetched ({} new)",
+                            batch_idx + 1, total_fetched, total_new
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!("Tier 1.5: subscribe error on batch {}: {}", batch_idx + 1, e);
+                    let policy = policies
+                        .entry(policy_url.clone())
+                        .or_insert_with(|| RelayPolicy::new(self.sync_config.relay_min_interval_secs as u64));
+                    policy.on_connection_failure();
+                }
+            }
+
+            // Polite pause between batches
+            tokio::time::sleep(Duration::from_secs(self.sync_config.batch_pause_secs as u64)).await;
+        }
+
+        client.disconnect().await.ok();
+        info!(
+            "Tier 1.5 complete: {} events fetched ({} new) for {} WoT pubkeys",
+            total_fetched, total_new, wot_pubkeys.len()
+        );
+
+        // Cool-down before next tier
+        if !self.cancel.is_cancelled() {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+
         Ok(())
     }
 
@@ -901,6 +1050,93 @@ impl SyncEngine {
             "Tier 2 complete: {} events fetched ({} new, {} dupe, {} batches)",
             fetched, total_new, total_dupe, batches_processed
         );
+
+        // ── Historical backfill: fetch older events going backward in time ──
+        if !self.cancel.is_cancelled() && !follows.is_empty() {
+            let history_until = self.db.get_history_cursor().unwrap_or(None).unwrap_or_else(|| {
+                // Default: start from lookback floor, go backward
+                chrono::Utc::now().timestamp() as u64 - (self.sync_config.lookback_days as u64 * 86400)
+            });
+
+            let age_secs = now_epoch.saturating_sub(history_until);
+            let age_days = age_secs / 86400;
+            info!(
+                "Tier 2: Historical backfill until={} (~{}d ago)",
+                history_until, age_days
+            );
+
+            let authors: Vec<PublicKey> = follows.iter()
+                .filter_map(|hex| PublicKey::from_hex(hex).ok())
+                .collect();
+
+            let hist_filter = Filter::new()
+                .authors(authors)
+                .kinds(vec![Kind::TextNote, Kind::Repost, Kind::LongFormTextNote])
+                .until(Timestamp::from(history_until))
+                .limit(500);
+
+            // Use fresh client for historical fetch
+            let hist_client = Client::default();
+            for url in &relay_urls {
+                hist_client.add_relay(url.as_str()).await.ok();
+            }
+            hist_client.connect().await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            let hist_policy_url = relay_urls.first().cloned().unwrap_or_default();
+            let hist_policy = policies
+                .entry(hist_policy_url.clone())
+                .or_insert_with(|| RelayPolicy::new(self.sync_config.relay_min_interval_secs as u64));
+
+            match subscribe_and_collect(&hist_client, vec![hist_filter], 30, hist_policy).await {
+                Ok(hist_events) if !hist_events.is_empty() => {
+                    let mut oldest_ts = history_until;
+                    let mut hist_new: u64 = 0;
+
+                    for event in &hist_events {
+                        let tags: Vec<Vec<String>> = event
+                            .tags
+                            .iter()
+                            .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
+                            .collect();
+                        let tags_json = serde_json::to_string(&tags).unwrap_or_default();
+                        let inserted = self.db
+                            .store_event(
+                                &event.id.to_hex(),
+                                &event.pubkey.to_hex(),
+                                event.created_at.as_u64() as i64,
+                                event.kind.as_u16() as u32,
+                                &tags_json,
+                                &event.content.to_string(),
+                                &event.sig.to_string(),
+                            )
+                            .unwrap_or(false);
+                        if inserted {
+                            hist_new += 1;
+                            self.queue_media_for_event(&event.pubkey.to_hex(), &event.content.to_string(), &tags_json);
+                        }
+                        let ts = event.created_at.as_u64();
+                        if ts < oldest_ts {
+                            oldest_ts = ts;
+                        }
+                    }
+
+                    // Move cursor back
+                    self.db.set_history_cursor(oldest_ts.saturating_sub(1)).ok();
+                    info!(
+                        "Tier 2: Historical: {} events ({} new), cursor now at {} (~{}d ago)",
+                        hist_events.len(),
+                        hist_new,
+                        oldest_ts,
+                        now_epoch.saturating_sub(oldest_ts) / 86400
+                    );
+                }
+                Ok(_) => info!("Tier 2: Historical: no more events at this cursor position"),
+                Err(e) => warn!("Tier 2: Historical fetch error: {}", e),
+            }
+
+            hist_client.disconnect().await.ok();
+        }
 
         // Cool-down: give relays a break before Tier 3
         if !self.cancel.is_cancelled() {

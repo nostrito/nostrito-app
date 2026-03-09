@@ -796,6 +796,20 @@ impl Database {
         self.set_config("tier2_since", &ts.to_string())
     }
 
+    /// Get the Tier 2 historical backfill cursor (walks backward in time).
+    /// Stored in app_config under key "tier2_history_until".
+    pub fn get_history_cursor(&self) -> Result<Option<u64>> {
+        match self.get_config("tier2_history_until")? {
+            Some(val) => Ok(val.parse::<u64>().ok()),
+            None => Ok(None),
+        }
+    }
+
+    /// Set the Tier 2 historical backfill cursor.
+    pub fn set_history_cursor(&self, ts: u64) -> Result<()> {
+        self.set_config("tier2_history_until", &ts.to_string())
+    }
+
     /// Get the latest created_at timestamp from stored nostr events.
     pub fn get_latest_event_timestamp(&self) -> Result<Option<u64>> {
         let conn = self.conn.lock().unwrap();
