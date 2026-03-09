@@ -255,6 +255,7 @@ pub struct SyncConfig {
     pub relay_min_interval_secs: u32,
     pub wot_batch_size: u32,
     pub wot_events_per_batch: u32,
+    pub cycle_interval_secs: u32,
 }
 
 impl Default for SyncConfig {
@@ -267,6 +268,7 @@ impl Default for SyncConfig {
             relay_min_interval_secs: 3,
             wot_batch_size: 5,
             wot_events_per_batch: 15,
+            cycle_interval_secs: 300,
         }
     }
 }
@@ -425,7 +427,7 @@ impl SyncEngine {
                     info!("Sync engine cancelled during inter-cycle wait");
                     break;
                 }
-                _ = tokio::time::sleep(Duration::from_secs(300)) => {}
+                _ = tokio::time::sleep(Duration::from_secs(self.sync_config.cycle_interval_secs as u64)) => {}
             }
         }
 

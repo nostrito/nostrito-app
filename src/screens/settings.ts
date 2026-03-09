@@ -79,7 +79,7 @@ export function renderSettings(container: HTMLElement): void {
           <div class="settings-pane-title">Web of Trust</div>
           <div class="settings-pane-desc">Configure trust graph computation.</div>
           <div class="settings-field"><div class="settings-field-info"><span class="settings-field-label">Max depth</span><span class="settings-field-desc">How many hops to compute</span></div><span style="font-family:var(--mono);font-size:0.85rem;color:var(--accent-light)" id="settings-wot-depth">—</span></div>
-          <div class="settings-field"><div class="settings-field-info"><span class="settings-field-label">Sync interval</span><span class="settings-field-desc">Seconds between sync cycles</span></div><span style="font-family:var(--mono);font-size:0.85rem;color:var(--text-dim)" id="settings-sync-interval">—</span></div>
+          <div class="settings-field"><div class="settings-field-info"><span class="settings-field-label">Sync interval</span><span class="settings-field-desc">Minutes between full sync cycles. Lower = more real-time, higher = more polite.</span></div><span style="font-family:var(--mono);font-size:0.85rem;color:var(--text-dim)" id="settings-sync-interval">—</span></div>
         </div>
         <!-- Storage -->
         <div class="settings-pane" id="pane-storage">
@@ -226,6 +226,17 @@ export function renderSettings(container: HTMLElement): void {
             <div class="sync-slider-wrap">
               <input type="range" class="sync-slider" id="sync-wot-events" min="5" max="100" value="15">
               <span class="sync-slider-val" id="sync-wot-events-val">15</span>
+            </div>
+          </div>
+
+          <div class="settings-field">
+            <div class="settings-field-info">
+              <span class="settings-field-label">Sync cycle interval</span>
+              <span class="settings-field-desc">Minutes between full sync cycles. Lower = more real-time, higher = more polite.</span>
+            </div>
+            <div class="sync-slider-wrap">
+              <input type="range" class="sync-slider" id="sync-interval" min="1" max="60" value="5">
+              <span class="sync-slider-val" id="sync-interval-val">5 min</span>
             </div>
           </div>
 
@@ -423,6 +434,7 @@ export function renderSettings(container: HTMLElement): void {
     ["sync-relay-interval", "s"],
     ["sync-wot-batch", ""],
     ["sync-wot-events", ""],
+    ["sync-interval", " min"],
   ];
   for (const [id, suffix] of syncSliderMap) {
     const slider = document.getElementById(id) as HTMLInputElement | null;
@@ -451,6 +463,7 @@ export function renderSettings(container: HTMLElement): void {
       sync_relay_min_interval_secs: getVal("sync-relay-interval"),
       sync_wot_batch_size: getVal("sync-wot-batch"),
       sync_wot_events_per_batch: getVal("sync-wot-events"),
+      sync_interval_secs: getVal("sync-interval") * 60,
     };
 
     btn.disabled = true;
@@ -526,7 +539,7 @@ async function loadSettings(): Promise<void> {
     if (depthEl) depthEl.textContent = settings.wot_max_depth.toString();
 
     const intervalEl = document.getElementById("settings-sync-interval");
-    if (intervalEl) intervalEl.textContent = `${settings.sync_interval_secs}s`;
+    if (intervalEl) intervalEl.textContent = `${Math.round(settings.sync_interval_secs / 60)} min`;
 
     // Advanced
     const portEl = document.getElementById("settings-port");
@@ -559,6 +572,7 @@ async function loadSettings(): Promise<void> {
       ["sync-relay-interval", settings.sync_relay_min_interval_secs, "s"],
       ["sync-wot-batch", settings.sync_wot_batch_size, ""],
       ["sync-wot-events", settings.sync_wot_events_per_batch, ""],
+      ["sync-interval", Math.round(settings.sync_interval_secs / 60), " min"],
     ];
     for (const [id, val, suffix] of syncFields) {
       const sl = document.getElementById(id) as HTMLInputElement | null;

@@ -277,6 +277,7 @@ async fn init_nostrito(
         relay_min_interval_secs: config.sync_relay_min_interval_secs,
         wot_batch_size: config.sync_wot_batch_size,
         wot_events_per_batch: config.sync_wot_events_per_batch,
+        cycle_interval_secs: config.sync_interval_secs,
     };
     let sync_engine = Arc::new(SyncEngine::new(
         state.wot_graph.clone(),
@@ -453,6 +454,7 @@ async fn start_sync(
         relay_min_interval_secs: config.sync_relay_min_interval_secs,
         wot_batch_size: config.sync_wot_batch_size,
         wot_events_per_batch: config.sync_wot_events_per_batch,
+        cycle_interval_secs: config.sync_interval_secs,
     };
     let sync_engine = Arc::new(SyncEngine::new(
         state.wot_graph.clone(),
@@ -509,6 +511,7 @@ async fn restart_sync(state: State<'_, AppState>, app_handle: tauri::AppHandle) 
         relay_min_interval_secs: config.sync_relay_min_interval_secs,
         wot_batch_size: config.sync_wot_batch_size,
         wot_events_per_batch: config.sync_wot_events_per_batch,
+        cycle_interval_secs: config.sync_interval_secs,
     };
 
     let sync_engine = Arc::new(SyncEngine::new(
@@ -1124,6 +1127,7 @@ pub fn run() {
                         relay_min_interval_secs: cfg2.sync_relay_min_interval_secs,
                         wot_batch_size: cfg2.sync_wot_batch_size,
                         wot_events_per_batch: cfg2.sync_wot_events_per_batch,
+                        cycle_interval_secs: cfg2.sync_interval_secs,
                     };
                     drop(cfg2);
                     let sync_engine = Arc::new(SyncEngine::new(
