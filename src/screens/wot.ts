@@ -36,6 +36,7 @@ let ctx: CanvasRenderingContext2D;
 let selectedPubkey: string | null = null;
 let myPubkey: string = "";
 let avatarCache: Map<string, HTMLImageElement> = new Map();
+const expandedByHop: Map<number, string> = new Map(); // hop level → pubkey of expanded node
 
 // Pan & zoom state
 let panX = 0, panY = 0;
@@ -219,8 +220,46 @@ function hitTest(mx: number, my: number): WotNode | null {
   return null;
 }
 
+function collapseNode(pubkey: string): void {
+  const node = nodes.get(pubkey);
+  if (!node || !node.expanded) return;
+  node.expanded = false;
+
+  // Collect all nodes whose parentPubkey traces back to this node (recursive)
+  const toRemove = new Set<string>();
+  function collectChildren(pk: string): void {
+    for (const [npk, n] of nodes.entries()) {
+      if (n.parentPubkey === pk && !toRemove.has(npk)) {
+        toRemove.add(npk);
+        collectChildren(npk);
+      }
+    }
+  }
+  collectChildren(pubkey);
+
+  // Remove child nodes
+  for (const pk of toRemove) {
+    nodes.delete(pk);
+  }
+
+  // Remove edges to/from removed nodes
+  edges = edges.filter(e => !toRemove.has(e.from) && !toRemove.has(e.to));
+
+  // Clean up expandedByHop for removed nodes
+  for (const [hop, pk] of expandedByHop.entries()) {
+    if (toRemove.has(pk)) expandedByHop.delete(hop);
+  }
+}
+
 async function expandNode(node: WotNode): Promise<void> {
   if (node.expanded) return;
+
+  // Accordion: collapse any other expanded node at the same hop level
+  const previousPubkey = expandedByHop.get(node.hop);
+  if (previousPubkey && previousPubkey !== node.pubkey) {
+    collapseNode(previousPubkey);
+  }
+  expandedByHop.set(node.hop, node.pubkey);
 
   const follows: string[] = await invoke("get_follows", {
     pubkey: node.pubkey,
@@ -235,6 +274,23 @@ async function expandNode(node: WotNode): Promise<void> {
   }
 
   const capped = follows.slice(0, MAX_NODES_PER_EXPAND);
+
+  // Update existing nodes if we found a shorter path
+  for (const pk of capped) {
+    const newHop = node.hop + 1;
+    if (nodes.has(pk)) {
+      const existingNode = nodes.get(pk)!;
+      if (newHop < existingNode.hop) {
+        existingNode.hop = newHop;
+        existingNode.color = nodeColor(newHop);
+        existingNode.radius = newHop === 1 ? 12 : 8;
+      }
+      if (!edges.some(e => e.from === node.pubkey && e.to === pk)) {
+        edges.push({ from: node.pubkey, to: pk });
+      }
+    }
+  }
+
   const newPubkeys = capped.filter((pk) => !nodes.has(pk));
 
   // Fetch profiles for new nodes
@@ -381,6 +437,7 @@ export async function renderWot(container: HTMLElement): Promise<void> {
   edges = [];
   selectedPubkey = null;
   avatarCache.clear();
+  expandedByHop.clear();
   panX = 0;
   panY = 0;
   zoom = 1;
