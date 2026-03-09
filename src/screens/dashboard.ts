@@ -49,6 +49,7 @@ interface RelayStatusInfo {
 }
 
 let pollInterval: ReturnType<typeof setInterval> | null = null;
+let slowPollInterval: ReturnType<typeof setInterval> | null = null;
 let unlistenProgress: UnlistenFn | null = null;
 let unlistenTierComplete: UnlistenFn | null = null;
 let dashFeedLoading = false;
@@ -299,6 +300,7 @@ function escapeHtml(str: string): string {
 
 export async function renderDashboard(container: HTMLElement): Promise<void> {
   if (pollInterval) clearInterval(pollInterval);
+  if (slowPollInterval) clearInterval(slowPollInterval);
   if (unlistenProgress) unlistenProgress();
   if (unlistenTierComplete) unlistenTierComplete();
 
@@ -405,8 +407,14 @@ export async function renderDashboard(container: HTMLElement): Promise<void> {
   });
 
   await Promise.all([loadStats(), loadFeed(), loadActivityChart(), loadRelayStatus()]);
+
+  // Stats refresh every 1s for responsive dashboard
   pollInterval = setInterval(() => {
     loadStats();
+  }, 1000);
+
+  // Feed, activity chart, and relay status on a slower 15s cadence
+  slowPollInterval = setInterval(() => {
     loadFeed();
     loadActivityChart();
     loadRelayStatus();
