@@ -371,11 +371,7 @@ impl SyncEngine {
             &self.hex_pubkey[..8]
         );
 
-        let mut relay_policies: HashMap<String, RelayPolicy> = HashMap::new();
         let min_interval = self.sync_config.relay_min_interval_secs as u64;
-        for url in self.all_relay_urls() {
-            relay_policies.insert(url, RelayPolicy::new(min_interval));
-        }
 
         let mut cycle: u64 = 0;
 
@@ -384,7 +380,14 @@ impl SyncEngine {
                 break;
             }
 
-            info!("Sync cycle {} starting", cycle);
+            // Fresh relay policies each cycle — clears any accumulated backoff/rate-limit
+            // state from the previous cycle so relays aren't permanently blocked.
+            let mut relay_policies: HashMap<String, RelayPolicy> = HashMap::new();
+            for url in self.all_relay_urls() {
+                relay_policies.insert(url, RelayPolicy::new(min_interval));
+            }
+
+            info!("Sync cycle {} starting (fresh relay policies)", cycle);
 
             // Tier 1: Critical — always run (fast, own profile + follows)
             if !self.cancel.is_cancelled() {
@@ -656,7 +659,12 @@ impl SyncEngine {
             }
         };
 
-        info!("Tier 2: {} follows to fetch", follows.len());
+        info!("Tier 2: Found {} follows in WoT graph", follows.len());
+        if follows.is_empty() {
+            warn!("Tier 2: Follows list is empty — Tier 1 may not have loaded contacts yet");
+            self.emit_tier_complete(2);
+            return Ok(());
+        }
 
         // Use a wall-clock sync cursor for incremental sync.
         // The cursor records when the last successful Tier 2 sync completed,
@@ -679,9 +687,22 @@ impl SyncEngine {
 
         let since = Timestamp::from(since_ts);
 
+        info!(
+            "Tier 2: since={} ({}), {} follow chunks of {}",
+            since_ts,
+            chrono::DateTime::from_timestamp(since_ts as i64, 0)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                .unwrap_or_else(|| "?".into()),
+            (follows.len() + self.sync_config.batch_size as usize - 1) / self.sync_config.batch_size as usize,
+            self.sync_config.batch_size,
+        );
+
         let relay_urls = self.all_relay_urls();
         let total = follows.len() as u64;
         let mut fetched: u64 = 0;
+        let mut total_new: u64 = 0;
+        let mut total_dupe: u64 = 0;
+        let mut batches_processed: u64 = 0;
 
         // ONE persistent client for the entire tier
         let client = Client::default();
@@ -734,6 +755,9 @@ impl SyncEngine {
 
             match subscribe_and_collect(&client, vec![filter], 10, policy).await {
                 Ok(events) => {
+                    let mut batch_new: u64 = 0;
+                    let mut batch_dupe: u64 = 0;
+
                     for event in events.iter() {
                         // Store every event in DB
                         let tags: Vec<Vec<String>> = event
@@ -742,7 +766,7 @@ impl SyncEngine {
                             .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
                             .collect();
                         let tags_json = serde_json::to_string(&tags).unwrap_or_default();
-                        self.db
+                        let inserted = self.db
                             .store_event(
                                 &event.id.to_hex(),
                                 &event.pubkey.to_hex(),
@@ -752,7 +776,13 @@ impl SyncEngine {
                                 &event.content.to_string(),
                                 &event.sig.to_string(),
                             )
-                            .ok();
+                            .unwrap_or(false);
+
+                        if inserted {
+                            batch_new += 1;
+                        } else {
+                            batch_dupe += 1;
+                        }
 
                         // Process kind:3 → update WoT graph with follows-of-follows
                         if event.kind == Kind::ContactList {
@@ -781,11 +811,16 @@ impl SyncEngine {
                         }
                     }
                     fetched += events.len() as u64;
-                    debug!(
-                        "Tier 2: batch {}: {} follows → {} events",
+                    total_new += batch_new;
+                    total_dupe += batch_dupe;
+                    batches_processed += 1;
+                    info!(
+                        "Tier 2: batch {}: {} follows → {} events ({} new, {} dupe)",
                         batch_idx + 1,
                         chunk.len(),
                         events.len(),
+                        batch_new,
+                        batch_dupe,
                     );
                 }
                 Err(e) => {
@@ -807,12 +842,22 @@ impl SyncEngine {
         client.disconnect().await.ok();
         info!("Tier 2: Disconnected persistent client");
 
-        // Update sync cursor to wall-clock now minus 60s overlap buffer.
-        // This ensures the next sync picks up from where we left off,
-        // with a small overlap to avoid missing edge-case events.
-        let cursor_ts = chrono::Utc::now().timestamp() as u64;
-        self.db.set_sync_cursor(cursor_ts.saturating_sub(60)).ok();
-        info!("Tier 2: Updated sync cursor to {}", cursor_ts.saturating_sub(60));
+        // Only advance sync cursor if we actually processed batches and fetched events.
+        // This prevents the cursor from racing ahead when relays return 0 events,
+        // which would cause the next cycle to use a too-narrow since window.
+        if batches_processed > 0 && total_new > 0 {
+            let cursor_ts = chrono::Utc::now().timestamp() as u64;
+            self.db.set_sync_cursor(cursor_ts.saturating_sub(60)).ok();
+            info!(
+                "Tier 2: Updated sync cursor to {} ({} new events across {} batches)",
+                cursor_ts.saturating_sub(60), total_new, batches_processed
+            );
+        } else {
+            info!(
+                "Tier 2: Cursor NOT advanced (batches={}, new={}, dupe={}) — will retry same window next cycle",
+                batches_processed, total_new, total_dupe
+            );
+        }
 
         {
             let mut stats = self.sync_stats.write().await;
@@ -821,7 +866,10 @@ impl SyncEngine {
         }
 
         self.emit_tier_complete(2);
-        info!("Tier 2 complete: {} events fetched", fetched);
+        info!(
+            "Tier 2 complete: {} events fetched ({} new, {} dupe, {} batches)",
+            fetched, total_new, total_dupe, batches_processed
+        );
 
         // Cool-down: give relays a break before Tier 3
         if !self.cancel.is_cancelled() {
