@@ -797,25 +797,76 @@ async fn get_activity_data(state: State<'_, AppState>) -> Result<Vec<u64>, Strin
 async fn get_relay_status(state: State<'_, AppState>) -> Result<Vec<RelayStatusInfo>, String> {
     tracing::debug!("[cmd:get_relay_status] called");
     let config = state.config.read().await;
-    tracing::debug!("[cmd:get_relay_status] returning {} relays", config.outbound_relays.len());
-    Ok(config
-        .outbound_relays
+    let relays = config.outbound_relays.clone();
+    drop(config);
+
+    tracing::debug!("[cmd:get_relay_status] checking {} relays concurrently", relays.len());
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .user_agent("nostrito/0.1.0")
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+
+    // Check all relays concurrently via NIP-11 info endpoint
+    let futures: Vec<_> = relays
         .iter()
         .map(|url| {
-            let name = url
-                .replace("wss://", "")
-                .replace("ws://", "")
-                .replace("relay.", "")
-                .trim_end_matches('/')
-                .to_string();
-            RelayStatusInfo {
-                url: url.clone(),
-                name,
-                connected: true, // reflects configured status; real connectivity TBD
-                latency_ms: None, // TODO: measure actual latency
+            let client = client.clone();
+            let url = url.clone();
+            async move {
+                let name = url
+                    .replace("wss://", "")
+                    .replace("ws://", "")
+                    .replace("relay.", "")
+                    .trim_end_matches('/')
+                    .to_string();
+
+                // Convert wss:// → https:// or ws:// → http:// for NIP-11 info request
+                let http_url = url
+                    .replace("wss://", "https://")
+                    .replace("ws://", "http://");
+
+                let start = std::time::Instant::now();
+                let result = client
+                    .get(&http_url)
+                    .header("Accept", "application/nostr+json")
+                    .send()
+                    .await;
+
+                match result {
+                    Ok(_response) => {
+                        let latency = start.elapsed().as_millis() as u32;
+                        tracing::debug!("[relay_status] {} — connected ({}ms)", url, latency);
+                        RelayStatusInfo {
+                            url,
+                            name,
+                            connected: true,
+                            latency_ms: Some(latency),
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("[relay_status] {} — failed: {}", url, e);
+                        RelayStatusInfo {
+                            url,
+                            name,
+                            connected: false,
+                            latency_ms: None,
+                        }
+                    }
+                }
             }
         })
-        .collect())
+        .collect();
+
+    let results = futures_util::future::join_all(futures).await;
+    tracing::info!(
+        "[cmd:get_relay_status] {} relays checked: {} connected",
+        results.len(),
+        results.iter().filter(|r| r.connected).count()
+    );
+
+    Ok(results)
 }
 
 #[tauri::command]

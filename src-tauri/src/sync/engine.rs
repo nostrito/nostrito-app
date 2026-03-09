@@ -591,6 +591,10 @@ impl SyncEngine {
         }
 
         // ── Tier 1b: Fetch ALL own events (full history backup) ──
+        // We intentionally keep ALL kinds here (including reactions, zaps, DMs)
+        // because this is the user's own event history — we want a complete backup
+        // of everything they've published. The broader kind set only applies to
+        // this user's pubkey, so it doesn't create noise in the feed.
         info!("Tier 1b: Fetching ALL own events (full history backup)");
 
         let all_own_filter = Filter::new()
@@ -910,17 +914,18 @@ impl SyncEngine {
                 continue;
             }
 
+            // Only fetch meaningful content kinds from follows.
+            // Excluded: kind 4 (DMs — own events only), kind 7 (reactions — noisy,
+            // low value for feed), kind 9735 (zaps — noise). This keeps the event
+            // store focused on actual content and WoT-relevant data.
             let filter = Filter::new()
                 .authors(authors)
                 .kinds(vec![
-                    Kind::Metadata,                  // 0 — profile pics + WoT
-                    Kind::TextNote,                  // 1 — notes
-                    Kind::ContactList,               // 3 — WoT depth
-                    Kind::EncryptedDirectMessage,    // 4 — NIP-04 DMs
-                    Kind::Repost,                    // 6
-                    Kind::Reaction,                  // 7
-                    Kind::ZapReceipt,                // 9735
-                    Kind::LongFormTextNote,          // 30023
+                    Kind::Metadata,           // 0 — profiles
+                    Kind::TextNote,           // 1 — notes
+                    Kind::ContactList,        // 3 — follows (for WoT)
+                    Kind::Repost,             // 6 — reposts
+                    Kind::LongFormTextNote,   // 30023 — articles
                 ])
                 .since(since)
                 .limit(self.sync_config.events_per_batch as usize);
