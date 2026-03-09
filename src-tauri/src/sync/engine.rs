@@ -375,28 +375,62 @@ impl SyncEngine {
             relay_policies.insert(url, RelayPolicy::new(min_interval));
         }
 
-        // Tier 1: Critical
-        if !self.cancel.is_cancelled() {
-            self.run_tier1(&mut relay_policies).await?;
-        }
+        let mut cycle: u64 = 0;
 
-        // Tier 2: Important
-        if !self.cancel.is_cancelled() {
-            self.run_tier2(&mut relay_policies).await?;
-        }
+        loop {
+            if self.cancel.is_cancelled() {
+                break;
+            }
 
-        // Tier 3: Background
-        if !self.cancel.is_cancelled() {
-            self.run_tier3(&mut relay_policies).await?;
-        }
+            info!("Sync cycle {} starting", cycle);
 
-        // Tier 4: Archive
-        if !self.cancel.is_cancelled() {
-            self.run_tier4(&mut relay_policies).await?;
+            // Tier 1: Critical — always run (fast, own profile + follows)
+            if !self.cancel.is_cancelled() {
+                if let Err(e) = self.run_tier1(&mut relay_policies).await {
+                    error!("Sync cycle {}: Tier 1 error: {}", cycle, e);
+                }
+            }
+
+            // Tier 2: Important — always run (incremental via sync cursor)
+            if !self.cancel.is_cancelled() {
+                if let Err(e) = self.run_tier2(&mut relay_policies).await {
+                    error!("Sync cycle {}: Tier 2 error: {}", cycle, e);
+                }
+            }
+
+            // Tier 3: Background — every 6 cycles (~30 min)
+            if !self.cancel.is_cancelled() && cycle % 6 == 0 {
+                info!("Sync cycle {}: Running Tier 3 (WoT crawl, every 6 cycles)", cycle);
+                if let Err(e) = self.run_tier3(&mut relay_policies).await {
+                    error!("Sync cycle {}: Tier 3 error: {}", cycle, e);
+                }
+            }
+
+            // Tier 4: Archive — every 12 cycles (~1 hour)
+            if !self.cancel.is_cancelled() && cycle % 12 == 0 {
+                info!("Sync cycle {}: Running Tier 4 (media backup, every 12 cycles)", cycle);
+                if let Err(e) = self.run_tier4(&mut relay_policies).await {
+                    error!("Sync cycle {}: Tier 4 error: {}", cycle, e);
+                }
+            }
+
+            self.set_tier(SyncTier::Idle);
+            info!("Sync cycle {} complete, waiting 5 minutes before next cycle", cycle);
+
+            cycle += 1;
+
+            // Wait 5 minutes before next cycle, but respect cancellation
+            tokio::select! {
+                _ = self.cancel.cancelled() => {
+                    info!("Sync engine cancelled during inter-cycle wait");
+                    break;
+                }
+                _ = tokio::time::sleep(Duration::from_secs(300)) => {}
+            }
         }
 
         self.set_tier(SyncTier::Idle);
-        info!("All sync tiers complete");
+        info!("Sync engine stopped after {} cycles", cycle);
         Ok(())
     }
 
