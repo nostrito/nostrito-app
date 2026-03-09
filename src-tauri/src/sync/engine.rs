@@ -411,9 +411,9 @@ impl SyncEngine {
                 }
             }
 
-            // Tier 4: Archive — every 12 cycles (~1 hour)
-            if !self.cancel.is_cancelled() && cycle % 12 == 0 {
-                info!("Sync cycle {}: Running Tier 4 (media backup, every 12 cycles)", cycle);
+            // Tier 4: Archive (media backup) — every cycle
+            if !self.cancel.is_cancelled() {
+                info!("Sync cycle {}: Running Tier 4 (media backup)", cycle);
                 if let Err(e) = self.run_tier4(&mut relay_policies).await {
                     error!("Sync cycle {}: Tier 4 error: {}", cycle, e);
                 }
@@ -1062,7 +1062,7 @@ impl SyncEngine {
         self.enforce_media_limit(limit_bytes).await;
 
         // 2. Collect media URLs from recently-stored events
-        let urls = self.extract_media_urls_from_events(500).await;
+        let urls = self.extract_media_urls_from_events(2000).await;
         info!("Tier 4: {} candidate media URLs from recent events", urls.len());
 
         // Also extract from ALL own events (full history, not just recent 500)
@@ -1432,6 +1432,7 @@ fn is_nostr_media_cdn(url: &str) -> bool {
     lower.contains("void.cat/d/")
         || lower.contains("nostr.build/")
         || lower.contains("image.nostr.build/")
+        || lower.contains("i.nostr.build/")
         || lower.contains("cdn.nostr.build/")
         || lower.contains("media.nostr.band/")
         || lower.contains("nostrimg.com/")
@@ -1441,6 +1442,13 @@ fn is_nostr_media_cdn(url: &str) -> bool {
         || lower.contains("files.v0l.io/")
         || lower.contains("nostr.mtrr.me/")
         || lower.contains("cdn.satellite.earth/")
+        || lower.contains("primal.b-cdn.net/")
+        || lower.contains("m.primal.net/")
+        || lower.contains("media.tenor.com/")
+        || lower.contains("i.imgur.com/")
+        || lower.contains("pbs.twimg.com/")
+        || lower.contains("video.twimg.com/")
+        || lower.contains("cdn.zaprite.com/")
 }
 
 fn extract_sha256_from_url(url: &str) -> Option<String> {
