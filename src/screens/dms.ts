@@ -162,8 +162,11 @@ function renderReadOnlyNotice(): string {
         You have DMs but your configuration is read-only.
       </div>
       <div style="font-size:0.85rem;color:var(--text-muted);max-width:360px;line-height:1.5;">
-        Go to <strong style="color:var(--accent-light);cursor:pointer;" data-navigate="settings-identity">Settings → Identity</strong> and connect your Nostr account to decrypt and read your messages.
+        Connect your Nostr account to decrypt and read your messages.
       </div>
+      <button class="btn btn-primary" data-navigate="settings-identity" style="margin-top:4px;padding:10px 28px;font-size:0.9rem;font-weight:600;border:none;border-radius:8px;background:var(--accent);color:#fff;cursor:pointer;">
+        Settings
+      </button>
     </div>
   `;
 }
