@@ -81,6 +81,26 @@ async function loadDms(): Promise<void> {
     });
 
     if (!events || events.length === 0) {
+      // Check if kind:4 DM events exist in the DB at all (might belong to others
+      // or be undecryptable in read-only mode)
+      try {
+        const kindCounts = await invoke<{ counts: Record<number, number> }>("get_kind_counts");
+        const dmCount = kindCounts.counts[4] || 0;
+        if (dmCount > 0) {
+          // DMs exist in the DB but none matched our pubkey query, or we're in
+          // read-only mode and can't decrypt. Since no signer is configured yet,
+          // the app is effectively read-only.
+          root.innerHTML = renderReadOnlyNotice();
+          root.querySelector("[data-navigate='settings-identity']")?.addEventListener("click", () => {
+            // Navigate to settings via the sidebar nav item to avoid circular imports
+            const settingsNav = document.querySelector('[data-screen="settings"]') as HTMLElement | null;
+            if (settingsNav) settingsNav.click();
+          });
+          return;
+        }
+      } catch (_) {
+        // Fall through to default empty state
+      }
       root.innerHTML = renderEmpty("No DMs found yet.");
       return;
     }
@@ -130,6 +150,20 @@ function renderEmpty(message: string): string {
     <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;padding:48px 24px;color:var(--text-muted);text-align:center;gap:12px;">
       <div style="font-size:2rem;">💬</div>
       <div style="font-size:0.95rem;font-weight:500;color:var(--text-dim);">${message}</div>
+    </div>
+  `;
+}
+
+function renderReadOnlyNotice(): string {
+  return `
+    <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;padding:48px 24px;text-align:center;gap:16px;">
+      <div style="font-size:2rem;">🔒</div>
+      <div style="font-size:0.95rem;font-weight:500;color:var(--text-dim);">
+        You have DMs but your configuration is read-only.
+      </div>
+      <div style="font-size:0.85rem;color:var(--text-muted);max-width:360px;line-height:1.5;">
+        Go to <strong style="color:var(--accent-light);cursor:pointer;" data-navigate="settings-identity">Settings → Identity</strong> and connect your Nostr account to decrypt and read your messages.
+      </div>
     </div>
   `;
 }
