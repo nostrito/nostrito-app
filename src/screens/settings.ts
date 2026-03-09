@@ -238,7 +238,6 @@ export function renderSettings(container: HTMLElement): void {
           <div class="settings-pane-desc">Low-level configuration options.</div>
           <div class="settings-field"><div class="settings-field-info"><span class="settings-field-label">Relay port</span><span class="settings-field-desc">Local WebSocket relay port</span></div><span style="font-family:var(--mono);font-size:0.85rem;color:var(--text-dim)" id="settings-port">—</span></div>
           <div class="settings-field"><div class="settings-field-info"><span class="settings-field-label">Auto-start</span><span class="settings-field-desc">Start nostrito on login</span></div><label class="toggle"><input type="checkbox" id="settings-autostart"><span class="toggle-slider"></span></label></div>
-          <div class="settings-field"><div class="settings-field-info"><span class="settings-field-label">Max storage</span><span class="settings-field-desc">Database size limit</span></div><span style="font-family:var(--mono);font-size:0.85rem;color:var(--text-dim)" id="settings-max-storage">—</span></div>
 
           <div class="settings-field" style="border-bottom:none;padding-bottom:8px"><div class="settings-field-info"><span class="settings-field-label">Browser Integration</span><span class="settings-field-desc">Enable wss:// for web Nostr clients (Coracle, Snort, Primal)</span></div></div>
           <div style="background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:14px 18px;margin-bottom:16px">
@@ -535,14 +534,6 @@ async function loadSettings(): Promise<void> {
 
     const autostartEl = document.getElementById("settings-autostart") as HTMLInputElement | null;
     if (autostartEl) autostartEl.checked = settings.auto_start;
-
-    const maxStorageEl = document.getElementById("settings-max-storage");
-    if (maxStorageEl) {
-      maxStorageEl.textContent =
-        settings.max_storage_mb >= 1024
-          ? `${(settings.max_storage_mb / 1024).toFixed(1)} GB`
-          : `${settings.max_storage_mb} MB`;
-    }
 
     // Storage sliders
     _currentSettings = settings;
