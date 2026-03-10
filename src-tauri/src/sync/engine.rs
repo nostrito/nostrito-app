@@ -55,6 +55,7 @@ pub struct TierComplete {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SyncStats {
     pub tier1_fetched: u64,
+    pub tracked_fetched: u64,
     pub tier2_fetched: u64,
     pub tier3_fetched: u64,
     pub tier4_fetched: u64,
@@ -288,10 +289,16 @@ impl Default for SyncConfig {
 // ║             no size limit, never evicted)                         ║
 // ║    ► MUST complete before anything else starts.                   ║
 // ║                                                                   ║
+// ║  Layer 0.5 — Tracked Profiles                                     ║
+// ║    Events + media from tracked npubs — always kept, no age limit. ║
+// ║    Fetches kinds 0, 1, 3, 6, 30023 for all tracked pubkeys.      ║
+// ║    Media downloaded same as own (no eviction, no size limit).     ║
+// ║    ► Runs after Layer 0, before Layer 1.                          ║
+// ║                                                                   ║
 // ║  Layer 1 — Direct Follows Content                                 ║
 // ║    Tier 2:  Fetch events from direct follows                      ║
 // ║             (kinds 0, 1, 3, 6, 30023 + historical backfill)       ║
-// ║    ► Only starts after Layer 0 is done.                           ║
+// ║    ► Only starts after Layer 0.5 is done.                         ║
 // ║                                                                   ║
 // ║  Layer 2 — WoT / Follows-of-Follows                              ║
 // ║    Tier 1.5: Metadata refresh for WoT peers (every 3 cycles)     ║
@@ -307,6 +314,7 @@ impl Default for SyncConfig {
 // ║  Storage Pruning Rules:                                           ║
 // ║    • Own events: NEVER pruned, regardless of limits               ║
 // ║    • Tracked profile events: NEVER pruned                         ║
+// ║    • Tracked profile media: NEVER evicted (same as own media)     ║
 // ║    • WoT/others events: pruned when older than max_event_age_days ║
 // ║    • Own media: NEVER evicted from media cache                    ║
 // ║    • Others' media: LRU eviction when over storage_media_gb       ║
@@ -544,8 +552,27 @@ impl SyncEngine {
             }
 
             // ────────────────────────────────────────────────────────
+            // LAYER 0.5 — TRACKED PROFILES
+            // Events + media from tracked npubs. Always kept, no age
+            // limit. Runs after Layer 0, before Layer 1.
+            // ────────────────────────────────────────────────────────
+
+            if !self.cancel.is_cancelled() {
+                if let Err(e) = self.run_tracked_profiles_sync(&mut relay_policies).await {
+                    error!("Sync cycle {}: Tracked profiles sync error: {}", cycle, e);
+                }
+            }
+
+            // Tracked profiles media download (same rules as own media — never evicted)
+            if !self.cancel.is_cancelled() {
+                if let Err(e) = self.run_tracked_media_download().await {
+                    error!("Sync cycle {}: Tracked media download error: {}", cycle, e);
+                }
+            }
+
+            // ────────────────────────────────────────────────────────
             // LAYER 1 — DIRECT FOLLOWS CONTENT
-            // Only starts after Layer 0 (own content) is complete.
+            // Only starts after Layer 0.5 (tracked profiles) is complete.
             // ────────────────────────────────────────────────────────
 
             // Tier 2: Fetch recent events from direct follows (kinds 0,1,3,6,30023)
@@ -906,6 +933,279 @@ impl SyncEngine {
         info!(
             "Tier 1a complete: {} downloaded, {} skipped, {} already cached (of {} total own media URLs)",
             downloaded, skipped, already_cached, own_media_urls.len()
+        );
+        Ok(())
+    }
+
+    // ── Layer 0.5: Tracked Profiles Sync ──────────────────────────
+    // Fetches events from all tracked profiles (kinds 0, 1, 3, 6, 30023).
+    // Uses an incremental cursor (tracked_since) stored in config.
+    // Events from tracked profiles are NEVER pruned.
+    // Runs every sync cycle, after Layer 0 and before Layer 1.
+
+    async fn run_tracked_profiles_sync(&self, policies: &mut HashMap<String, RelayPolicy>) -> Result<()> {
+        let tracked_pubkeys = self.db.get_tracked_pubkeys().unwrap_or_default();
+        if tracked_pubkeys.is_empty() {
+            debug!("Layer 0.5: No tracked profiles, skipping");
+            return Ok(());
+        }
+
+        info!("Layer 0.5: Syncing {} tracked profiles", tracked_pubkeys.len());
+
+        // Incremental cursor — shared across all tracked profiles
+        let now_epoch = chrono::Utc::now().timestamp() as u64;
+        let since_ts = match self.db.get_config("tracked_since")? {
+            Some(val) => val.parse::<u64>().unwrap_or(0).saturating_sub(60),
+            None => {
+                // First run: look back 30 days for tracked profiles
+                now_epoch.saturating_sub(30 * 86400)
+            }
+        };
+        let since = Timestamp::from(since_ts);
+
+        info!(
+            "Layer 0.5: since={} ({}), {} tracked pubkeys",
+            since_ts,
+            chrono::DateTime::from_timestamp(since_ts as i64, 0)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                .unwrap_or_else(|| "?".into()),
+            tracked_pubkeys.len(),
+        );
+
+        let relay_urls = self.all_relay_urls();
+        let mut fetched: u64 = 0;
+        let mut total_new: u64 = 0;
+
+        // ONE persistent client for this tier
+        let client = Client::default();
+        for url in &relay_urls {
+            if let Err(e) = client.add_relay(url.as_str()).await {
+                warn!("Layer 0.5: Failed to add relay {}: {}", url, e);
+            }
+        }
+        client.connect().await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let policy_url = relay_urls.first().cloned().unwrap_or_default();
+
+        // Process in batches of 10 tracked pubkeys
+        for (batch_idx, chunk) in tracked_pubkeys.chunks(10).enumerate() {
+            if self.cancel.is_cancelled() {
+                break;
+            }
+
+            let authors: Vec<PublicKey> = chunk
+                .iter()
+                .filter_map(|hex| PublicKey::from_hex(hex).ok())
+                .collect();
+
+            if authors.is_empty() {
+                continue;
+            }
+
+            let main_filter = Filter::new()
+                .authors(authors.clone())
+                .kinds(vec![
+                    Kind::Metadata,           // 0
+                    Kind::TextNote,           // 1
+                    Kind::ContactList,        // 3
+                    Kind::Repost,             // 6
+                ])
+                .since(since)
+                .limit(200);
+
+            let articles_filter = Filter::new()
+                .authors(authors)
+                .kinds(vec![Kind::LongFormTextNote]) // 30023
+                .since(since)
+                .limit(50);
+
+            let policy = policies
+                .entry(policy_url.clone())
+                .or_insert_with(|| RelayPolicy::new(self.sync_config.relay_min_interval_secs as u64));
+
+            match subscribe_and_collect(&client, vec![main_filter, articles_filter], 15, policy).await {
+                Ok(events) => {
+                    let mut batch_new: u64 = 0;
+                    for event in events.iter() {
+                        let tags: Vec<Vec<String>> = event
+                            .tags
+                            .iter()
+                            .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
+                            .collect();
+                        let tags_json = serde_json::to_string(&tags).unwrap_or_default();
+                        let inserted = self.db
+                            .store_event(
+                                &event.id.to_hex(),
+                                &event.pubkey.to_hex(),
+                                event.created_at.as_u64() as i64,
+                                event.kind.as_u16() as u32,
+                                &tags_json,
+                                &event.content.to_string(),
+                                &event.sig.to_string(),
+                            )
+                            .unwrap_or(false);
+
+                        if inserted {
+                            batch_new += 1;
+                            self.queue_media_for_event(&event.pubkey.to_hex(), &event.content.to_string(), &tags_json);
+                        }
+
+                        // Process kind:3 → update WoT graph
+                        if event.kind == Kind::ContactList {
+                            if let Some(update) = process_contact_event(event) {
+                                let updated = self.graph.update_follows(
+                                    &update.pubkey,
+                                    &update.follows,
+                                    Some(update.event_id.clone()),
+                                    Some(update.created_at),
+                                );
+                                if updated {
+                                    let batch = vec![FollowUpdateBatch {
+                                        pubkey: &update.pubkey,
+                                        follows: &update.follows,
+                                        event_id: Some(&update.event_id),
+                                        created_at: Some(update.created_at),
+                                    }];
+                                    self.db.update_follows_batch(&batch).ok();
+                                }
+                            }
+                        }
+                    }
+                    fetched += events.len() as u64;
+                    total_new += batch_new;
+                    info!(
+                        "Layer 0.5: batch {}: {} tracked → {} events ({} new)",
+                        batch_idx + 1,
+                        chunk.len(),
+                        events.len(),
+                        batch_new,
+                    );
+                }
+                Err(e) => {
+                    warn!("Layer 0.5: batch {} failed: {}", batch_idx + 1, e);
+                }
+            }
+
+            // Pause between batches
+            if batch_idx + 1 < tracked_pubkeys.chunks(10).len() {
+                tokio::time::sleep(Duration::from_secs(self.sync_config.batch_pause_secs as u64)).await;
+            }
+        }
+
+        client.disconnect().await.ok();
+
+        // Advance cursor
+        self.db.set_config("tracked_since", &now_epoch.to_string())?;
+
+        {
+            let mut stats = self.sync_stats.write().await;
+            stats.tracked_fetched = fetched;
+        }
+
+        self.emit_progress(15, fetched, fetched, ""); // tier 15 = layer 0.5 indicator
+        self.emit_tier_complete(15);
+
+        info!(
+            "Layer 0.5 complete: {} events fetched ({} new) from {} tracked profiles",
+            fetched, total_new, tracked_pubkeys.len()
+        );
+        Ok(())
+    }
+
+    // ── Layer 0.5: Tracked Profiles Media Download ──────────────
+    // Downloads media from tracked profiles' events. Same rules as own
+    // media: no size limit, never evicted.
+
+    async fn run_tracked_media_download(&self) -> Result<()> {
+        let tracked_pubkeys = self.db.get_tracked_pubkeys().unwrap_or_default();
+        if tracked_pubkeys.is_empty() {
+            return Ok(());
+        }
+
+        info!("Layer 0.5 media: Downloading media for {} tracked profiles", tracked_pubkeys.len());
+
+        let events = self.db.query_events(
+            None,
+            Some(&tracked_pubkeys),
+            None,  // all kinds
+            None,
+            None,
+            5000,
+        ).unwrap_or_default();
+
+        let mut urls = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for (_id, pubkey, _created_at, _kind, tags_json, content, _sig) in &events {
+            for url in extract_urls_from_text(content) {
+                let is_media = extract_sha256_from_url(&url).is_some()
+                    || mime_type_from_url(&url).is_some()
+                    || is_nostr_media_cdn(&url);
+                if is_media && seen.insert(url.clone()) {
+                    urls.push((url, pubkey.clone()));
+                }
+            }
+            for url in extract_urls_from_tags(tags_json) {
+                let is_media = extract_sha256_from_url(&url).is_some()
+                    || mime_type_from_url(&url).is_some()
+                    || is_nostr_media_cdn(&url);
+                if is_media && seen.insert(url.clone()) {
+                    urls.push((url, pubkey.clone()));
+                }
+            }
+        }
+
+        if urls.is_empty() {
+            info!("Layer 0.5 media: No media URLs found for tracked profiles");
+            return Ok(());
+        }
+
+        info!("Layer 0.5 media: Found {} media URLs to check", urls.len());
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .user_agent("nostrito/0.1.0")
+            .build()
+            .unwrap_or_default();
+
+        let mut downloaded: u64 = 0;
+        let mut skipped: u64 = 0;
+        let mut already_cached: u64 = 0;
+
+        for (url, pubkey) in &urls {
+            if self.cancel.is_cancelled() {
+                break;
+            }
+
+            let hash = extract_sha256_from_url(url)
+                .unwrap_or_else(|| sha256_of_string(url));
+
+            if self.db.media_exists(&hash) {
+                already_cached += 1;
+                continue;
+            }
+
+            // Tracked media: is_own=true (never evicted), no size limit
+            match self.download_media(&client, url, &hash, pubkey, u64::MAX, true).await {
+                Ok(true) => {
+                    downloaded += 1;
+                }
+                Ok(false) => {
+                    skipped += 1;
+                }
+                Err(e) => {
+                    warn!("Layer 0.5 media: download failed for {}: {}", url, e);
+                    skipped += 1;
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        info!(
+            "Layer 0.5 media complete: {} downloaded, {} skipped, {} already cached (of {} total)",
+            downloaded, skipped, already_cached, urls.len()
         );
         Ok(())
     }

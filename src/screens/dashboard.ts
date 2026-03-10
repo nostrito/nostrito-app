@@ -18,12 +18,13 @@ interface AppStatus {
   sync_tier: number;
   sync_stats: {
     tier1_fetched: number;
+    tracked_fetched: number;
     tier2_fetched: number;
     tier3_fetched: number;
     tier4_fetched: number;
     current_tier: number;
   };
-  // Mapped to layers: tier1→layer0, tier2→layer1, tier3→layer2
+  // Mapped to layers: tier1→layer0, tracked→layer0.5, tier2→layer1, tier3→layer2
 }
 
 interface NostrEvent {
@@ -177,13 +178,15 @@ async function loadStats(): Promise<void> {
         : `nostrito — Dashboard`;
     }
 
-    // Sync layers (mapped from backend tiers: tier1→layer0, tier2→layer1, tier3→layer2)
+    // Sync layers (mapped from backend tiers)
+    // Layer IDs: 0 = own, 05 = tracked, 1 = follows, 2 = WoT
     const ct = status.sync_tier;
-    // Map: layer 0 = tier 1, layer 1 = tier 2, layer 2 = tier 3
-    const layerToTier: Record<number, number> = { 0: 1, 1: 2, 2: 3 };
-    for (let layer = 0; layer <= 2; layer++) {
-      const tier = layerToTier[layer];
-      const badgeEl = document.getElementById(`sync-layer-${layer}-badge`);
+    const layerIds = ["0", "05", "1", "2"];
+    // Map layer ID to the backend tier number that drives it
+    const layerToTier: Record<string, number> = { "0": 1, "05": 15, "1": 2, "2": 3 };
+    for (const lid of layerIds) {
+      const tier = layerToTier[lid];
+      const badgeEl = document.getElementById(`sync-layer-${lid}-badge`);
       if (badgeEl) {
         if (tier === ct) {
           badgeEl.className = "sync-tier-badge fast";
@@ -200,16 +203,17 @@ async function loadStats(): Promise<void> {
 
     // Sync detail per layer
     const s = status.sync_stats;
-    const layerDetails: Record<number, string> = {};
-    if (s.tier1_fetched > 0) layerDetails[0] = `${s.tier1_fetched} events`;
-    if (s.tier2_fetched > 0) layerDetails[1] = `${s.tier2_fetched} events`;
+    const layerDetails: Record<string, string> = {};
+    if (s.tier1_fetched > 0) layerDetails["0"] = `${s.tier1_fetched} events`;
+    if ((s.tracked_fetched || 0) > 0) layerDetails["05"] = `${s.tracked_fetched} events`;
+    if (s.tier2_fetched > 0) layerDetails["1"] = `${s.tier2_fetched} events`;
     if ((s.tier3_fetched || 0) + (s.tier4_fetched || 0) > 0)
-      layerDetails[2] = `${(s.tier3_fetched || 0) + (s.tier4_fetched || 0)} events`;
-    for (let layer = 0; layer <= 2; layer++) {
-      const tier = layerToTier[layer];
-      const el = document.getElementById(`sync-layer-${layer}-detail`);
+      layerDetails["2"] = `${(s.tier3_fetched || 0) + (s.tier4_fetched || 0)} events`;
+    for (const lid of layerIds) {
+      const tier = layerToTier[lid];
+      const el = document.getElementById(`sync-layer-${lid}-detail`);
       if (el) {
-        el.textContent = layerDetails[layer] || (tier <= ct ? "complete" : "—");
+        el.textContent = layerDetails[lid] || (tier <= ct ? "complete" : "—");
       }
     }
   } catch (e) {

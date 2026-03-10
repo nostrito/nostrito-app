@@ -580,6 +580,29 @@ impl Database {
         Ok(count as u64)
     }
 
+    /// Count events for a specific pubkey.
+    pub fn count_events_for_pubkey(&self, pubkey: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM nostr_events WHERE pubkey = ?1",
+            [pubkey],
+            |row| row.get(0),
+        )?;
+        debug!("[db] count_events_for_pubkey({}…): {}", &pubkey[..pubkey.len().min(8)], count);
+        Ok(count as u64)
+    }
+
+    /// Check if a pubkey has kind 0 (metadata) event stored.
+    pub fn has_profile_metadata(&self, pubkey: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM nostr_events WHERE pubkey = ?1 AND kind = 0",
+            [pubkey],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// Count events of a specific kind.
     pub fn count_events_by_kind(&self, kind: u32) -> Result<u64> {
         let conn = self.conn.lock().unwrap();

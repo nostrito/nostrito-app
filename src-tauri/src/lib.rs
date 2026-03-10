@@ -603,9 +603,12 @@ async fn get_feed(filter: FeedFilter, state: State<'_, AppState>) -> Result<Vec<
     let kinds = feed_kinds.as_deref();
     let limit = filter.limit.unwrap_or(50);
 
+    let author_vec = filter.author.map(|a| vec![a]);
+    let authors = author_vec.as_deref();
+
     let events = state
         .db
-        .query_events(None, None, kinds, filter.since, None, limit)
+        .query_events(None, authors, kinds, filter.since, None, limit)
         .map_err(|e| {
             tracing::error!("[cmd:get_feed] query failed: {}", e);
             format!("Failed to query events: {}", e)
@@ -1388,6 +1391,188 @@ async fn get_profile_media(pubkey: String, state: State<'_, AppState>) -> Result
     }).collect())
 }
 
+// ── Profile Fetch Types ────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProfileFetchResult {
+    pub events_fetched: u64,
+    pub has_profile: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProfileCacheStatus {
+    pub event_count: u64,
+    pub has_metadata: bool,
+}
+
+#[tauri::command]
+async fn get_profile_cache_status(pubkey: String, state: State<'_, AppState>) -> Result<ProfileCacheStatus, String> {
+    let event_count = state.db.count_events_for_pubkey(&pubkey).map_err(|e| e.to_string())?;
+    let has_metadata = state.db.has_profile_metadata(&pubkey).map_err(|e| e.to_string())?;
+    Ok(ProfileCacheStatus { event_count, has_metadata })
+}
+
+/// One-shot targeted fetch for a specific pubkey from all connected relays.
+#[tauri::command]
+async fn fetch_profile(pubkey: String, state: State<'_, AppState>) -> Result<ProfileFetchResult, String> {
+    use nostr_sdk::prelude::*;
+
+    tracing::info!("[cmd:fetch_profile] pubkey={}…", &pubkey[..pubkey.len().min(12)]);
+
+    let config = state.config.read().await;
+    let relay_urls = config.outbound_relays.clone();
+    drop(config);
+
+    if relay_urls.is_empty() {
+        return Err("No relays configured".into());
+    }
+
+    let mut all_events: Vec<Event> = Vec::new();
+
+    // Metadata + contacts filter
+    let meta_filter = Filter::new()
+        .kinds(vec![Kind::Metadata, Kind::ContactList])
+        .authors(vec![PublicKey::from_hex(&pubkey).map_err(|e| format!("Invalid pubkey: {}", e))?]);
+
+    // Recent events filter
+    let events_filter = Filter::new()
+        .kinds(vec![Kind::TextNote, Kind::Repost, Kind::Custom(30023)])
+        .authors(vec![PublicKey::from_hex(&pubkey).map_err(|e| format!("Invalid pubkey: {}", e))?])
+        .limit(100);
+
+    for url in &relay_urls {
+        let client = Client::default();
+        match client.add_relay(url.as_str()).await {
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!("[fetch_profile] Failed to add relay {}: {}", url, e);
+                continue;
+            }
+        }
+        client.connect().await;
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        // Subscribe and collect with a simple timeout approach
+        let mut notifications = client.notifications();
+        let sub_id = match client.subscribe(vec![meta_filter.clone(), events_filter.clone()], None).await {
+            Ok(output) => output.val,
+            Err(e) => {
+                tracing::warn!("[fetch_profile] Subscribe failed on {}: {}", url, e);
+                client.disconnect().await.ok();
+                continue;
+            }
+        };
+
+        let deadline = tokio::time::sleep(std::time::Duration::from_secs(15));
+        tokio::pin!(deadline);
+
+        loop {
+            tokio::select! {
+                result = notifications.recv() => {
+                    match result {
+                        Ok(RelayPoolNotification::Event { event, .. }) => {
+                            if !all_events.iter().any(|e| e.id == event.id) {
+                                all_events.push(*event);
+                            }
+                        }
+                        Ok(RelayPoolNotification::Message { message, .. }) => {
+                            if matches!(&message, RelayMessage::EndOfStoredEvents(_)) {
+                                break;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+                _ = &mut deadline => {
+                    tracing::warn!("[fetch_profile] Timeout on {}, got {} events so far", url, all_events.len());
+                    break;
+                }
+            }
+        }
+
+        client.unsubscribe(sub_id).await;
+        client.disconnect().await.ok();
+
+        tracing::info!("[fetch_profile] Got {} events from {}", all_events.len(), url);
+
+        // If we got metadata + contacts, skip remaining relays
+        let has_meta = all_events.iter().any(|e| e.kind == Kind::Metadata && e.author().to_hex() == pubkey);
+        let has_contacts = all_events.iter().any(|e| e.kind == Kind::ContactList && e.author().to_hex() == pubkey);
+        if has_meta && has_contacts && all_events.len() >= 10 {
+            break;
+        }
+    }
+
+    // Store events
+    let mut stored_count: u64 = 0;
+    let mut has_profile = false;
+
+    // Sort newest-first for replaceable events
+    all_events.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    for event in &all_events {
+        let tags_json = serde_json::to_string(
+            &event.tags.iter().map(|t| t.as_slice().to_vec()).collect::<Vec<Vec<String>>>()
+        ).unwrap_or_else(|_| "[]".to_string());
+
+        match state.db.store_event(
+            &event.id.to_hex(),
+            &event.author().to_hex(),
+            event.created_at.as_u64() as i64,
+            event.kind.as_u16() as u32,
+            &tags_json,
+            &event.content,
+            &event.sig.to_string(),
+        ) {
+            Ok(true) => stored_count += 1,
+            Ok(false) => {} // duplicate
+            Err(e) => tracing::warn!("[fetch_profile] Failed to store event: {}", e),
+        }
+
+        // Update WoT graph for contact lists
+        if event.kind == Kind::ContactList {
+            let follows: Vec<String> = event.tags.iter()
+                .filter(|t| {
+                    let slice = t.as_slice();
+                    slice.len() >= 2 && slice[0] == "p"
+                })
+                .map(|t| t.as_slice()[1].clone())
+                .collect();
+
+            let updated = state.wot_graph.update_follows(
+                &event.author().to_hex(),
+                &follows,
+                Some(event.id.to_hex()),
+                Some(event.created_at.as_u64() as i64),
+            );
+            if updated {
+                let batch = vec![storage::FollowUpdateBatch {
+                    pubkey: &event.author().to_hex(),
+                    follows: &follows,
+                    event_id: Some(&event.id.to_hex()),
+                    created_at: Some(event.created_at.as_u64() as i64),
+                }];
+                state.db.update_follows_batch(&batch).ok();
+            }
+        }
+
+        if event.kind == Kind::Metadata {
+            has_profile = true;
+        }
+    }
+
+    tracing::info!(
+        "[cmd:fetch_profile] Done: {} events fetched, {} stored, has_profile={}",
+        all_events.len(), stored_count, has_profile
+    );
+
+    Ok(ProfileFetchResult {
+        events_fetched: all_events.len() as u64,
+        has_profile,
+    })
+}
+
 #[tauri::command]
 async fn check_browser_integration() -> Result<bool, String> {
     let cert_path = dirs::home_dir()
@@ -1643,6 +1828,8 @@ pub fn run() {
             track_profile,
             untrack_profile,
             get_tracked_profiles,
+            fetch_profile,
+            get_profile_cache_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running nostrito");
