@@ -1108,7 +1108,7 @@ async fn save_settings(settings: Settings, state: State<'_, AppState>) -> Result
     config.wot_event_retention_days = settings.wot_event_retention_days;
     config.wot_max_depth = settings.wot_max_depth;
     config.sync_interval_secs = settings.sync_interval_secs;
-    config.outbound_relays = settings.outbound_relays;
+    config.outbound_relays = settings.outbound_relays.clone();
     config.auto_start = settings.auto_start;
     config.sync_lookback_days = settings.sync_lookback_days;
     config.sync_batch_size = settings.sync_batch_size;

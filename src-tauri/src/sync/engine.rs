@@ -451,7 +451,7 @@ impl SyncEngine {
         let now_epoch = chrono::Utc::now().timestamp() as u64;
         let twenty_four_hours = 24 * 3600;
 
-        if let Ok(Some(articles_cursor)) = self.db.get_articles_history_cursor() {
+        if let Ok(Some(_articles_cursor)) = self.db.get_articles_history_cursor() {
             // The cursor walks backward in time. If it's set but the difference
             // between now and the cursor is less than 24h, it means the cursor
             // hasn't walked back at all — it might be stuck right near "now".
