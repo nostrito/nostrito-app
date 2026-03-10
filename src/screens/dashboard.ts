@@ -23,6 +23,7 @@ interface AppStatus {
     tier3_fetched: number;
     tier4_fetched: number;
     current_tier: number;
+    current_layer: string; // "0", "0.5", "1", "2", "3", or ""
   };
   // Mapped to layers: tier1→layer0, tracked→layer0.5, tier2→layer1, tier3→layer2
 }
@@ -154,7 +155,8 @@ async function loadStats(): Promise<void> {
     setTextContent("dash-events", status.events_stored.toLocaleString());
     setTextContent("dash-wot-peers", status.wot_nodes.toLocaleString());
     setTextContent("dash-media", "—");
-    setTextContent("dash-sync-rate", status.sync_tier > 0 ? "~syncing" : "idle");
+    const isSyncing = status.sync_tier > 0 || (status.sync_stats.current_layer || "") !== "";
+    setTextContent("dash-sync-rate", isSyncing ? "~syncing" : "idle");
     setTextContent("dash-uptime", uptimeStr);
 
     // Relay badge — show URL when running
@@ -178,20 +180,27 @@ async function loadStats(): Promise<void> {
         : `nostrito — Dashboard`;
     }
 
-    // Sync layers (mapped from backend tiers)
-    // Layer IDs: 0 = own, 05 = tracked, 1 = follows, 2 = WoT
-    const ct = status.sync_tier;
+    // Sync layers — use current_layer from backend for accurate display
+    // Layer IDs on dashboard: "0" = own, "05" = tracked, "1" = follows, "2" = WoT
+    // Backend current_layer values: "0", "0.5", "1", "2", "3", or "" (idle)
+    const s = status.sync_stats;
+    const cl = s.current_layer || "";
     const layerIds = ["0", "05", "1", "2"];
-    // Map layer ID to the backend tier number that drives it
-    const layerToTier: Record<string, number> = { "0": 1, "05": 15, "1": 2, "2": 3 };
+    // Map dashboard layer ID to backend current_layer value
+    const layerToBackend: Record<string, string> = { "0": "0", "05": "0.5", "1": "1", "2": "2" };
+    // Ordered layer progression for "done" detection
+    const layerOrder = ["0", "0.5", "1", "2", "3"];
+
     for (const lid of layerIds) {
-      const tier = layerToTier[lid];
+      const backendLayer = layerToBackend[lid];
       const badgeEl = document.getElementById(`sync-layer-${lid}-badge`);
       if (badgeEl) {
-        if (tier === ct) {
+        if (cl === backendLayer) {
+          // Currently running this layer
           badgeEl.className = "sync-tier-badge fast";
           badgeEl.textContent = "FAST";
-        } else if (tier < ct) {
+        } else if (cl !== "" && layerOrder.indexOf(backendLayer) < layerOrder.indexOf(cl)) {
+          // Engine has moved past this layer in the current cycle
           badgeEl.className = "sync-tier-badge done";
           badgeEl.textContent = "✓";
         } else {
@@ -201,8 +210,7 @@ async function loadStats(): Promise<void> {
       }
     }
 
-    // Sync detail per layer
-    const s = status.sync_stats;
+    // Sync detail per layer — show event counts when available
     const layerDetails: Record<string, string> = {};
     if (s.tier1_fetched > 0) layerDetails["0"] = `${s.tier1_fetched} events`;
     if ((s.tracked_fetched || 0) > 0) layerDetails["05"] = `${s.tracked_fetched} events`;
@@ -210,10 +218,11 @@ async function loadStats(): Promise<void> {
     if ((s.tier3_fetched || 0) + (s.tier4_fetched || 0) > 0)
       layerDetails["2"] = `${(s.tier3_fetched || 0) + (s.tier4_fetched || 0)} events`;
     for (const lid of layerIds) {
-      const tier = layerToTier[lid];
+      const backendLayer = layerToBackend[lid];
       const el = document.getElementById(`sync-layer-${lid}-detail`);
       if (el) {
-        el.textContent = layerDetails[lid] || (tier <= ct ? "complete" : "—");
+        const isDone = cl !== "" && layerOrder.indexOf(backendLayer) < layerOrder.indexOf(cl);
+        el.textContent = layerDetails[lid] || (isDone ? "complete" : "—");
       }
     }
   } catch (e) {

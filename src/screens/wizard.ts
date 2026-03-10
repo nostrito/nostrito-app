@@ -4,7 +4,7 @@
 
 import { showAppShell } from "../app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { RELAYS } from "../relays";
+import { RELAYS, resolveRelayUrl } from "../relays";
 import { iconCheck, iconBookOpen, iconKey, iconCastle, iconPlug, iconSparkles, iconLock, iconImage, iconVideo, iconVolume, iconClipboard, iconParty } from "../utils/icons";
 
 export interface WizardConfig {
@@ -483,7 +483,7 @@ export class WizardScreen {
       identityMode: this.identityMode,
       npub: this.npub,
       signerType: this.signerType || undefined,
-      relays: Array.from(this.selectedRelays),
+      relays: Array.from(this.selectedRelays).map(resolveRelayUrl),
       storage: {
         othersEventsGb: this.othersEventsGb,
         othersMediaGb: this.othersMediaGb,

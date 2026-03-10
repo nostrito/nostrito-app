@@ -12,7 +12,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use storage::{Database, ProfileInfo};
-use sync::{SyncConfig, SyncEngine, SyncStats, SyncTier};
+use sync::{resolve_relay_alias, SyncConfig, SyncEngine, SyncStats, SyncTier};
 use wot::WotGraph;
 
 // ── App State ──────────────────────────────────────────────────────
@@ -63,8 +63,8 @@ impl Default for AppConfig {
             npub: None,
             hex_pubkey: None,
             relay_port: 4869,
-            max_storage_mb: 500,
-            wot_max_depth: 3,
+            max_storage_mb: 10240,
+            wot_max_depth: 2,
             sync_interval_secs: 300,
             outbound_relays: vec![
                 "wss://relay.damus.io".into(),
@@ -78,8 +78,8 @@ impl Default for AppConfig {
             storage_tracked_media_gb: 3.0,
             storage_wot_media_gb: 2.0,
             wot_event_retention_days: 30,
-            sync_lookback_days: 7,
-            sync_batch_size: 10,
+            sync_lookback_days: 30,
+            sync_batch_size: 50,
             sync_events_per_batch: 50,
             sync_batch_pause_secs: 7,
             sync_relay_min_interval_secs: 3,
@@ -259,13 +259,19 @@ async fn init_nostrito(
         return Err("Invalid pubkey format. Use npub1... or 64-char hex".into());
     };
 
+    // Resolve relay aliases to canonical wss:// URLs (wizard may send short aliases)
+    let resolved_relays: Vec<String> = relays
+        .iter()
+        .map(|r| resolve_relay_alias(r).to_string())
+        .collect();
+
     // Update config
     {
         let mut config = state.config.write().await;
         config.npub = Some(npub.clone());
         config.hex_pubkey = Some(hex_pubkey.clone());
-        if !relays.is_empty() {
-            config.outbound_relays = relays.clone();
+        if !resolved_relays.is_empty() {
+            config.outbound_relays = resolved_relays.clone();
         }
         if let Some(gb) = storage_others_gb {
             config.storage_others_gb = gb;
@@ -284,10 +290,10 @@ async fn init_nostrito(
         .db
         .set_config("hex_pubkey", &hex_pubkey)
         .map_err(|e| format!("Failed to save config: {}", e))?;
-    if !relays.is_empty() {
+    if !resolved_relays.is_empty() {
         state
             .db
-            .set_config("outbound_relays", &relays.join(","))
+            .set_config("outbound_relays", &resolved_relays.join(","))
             .map_err(|e| format!("Failed to save relays: {}", e))?;
     }
 
@@ -952,8 +958,18 @@ async fn get_activity_data(state: State<'_, AppState>) -> Result<Vec<u64>, Strin
 async fn get_relay_status(state: State<'_, AppState>) -> Result<Vec<RelayStatusInfo>, String> {
     tracing::debug!("[cmd:get_relay_status] called");
     let config = state.config.read().await;
-    let relays = config.outbound_relays.clone();
+    let mut relays = config.outbound_relays.clone();
     drop(config);
+
+    // Filter out empty strings and fall back to defaults if nothing valid remains
+    relays.retain(|r| !r.trim().is_empty());
+    if relays.is_empty() {
+        relays = vec![
+            "wss://relay.damus.io".into(),
+            "wss://relay.primal.net".into(),
+            "wss://nos.lol".into(),
+        ];
+    }
 
     tracing::debug!("[cmd:get_relay_status] checking {} relays concurrently", relays.len());
 
@@ -1108,7 +1124,14 @@ async fn save_settings(settings: Settings, state: State<'_, AppState>) -> Result
     config.wot_event_retention_days = settings.wot_event_retention_days;
     config.wot_max_depth = settings.wot_max_depth;
     config.sync_interval_secs = settings.sync_interval_secs;
-    config.outbound_relays = settings.outbound_relays.clone();
+    // Only update relays if the new list has valid entries — never clear to empty
+    let valid_relays: Vec<String> = settings.outbound_relays.iter()
+        .filter(|r| !r.trim().is_empty())
+        .cloned()
+        .collect();
+    if !valid_relays.is_empty() {
+        config.outbound_relays = valid_relays;
+    }
     config.auto_start = settings.auto_start;
     config.sync_lookback_days = settings.sync_lookback_days;
     config.sync_batch_size = settings.sync_batch_size;
@@ -1636,7 +1659,12 @@ pub fn run() {
         config.hex_pubkey = Some(hex);
     }
     if let Ok(Some(relays_csv)) = db.get_config("outbound_relays") {
-        let relays: Vec<String> = relays_csv.split(',').map(|s| s.to_string()).collect();
+        let relays: Vec<String> = relays_csv
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| resolve_relay_alias(s).to_string())
+            .collect();
         if !relays.is_empty() {
             tracing::info!("[init] Loaded {} relays from DB: {:?}", relays.len(), relays);
             config.outbound_relays = relays;

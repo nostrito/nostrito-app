@@ -60,6 +60,8 @@ pub struct SyncStats {
     pub tier3_fetched: u64,
     pub tier4_fetched: u64,
     pub current_tier: u8,
+    /// Conceptual layer currently executing: "0", "0.5", "1", "2", "3", or "" (idle)
+    pub current_layer: String,
 }
 
 // ── Relay Policy ───────────────────────────────────────────────────
@@ -152,7 +154,9 @@ impl RelayPolicy {
 
 // ── Relay URL Resolution ───────────────────────────────────────────
 
-fn resolve_relay_url(alias: &str) -> &str {
+/// Resolve a relay alias (e.g. "primal") to its canonical wss:// URL.
+/// Returns the input unchanged if it's already a URL or unknown alias.
+pub fn resolve_relay_url(alias: &str) -> &str {
     match alias {
         "primal" => "wss://relay.primal.net",
         "damus" => "wss://relay.damus.io",
@@ -379,10 +383,26 @@ impl SyncEngine {
         sync_config: SyncConfig,
         max_event_age_days: u32,
     ) -> Self {
+        // Filter out empty/whitespace-only relay URLs and fall back to defaults
+        let valid_relays: Vec<String> = relay_aliases.into_iter()
+            .filter(|r| !r.trim().is_empty())
+            .collect();
+        let final_relays = if valid_relays.is_empty() {
+            warn!("SyncEngine: No valid relay URLs provided, using defaults");
+            vec![
+                "wss://relay.damus.io".to_string(),
+                "wss://relay.primal.net".to_string(),
+                "wss://nos.lol".to_string(),
+            ]
+        } else {
+            valid_relays
+        };
+        info!("SyncEngine: initialized with {} relays: {:?}", final_relays.len(), final_relays);
+
         Self {
             graph,
             db,
-            relay_aliases,
+            relay_aliases: final_relays,
             cancel: CancellationToken::new(),
             hex_pubkey,
             sync_tier,
@@ -510,6 +530,12 @@ impl SyncEngine {
         self.sync_tier.store(tier as u8, Ordering::Relaxed);
     }
 
+    /// Update the current conceptual layer in SyncStats for dashboard display.
+    async fn set_layer(&self, layer: &str) {
+        let mut stats = self.sync_stats.write().await;
+        stats.current_layer = layer.to_string();
+    }
+
     fn all_relay_urls(&self) -> Vec<String> {
         self.relay_aliases
             .iter()
@@ -539,10 +565,16 @@ impl SyncEngine {
 
     async fn run(&self) -> Result<()> {
         info!(
-            "Starting tiered sync from {} relays for pubkey {}",
+            "Starting tiered sync from {} relays for pubkey {}: {:?}",
             self.relay_aliases.len(),
-            &self.hex_pubkey[..8]
+            &self.hex_pubkey[..8],
+            self.relay_aliases,
         );
+
+        if self.relay_aliases.is_empty() {
+            error!("FATAL: No relay URLs configured — sync engine cannot operate. Aborting.");
+            return Ok(());
+        }
 
         let min_interval = self.sync_config.relay_min_interval_secs as u64;
 
@@ -569,6 +601,7 @@ impl SyncEngine {
 
             // Tier 1: Own profile (kind 0) + contact list (kind 3) + full event history
             if !self.cancel.is_cancelled() {
+                self.set_layer("0").await;
                 if let Err(e) = self.run_tier1(&mut relay_policies).await {
                     error!("Sync cycle {}: Tier 1 error: {}", cycle, e);
                 }
@@ -589,6 +622,7 @@ impl SyncEngine {
             // ────────────────────────────────────────────────────────
 
             if !self.cancel.is_cancelled() {
+                self.set_layer("0.5").await;
                 if let Err(e) = self.run_tracked_profiles_sync(&mut relay_policies).await {
                     error!("Sync cycle {}: Tracked profiles sync error: {}", cycle, e);
                 }
@@ -609,6 +643,7 @@ impl SyncEngine {
             // Tier 2: Fetch recent events from direct follows (kinds 0,1,3,6,30023)
             // Includes incremental sync + historical backfill
             if !self.cancel.is_cancelled() {
+                self.set_layer("1").await;
                 if let Err(e) = self.run_tier2(&mut relay_policies).await {
                     error!("Sync cycle {}: Tier 2 error: {}", cycle, e);
                 }
@@ -624,6 +659,7 @@ impl SyncEngine {
             // Runs every 3 cycles to keep display names, avatars, and follows fresh.
             // Placed in Layer 2 because it serves WoT graph, not direct follows.
             if !self.cancel.is_cancelled() && cycle % 3 == 0 {
+                self.set_layer("2").await;
                 info!("Sync cycle {}: Running Tier 1.5 (WoT metadata refresh)", cycle);
                 if let Err(e) = self.run_metadata_refresh(&mut relay_policies).await {
                     error!("Sync cycle {}: Tier 1.5 error: {}", cycle, e);
@@ -633,6 +669,7 @@ impl SyncEngine {
             // Tier 3: WoT crawl — contact lists from follows-of-follows
             // Runs every 6 cycles (~30 min). Subject to storage limits.
             if !self.cancel.is_cancelled() && cycle % 6 == 0 {
+                self.set_layer("2").await;
                 info!("Sync cycle {}: Running Tier 3 (WoT crawl, every 6 cycles)", cycle);
                 if let Err(e) = self.run_tier3(&mut relay_policies).await {
                     error!("Sync cycle {}: Tier 3 error: {}", cycle, e);
@@ -647,6 +684,7 @@ impl SyncEngine {
 
             // Tier 4: Blossom media backup for others' content
             if !self.cancel.is_cancelled() {
+                self.set_layer("3").await;
                 info!("Sync cycle {}: Running Tier 4 (media backup)", cycle);
                 if let Err(e) = self.run_tier4(&mut relay_policies).await {
                     error!("Sync cycle {}: Tier 4 error: {}", cycle, e);
@@ -654,6 +692,7 @@ impl SyncEngine {
             }
 
             self.set_tier(SyncTier::Idle);
+            self.set_layer("").await;
             info!("Sync cycle {} complete, waiting 5 minutes before next cycle", cycle);
 
             cycle += 1;
