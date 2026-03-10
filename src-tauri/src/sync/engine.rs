@@ -355,17 +355,110 @@ impl SyncEngine {
         }
     }
 
+    // ──────────────────────────────────────────────────────────────────
+    // SELF-HEALING DESIGN PRINCIPLE
+    // ──────────────────────────────────────────────────────────────────
+    // The sync engine is designed to be unbreakable and self-healing.
+    // Users should never need to manually intervene in the sync process.
+    // All cursor resets, backfills, and recovery logic must happen
+    // automatically. If a cursor is stale, the engine detects it and
+    // resets it. If articles are missing, the engine re-fetches them.
+    // No buttons, no manual triggers, no user action required.
+    // ──────────────────────────────────────────────────────────────────
+
     /// Start sync as a background task. Returns a cancellation token to stop it.
     pub fn start(self: Arc<Self>) -> CancellationToken {
         let cancel = self.cancel.clone();
 
         tokio::spawn(async move {
+            // Run self-healing checks before starting the main sync loop
+            self.run_self_healing_checks();
+
             if let Err(e) = self.run().await {
                 error!("Sync engine error: {}", e);
             }
         });
 
         cancel
+    }
+
+    /// Self-healing checks that run on every startup.
+    /// Detects and fixes stale or missing cursors so users never have to
+    /// manually reset anything.
+    fn run_self_healing_checks(&self) {
+        info!("[self-healing] Running startup checks");
+
+        // ── Check 1: Zero articles with existing follows ──
+        // If we have follows but zero kind 30023 events, reset the articles
+        // cursor so backfill starts fresh.
+        let article_count = self.db.count_events_by_kind(30023).unwrap_or(0);
+        let follows_count = self.graph.get_follows(&self.hex_pubkey)
+            .map(|f| f.len())
+            .unwrap_or(0);
+
+        if article_count == 0 && follows_count > 0 {
+            info!(
+                "[self-healing] Zero articles (kind 30023) with {} follows — resetting articles cursor",
+                follows_count
+            );
+            self.db.delete_config("tier2_history_until_articles").ok();
+        }
+
+        // ── Check 2: Suspiciously low article count ──
+        // If follows > 10 but articles < 10, the cursor may be stuck.
+        // Reset it so backfill reruns from now.
+        if follows_count > 10 && article_count > 0 && article_count < 10 {
+            info!(
+                "[self-healing] Suspiciously low article count ({}) with {} follows — resetting articles cursor",
+                article_count, follows_count
+            );
+            let now = chrono::Utc::now().timestamp() as u64;
+            self.db.set_articles_history_cursor(now).ok();
+        }
+
+        // ── Check 3: Frozen cursors (>24h without advancing) ──
+        // If a history cursor exists but hasn't moved in over 24 hours,
+        // it may be stuck. Reset it.
+        let now_epoch = chrono::Utc::now().timestamp() as u64;
+        let twenty_four_hours = 24 * 3600;
+
+        if let Ok(Some(articles_cursor)) = self.db.get_articles_history_cursor() {
+            // The cursor walks backward in time. If it's set but the difference
+            // between now and the cursor is less than 24h, it means the cursor
+            // hasn't walked back at all — it might be stuck right near "now".
+            // We check: if cursor > now - 24h AND article count is still low,
+            // something is wrong. But a more reliable check: if the cursor value
+            // itself hasn't changed in 24h. Since we can't track "last changed"
+            // without extra state, we use a proxy: if cursor exists but articles
+            // are still very low after 24h+ of app runtime, reset.
+            // For simplicity: if cursor is set and articles < 10 and follows > 5,
+            // always reset — the backfill clearly didn't complete successfully.
+            if article_count < 10 && follows_count > 5 {
+                info!(
+                    "[self-healing] Articles cursor exists but count still low ({}) — resetting for fresh backfill",
+                    article_count
+                );
+                self.db.delete_config("tier2_history_until_articles").ok();
+            }
+        }
+
+        if let Ok(Some(history_cursor)) = self.db.get_history_cursor() {
+            // If main history cursor exists and is suspiciously close to now
+            // (within 24h), but we have very few events, something may be stuck.
+            let age = now_epoch.saturating_sub(history_cursor);
+            if age < twenty_four_hours {
+                let total_events = self.db.event_count().unwrap_or(0);
+                if total_events < 50 && follows_count > 5 {
+                    warn!(
+                        "[self-healing] Main history cursor only {}h old with {} total events and {} follows — resetting",
+                        age / 3600, total_events, follows_count
+                    );
+                    self.db.delete_config("tier2_history_until").ok();
+                }
+            }
+        }
+
+        info!("[self-healing] Startup checks complete");
     }
 
     /// Stop the sync engine

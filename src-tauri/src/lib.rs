@@ -67,10 +67,9 @@ impl Default for AppConfig {
             wot_max_depth: 3,
             sync_interval_secs: 300,
             outbound_relays: vec![
-                "wss://relay.primal.net".into(),
                 "wss://relay.damus.io".into(),
-                "wss://nostr.wine".into(),
-                "wss://relay.yakihonne.com".into(),
+                "wss://relay.primal.net".into(),
+                "wss://nos.lol".into(),
             ],
             auto_start: true,
             storage_others_gb: 5.0,
@@ -571,6 +570,11 @@ async fn restart_sync(state: State<'_, AppState>, app_handle: tauri::AppHandle) 
 /// Reset the articles (kind 30023) backfill cursor so historical articles are re-fetched.
 /// Also resets the main history cursor to trigger a full re-crawl of notes too.
 /// The next sync cycle will start backfilling from now, walking backward through all history.
+///
+/// NOTE: This is no longer exposed as a user-facing Tauri command.
+/// The sync engine handles cursor resets automatically via self-healing checks.
+/// Kept as internal logic for programmatic use if needed.
+#[allow(dead_code)]
 #[tauri::command]
 async fn resync_articles(state: State<'_, AppState>) -> Result<String, String> {
     tracing::info!("[cmd:resync_articles] Resetting article sync cursors");
@@ -1112,9 +1116,26 @@ async fn save_settings(settings: Settings, state: State<'_, AppState>) -> Result
     config.sync_wot_events_per_batch = settings.sync_wot_events_per_batch;
     config.max_event_age_days = settings.max_event_age_days;
 
-    // Persist sync config to DB
+    // Persist ALL settings to DB so they survive restart
     drop(config);
     let db = &state.db;
+
+    // Persist relay list (BUG FIX: was missing — relay selections were lost on restart)
+    if !settings.outbound_relays.is_empty() {
+        db.set_config("outbound_relays", &settings.outbound_relays.join(","))
+            .map_err(|e| format!("Failed to save relays: {}", e))?;
+        tracing::info!("[cmd:save_settings] Persisted {} relays to DB", settings.outbound_relays.len());
+    }
+
+    // Persist other settings that were previously missing
+    db.set_config("relay_port", &settings.relay_port.to_string()).ok();
+    db.set_config("max_storage_mb", &settings.max_storage_mb.to_string()).ok();
+    db.set_config("storage_others_gb", &settings.storage_others_gb.to_string()).ok();
+    db.set_config("storage_media_gb", &settings.storage_media_gb.to_string()).ok();
+    db.set_config("wot_max_depth", &settings.wot_max_depth.to_string()).ok();
+    db.set_config("sync_interval_secs", &settings.sync_interval_secs.to_string()).ok();
+
+    // Persist sync tuning config
     db.set_config("sync_lookback_days", &settings.sync_lookback_days.to_string()).ok();
     db.set_config("sync_batch_size", &settings.sync_batch_size.to_string()).ok();
     db.set_config("sync_events_per_batch", &settings.sync_events_per_batch.to_string()).ok();
@@ -1343,6 +1364,31 @@ async fn get_own_media(state: State<'_, AppState>) -> Result<Vec<OwnMediaItem>, 
 }
 
 #[tauri::command]
+async fn get_profile_media(pubkey: String, state: State<'_, AppState>) -> Result<Vec<OwnMediaItem>, String> {
+    tracing::debug!("[cmd:get_profile_media] called for pubkey={}...", &pubkey[..pubkey.len().min(8)]);
+
+    let records = state.db.get_profile_media(&pubkey).map_err(|e| e.to_string())?;
+    tracing::info!("[cmd:get_profile_media] returning {} media items for {}...", records.len(), &pubkey[..pubkey.len().min(8)]);
+
+    let home = dirs::home_dir().unwrap_or_default();
+    Ok(records.into_iter().map(|(hash, url, mime_type, size_bytes, downloaded_at)| {
+        let local_path = home.join(".nostrito/media")
+            .join(&hash[..2])
+            .join(&hash)
+            .to_string_lossy()
+            .to_string();
+        OwnMediaItem {
+            hash,
+            url,
+            local_path,
+            mime_type,
+            size_bytes,
+            downloaded_at: downloaded_at as u64,
+        }
+    }).collect())
+}
+
+#[tauri::command]
 async fn check_browser_integration() -> Result<bool, String> {
     let cert_path = dirs::home_dir()
         .ok_or("no home")?
@@ -1422,6 +1468,14 @@ pub fn run() {
     if let Ok(Some(v)) = db.get_config("storage_tracked_media_gb") { if let Ok(n) = v.parse::<f64>() { config.storage_tracked_media_gb = n; } }
     if let Ok(Some(v)) = db.get_config("storage_wot_media_gb") { if let Ok(n) = v.parse::<f64>() { config.storage_wot_media_gb = n; } }
     if let Ok(Some(v)) = db.get_config("wot_event_retention_days") { if let Ok(n) = v.parse::<u32>() { config.wot_event_retention_days = n; } }
+
+    // Load additional settings that are now persisted by save_settings
+    if let Ok(Some(v)) = db.get_config("relay_port") { if let Ok(n) = v.parse::<u16>() { config.relay_port = n; } }
+    if let Ok(Some(v)) = db.get_config("max_storage_mb") { if let Ok(n) = v.parse::<u32>() { config.max_storage_mb = n; } }
+    if let Ok(Some(v)) = db.get_config("storage_others_gb") { if let Ok(n) = v.parse::<f64>() { config.storage_others_gb = n; } }
+    if let Ok(Some(v)) = db.get_config("storage_media_gb") { if let Ok(n) = v.parse::<f64>() { config.storage_media_gb = n; } }
+    if let Ok(Some(v)) = db.get_config("wot_max_depth") { if let Ok(n) = v.parse::<u32>() { config.wot_max_depth = n; } }
+    if let Ok(Some(v)) = db.get_config("sync_interval_secs") { if let Ok(n) = v.parse::<u32>() { config.sync_interval_secs = n; } }
 
     tracing::info!("[init] Config: npub={:?}, relays={:?}, port={}", config.npub, config.outbound_relays, config.relay_port);
 
@@ -1584,8 +1638,8 @@ pub fn run() {
             check_browser_integration,
             get_media_stats,
             get_own_media,
+            get_profile_media,
             restart_sync,
-            resync_articles,
             track_profile,
             untrack_profile,
             get_tracked_profiles,

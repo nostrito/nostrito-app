@@ -580,6 +580,18 @@ impl Database {
         Ok(count as u64)
     }
 
+    /// Count events of a specific kind.
+    pub fn count_events_by_kind(&self, kind: u32) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM nostr_events WHERE kind = ?1",
+            [kind],
+            |row| row.get(0),
+        )?;
+        debug!("[db] count_events_by_kind({}): {}", kind, count);
+        Ok(count as u64)
+    }
+
     /// Get database file size in bytes
     pub fn db_size_bytes(&self) -> Result<u64> {
         let conn = self.conn.lock().unwrap();
@@ -1059,6 +1071,29 @@ impl Database {
         )?;
         let rows = stmt
             .query_map(params![own_pubkey], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? as u64,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Get cached media for any pubkey (profile media explorer).
+    /// Returns (hash, url, mime_type, size_bytes, downloaded_at) sorted by downloaded_at DESC.
+    pub fn get_profile_media(&self, pubkey: &str) -> Result<Vec<(String, String, String, u64, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT hash, url, mime_type, size_bytes, downloaded_at FROM media_cache \
+             WHERE pubkey = ?1 ORDER BY downloaded_at DESC"
+        )?;
+        let rows = stmt
+            .query_map(params![pubkey], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
