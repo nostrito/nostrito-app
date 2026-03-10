@@ -13,6 +13,14 @@ use tracing::{debug, error, info, warn};
 use crate::storage::{Database, FollowUpdateBatch};
 use crate::wot::WotGraph;
 
+/// Hardcoded default relays — used as fallback when no relays are configured or
+/// all configured relays fail to connect. These should always be reachable.
+const DEFAULT_RELAYS: &[&str] = &[
+    "wss://relay.damus.io",
+    "wss://relay.primal.net",
+    "wss://nos.lol",
+];
+
 // ── Tier Definitions ───────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -593,6 +601,86 @@ impl SyncEngine {
             }
 
             info!("Sync cycle {} starting (fresh relay policies)", cycle);
+
+            // ── Defensive relay pre-flight check ───────────────────
+            // Before running any tier, verify we can connect to at least
+            // one relay. If the configured list is empty or all connections
+            // fail, fall back to DEFAULT_RELAYS. This catches:
+            //   - Empty relay config (DB corruption, wizard skip, etc.)
+            //   - All configured relays being unreachable
+            //   - Network-down scenarios (fail fast, retry next cycle)
+            {
+                let relay_urls = self.all_relay_urls();
+                if relay_urls.is_empty() {
+                    warn!(
+                        "Sync cycle {}: relay_aliases is EMPTY — this indicates a config issue \
+                         (relays not saved to DB or loaded incorrectly).",
+                        cycle
+                    );
+                }
+
+                let preflight_client = Client::default();
+                let urls_to_try: Vec<String> = if relay_urls.is_empty() {
+                    DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect()
+                } else {
+                    relay_urls.clone()
+                };
+
+                let mut any_added = false;
+                for url in &urls_to_try {
+                    if preflight_client.add_relay(url.as_str()).await.is_ok() {
+                        any_added = true;
+                    }
+                }
+
+                // If no configured relays could be added and we haven't tried defaults yet
+                if !any_added && !relay_urls.is_empty() {
+                    warn!("Sync cycle {}: No configured relays could be added, trying DEFAULT_RELAYS", cycle);
+                    for url in DEFAULT_RELAYS {
+                        if preflight_client.add_relay(*url).await.is_ok() {
+                            any_added = true;
+                        }
+                    }
+                }
+
+                if any_added {
+                    preflight_client.connect().await;
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+
+                    let connected = preflight_client.relays().await;
+                    if connected.is_empty() {
+                        warn!(
+                            "Sync cycle {}: Pre-flight relay check FAILED — added relays but \
+                             none connected. Retrying in 60s. Configured: {:?}",
+                            cycle, urls_to_try
+                        );
+                        preflight_client.disconnect().await.ok();
+                        cycle += 1;
+                        tokio::select! {
+                            _ = self.cancel.cancelled() => break,
+                            _ = tokio::time::sleep(Duration::from_secs(60)) => {}
+                        }
+                        continue;
+                    }
+                    info!(
+                        "Sync cycle {}: Pre-flight OK — {} relays connected",
+                        cycle, connected.len()
+                    );
+                    preflight_client.disconnect().await.ok();
+                } else {
+                    error!(
+                        "Sync cycle {}: Pre-flight CRITICAL — could not add ANY relay URL. \
+                         Configured: {:?}, Defaults: {:?}. Retrying in 60s.",
+                        cycle, relay_urls, DEFAULT_RELAYS
+                    );
+                    cycle += 1;
+                    tokio::select! {
+                        _ = self.cancel.cancelled() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(60)) => {}
+                    }
+                    continue;
+                }
+            }
 
             // ────────────────────────────────────────────────────────
             // LAYER 0 — OWN CONTENT (highest priority, always first)

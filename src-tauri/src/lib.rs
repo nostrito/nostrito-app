@@ -1111,7 +1111,7 @@ async fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
 }
 
 #[tauri::command]
-async fn save_settings(settings: Settings, state: State<'_, AppState>) -> Result<(), String> {
+async fn save_settings(settings: Settings, app_handle: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     tracing::info!("[cmd:save_settings] called — port={}, relays={:?}, wot_depth={}, sync_interval={}s", settings.relay_port, settings.outbound_relays, settings.wot_max_depth, settings.sync_interval_secs);
     let mut config = state.config.write().await;
     config.relay_port = settings.relay_port;
@@ -1126,11 +1126,11 @@ async fn save_settings(settings: Settings, state: State<'_, AppState>) -> Result
     config.sync_interval_secs = settings.sync_interval_secs;
     // Only update relays if the new list has valid entries — never clear to empty
     let valid_relays: Vec<String> = settings.outbound_relays.iter()
+        .map(|r| sync::resolve_relay_alias(r).to_string())
         .filter(|r| !r.trim().is_empty())
-        .cloned()
         .collect();
     if !valid_relays.is_empty() {
-        config.outbound_relays = valid_relays;
+        config.outbound_relays = valid_relays.clone();
     }
     config.auto_start = settings.auto_start;
     config.sync_lookback_days = settings.sync_lookback_days;
@@ -1146,11 +1146,13 @@ async fn save_settings(settings: Settings, state: State<'_, AppState>) -> Result
     drop(config);
     let db = &state.db;
 
-    // Persist relay list (BUG FIX: was missing — relay selections were lost on restart)
-    if !settings.outbound_relays.is_empty() {
-        db.set_config("outbound_relays", &settings.outbound_relays.join(","))
+    // Persist relay list — use the FILTERED/RESOLVED list, not the raw input.
+    // BUG FIX: previously persisted raw settings.outbound_relays which could
+    // contain empty strings or unresolved aliases.
+    if !valid_relays.is_empty() {
+        db.set_config("outbound_relays", &valid_relays.join(","))
             .map_err(|e| format!("Failed to save relays: {}", e))?;
-        tracing::info!("[cmd:save_settings] Persisted {} relays to DB", settings.outbound_relays.len());
+        tracing::info!("[cmd:save_settings] Persisted {} relays to DB: {:?}", valid_relays.len(), valid_relays);
     }
 
     // Persist other settings that were previously missing
@@ -1174,6 +1176,46 @@ async fn save_settings(settings: Settings, state: State<'_, AppState>) -> Result
     db.set_config("storage_tracked_media_gb", &settings.storage_tracked_media_gb.to_string()).ok();
     db.set_config("storage_wot_media_gb", &settings.storage_wot_media_gb.to_string()).ok();
     db.set_config("wot_event_retention_days", &settings.wot_event_retention_days.to_string()).ok();
+
+    // ── Restart sync engine with new settings (especially relay changes) ──
+    // Without this, relay changes in Settings only take effect on app restart.
+    // Cancel existing sync, then start a new engine with the fresh config.
+    if let Some(cancel) = state.sync_cancel.write().await.take() {
+        cancel.cancel();
+        state.sync_tier.store(SyncTier::Idle as u8, Ordering::Relaxed);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    let config = state.config.read().await;
+    if let Some(ref hex_pubkey) = config.hex_pubkey {
+        let sync_config = SyncConfig {
+            lookback_days: config.sync_lookback_days,
+            batch_size: config.sync_batch_size,
+            events_per_batch: config.sync_events_per_batch,
+            batch_pause_secs: config.sync_batch_pause_secs,
+            relay_min_interval_secs: config.sync_relay_min_interval_secs,
+            wot_batch_size: config.sync_wot_batch_size,
+            wot_events_per_batch: config.sync_wot_events_per_batch,
+            cycle_interval_secs: config.sync_interval_secs,
+        };
+        let sync_engine = Arc::new(SyncEngine::new(
+            state.wot_graph.clone(),
+            state.db.clone(),
+            config.outbound_relays.clone(),
+            hex_pubkey.clone(),
+            state.sync_tier.clone(),
+            state.sync_stats.clone(),
+            app_handle.clone(),
+            config.storage_media_gb,
+            sync_config,
+            config.max_event_age_days,
+        ));
+        drop(config);
+
+        let cancel = sync_engine.start();
+        *state.sync_cancel.write().await = Some(cancel);
+        tracing::info!("[cmd:save_settings] Sync engine restarted with new settings");
+    }
 
     Ok(())
 }
@@ -1697,7 +1739,18 @@ pub fn run() {
         if !relays.is_empty() {
             tracing::info!("[init] Loaded {} relays from DB: {:?}", relays.len(), relays);
             config.outbound_relays = relays;
+        } else {
+            tracing::warn!(
+                "[init] DB has outbound_relays key but parsed to empty list (raw: {:?}). \
+                 Using defaults: {:?}",
+                relays_csv, config.outbound_relays
+            );
         }
+    } else {
+        tracing::info!(
+            "[init] No outbound_relays in DB — using defaults: {:?}",
+            config.outbound_relays
+        );
     }
     // Load sync tuning config
     if let Ok(Some(v)) = db.get_config("sync_lookback_days") { if let Ok(n) = v.parse::<u32>() { config.sync_lookback_days = n; } }
