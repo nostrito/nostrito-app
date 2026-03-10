@@ -3,6 +3,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { RELAYS, resolveRelayUrl, urlToAlias } from "../relays";
 import { iconKey, iconRadio, iconNetwork, iconDatabase, iconZap, iconSettings, iconLock, iconCastle, iconPlug, iconRocket, iconScale, iconTurtle, iconAlertTriangle, iconCheckCircle } from "../utils/icons";
+import { getProfiles, profileDisplayName } from "../utils/profiles";
 
 interface Settings {
   npub: string;
@@ -162,7 +163,7 @@ export function renderSettings(container: HTMLElement): void {
                 <span class="storage-row-label">Tracked Profiles</span>
                 <span class="storage-row-meta">These profiles are always kept — no age limit, never pruned. Perfect for important follows.</span>
               </div>
-              <div id="tracked-profiles-list" style="margin:8px 0;font-size:0.82rem;color:var(--text-dim)">Loading...</div>
+              <div id="tracked-profiles-list" style="margin:8px 0;max-height:400px;overflow-y:auto;font-size:0.82rem;color:var(--text-dim)">Loading...</div>
               <div style="display:flex;gap:8px;margin-top:8px">
                 <input type="text" id="track-profile-input" placeholder="npub or hex pubkey" style="flex:1;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:0.82rem;font-family:var(--mono)">
                 <button class="btn btn-primary" id="btn-track-profile" style="font-size:0.82rem;padding:8px 16px">Track</button>
@@ -618,23 +619,49 @@ export function renderSettings(container: HTMLElement): void {
 let _currentSettings: Settings | null = null;
 let _selectedRelayAliases: Set<string> = new Set();
 
+function generateAvatarFallback(name: string, pubkey: string): string {
+  const letter = name ? name.charAt(0).toUpperCase() : pubkey.charAt(0).toUpperCase();
+  // Deterministic color from pubkey
+  let hash = 0;
+  for (let i = 0; i < pubkey.length; i++) hash = ((hash << 5) - hash + pubkey.charCodeAt(i)) | 0;
+  const hue = Math.abs(hash) % 360;
+  return `<div style="width:38px;height:38px;border-radius:50%;background:hsl(${hue},45%,35%);display:flex;align-items:center;justify-content:center;font-size:0.85rem;font-weight:600;color:#fff;flex-shrink:0">${escapeHtml(letter)}</div>`;
+}
+
 async function loadTrackedProfiles(): Promise<void> {
   const listEl = document.getElementById("tracked-profiles-list");
   if (!listEl) return;
   try {
-    const profiles = await invoke<Array<{ pubkey: string; tracked_at: number; note: string | null }>>("get_tracked_profiles");
-    if (profiles.length === 0) {
+    const tracked = await invoke<Array<{ pubkey: string; tracked_at: number; note: string | null }>>("get_tracked_profiles");
+    if (tracked.length === 0) {
       listEl.innerHTML = `<div style="color:var(--text-muted);font-size:0.78rem;padding:4px 0">No tracked profiles yet.</div>`;
       return;
     }
-    listEl.innerHTML = profiles.map(p => {
+
+    // Fetch profile metadata for all tracked pubkeys
+    const pubkeys = tracked.map(p => p.pubkey);
+    const profileMap = await getProfiles(pubkeys);
+
+    listEl.innerHTML = tracked.map(p => {
+      const profile = profileMap.get(p.pubkey);
+      const displayName = profileDisplayName(profile, p.pubkey);
       const short = p.pubkey.length > 16 ? p.pubkey.slice(0, 8) + "…" + p.pubkey.slice(-8) : p.pubkey;
-      const noteHtml = p.note ? ` <span style="color:var(--text-muted);font-size:0.72rem">(${p.note})</span>` : "";
-      return `<div style="display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border)">
-        <span style="font-family:var(--mono);font-size:0.78rem" title="${p.pubkey}">${short}${noteHtml}</span>
-        <button class="btn-untrack" data-pubkey="${p.pubkey}" style="font-size:0.72rem;padding:2px 8px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--text-dim);cursor:pointer">Untrack</button>
+      const hasPicture = profile?.picture;
+
+      const avatarHtml = hasPicture
+        ? `<img src="${escapeHtml(profile!.picture!)}" style="width:38px;height:38px;border-radius:50%;object-fit:cover;flex-shrink:0;background:var(--bg)" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'" alt=""><div style="width:38px;height:38px;border-radius:50%;background:hsl(0,0%,30%);display:none;align-items:center;justify-content:center;font-size:0.85rem;font-weight:600;color:#fff;flex-shrink:0">${escapeHtml(displayName.charAt(0).toUpperCase())}</div>`
+        : generateAvatarFallback(displayName, p.pubkey);
+
+      return `<div style="display:flex;align-items:center;gap:10px;padding:8px 4px;border-bottom:1px solid var(--border)">
+        ${avatarHtml}
+        <div style="flex:1;min-width:0;overflow:hidden">
+          <div style="font-weight:600;font-size:0.84rem;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml(displayName)}</div>
+          <div style="font-family:var(--mono);font-size:0.72rem;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${escapeHtml(p.pubkey)}">${escapeHtml(short)}</div>
+        </div>
+        <button class="btn-untrack" data-pubkey="${escapeHtml(p.pubkey)}" style="font-size:0.72rem;padding:4px 10px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--text-dim);cursor:pointer;flex-shrink:0;transition:border-color 0.2s,color 0.2s">Untrack</button>
       </div>`;
     }).join("");
+
     listEl.querySelectorAll(".btn-untrack").forEach(btn => {
       btn.addEventListener("click", async () => {
         const pk = (btn as HTMLElement).dataset.pubkey;
