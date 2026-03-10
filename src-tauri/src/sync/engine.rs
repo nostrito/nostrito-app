@@ -274,6 +274,42 @@ impl Default for SyncConfig {
 }
 
 // ── Sync Engine ────────────────────────────────────────────────────
+//
+// ╔═══════════════════════════════════════════════════════════════════╗
+// ║                 SYNC PRIORITY ORDER (STRICT)                     ║
+// ╠═══════════════════════════════════════════════════════════════════╣
+// ║                                                                   ║
+// ║  Layer 0 — Own Content (HIGHEST PRIORITY, always first)           ║
+// ║    Tier 1:  Own profile (kind 0) + contact list (kind 3)          ║
+// ║    Tier 1b: Full own event history (all kinds, no time limit)     ║
+// ║    Tier 1a: Own media download (all media from own events,        ║
+// ║             no size limit, never evicted)                         ║
+// ║    ► MUST complete before anything else starts.                   ║
+// ║                                                                   ║
+// ║  Layer 1 — Direct Follows Content                                 ║
+// ║    Tier 2:  Fetch events from direct follows                      ║
+// ║             (kinds 0, 1, 3, 6, 30023 + historical backfill)       ║
+// ║    ► Only starts after Layer 0 is done.                           ║
+// ║                                                                   ║
+// ║  Layer 2 — WoT / Follows-of-Follows                              ║
+// ║    Tier 1.5: Metadata refresh for WoT peers (every 3 cycles)     ║
+// ║    Tier 3:   WoT crawl — contact lists from follows-of-follows   ║
+// ║              (every 6 cycles, subject to storage limits)          ║
+// ║    ► Runs last. WoT content pruned first when storage is tight.  ║
+// ║                                                                   ║
+// ║  Layer 3 — Media Archive                                         ║
+// ║    Tier 4: Blossom media backup for others' content               ║
+// ║            (subject to storage limit, LRU eviction)               ║
+// ║    ► Own media is NEVER evicted regardless of storage limits.     ║
+// ║                                                                   ║
+// ║  Storage Pruning Rules:                                           ║
+// ║    • Own events: NEVER pruned, regardless of limits               ║
+// ║    • Tracked profile events: NEVER pruned                         ║
+// ║    • WoT/others events: pruned when older than max_event_age_days ║
+// ║    • Own media: NEVER evicted from media cache                    ║
+// ║    • Others' media: LRU eviction when over storage_media_gb       ║
+// ║                                                                   ║
+// ╚═══════════════════════════════════════════════════════════════════╝
 
 pub struct SyncEngine {
     graph: Arc<WotGraph>,
@@ -392,15 +428,48 @@ impl SyncEngine {
 
             info!("Sync cycle {} starting (fresh relay policies)", cycle);
 
-            // Tier 1: Critical — always run (fast, own profile + follows)
+            // ────────────────────────────────────────────────────────
+            // LAYER 0 — OWN CONTENT (highest priority, always first)
+            // Must complete before ANY other layer starts.
+            // ────────────────────────────────────────────────────────
+
+            // Tier 1: Own profile (kind 0) + contact list (kind 3) + full event history
             if !self.cancel.is_cancelled() {
                 if let Err(e) = self.run_tier1(&mut relay_policies).await {
                     error!("Sync cycle {}: Tier 1 error: {}", cycle, e);
                 }
             }
 
-            // Tier 1.5: Metadata refresh — refresh profiles + contact lists for WoT peers
-            // Run every 3 cycles to keep display names, avatars, and follows fresh
+            // Tier 1a: Own media download — ALL media from own events, no size limit, never evicted
+            if !self.cancel.is_cancelled() {
+                info!("Sync cycle {}: Running Tier 1a (own media download)", cycle);
+                if let Err(e) = self.run_own_media_download().await {
+                    error!("Sync cycle {}: Tier 1a error: {}", cycle, e);
+                }
+            }
+
+            // ────────────────────────────────────────────────────────
+            // LAYER 1 — DIRECT FOLLOWS CONTENT
+            // Only starts after Layer 0 (own content) is complete.
+            // ────────────────────────────────────────────────────────
+
+            // Tier 2: Fetch recent events from direct follows (kinds 0,1,3,6,30023)
+            // Includes incremental sync + historical backfill
+            if !self.cancel.is_cancelled() {
+                if let Err(e) = self.run_tier2(&mut relay_policies).await {
+                    error!("Sync cycle {}: Tier 2 error: {}", cycle, e);
+                }
+            }
+
+            // ────────────────────────────────────────────────────────
+            // LAYER 2 — WoT / FOLLOWS-OF-FOLLOWS (lowest content priority)
+            // Runs after Layer 1. Subject to storage limits.
+            // WoT content is pruned first when storage is tight.
+            // ────────────────────────────────────────────────────────
+
+            // Tier 1.5: WoT metadata refresh — profiles + contact lists for WoT peers
+            // Runs every 3 cycles to keep display names, avatars, and follows fresh.
+            // Placed in Layer 2 because it serves WoT graph, not direct follows.
             if !self.cancel.is_cancelled() && cycle % 3 == 0 {
                 info!("Sync cycle {}: Running Tier 1.5 (WoT metadata refresh)", cycle);
                 if let Err(e) = self.run_metadata_refresh(&mut relay_policies).await {
@@ -408,14 +477,8 @@ impl SyncEngine {
                 }
             }
 
-            // Tier 2: Important — always run (incremental via sync cursor)
-            if !self.cancel.is_cancelled() {
-                if let Err(e) = self.run_tier2(&mut relay_policies).await {
-                    error!("Sync cycle {}: Tier 2 error: {}", cycle, e);
-                }
-            }
-
-            // Tier 3: Background — every 6 cycles (~30 min)
+            // Tier 3: WoT crawl — contact lists from follows-of-follows
+            // Runs every 6 cycles (~30 min). Subject to storage limits.
             if !self.cancel.is_cancelled() && cycle % 6 == 0 {
                 info!("Sync cycle {}: Running Tier 3 (WoT crawl, every 6 cycles)", cycle);
                 if let Err(e) = self.run_tier3(&mut relay_policies).await {
@@ -423,7 +486,13 @@ impl SyncEngine {
                 }
             }
 
-            // Tier 4: Archive (media backup) — every cycle
+            // ────────────────────────────────────────────────────────
+            // LAYER 3 — MEDIA ARCHIVE (others' media, subject to limits)
+            // Own media was already handled in Layer 0 (Tier 1a).
+            // Others' media: LRU eviction when over storage_media_gb.
+            // ────────────────────────────────────────────────────────
+
+            // Tier 4: Blossom media backup for others' content
             if !self.cancel.is_cancelled() {
                 info!("Sync cycle {}: Running Tier 4 (media backup)", cycle);
                 if let Err(e) = self.run_tier4(&mut relay_policies).await {
@@ -451,7 +520,11 @@ impl SyncEngine {
         Ok(())
     }
 
-    // ── Tier 1: Critical ──────────────────────────────────────────
+    // ── Tier 1: Critical (LAYER 0 — Own Content) ────────────────
+    // HIGHEST PRIORITY. Runs at the START of every sync cycle.
+    // Fetches: own profile (kind 0), own contact list (kind 3),
+    // and full own event history (Tier 1b: all kinds, no time limit).
+    // This MUST complete before Tier 2/3/4 start.
     // Stagger across relays: connect to one relay at a time, fetch, disconnect, wait.
 
     async fn run_tier1(&self, policies: &mut HashMap<String, RelayPolicy>) -> Result<()> {
@@ -676,10 +749,77 @@ impl SyncEngine {
         Ok(())
     }
 
-    // ── Tier 1.5: WoT Metadata Refresh ──────────────────────────
-    // Refresh kind:0 (profiles) and kind:3 (contact lists) for all known
-    // pubkeys in the WoT graph. Keeps display names, avatars, and follow
-    // lists fresh without waiting for Tier 3's full crawl.
+    // ── Tier 1a: Own Media Download (LAYER 0 — Own Content) ─────
+    // Part of Layer 0: runs immediately after Tier 1, before any
+    // follows or WoT work. Scans ALL own events for media URLs and
+    // downloads them immediately.
+    // Own media has NO size limit, NO eviction — always kept.
+
+    async fn run_own_media_download(&self) -> Result<()> {
+        info!("Tier 1a: Downloading own media (no limits, never evicted)");
+
+        // Extract all media URLs from own events
+        let own_media_urls = self.extract_own_media_urls().await;
+        if own_media_urls.is_empty() {
+            info!("Tier 1a: No own media URLs found");
+            return Ok(());
+        }
+
+        info!("Tier 1a: Found {} own media URLs to check", own_media_urls.len());
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .user_agent("nostrito/0.1.0")
+            .build()
+            .unwrap_or_default();
+
+        let mut downloaded: u64 = 0;
+        let mut skipped: u64 = 0;
+        let mut already_cached: u64 = 0;
+
+        for (url, pubkey) in &own_media_urls {
+            if self.cancel.is_cancelled() {
+                break;
+            }
+
+            let hash = extract_sha256_from_url(url)
+                .unwrap_or_else(|| sha256_of_string(url));
+
+            if self.db.media_exists(&hash) {
+                already_cached += 1;
+                continue;
+            }
+
+            // Own media: is_own=true, limit_bytes is irrelevant (ignored for own)
+            match self.download_media(&client, url, &hash, pubkey, u64::MAX, true).await {
+                Ok(true) => {
+                    downloaded += 1;
+                }
+                Ok(false) => {
+                    skipped += 1;
+                }
+                Err(e) => {
+                    warn!("Tier 1a: download failed for {}: {}", url, e);
+                    skipped += 1;
+                }
+            }
+
+            // Brief pause between downloads
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        info!(
+            "Tier 1a complete: {} downloaded, {} skipped, {} already cached (of {} total own media URLs)",
+            downloaded, skipped, already_cached, own_media_urls.len()
+        );
+        Ok(())
+    }
+
+    // ── Tier 1.5: WoT Metadata Refresh (LAYER 2 — WoT) ─────────
+    // Part of Layer 2: runs AFTER Tier 2 (direct follows content).
+    // Refreshes kind:0 (profiles) and kind:3 (contact lists) for all
+    // known pubkeys in the WoT graph. Keeps display names, avatars,
+    // and follow lists fresh without waiting for Tier 3's full crawl.
 
     async fn run_metadata_refresh(&self, policies: &mut HashMap<String, RelayPolicy>) -> Result<()> {
         info!("Tier 1.5: Refreshing metadata for WoT peers");
@@ -816,17 +956,22 @@ impl SyncEngine {
         Ok(())
     }
 
-    // ── Tier 2: Important ─────────────────────────────────────────
-    // Fetch recent notes from follows. ONE persistent client per sync session.
-    // Connect once, send all subscription batches on that connection with pauses,
-    // disconnect once at the end.
+    // ── Tier 2: Important (LAYER 1 — Direct Follows) ────────────
+    // Part of Layer 1: runs AFTER Layer 0 (own content) is complete.
+    // Fetches recent notes from direct follows (kinds 0,1,3,6,30023).
+    // Includes incremental sync via cursor + historical backfill.
+    // ONE persistent client per sync session. Connect once, send all
+    // subscription batches on that connection with pauses, disconnect
+    // once at the end.
 
     async fn run_tier2(&self, policies: &mut HashMap<String, RelayPolicy>) -> Result<()> {
         self.set_tier(SyncTier::Important);
         info!("Tier 2: Fetching recent events from follows");
 
         // ── Storage pruning: time-based event retention ──
-        // Prune others' events older than max_event_age_days, respecting tracked profiles
+        // Prune others' events older than max_event_age_days.
+        // NEVER prunes: own events (pubkey == hex_pubkey) or tracked profile events.
+        // Only WoT/others' events are eligible for pruning.
         let max_age_secs = self.max_event_age_days as u64 * 86400;
         let pruned = self.db.prune_old_events(&self.hex_pubkey, max_age_secs).unwrap_or(0);
         if pruned > 0 {
@@ -1208,8 +1353,12 @@ impl SyncEngine {
         Ok(())
     }
 
-    // ── Tier 3: Background ────────────────────────────────────────
-    // WoT crawl. ONE persistent client per sync session.
+    // ── Tier 3: Background (LAYER 2 — WoT Crawl) ────────────────
+    // Part of Layer 2: runs AFTER Tier 2 (direct follows content).
+    // WoT crawl — fetches contact lists from follows-of-follows.
+    // Subject to storage limits; WoT content is pruned first when
+    // storage is tight. Runs every 6 cycles (~30 min).
+    // ONE persistent client per sync session.
     // Connect once, send all subscription batches, disconnect once.
 
     async fn run_tier3(&self, policies: &mut HashMap<String, RelayPolicy>) -> Result<()> {
@@ -1382,7 +1531,11 @@ impl SyncEngine {
         Ok(())
     }
 
-    // ── Tier 4: Archive (Blossom Media Backup) ──────────────────
+    // ── Tier 4: Archive (LAYER 3 — Others' Media Backup) ────────
+    // Runs last. Downloads media from others' events, subject to
+    // storage_media_gb limit. Own media was already downloaded in
+    // Tier 1a (Layer 0) with no limits. Others' media uses LRU
+    // eviction when over limit — own media is NEVER evicted.
 
     async fn run_tier4(&self, _policies: &mut HashMap<String, RelayPolicy>) -> Result<()> {
         self.set_tier(SyncTier::Archive);
@@ -1507,7 +1660,6 @@ impl SyncEngine {
     }
 
     /// Extract media URLs from ALL own events (full history, no limit cap)
-    #[allow(dead_code)]
     async fn extract_own_media_urls(&self) -> Vec<(String, String)> {
         let own_pubkey = vec![self.hex_pubkey.clone()];
         let events = self.db.query_events(
@@ -1716,7 +1868,8 @@ impl SyncEngine {
     }
 
     /// Enforce media storage limit — evict LRU items if over 95% of limit.
-    /// Only counts and evicts OTHERS' media — own media is never evicted.
+    /// Only counts and evicts OTHERS' media — own media is NEVER evicted.
+    /// Tracked profile media follows the same LRU policy as other non-own media.
     async fn enforce_media_limit(&self, limit_bytes: u64) {
         let used = match self.db.media_others_bytes(&self.hex_pubkey) {
             Ok(b) => b,
