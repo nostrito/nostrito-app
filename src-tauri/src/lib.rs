@@ -12,7 +12,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use storage::{Database, ProfileInfo};
-use sync::{SyncConfig, SyncEngine, SyncStats, SyncTier};
+use sync::{resolve_relay_alias, SyncConfig, SyncEngine, SyncStats, SyncTier};
 use wot::WotGraph;
 
 // ── App State ──────────────────────────────────────────────────────
@@ -41,6 +41,11 @@ pub struct AppConfig {
     pub auto_start: bool,
     pub storage_others_gb: f64,
     pub storage_media_gb: f64,
+    // Per-category storage limits
+    pub storage_own_media_gb: f64,
+    pub storage_tracked_media_gb: f64,
+    pub storage_wot_media_gb: f64,
+    pub wot_event_retention_days: u32,
     // Sync tuning
     pub sync_lookback_days: u32,
     pub sync_batch_size: u32,
@@ -58,20 +63,23 @@ impl Default for AppConfig {
             npub: None,
             hex_pubkey: None,
             relay_port: 4869,
-            max_storage_mb: 500,
-            wot_max_depth: 3,
+            max_storage_mb: 2048,
+            wot_max_depth: 2,
             sync_interval_secs: 300,
             outbound_relays: vec![
-                "wss://relay.primal.net".into(),
                 "wss://relay.damus.io".into(),
-                "wss://nostr.wine".into(),
-                "wss://relay.yakihonne.com".into(),
+                "wss://relay.primal.net".into(),
+                "wss://nos.lol".into(),
             ],
             auto_start: true,
             storage_others_gb: 5.0,
             storage_media_gb: 2.0,
-            sync_lookback_days: 7,
-            sync_batch_size: 10,
+            storage_own_media_gb: 5.0,
+            storage_tracked_media_gb: 3.0,
+            storage_wot_media_gb: 2.0,
+            wot_event_retention_days: 30,
+            sync_lookback_days: 30,
+            sync_batch_size: 50,
             sync_events_per_batch: 50,
             sync_batch_pause_secs: 7,
             sync_relay_min_interval_secs: 3,
@@ -135,6 +143,18 @@ pub struct StorageStats {
     pub newest_event: u64,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OwnershipStorageStats {
+    pub own_events_count: u64,
+    pub own_media_bytes: u64,
+    pub tracked_events_count: u64,
+    pub tracked_media_bytes: u64,
+    pub wot_events_count: u64,
+    pub wot_media_bytes: u64,
+    pub total_events: u64,
+    pub db_size_bytes: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub npub: String,
@@ -142,6 +162,10 @@ pub struct Settings {
     pub max_storage_mb: u32,
     pub storage_others_gb: f64,
     pub storage_media_gb: f64,
+    pub storage_own_media_gb: f64,
+    pub storage_tracked_media_gb: f64,
+    pub storage_wot_media_gb: f64,
+    pub wot_event_retention_days: u32,
     pub wot_max_depth: u32,
     pub sync_interval_secs: u32,
     pub outbound_relays: Vec<String>,
@@ -235,13 +259,19 @@ async fn init_nostrito(
         return Err("Invalid pubkey format. Use npub1... or 64-char hex".into());
     };
 
+    // Resolve relay aliases to canonical wss:// URLs (wizard may send short aliases)
+    let resolved_relays: Vec<String> = relays
+        .iter()
+        .map(|r| resolve_relay_alias(r).to_string())
+        .collect();
+
     // Update config
     {
         let mut config = state.config.write().await;
         config.npub = Some(npub.clone());
         config.hex_pubkey = Some(hex_pubkey.clone());
-        if !relays.is_empty() {
-            config.outbound_relays = relays.clone();
+        if !resolved_relays.is_empty() {
+            config.outbound_relays = resolved_relays.clone();
         }
         if let Some(gb) = storage_others_gb {
             config.storage_others_gb = gb;
@@ -260,10 +290,10 @@ async fn init_nostrito(
         .db
         .set_config("hex_pubkey", &hex_pubkey)
         .map_err(|e| format!("Failed to save config: {}", e))?;
-    if !relays.is_empty() {
+    if !resolved_relays.is_empty() {
         state
             .db
-            .set_config("outbound_relays", &relays.join(","))
+            .set_config("outbound_relays", &resolved_relays.join(","))
             .map_err(|e| format!("Failed to save relays: {}", e))?;
     }
 
@@ -294,7 +324,6 @@ async fn init_nostrito(
         state.sync_stats.clone(),
         app_handle.clone(),
         config.storage_media_gb,
-        config.storage_others_gb,
         sync_config,
         config.max_event_age_days,
     ));
@@ -473,7 +502,6 @@ async fn start_sync(
         state.sync_stats.clone(),
         app_handle,
         config.storage_media_gb,
-        config.storage_others_gb,
         sync_config,
         config.max_event_age_days,
     ));
@@ -533,7 +561,6 @@ async fn restart_sync(state: State<'_, AppState>, app_handle: tauri::AppHandle) 
         state.sync_stats.clone(),
         app_handle.clone(),
         config.storage_media_gb,
-        config.storage_others_gb,
         sync_config,
         config.max_event_age_days,
     ));
@@ -544,6 +571,30 @@ async fn restart_sync(state: State<'_, AppState>, app_handle: tauri::AppHandle) 
 
     tracing::info!("[cmd:restart_sync] Sync restarted with new config");
     Ok(())
+}
+
+/// Reset the articles (kind 30023) backfill cursor so historical articles are re-fetched.
+/// Also resets the main history cursor to trigger a full re-crawl of notes too.
+/// The next sync cycle will start backfilling from now, walking backward through all history.
+///
+/// NOTE: This is no longer exposed as a user-facing Tauri command.
+/// The sync engine handles cursor resets automatically via self-healing checks.
+/// Kept as internal logic for programmatic use if needed.
+#[allow(dead_code)]
+#[tauri::command]
+async fn resync_articles(state: State<'_, AppState>) -> Result<String, String> {
+    tracing::info!("[cmd:resync_articles] Resetting article sync cursors");
+
+    // Reset articles-specific cursor (kind 30023 backfill)
+    state.db.delete_config("tier2_history_until_articles")
+        .map_err(|e| format!("Failed to reset articles cursor: {}", e))?;
+
+    // Also reset the main history cursor so notes/reposts re-backfill too
+    state.db.delete_config("tier2_history_until")
+        .map_err(|e| format!("Failed to reset history cursor: {}", e))?;
+
+    tracing::info!("[cmd:resync_articles] Cursors reset — next sync cycle will re-backfill all history");
+    Ok("Article sync cursors reset. Historical backfill will restart on next sync cycle.".to_string())
 }
 
 #[tauri::command]
@@ -558,9 +609,12 @@ async fn get_feed(filter: FeedFilter, state: State<'_, AppState>) -> Result<Vec<
     let kinds = feed_kinds.as_deref();
     let limit = filter.limit.unwrap_or(50);
 
+    let author_vec = filter.author.map(|a| vec![a]);
+    let authors = author_vec.as_deref();
+
     let events = state
         .db
-        .query_events(None, None, kinds, filter.since, None, limit)
+        .query_events(None, authors, kinds, filter.since, None, limit)
         .map_err(|e| {
             tracing::error!("[cmd:get_feed] query failed: {}", e);
             format!("Failed to query events: {}", e)
@@ -652,6 +706,46 @@ async fn get_storage_stats(state: State<'_, AppState>) -> Result<StorageStats, S
         db_size_bytes,
         oldest_event,
         newest_event,
+    })
+}
+
+#[tauri::command]
+async fn get_ownership_storage_stats(state: State<'_, AppState>) -> Result<OwnershipStorageStats, String> {
+    tracing::debug!("[cmd:get_ownership_storage_stats] called");
+    let config = state.config.read().await;
+    let own_pubkey = config.hex_pubkey.clone().unwrap_or_default();
+    drop(config);
+
+    if own_pubkey.is_empty() {
+        return Err("Not initialized — no pubkey set".into());
+    }
+
+    let db = &state.db;
+    let own_events_count = db.own_event_count(&own_pubkey).map_err(|e| e.to_string())?;
+    let own_media_bytes = db.own_media_bytes(&own_pubkey).map_err(|e| e.to_string())?;
+    let tracked_events_count = db.tracked_event_count(&own_pubkey).map_err(|e| e.to_string())?;
+    let tracked_media_bytes = db.tracked_media_bytes(&own_pubkey).map_err(|e| e.to_string())?;
+    let wot_events_count = db.wot_event_count(&own_pubkey).map_err(|e| e.to_string())?;
+    let wot_media_bytes = db.wot_media_bytes(&own_pubkey).map_err(|e| e.to_string())?;
+    let total_events = db.event_count().map_err(|e| e.to_string())?;
+    let db_size_bytes = db.db_size_bytes().map_err(|e| e.to_string())?;
+
+    tracing::info!(
+        "[cmd:get_ownership_storage_stats] own={}/{}, tracked={}/{}, wot={}/{}",
+        own_events_count, own_media_bytes,
+        tracked_events_count, tracked_media_bytes,
+        wot_events_count, wot_media_bytes,
+    );
+
+    Ok(OwnershipStorageStats {
+        own_events_count,
+        own_media_bytes,
+        tracked_events_count,
+        tracked_media_bytes,
+        wot_events_count,
+        wot_media_bytes,
+        total_events,
+        db_size_bytes,
     })
 }
 
@@ -771,6 +865,73 @@ async fn reset_app_data(
     Ok(())
 }
 
+/// Change account: clears only identity (npub/hex_pubkey) and sync cursors,
+/// keeps all event data, WoT graph edges, settings, and media intact.
+/// When the user re-enters an npub that already has events in the DB,
+/// the existing data is reused (fast account switching).
+#[tauri::command]
+async fn change_account(
+    app_handle: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    tracing::info!("Changing account — clearing identity, keeping event data");
+
+    // Stop sync if running
+    if let Some(cancel) = state.sync_cancel.write().await.take() {
+        cancel.cancel();
+        state
+            .sync_tier
+            .store(SyncTier::Idle as u8, Ordering::Relaxed);
+    }
+
+    // Stop relay if running
+    if let Some(cancel) = state.relay_cancel.write().await.take() {
+        cancel.cancel();
+    }
+
+    // Clear only identity keys and sync cursors from DB config
+    // Keep: outbound_relays, sync tuning params, storage settings, etc.
+    let identity_keys = [
+        "npub",
+        "hex_pubkey",
+        "tier2_since",
+        "tier2_history_until",
+        "tier2_history_until_articles",
+        "sync_tier3_checkpoint",
+    ];
+    for key in &identity_keys {
+        state
+            .db
+            .delete_config(key)
+            .map_err(|e| format!("Failed to delete config key {}: {}", key, e))?;
+    }
+
+    // Clear sync_state (per-relay cursors) so new account starts fresh
+    state
+        .db
+        .clear_sync_state()
+        .map_err(|e| format!("Failed to clear sync_state: {}", e))?;
+
+    // Reset sync stats
+    {
+        let mut stats = state.sync_stats.write().await;
+        *stats = SyncStats::default();
+    }
+
+    // Clear identity from in-memory config (keep all other settings)
+    {
+        let mut config = state.config.write().await;
+        config.npub = None;
+        config.hex_pubkey = None;
+    }
+
+    // Emit event to frontend to show wizard
+    app_handle.emit("app:reset", ()).ok();
+
+    tracing::info!("Account change complete — identity cleared, events preserved");
+    Ok(())
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RelayStatusInfo {
     pub url: String,
@@ -797,8 +958,18 @@ async fn get_activity_data(state: State<'_, AppState>) -> Result<Vec<u64>, Strin
 async fn get_relay_status(state: State<'_, AppState>) -> Result<Vec<RelayStatusInfo>, String> {
     tracing::debug!("[cmd:get_relay_status] called");
     let config = state.config.read().await;
-    let relays = config.outbound_relays.clone();
+    let mut relays = config.outbound_relays.clone();
     drop(config);
+
+    // Filter out empty strings and fall back to defaults if nothing valid remains
+    relays.retain(|r| !r.trim().is_empty());
+    if relays.is_empty() {
+        relays = vec![
+            "wss://relay.damus.io".into(),
+            "wss://relay.primal.net".into(),
+            "wss://nos.lol".into(),
+        ];
+    }
 
     tracing::debug!("[cmd:get_relay_status] checking {} relays concurrently", relays.len());
 
@@ -920,6 +1091,10 @@ async fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
         max_storage_mb: config.max_storage_mb,
         storage_others_gb: config.storage_others_gb,
         storage_media_gb: config.storage_media_gb,
+        storage_own_media_gb: config.storage_own_media_gb,
+        storage_tracked_media_gb: config.storage_tracked_media_gb,
+        storage_wot_media_gb: config.storage_wot_media_gb,
+        wot_event_retention_days: config.wot_event_retention_days,
         wot_max_depth: config.wot_max_depth,
         sync_interval_secs: config.sync_interval_secs,
         outbound_relays: config.outbound_relays.clone(),
@@ -936,16 +1111,27 @@ async fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
 }
 
 #[tauri::command]
-async fn save_settings(settings: Settings, state: State<'_, AppState>) -> Result<(), String> {
+async fn save_settings(settings: Settings, app_handle: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     tracing::info!("[cmd:save_settings] called — port={}, relays={:?}, wot_depth={}, sync_interval={}s", settings.relay_port, settings.outbound_relays, settings.wot_max_depth, settings.sync_interval_secs);
     let mut config = state.config.write().await;
     config.relay_port = settings.relay_port;
     config.max_storage_mb = settings.max_storage_mb;
     config.storage_others_gb = settings.storage_others_gb;
     config.storage_media_gb = settings.storage_media_gb;
+    config.storage_own_media_gb = settings.storage_own_media_gb;
+    config.storage_tracked_media_gb = settings.storage_tracked_media_gb;
+    config.storage_wot_media_gb = settings.storage_wot_media_gb;
+    config.wot_event_retention_days = settings.wot_event_retention_days;
     config.wot_max_depth = settings.wot_max_depth;
     config.sync_interval_secs = settings.sync_interval_secs;
-    config.outbound_relays = settings.outbound_relays;
+    // Only update relays if the new list has valid entries — never clear to empty
+    let valid_relays: Vec<String> = settings.outbound_relays.iter()
+        .map(|r| sync::resolve_relay_alias(r).to_string())
+        .filter(|r| !r.trim().is_empty())
+        .collect();
+    if !valid_relays.is_empty() {
+        config.outbound_relays = valid_relays.clone();
+    }
     config.auto_start = settings.auto_start;
     config.sync_lookback_days = settings.sync_lookback_days;
     config.sync_batch_size = settings.sync_batch_size;
@@ -956,9 +1142,28 @@ async fn save_settings(settings: Settings, state: State<'_, AppState>) -> Result
     config.sync_wot_events_per_batch = settings.sync_wot_events_per_batch;
     config.max_event_age_days = settings.max_event_age_days;
 
-    // Persist sync config to DB
+    // Persist ALL settings to DB so they survive restart
     drop(config);
     let db = &state.db;
+
+    // Persist relay list — use the FILTERED/RESOLVED list, not the raw input.
+    // BUG FIX: previously persisted raw settings.outbound_relays which could
+    // contain empty strings or unresolved aliases.
+    if !valid_relays.is_empty() {
+        db.set_config("outbound_relays", &valid_relays.join(","))
+            .map_err(|e| format!("Failed to save relays: {}", e))?;
+        tracing::info!("[cmd:save_settings] Persisted {} relays to DB: {:?}", valid_relays.len(), valid_relays);
+    }
+
+    // Persist other settings that were previously missing
+    db.set_config("relay_port", &settings.relay_port.to_string()).ok();
+    db.set_config("max_storage_mb", &settings.max_storage_mb.to_string()).ok();
+    db.set_config("storage_others_gb", &settings.storage_others_gb.to_string()).ok();
+    db.set_config("storage_media_gb", &settings.storage_media_gb.to_string()).ok();
+    db.set_config("wot_max_depth", &settings.wot_max_depth.to_string()).ok();
+    db.set_config("sync_interval_secs", &settings.sync_interval_secs.to_string()).ok();
+
+    // Persist sync tuning config
     db.set_config("sync_lookback_days", &settings.sync_lookback_days.to_string()).ok();
     db.set_config("sync_batch_size", &settings.sync_batch_size.to_string()).ok();
     db.set_config("sync_events_per_batch", &settings.sync_events_per_batch.to_string()).ok();
@@ -967,6 +1172,50 @@ async fn save_settings(settings: Settings, state: State<'_, AppState>) -> Result
     db.set_config("sync_wot_batch_size", &settings.sync_wot_batch_size.to_string()).ok();
     db.set_config("sync_wot_events_per_batch", &settings.sync_wot_events_per_batch.to_string()).ok();
     db.set_config("max_event_age_days", &settings.max_event_age_days.to_string()).ok();
+    db.set_config("storage_own_media_gb", &settings.storage_own_media_gb.to_string()).ok();
+    db.set_config("storage_tracked_media_gb", &settings.storage_tracked_media_gb.to_string()).ok();
+    db.set_config("storage_wot_media_gb", &settings.storage_wot_media_gb.to_string()).ok();
+    db.set_config("wot_event_retention_days", &settings.wot_event_retention_days.to_string()).ok();
+
+    // ── Restart sync engine with new settings (especially relay changes) ──
+    // Without this, relay changes in Settings only take effect on app restart.
+    // Cancel existing sync, then start a new engine with the fresh config.
+    if let Some(cancel) = state.sync_cancel.write().await.take() {
+        cancel.cancel();
+        state.sync_tier.store(SyncTier::Idle as u8, Ordering::Relaxed);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    let config = state.config.read().await;
+    if let Some(ref hex_pubkey) = config.hex_pubkey {
+        let sync_config = SyncConfig {
+            lookback_days: config.sync_lookback_days,
+            batch_size: config.sync_batch_size,
+            events_per_batch: config.sync_events_per_batch,
+            batch_pause_secs: config.sync_batch_pause_secs,
+            relay_min_interval_secs: config.sync_relay_min_interval_secs,
+            wot_batch_size: config.sync_wot_batch_size,
+            wot_events_per_batch: config.sync_wot_events_per_batch,
+            cycle_interval_secs: config.sync_interval_secs,
+        };
+        let sync_engine = Arc::new(SyncEngine::new(
+            state.wot_graph.clone(),
+            state.db.clone(),
+            config.outbound_relays.clone(),
+            hex_pubkey.clone(),
+            state.sync_tier.clone(),
+            state.sync_stats.clone(),
+            app_handle.clone(),
+            config.storage_media_gb,
+            sync_config,
+            config.max_event_age_days,
+        ));
+        drop(config);
+
+        let cancel = sync_engine.start();
+        *state.sync_cancel.write().await = Some(cancel);
+        tracing::info!("[cmd:save_settings] Sync engine restarted with new settings");
+    }
 
     Ok(())
 }
@@ -1140,6 +1389,257 @@ async fn get_media_stats(state: State<'_, AppState>) -> Result<MediaStats, Strin
     })
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OwnMediaItem {
+    pub hash: String,
+    pub url: String,
+    pub local_path: String,
+    pub mime_type: String,
+    pub size_bytes: u64,
+    pub downloaded_at: u64,
+}
+
+#[tauri::command]
+async fn get_own_media(state: State<'_, AppState>) -> Result<Vec<OwnMediaItem>, String> {
+    tracing::debug!("[cmd:get_own_media] called");
+    let config = state.config.read().await;
+    let own_pubkey = config.hex_pubkey.clone().unwrap_or_default();
+    drop(config);
+
+    if own_pubkey.is_empty() {
+        return Err("Not initialized — no pubkey set".into());
+    }
+
+    let records = state.db.get_own_media(&own_pubkey).map_err(|e| e.to_string())?;
+    tracing::info!("[cmd:get_own_media] returning {} own media items", records.len());
+
+    let home = dirs::home_dir().unwrap_or_default();
+    Ok(records.into_iter().map(|(hash, url, mime_type, size_bytes, downloaded_at)| {
+        let local_path = home.join(".nostrito/media")
+            .join(&hash[..2])
+            .join(&hash)
+            .to_string_lossy()
+            .to_string();
+        OwnMediaItem {
+            hash,
+            url,
+            local_path,
+            mime_type,
+            size_bytes,
+            downloaded_at: downloaded_at as u64,
+        }
+    }).collect())
+}
+
+#[tauri::command]
+async fn get_profile_media(pubkey: String, state: State<'_, AppState>) -> Result<Vec<OwnMediaItem>, String> {
+    tracing::debug!("[cmd:get_profile_media] called for pubkey={}...", &pubkey[..pubkey.len().min(8)]);
+
+    let records = state.db.get_profile_media(&pubkey).map_err(|e| e.to_string())?;
+    tracing::info!("[cmd:get_profile_media] returning {} media items for {}...", records.len(), &pubkey[..pubkey.len().min(8)]);
+
+    let home = dirs::home_dir().unwrap_or_default();
+    Ok(records.into_iter().map(|(hash, url, mime_type, size_bytes, downloaded_at)| {
+        let local_path = home.join(".nostrito/media")
+            .join(&hash[..2])
+            .join(&hash)
+            .to_string_lossy()
+            .to_string();
+        OwnMediaItem {
+            hash,
+            url,
+            local_path,
+            mime_type,
+            size_bytes,
+            downloaded_at: downloaded_at as u64,
+        }
+    }).collect())
+}
+
+// ── Profile Fetch Types ────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProfileFetchResult {
+    pub events_fetched: u64,
+    pub has_profile: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProfileCacheStatus {
+    pub event_count: u64,
+    pub has_metadata: bool,
+}
+
+#[tauri::command]
+async fn get_profile_cache_status(pubkey: String, state: State<'_, AppState>) -> Result<ProfileCacheStatus, String> {
+    let event_count = state.db.count_events_for_pubkey(&pubkey).map_err(|e| e.to_string())?;
+    let has_metadata = state.db.has_profile_metadata(&pubkey).map_err(|e| e.to_string())?;
+    Ok(ProfileCacheStatus { event_count, has_metadata })
+}
+
+/// One-shot targeted fetch for a specific pubkey from all connected relays.
+#[tauri::command]
+async fn fetch_profile(pubkey: String, state: State<'_, AppState>) -> Result<ProfileFetchResult, String> {
+    use nostr_sdk::prelude::*;
+
+    tracing::info!("[cmd:fetch_profile] pubkey={}…", &pubkey[..pubkey.len().min(12)]);
+
+    let config = state.config.read().await;
+    let relay_urls = config.outbound_relays.clone();
+    drop(config);
+
+    if relay_urls.is_empty() {
+        return Err("No relays configured".into());
+    }
+
+    let mut all_events: Vec<Event> = Vec::new();
+
+    // Metadata + contacts filter
+    let meta_filter = Filter::new()
+        .kinds(vec![Kind::Metadata, Kind::ContactList])
+        .authors(vec![PublicKey::from_hex(&pubkey).map_err(|e| format!("Invalid pubkey: {}", e))?]);
+
+    // Recent events filter
+    let events_filter = Filter::new()
+        .kinds(vec![Kind::TextNote, Kind::Repost, Kind::LongFormTextNote])
+        .authors(vec![PublicKey::from_hex(&pubkey).map_err(|e| format!("Invalid pubkey: {}", e))?])
+        .limit(100);
+
+    for url in &relay_urls {
+        let client = Client::default();
+        match client.add_relay(url.as_str()).await {
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!("[fetch_profile] Failed to add relay {}: {}", url, e);
+                continue;
+            }
+        }
+        client.connect().await;
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        // Subscribe and collect with a simple timeout approach
+        let mut notifications = client.notifications();
+        let sub_id = match client.subscribe(vec![meta_filter.clone(), events_filter.clone()], None).await {
+            Ok(output) => output.val,
+            Err(e) => {
+                tracing::warn!("[fetch_profile] Subscribe failed on {}: {}", url, e);
+                client.disconnect().await.ok();
+                continue;
+            }
+        };
+
+        let deadline = tokio::time::sleep(std::time::Duration::from_secs(15));
+        tokio::pin!(deadline);
+
+        loop {
+            tokio::select! {
+                result = notifications.recv() => {
+                    match result {
+                        Ok(RelayPoolNotification::Event { event, .. }) => {
+                            if !all_events.iter().any(|e| e.id == event.id) {
+                                all_events.push(*event);
+                            }
+                        }
+                        Ok(RelayPoolNotification::Message { message, .. }) => {
+                            if matches!(&message, RelayMessage::EndOfStoredEvents(_)) {
+                                break;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+                _ = &mut deadline => {
+                    tracing::warn!("[fetch_profile] Timeout on {}, got {} events so far", url, all_events.len());
+                    break;
+                }
+            }
+        }
+
+        client.unsubscribe(sub_id).await;
+        client.disconnect().await.ok();
+
+        tracing::info!("[fetch_profile] Got {} events from {}", all_events.len(), url);
+
+        // If we got metadata + contacts, skip remaining relays
+        let has_meta = all_events.iter().any(|e| e.kind == Kind::Metadata && e.pubkey.to_hex() == pubkey);
+        let has_contacts = all_events.iter().any(|e| e.kind == Kind::ContactList && e.pubkey.to_hex() == pubkey);
+        if has_meta && has_contacts && all_events.len() >= 10 {
+            break;
+        }
+    }
+
+    // Store events
+    let mut stored_count: u64 = 0;
+    let mut has_profile = false;
+
+    // Sort newest-first for replaceable events
+    all_events.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    for event in &all_events {
+        let tags_json = serde_json::to_string(
+            &event.tags.iter().map(|t| t.as_slice().iter().map(|s| s.to_string()).collect::<Vec<String>>()).collect::<Vec<Vec<String>>>()
+        ).unwrap_or_else(|_| "[]".to_string());
+
+        match state.db.store_event(
+            &event.id.to_hex(),
+            &event.pubkey.to_hex(),
+            event.created_at.as_u64() as i64,
+            event.kind.as_u16() as u32,
+            &tags_json,
+            &event.content.to_string(),
+            &event.sig.to_string(),
+        ) {
+            Ok(true) => stored_count += 1,
+            Ok(false) => {} // duplicate
+            Err(e) => tracing::warn!("[fetch_profile] Failed to store event: {}", e),
+        }
+
+        // Update WoT graph for contact lists
+        if event.kind == Kind::ContactList {
+            let follows: Vec<String> = event.tags.iter()
+                .filter(|t| {
+                    let slice = t.as_slice();
+                    slice.len() >= 2 && slice[0] == "p"
+                })
+                .map(|t| t.as_slice()[1].to_string())
+                .collect();
+
+            let pk_hex = event.pubkey.to_hex();
+            let ev_id = event.id.to_hex();
+            let updated = state.wot_graph.update_follows(
+                &pk_hex,
+                &follows,
+                Some(ev_id.clone()),
+                Some(event.created_at.as_u64() as i64),
+            );
+            if updated {
+                let batch = vec![storage::FollowUpdateBatch {
+                    pubkey: &pk_hex,
+                    follows: &follows,
+                    event_id: Some(&ev_id),
+                    created_at: Some(event.created_at.as_u64() as i64),
+                }];
+                state.db.update_follows_batch(&batch).ok();
+            }
+        }
+
+        if event.kind == Kind::Metadata {
+            has_profile = true;
+        }
+    }
+
+    tracing::info!(
+        "[cmd:fetch_profile] Done: {} events fetched, {} stored, has_profile={}",
+        all_events.len(), stored_count, has_profile
+    );
+
+    Ok(ProfileFetchResult {
+        events_fetched: all_events.len() as u64,
+        has_profile,
+    })
+}
+
 #[tauri::command]
 async fn check_browser_integration() -> Result<bool, String> {
     let cert_path = dirs::home_dir()
@@ -1151,10 +1651,39 @@ async fn check_browser_integration() -> Result<bool, String> {
 // ── App Entry ──────────────────────────────────────────────────────
 
 pub fn run() {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
-        .with_target(true)
-        .init();
+    // Set up dual logging: console (INFO+) and rotating file (~/.nostrito/nostrito.log, max ~10MB)
+    {
+        use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+        let log_dir = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".nostrito");
+        std::fs::create_dir_all(&log_dir).ok();
+
+        // Rotating file appender: daily rotation, keep up to 3 files (~10MB effective cap)
+        let file_appender = tracing_appender::rolling::daily(&log_dir, "nostrito.log");
+        let (file_writer, _guard) = tracing_appender::non_blocking(file_appender);
+        // Leak the guard so it lives for the entire process lifetime
+        std::mem::forget(_guard);
+
+        let env_filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("info,nostrito_lib=info"));
+
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(
+                fmt::layer()
+                    .with_target(true)
+                    .with_ansi(true),
+            )
+            .with(
+                fmt::layer()
+                    .with_target(true)
+                    .with_ansi(false)
+                    .with_writer(file_writer),
+            )
+            .init();
+    }
 
     tracing::info!("[init] Starting nostrito");
 
@@ -1201,11 +1730,27 @@ pub fn run() {
         config.hex_pubkey = Some(hex);
     }
     if let Ok(Some(relays_csv)) = db.get_config("outbound_relays") {
-        let relays: Vec<String> = relays_csv.split(',').map(|s| s.to_string()).collect();
+        let relays: Vec<String> = relays_csv
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| resolve_relay_alias(s).to_string())
+            .collect();
         if !relays.is_empty() {
             tracing::info!("[init] Loaded {} relays from DB: {:?}", relays.len(), relays);
             config.outbound_relays = relays;
+        } else {
+            tracing::warn!(
+                "[init] DB has outbound_relays key but parsed to empty list (raw: {:?}). \
+                 Using defaults: {:?}",
+                relays_csv, config.outbound_relays
+            );
         }
+    } else {
+        tracing::info!(
+            "[init] No outbound_relays in DB — using defaults: {:?}",
+            config.outbound_relays
+        );
     }
     // Load sync tuning config
     if let Ok(Some(v)) = db.get_config("sync_lookback_days") { if let Ok(n) = v.parse::<u32>() { config.sync_lookback_days = n; } }
@@ -1216,8 +1761,55 @@ pub fn run() {
     if let Ok(Some(v)) = db.get_config("sync_wot_batch_size") { if let Ok(n) = v.parse::<u32>() { config.sync_wot_batch_size = n; } }
     if let Ok(Some(v)) = db.get_config("sync_wot_events_per_batch") { if let Ok(n) = v.parse::<u32>() { config.sync_wot_events_per_batch = n; } }
     if let Ok(Some(v)) = db.get_config("max_event_age_days") { if let Ok(n) = v.parse::<u32>() { config.max_event_age_days = n; } }
+    if let Ok(Some(v)) = db.get_config("storage_own_media_gb") { if let Ok(n) = v.parse::<f64>() { config.storage_own_media_gb = n; } }
+    if let Ok(Some(v)) = db.get_config("storage_tracked_media_gb") { if let Ok(n) = v.parse::<f64>() { config.storage_tracked_media_gb = n; } }
+    if let Ok(Some(v)) = db.get_config("storage_wot_media_gb") { if let Ok(n) = v.parse::<f64>() { config.storage_wot_media_gb = n; } }
+    if let Ok(Some(v)) = db.get_config("wot_event_retention_days") { if let Ok(n) = v.parse::<u32>() { config.wot_event_retention_days = n; } }
+
+    // Load additional settings that are now persisted by save_settings
+    if let Ok(Some(v)) = db.get_config("relay_port") { if let Ok(n) = v.parse::<u16>() { config.relay_port = n; } }
+    if let Ok(Some(v)) = db.get_config("max_storage_mb") { if let Ok(n) = v.parse::<u32>() { config.max_storage_mb = n; } }
+    if let Ok(Some(v)) = db.get_config("storage_others_gb") { if let Ok(n) = v.parse::<f64>() { config.storage_others_gb = n; } }
+    if let Ok(Some(v)) = db.get_config("storage_media_gb") { if let Ok(n) = v.parse::<f64>() { config.storage_media_gb = n; } }
+    if let Ok(Some(v)) = db.get_config("wot_max_depth") { if let Ok(n) = v.parse::<u32>() { config.wot_max_depth = n; } }
+    if let Ok(Some(v)) = db.get_config("sync_interval_secs") { if let Ok(n) = v.parse::<u32>() { config.sync_interval_secs = n; } }
 
     tracing::info!("[init] Config: npub={:?}, relays={:?}, port={}", config.npub, config.outbound_relays, config.relay_port);
+
+    // ── STARTUP LOG ──
+    {
+        let event_count = db.event_count().unwrap_or(0);
+        let wot_stats = wot_graph.stats();
+        let follows_count = config.hex_pubkey.as_ref()
+            .and_then(|pk| wot_graph.get_follows(pk))
+            .map(|f| f.len())
+            .unwrap_or(0);
+        let tracked_count = db.get_tracked_pubkeys().map(|t| t.len()).unwrap_or(0);
+        let npub_display = config.npub.as_deref().unwrap_or("(not set)");
+        let relay_list: Vec<&str> = config.outbound_relays.iter().map(|s| s.as_str()).collect();
+
+        let tier2_since_display = db.get_sync_cursor().ok().flatten()
+            .and_then(|ts| chrono::DateTime::from_timestamp(ts as i64, 0))
+            .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+            .unwrap_or_else(|| "(none)".into());
+        let articles_cursor_display = db.get_articles_history_cursor().ok().flatten()
+            .and_then(|ts| chrono::DateTime::from_timestamp(ts as i64, 0))
+            .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+            .unwrap_or_else(|| "(none)".into());
+
+        tracing::info!(
+            "\n[NOSTRITO STARTUP]\n  npub: {}\n  relays configured: {} → {:?}\n  own events in DB: {}\n  follows: {}\n  tracked profiles: {}\n  wot peers: {}\n  tier2_since cursor: {}\n  articles cursor: {}\n  cycle interval: {}s",
+            npub_display,
+            relay_list.len(), relay_list,
+            event_count,
+            follows_count,
+            tracked_count,
+            wot_stats.node_count,
+            tier2_since_display,
+            articles_cursor_display,
+            config.sync_interval_secs,
+        );
+    }
 
     let app_state = AppState {
         wot_graph,
@@ -1264,7 +1856,6 @@ pub fn run() {
 
                     let cfg2 = config.read().await;
                     let media_gb = cfg2.storage_media_gb;
-                    let others_gb = cfg2.storage_others_gb;
                     let max_age_days = cfg2.max_event_age_days;
                     let sync_config = SyncConfig {
                         lookback_days: cfg2.sync_lookback_days,
@@ -1286,7 +1877,6 @@ pub fn run() {
                         sync_stats,
                         app_handle.clone(),
                         media_gb,
-                        others_gb,
                         sync_config,
                         max_age_days,
                     ));
@@ -1360,6 +1950,7 @@ pub fn run() {
             get_feed,
             search_events,
             get_storage_stats,
+            get_ownership_storage_stats,
             get_settings,
             save_settings,
             start_sync,
@@ -1368,6 +1959,7 @@ pub fn run() {
             stop_relay,
             get_uptime,
             reset_app_data,
+            change_account,
             get_activity_data,
             get_relay_status,
             get_kind_counts,
@@ -1377,10 +1969,14 @@ pub fn run() {
             setup_browser_integration,
             check_browser_integration,
             get_media_stats,
+            get_own_media,
+            get_profile_media,
             restart_sync,
             track_profile,
             untrack_profile,
             get_tracked_profiles,
+            fetch_profile,
+            get_profile_cache_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running nostrito");

@@ -2,7 +2,8 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { RELAYS, resolveRelayUrl, urlToAlias } from "../relays";
-import { iconKey, iconRadio, iconNetwork, iconDatabase, iconZap, iconSettings, iconLock, iconCastle, iconPlug, iconRocket, iconScale, iconTurtle, iconAlertTriangle, iconCheckCircle } from "../utils/icons";
+import { iconKey, iconRadio, iconNetwork, iconDatabase, iconSettings, iconLock, iconCastle, iconPlug, iconRocket, iconScale, iconTurtle, iconAlertTriangle, iconCheckCircle, iconUsers } from "../utils/icons";
+import { getProfiles, profileDisplayName } from "../utils/profiles";
 
 interface Settings {
   npub: string;
@@ -10,6 +11,10 @@ interface Settings {
   max_storage_mb: number;
   storage_others_gb: number;
   storage_media_gb: number;
+  storage_own_media_gb: number;
+  storage_tracked_media_gb: number;
+  storage_wot_media_gb: number;
+  wot_event_retention_days: number;
   wot_max_depth: number;
   sync_interval_secs: number;
   outbound_relays: string[];
@@ -23,6 +28,23 @@ interface Settings {
   sync_wot_events_per_batch: number;
   max_event_age_days: number;
 }
+
+/** Defaults matching the Rust AppConfig::default() — used for "Reset to defaults" */
+const DEFAULTS = {
+  sync_interval_secs: 300,
+  sync_lookback_days: 30,
+  sync_batch_size: 50,
+  sync_events_per_batch: 50,
+  sync_batch_pause_secs: 7,
+  sync_relay_min_interval_secs: 3,
+  sync_wot_batch_size: 5,
+  sync_wot_events_per_batch: 15,
+  wot_max_depth: 2,
+  wot_event_retention_days: 30,
+  max_storage_mb: 10240,
+  storage_media_gb: 2.0,
+  max_event_age_days: 30,
+};
 
 function escapeHtml(str: string): string {
   const div = document.createElement("div");
@@ -38,16 +60,15 @@ export function renderSettings(container: HTMLElement): void {
       <div class="settings-sub-nav">
         <div class="settings-sub-item active" data-settings="identity"><span class="icon">${iconKey()}</span> Identity</div>
         <div class="settings-sub-item" data-settings="relays"><span class="icon">${iconRadio()}</span> Relays</div>
-        <div class="settings-sub-item" data-settings="wot-settings"><span class="icon">${iconNetwork()}</span> WoT</div>
         <div class="settings-sub-item" data-settings="storage"><span class="icon">${iconDatabase()}</span> Storage</div>
-        <div class="settings-sub-item" data-settings="sync"><span class="icon">${iconZap()}</span> Sync</div>
         <div class="settings-sub-item" data-settings="advanced"><span class="icon">${iconSettings()}</span> Advanced</div>
+        <div class="settings-sub-item" data-settings="tracked"><span class="icon">${iconUsers()}</span> Tracked Profiles</div>
       </div>
       <div class="settings-panel">
-        <!-- Identity -->
+        <!-- ═══════════════ Tab 1: Identity ═══════════════ -->
         <div class="settings-pane active" id="pane-identity">
           <div class="settings-pane-title">Identity</div>
-          <div class="settings-pane-desc">Your Nostr identity configuration.</div>
+          <div class="settings-pane-desc">Your Nostr identity.</div>
           <div class="settings-field"><div class="settings-field-info"><span class="settings-field-label">Public Key</span><span class="settings-field-desc">Your npub used for WoT computation</span></div></div>
           <div class="settings-mono" id="settings-npub">Loading...</div>
 
@@ -58,13 +79,24 @@ export function renderSettings(container: HTMLElement): void {
           </div>
 
           <div class="settings-field" style="border-bottom:none;padding-bottom:8px"><div class="settings-field-info"><span class="settings-field-label">Connect Signer</span><span class="settings-field-desc">Upgrade to full access</span></div></div>
-          <div style="display:flex;flex-direction:column;gap:8px">
+          <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:24px">
             <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:var(--bg);border:1px solid var(--border);border-radius:10px;cursor:pointer;transition:border-color 0.2s"><span style="font-size:0.85rem;font-weight:500"><span class="icon">${iconKey()}</span> Paste nsec</span><span style="font-size:0.72rem;color:var(--text-muted)">Full access</span></div>
             <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:var(--bg);border:1px solid var(--border);border-radius:10px;cursor:pointer;transition:border-color 0.2s"><span style="font-size:0.85rem;font-weight:500"><span class="icon">${iconCastle()}</span> NBunker</span><span style="font-size:0.72rem;color:var(--text-muted)">Remote signer</span></div>
             <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:var(--bg);border:1px solid var(--border);border-radius:10px;cursor:pointer;transition:border-color 0.2s"><span style="font-size:0.85rem;font-weight:500"><span class="icon">${iconPlug()}</span> Nostr Connect</span><span style="font-size:0.72rem;color:var(--text-muted)">NIP-46</span></div>
           </div>
+
+          <div class="danger-zone">
+            <div class="danger-zone-row">
+              <div>
+                <div class="danger-zone-label">Change Account</div>
+                <div class="danger-zone-desc">Remove your npub and start over. Keeps your event data.</div>
+              </div>
+              <button class="btn-danger" id="btn-change-account">Change Account</button>
+            </div>
+          </div>
         </div>
-        <!-- Relays -->
+
+        <!-- ═══════════════ Tab 2: Relays ═══════════════ -->
         <div class="settings-pane" id="pane-relays">
           <div class="settings-pane-title">Relays</div>
           <div class="settings-pane-desc">Pick which relays to sync from. Changes take effect after saving.</div>
@@ -72,100 +104,102 @@ export function renderSettings(container: HTMLElement): void {
           <button class="btn btn-primary" id="btn-save-relays" style="width:100%">Save Relays</button>
           <div id="relay-save-result" style="margin-top:8px;font-size:0.78rem;text-align:center"></div>
         </div>
-        <!-- WoT Settings -->
-        <div class="settings-pane" id="pane-wot-settings">
-          <div class="settings-pane-title">Web of Trust</div>
-          <div class="settings-pane-desc">Configure trust graph computation.</div>
-          <div class="settings-field"><div class="settings-field-info"><span class="settings-field-label">Max depth</span><span class="settings-field-desc">How many hops to compute</span></div><span style="font-family:var(--mono);font-size:0.85rem;color:var(--accent-light)" id="settings-wot-depth">—</span></div>
-          <div class="settings-field"><div class="settings-field-info"><span class="settings-field-label">Sync interval</span><span class="settings-field-desc">Minutes between full sync cycles. Lower = more real-time, higher = more polite.</span></div><span style="font-family:var(--mono);font-size:0.85rem;color:var(--text-dim)" id="settings-sync-interval">—</span></div>
-        </div>
-        <!-- Storage -->
+
+        <!-- ═══════════════ Tab 3: Storage ═══════════════ -->
         <div class="settings-pane" id="pane-storage">
           <div class="settings-pane-title">Storage</div>
-          <div class="settings-pane-desc">Control what gets stored and how much space to use.</div>
+          <div class="settings-pane-desc">Control what gets stored, organized by ownership.</div>
 
-          <div class="storage-section">
-            <div class="storage-row locked">
-              <div class="storage-row-info">
-                <span class="storage-row-label">Your events & media</span>
-                <span class="storage-row-meta"><span class="icon">${iconLock()}</span> Always stored. No exceptions.</span>
+          <!-- Own Events Section -->
+          <div class="storage-category-section">
+            <div class="storage-category-header">
+              <span class="storage-category-badge own">YOU</span>
+              <span class="storage-category-title">Own Events</span>
+            </div>
+            <div class="storage-section">
+              <div class="storage-row locked">
+                <div class="storage-row-info">
+                  <span class="storage-row-label">Event retention</span>
+                  <span class="storage-row-meta"><span class="icon">${iconLock()}</span> Own events are always kept</span>
+                </div>
               </div>
-              <div class="storage-bar-wrap">
-                <div class="storage-bar"><div class="storage-bar-fill"></div></div>
-                <span class="storage-bar-label">100%</span>
+            </div>
+            <div class="storage-section">
+              <div class="storage-row">
+                <div class="storage-row-info">
+                  <span class="storage-row-label">Own media limit</span>
+                  <span class="storage-row-meta">Blossom media from your own events — always kept, never evicted</span>
+                </div>
+                <div class="storage-slider-wrap">
+                  <span class="storage-slider-value" id="settings-own-media-val" style="color:var(--green);font-weight:600">∞ Unlimited</span>
+                </div>
               </div>
             </div>
           </div>
 
-          <div class="storage-section">
-            <div class="storage-row">
-              <div class="storage-row-info">
-                <span class="storage-row-label">Others' events</span>
-                <span class="storage-row-meta">From your Web of Trust</span>
+          <!-- Tracked Profiles Section -->
+          <div class="storage-category-section">
+            <div class="storage-category-header">
+              <span class="storage-category-badge tracked">TRACKED</span>
+              <span class="storage-category-title">Tracked Profiles</span>
+            </div>
+            <div class="storage-section">
+              <div class="storage-row locked">
+                <div class="storage-row-info">
+                  <span class="storage-row-label">Event retention</span>
+                  <span class="storage-row-meta"><span class="icon">${iconLock()}</span> Tracked profiles are always kept</span>
+                </div>
               </div>
-              <div class="storage-slider-wrap">
-                <input type="range" class="storage-slider" min="1" max="50" value="5" id="settings-others-events-slider">
-                <span class="storage-slider-value" id="settings-others-events-val">5 GB</span>
+            </div>
+            <div class="storage-section">
+              <div class="storage-row">
+                <div class="storage-row-info">
+                  <span class="storage-row-label">Tracked media limit</span>
+                  <span class="storage-row-meta">Blossom media from tracked profiles</span>
+                </div>
+                <div class="storage-slider-wrap">
+                  <input type="range" class="storage-slider" min="1" max="50" value="3" id="settings-tracked-media-slider">
+                  <span class="storage-slider-value" id="settings-tracked-media-val">3 GB</span>
+                </div>
               </div>
             </div>
           </div>
 
-          <div class="storage-section">
-            <div class="storage-row">
-              <div class="storage-row-info">
-                <span class="storage-row-label">Others' media (Blossom)</span>
-                <span class="storage-row-meta">Images, videos, audio from your network</span>
-              </div>
-              <div class="storage-slider-wrap">
-                <input type="range" class="storage-slider" min="1" max="50" value="2" id="settings-others-media-slider">
-                <span class="storage-slider-value" id="settings-others-media-val">2 GB</span>
+          <!-- WoT Profiles Section -->
+          <div class="storage-category-section">
+            <div class="storage-category-header">
+              <span class="storage-category-badge wot">WOT</span>
+              <span class="storage-category-title">WoT Profiles</span>
+            </div>
+            <div class="storage-section">
+              <div class="storage-row">
+                <div class="storage-row-info">
+                  <span class="storage-row-label">Event retention</span>
+                  <span class="storage-row-meta">How long to keep WoT events before pruning</span>
+                </div>
+                <div class="storage-slider-wrap">
+                  <input type="range" class="storage-slider" min="7" max="365" step="1" value="30" id="storage-wot-retention">
+                  <span class="storage-slider-value" id="storage-wot-retention-val">30 days</span>
+                </div>
+                <div style="display:flex;gap:8px;margin-top:8px">
+                  <button class="btn btn-secondary wot-age-preset" data-days="7" style="font-size:0.75rem;padding:4px 10px">7d</button>
+                  <button class="btn btn-secondary wot-age-preset" data-days="14" style="font-size:0.75rem;padding:4px 10px">14d</button>
+                  <button class="btn btn-secondary wot-age-preset" data-days="30" style="font-size:0.75rem;padding:4px 10px">30d</button>
+                  <button class="btn btn-secondary wot-age-preset" data-days="90" style="font-size:0.75rem;padding:4px 10px">90d</button>
+                  <button class="btn btn-secondary wot-age-preset" data-days="365" style="font-size:0.75rem;padding:4px 10px">1yr</button>
+                </div>
               </div>
             </div>
-          </div>
-
-          <div class="storage-section">
-            <div class="storage-row">
-              <div class="storage-row-info">
-                <span class="storage-row-label">Auto-cleanup</span>
-                <span class="storage-row-meta">When storage limit is reached</span>
-              </div>
-              <div class="cleanup-group" id="settings-cleanup-group">
-                <div class="cleanup-radio active" data-cleanup="oldest">Oldest first</div>
-                <div class="cleanup-radio" data-cleanup="least-interacted">Least interacted</div>
-              </div>
-            </div>
-          </div>
-
-          <div class="storage-section">
-            <div class="storage-row">
-              <div class="storage-row-info">
-                <span class="storage-row-label">Event retention</span>
-                <span class="storage-row-meta">How long to keep others' events. Own events and tracked profiles are kept forever.</span>
-              </div>
-              <div class="storage-slider-wrap">
-                <input type="range" class="storage-slider" min="7" max="365" step="1" value="30" id="storage-max-age">
-                <span class="storage-slider-value" id="storage-max-age-val">30 days</span>
-              </div>
-              <div style="display:flex;gap:8px;margin-top:8px">
-                <button class="btn btn-secondary age-preset" data-days="7" style="font-size:0.75rem;padding:4px 10px">7d</button>
-                <button class="btn btn-secondary age-preset" data-days="14" style="font-size:0.75rem;padding:4px 10px">14d</button>
-                <button class="btn btn-secondary age-preset" data-days="30" style="font-size:0.75rem;padding:4px 10px">30d</button>
-                <button class="btn btn-secondary age-preset" data-days="90" style="font-size:0.75rem;padding:4px 10px">90d</button>
-                <button class="btn btn-secondary age-preset" data-days="365" style="font-size:0.75rem;padding:4px 10px">1yr</button>
-              </div>
-            </div>
-          </div>
-
-          <div class="storage-section">
-            <div class="storage-row">
-              <div class="storage-row-info">
-                <span class="storage-row-label">Tracked Profiles</span>
-                <span class="storage-row-meta">These profiles are always kept — no age limit, never pruned. Perfect for important follows.</span>
-              </div>
-              <div id="tracked-profiles-list" style="margin:8px 0;font-size:0.82rem;color:var(--text-dim)">Loading...</div>
-              <div style="display:flex;gap:8px;margin-top:8px">
-                <input type="text" id="track-profile-input" placeholder="npub or hex pubkey" style="flex:1;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:0.82rem;font-family:var(--mono)">
-                <button class="btn btn-primary" id="btn-track-profile" style="font-size:0.82rem;padding:8px 16px">Track</button>
+            <div class="storage-section">
+              <div class="storage-row">
+                <div class="storage-row-info">
+                  <span class="storage-row-label">WoT media limit</span>
+                  <span class="storage-row-meta">Blossom media from WoT profiles</span>
+                </div>
+                <div class="storage-slider-wrap">
+                  <input type="range" class="storage-slider" min="1" max="50" value="2" id="settings-wot-media-slider">
+                  <span class="storage-slider-value" id="settings-wot-media-val">2 GB</span>
+                </div>
               </div>
             </div>
           </div>
@@ -173,43 +207,54 @@ export function renderSettings(container: HTMLElement): void {
           <button class="btn btn-primary" id="btn-save-storage" style="margin-top:16px;width:100%">Save Storage Settings</button>
           <div id="storage-save-result" style="margin-top:8px;font-size:0.78rem;text-align:center"></div>
         </div>
-        <!-- Sync -->
-        <div class="settings-pane" id="pane-sync">
-          <div class="settings-pane-title">Sync Configuration</div>
-          <div class="settings-pane-desc">Tune how the sync engine fetches events. Use aggressive settings to build the initial database, then switch to conservative for ongoing sync.</div>
 
-          <div class="sync-presets">
-            <button class="sync-preset-btn" data-preset="aggressive"><span class="icon">${iconRocket()}</span> Aggressive (initial build)</button>
-            <button class="sync-preset-btn" data-preset="balanced"><span class="icon">${iconScale()}</span> Balanced (default)</button>
-            <button class="sync-preset-btn" data-preset="polite"><span class="icon">${iconTurtle()}</span> Polite (background)</button>
+        <!-- ═══════════════ Tab 4: Advanced ═══════════════ -->
+        <div class="settings-pane" id="pane-advanced">
+          <div class="settings-pane-title">Advanced</div>
+          <div style="background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:14px 18px;margin-bottom:20px">
+            <div style="font-size:0.84rem;color:var(--text-dim)">These settings are for advanced users. The defaults work well for most people.</div>
           </div>
 
+          <button class="btn btn-secondary" id="btn-reset-defaults" style="width:100%;margin-bottom:20px">Reset to Defaults</button>
+          <div id="reset-defaults-result" style="margin-top:-12px;margin-bottom:12px;font-size:0.78rem;text-align:center"></div>
+
+          <!-- Sync Presets -->
+          <div style="margin-bottom:20px">
+            <div style="font-size:0.82rem;font-weight:600;color:var(--text);margin-bottom:8px">Sync Presets</div>
+            <div class="sync-presets">
+              <button class="sync-preset-btn" data-preset="light"><span class="icon">${iconTurtle()}</span> Light</button>
+              <button class="sync-preset-btn" data-preset="balanced"><span class="icon">${iconScale()}</span> Balanced</button>
+              <button class="sync-preset-btn" data-preset="power"><span class="icon">${iconRocket()}</span> Power</button>
+            </div>
+          </div>
+
+          <!-- Sync Sliders -->
           <div class="settings-field">
             <div class="settings-field-info">
               <span class="settings-field-label">Lookback window</span>
-              <span class="settings-field-desc">How many days back to fetch in Tier 2</span>
+              <span class="settings-field-desc">How many days back to fetch</span>
             </div>
             <div class="sync-slider-wrap">
-              <input type="range" class="sync-slider" id="sync-lookback" min="1" max="90" value="7">
-              <span class="sync-slider-val" id="sync-lookback-val">7 days</span>
+              <input type="range" class="sync-slider" id="sync-lookback" min="1" max="90" value="30">
+              <span class="sync-slider-val" id="sync-lookback-val">30 days</span>
             </div>
           </div>
 
           <div class="settings-field">
             <div class="settings-field-info">
               <span class="settings-field-label">Authors per batch</span>
-              <span class="settings-field-desc">How many authors per subscription request (Tier 2). Higher = faster but more likely to get rate-limited.</span>
+              <span class="settings-field-desc">How many authors per subscription request</span>
             </div>
             <div class="sync-slider-wrap">
-              <input type="range" class="sync-slider" id="sync-batch-size" min="1" max="50" value="10">
-              <span class="sync-slider-val" id="sync-batch-size-val">10</span>
+              <input type="range" class="sync-slider" id="sync-batch-size" min="1" max="50" value="50">
+              <span class="sync-slider-val" id="sync-batch-size-val">50</span>
             </div>
           </div>
 
           <div class="settings-field">
             <div class="settings-field-info">
               <span class="settings-field-label">Events per request</span>
-              <span class="settings-field-desc">Max events per REQ (limit). Higher = more data per round trip.</span>
+              <span class="settings-field-desc">Max events per REQ</span>
             </div>
             <div class="sync-slider-wrap">
               <input type="range" class="sync-slider" id="sync-events-per-batch" min="10" max="500" step="10" value="50">
@@ -220,7 +265,7 @@ export function renderSettings(container: HTMLElement): void {
           <div class="settings-field">
             <div class="settings-field-info">
               <span class="settings-field-label">Pause between batches</span>
-              <span class="settings-field-desc">Seconds to wait between subscription batches. Lower = faster, higher = more polite.</span>
+              <span class="settings-field-desc">Seconds to wait between subscription batches</span>
             </div>
             <div class="sync-slider-wrap">
               <input type="range" class="sync-slider" id="sync-batch-pause" min="0" max="30" value="7">
@@ -231,7 +276,7 @@ export function renderSettings(container: HTMLElement): void {
           <div class="settings-field">
             <div class="settings-field-info">
               <span class="settings-field-label">Min relay interval</span>
-              <span class="settings-field-desc">Minimum seconds between requests to the same relay.</span>
+              <span class="settings-field-desc">Minimum seconds between requests to the same relay</span>
             </div>
             <div class="sync-slider-wrap">
               <input type="range" class="sync-slider" id="sync-relay-interval" min="0" max="10" value="3">
@@ -242,7 +287,7 @@ export function renderSettings(container: HTMLElement): void {
           <div class="settings-field">
             <div class="settings-field-info">
               <span class="settings-field-label">WoT authors per batch</span>
-              <span class="settings-field-desc">Authors per batch in Tier 3 (WoT crawl).</span>
+              <span class="settings-field-desc">Authors per batch in WoT crawl</span>
             </div>
             <div class="sync-slider-wrap">
               <input type="range" class="sync-slider" id="sync-wot-batch" min="1" max="30" value="5">
@@ -253,7 +298,7 @@ export function renderSettings(container: HTMLElement): void {
           <div class="settings-field">
             <div class="settings-field-info">
               <span class="settings-field-label">WoT events per request</span>
-              <span class="settings-field-desc">Max events per REQ in Tier 3 WoT crawl.</span>
+              <span class="settings-field-desc">Max events per REQ in WoT crawl</span>
             </div>
             <div class="sync-slider-wrap">
               <input type="range" class="sync-slider" id="sync-wot-events" min="5" max="100" value="15">
@@ -264,7 +309,7 @@ export function renderSettings(container: HTMLElement): void {
           <div class="settings-field">
             <div class="settings-field-info">
               <span class="settings-field-label">Sync cycle interval</span>
-              <span class="settings-field-desc">Minutes between full sync cycles. Lower = more real-time, higher = more polite.</span>
+              <span class="settings-field-desc">Minutes between full sync cycles</span>
             </div>
             <div class="sync-slider-wrap">
               <input type="range" class="sync-slider" id="sync-interval" min="1" max="60" value="5">
@@ -272,28 +317,39 @@ export function renderSettings(container: HTMLElement): void {
             </div>
           </div>
 
-          <button class="btn btn-primary" id="sync-save-btn" style="margin-top:16px">Save & Restart Sync</button>
-          <div id="sync-save-result" style="margin-top:8px;font-size:0.78rem"></div>
-        </div>
-        <!-- Advanced -->
-        <div class="settings-pane" id="pane-advanced">
-          <div class="settings-pane-title">Advanced</div>
-          <div class="settings-pane-desc">Low-level configuration options.</div>
-          <div class="settings-field"><div class="settings-field-info"><span class="settings-field-label">Relay port</span><span class="settings-field-desc">Local WebSocket relay port</span></div><span style="font-family:var(--mono);font-size:0.85rem;color:var(--text-dim)" id="settings-port">—</span></div>
-          <div class="settings-field"><div class="settings-field-info"><span class="settings-field-label">Auto-start</span><span class="settings-field-desc">Start nostrito on login</span></div><label class="toggle"><input type="checkbox" id="settings-autostart"><span class="toggle-slider"></span></label></div>
-
-          <div class="settings-field" style="border-bottom:none;padding-bottom:8px"><div class="settings-field-info"><span class="settings-field-label">Browser Integration</span><span class="settings-field-desc">Enable wss:// for web Nostr clients (Coracle, Snort, Primal)</span></div></div>
-          <div style="background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:14px 18px;margin-bottom:16px">
-            <div style="display:flex;align-items:center;justify-content:space-between">
-              <div>
-                <div id="browser-integration-status" style="font-size:0.85rem;color:var(--text-dim);margin-bottom:2px">Checking...</div>
-                <div id="browser-integration-detail" style="font-size:0.75rem;color:var(--text-muted)"></div>
-              </div>
-              <button class="btn btn-primary" id="btn-enable-browser" style="font-size:0.8rem;padding:8px 16px">Enable</button>
+          <div class="settings-field">
+            <div class="settings-field-info">
+              <span class="settings-field-label">WoT max depth</span>
+              <span class="settings-field-desc">How many hops to compute in the trust graph</span>
             </div>
-            <div id="browser-integration-result" style="margin-top:10px"></div>
+            <div class="sync-slider-wrap">
+              <input type="range" class="sync-slider" id="sync-wot-depth" min="1" max="4" value="2">
+              <span class="sync-slider-val" id="sync-wot-depth-val">2</span>
+            </div>
           </div>
 
+          <button class="btn btn-primary" id="sync-save-btn" style="margin-top:16px;width:100%">Save & Restart Sync</button>
+          <div id="sync-save-result" style="margin-top:8px;font-size:0.78rem;text-align:center"></div>
+
+          <!-- Low-level config -->
+          <div style="margin-top:24px;padding-top:16px;border-top:1px solid var(--border)">
+            <div class="settings-field"><div class="settings-field-info"><span class="settings-field-label">Relay port</span><span class="settings-field-desc">Local WebSocket relay port</span></div><span style="font-family:var(--mono);font-size:0.85rem;color:var(--text-dim)" id="settings-port">—</span></div>
+            <div class="settings-field"><div class="settings-field-info"><span class="settings-field-label">Auto-start</span><span class="settings-field-desc">Start nostrito on login</span></div><label class="toggle"><input type="checkbox" id="settings-autostart"><span class="toggle-slider"></span></label></div>
+
+            <div class="settings-field" style="border-bottom:none;padding-bottom:8px"><div class="settings-field-info"><span class="settings-field-label">Browser Integration</span><span class="settings-field-desc">Enable wss:// for web Nostr clients (Coracle, Snort, Primal)</span></div></div>
+            <div style="background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:14px 18px;margin-bottom:16px">
+              <div style="display:flex;align-items:center;justify-content:space-between">
+                <div>
+                  <div id="browser-integration-status" style="font-size:0.85rem;color:var(--text-dim);margin-bottom:2px">Checking...</div>
+                  <div id="browser-integration-detail" style="font-size:0.75rem;color:var(--text-muted)"></div>
+                </div>
+                <button class="btn btn-primary" id="btn-enable-browser" style="font-size:0.8rem;padding:8px 16px">Enable</button>
+              </div>
+              <div id="browser-integration-result" style="margin-top:10px"></div>
+            </div>
+          </div>
+
+          <!-- Danger Zone -->
           <div class="danger-zone">
             <div class="danger-zone-title"><span class="icon">${iconAlertTriangle()}</span> Danger Zone</div>
             <div class="danger-zone-row">
@@ -303,20 +359,24 @@ export function renderSettings(container: HTMLElement): void {
               </div>
               <button class="btn-danger" id="btn-reset-app">Reset App Data</button>
             </div>
-            <div class="danger-zone-row">
-              <div>
-                <div class="danger-zone-label">Change Account</div>
-                <div class="danger-zone-desc">Remove your npub and start over. Keeps your event data.</div>
-              </div>
-              <button class="btn-danger" id="btn-change-account">Change Account</button>
-            </div>
+          </div>
+        </div>
+
+        <!-- ═══════════════ Tab 5: Tracked Profiles ═══════════════ -->
+        <div class="settings-pane" id="pane-tracked">
+          <div class="settings-pane-title">Tracked Profiles</div>
+          <div class="settings-pane-desc">These profiles are never pruned. Perfect for important follows.</div>
+          <div id="tracked-profiles-list" style="margin:8px 0;max-height:500px;overflow-y:auto;font-size:0.82rem;color:var(--text-dim)">Loading...</div>
+          <div style="display:flex;gap:8px;margin-top:12px">
+            <input type="text" id="track-profile-input" placeholder="npub or hex pubkey" style="flex:1;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:0.82rem;font-family:var(--mono)">
+            <button class="btn btn-primary" id="btn-track-profile" style="font-size:0.82rem;padding:8px 16px">Track</button>
           </div>
         </div>
       </div>
     </div>
   `;
 
-  // Wire settings sub-nav
+  // ── Wire settings sub-nav ──
   const items = container.querySelectorAll(".settings-sub-item");
   const panes = container.querySelectorAll(".settings-pane");
   items.forEach((item) => {
@@ -330,55 +390,43 @@ export function renderSettings(container: HTMLElement): void {
     });
   });
 
-  // Wire storage sliders
-  const evSlider = document.getElementById("settings-others-events-slider") as HTMLInputElement | null;
-  const evVal = document.getElementById("settings-others-events-val");
-  if (evSlider && evVal) {
-    evSlider.addEventListener("input", () => {
-      evVal.textContent = `${evSlider.value} GB`;
+  // ── Wire storage sliders ──
+  const trackedMediaSlider = document.getElementById("settings-tracked-media-slider") as HTMLInputElement | null;
+  const trackedMediaVal = document.getElementById("settings-tracked-media-val");
+  if (trackedMediaSlider && trackedMediaVal) {
+    trackedMediaSlider.addEventListener("input", () => {
+      trackedMediaVal.textContent = `${trackedMediaSlider.value} GB`;
     });
   }
 
-  const mdSlider = document.getElementById("settings-others-media-slider") as HTMLInputElement | null;
-  const mdVal = document.getElementById("settings-others-media-val");
-  if (mdSlider && mdVal) {
-    mdSlider.addEventListener("input", () => {
-      mdVal.textContent = `${mdSlider.value} GB`;
+  const wotMediaSlider = document.getElementById("settings-wot-media-slider") as HTMLInputElement | null;
+  const wotMediaVal = document.getElementById("settings-wot-media-val");
+  if (wotMediaSlider && wotMediaVal) {
+    wotMediaSlider.addEventListener("input", () => {
+      wotMediaVal.textContent = `${wotMediaSlider.value} GB`;
     });
   }
 
-  // Wire cleanup radios
-  const cleanupGroup = document.getElementById("settings-cleanup-group");
-  if (cleanupGroup) {
-    cleanupGroup.querySelectorAll(".cleanup-radio").forEach((radio) => {
-      radio.addEventListener("click", () => {
-        cleanupGroup.querySelectorAll(".cleanup-radio").forEach((r) => r.classList.remove("active"));
-        radio.classList.add("active");
-      });
+  const wotRetentionSlider = document.getElementById("storage-wot-retention") as HTMLInputElement | null;
+  const wotRetentionVal = document.getElementById("storage-wot-retention-val");
+  if (wotRetentionSlider && wotRetentionVal) {
+    wotRetentionSlider.addEventListener("input", () => {
+      wotRetentionVal.textContent = `${wotRetentionSlider.value} days`;
     });
   }
 
-  // Wire event retention slider
-  const ageSlider = document.getElementById("storage-max-age") as HTMLInputElement | null;
-  const ageVal = document.getElementById("storage-max-age-val");
-  if (ageSlider && ageVal) {
-    ageSlider.addEventListener("input", () => {
-      ageVal.textContent = `${ageSlider.value} days`;
-    });
-  }
-
-  // Wire age preset buttons
-  container.querySelectorAll(".age-preset").forEach((btn) => {
+  // Wire WoT age preset buttons
+  container.querySelectorAll(".wot-age-preset").forEach((btn) => {
     btn.addEventListener("click", () => {
       const days = (btn as HTMLElement).dataset.days;
-      if (days && ageSlider && ageVal) {
-        ageSlider.value = days;
-        ageVal.textContent = `${days} days`;
+      if (days && wotRetentionSlider && wotRetentionVal) {
+        wotRetentionSlider.value = days;
+        wotRetentionVal.textContent = `${days} days`;
       }
     });
   });
 
-  // Wire track profile button
+  // ── Wire track profile button ──
   document.getElementById("btn-track-profile")?.addEventListener("click", async () => {
     const input = document.getElementById("track-profile-input") as HTMLInputElement | null;
     if (!input || !input.value.trim()) return;
@@ -392,15 +440,13 @@ export function renderSettings(container: HTMLElement): void {
     }
   });
 
-  // Wire danger zone buttons
+  // ── Wire danger zone buttons ──
   document.getElementById("btn-reset-app")?.addEventListener("click", async () => {
     if (confirm("Are you sure? This will delete ALL data and return to the setup wizard.")) {
       try {
         console.log("[settings] Calling reset_app_data...");
         await invoke("reset_app_data");
         console.log("[settings] reset_app_data complete");
-        // Backend emits app:reset which app.ts listens to → navigates to wizard
-        // Fallback: clear local state and reload
         localStorage.removeItem("nostrito_initialized");
         localStorage.removeItem("nostrito_config");
         window.dispatchEvent(new CustomEvent("nostrito:reset"));
@@ -411,37 +457,40 @@ export function renderSettings(container: HTMLElement): void {
   });
 
   document.getElementById("btn-change-account")?.addEventListener("click", async () => {
-    if (confirm("Remove your npub and start over? Event data will be kept.")) {
+    if (confirm("You will be signed out and redirected to the setup wizard.\n\nYour event data will be preserved — if you re-enter the same npub later, it will resume where you left off.\n\nContinue?")) {
       try {
-        console.log("[settings] Calling reset_app_data (change account)...");
-        await invoke("reset_app_data");
-        console.log("[settings] reset_app_data (change account) complete");
+        console.log("[settings] Calling change_account...");
+        await invoke("change_account");
+        console.log("[settings] change_account complete — identity cleared, events preserved");
         localStorage.removeItem("nostrito_initialized");
         localStorage.removeItem("nostrito_config");
         window.dispatchEvent(new CustomEvent("nostrito:reset"));
       } catch (e) {
         console.error("[settings] Change account failed:", e);
+        alert("Failed to change account: " + e);
       }
     }
   });
 
   loadSettings();
 
-  // Wire storage save button (needs to be after loadSettings call to use _currentSettings)
+  // ── Wire storage save button ──
   document.getElementById("btn-save-storage")?.addEventListener("click", async () => {
     const resultEl = document.getElementById("storage-save-result");
     const btn = document.getElementById("btn-save-storage") as HTMLButtonElement | null;
     if (!_currentSettings || !btn) return;
 
-    const evSliderEl = document.getElementById("settings-others-events-slider") as HTMLInputElement;
-    const mdSliderEl = document.getElementById("settings-others-media-slider") as HTMLInputElement;
+    const trackedMediaEl = document.getElementById("settings-tracked-media-slider") as HTMLInputElement;
+    const wotMediaEl = document.getElementById("settings-wot-media-slider") as HTMLInputElement;
+    const wotRetentionEl = document.getElementById("storage-wot-retention") as HTMLInputElement;
 
-    const ageSliderSave = document.getElementById("storage-max-age") as HTMLInputElement;
     const updated = {
       ..._currentSettings,
-      storage_others_gb: parseFloat(evSliderEl.value),
-      storage_media_gb: parseFloat(mdSliderEl.value),
-      max_event_age_days: parseInt(ageSliderSave?.value || "30", 10),
+      storage_own_media_gb: 0,
+      storage_tracked_media_gb: parseFloat(trackedMediaEl?.value || "3"),
+      storage_wot_media_gb: parseFloat(wotMediaEl?.value || "2"),
+      wot_event_retention_days: parseInt(wotRetentionEl?.value || "30", 10),
+      max_event_age_days: parseInt(wotRetentionEl?.value || "30", 10),
     };
 
     btn.disabled = true;
@@ -461,7 +510,7 @@ export function renderSettings(container: HTMLElement): void {
     }
   });
 
-  // Wire relay save button
+  // ── Wire relay save button ──
   document.getElementById("btn-save-relays")?.addEventListener("click", async () => {
     const resultEl = document.getElementById("relay-save-result");
     const btn = document.getElementById("btn-save-relays") as HTMLButtonElement | null;
@@ -493,12 +542,11 @@ export function renderSettings(container: HTMLElement): void {
     }
   });
 
-  // ── Sync pane: sliders, presets, save ──
-
-  const SYNC_PRESETS: Record<string, { lookback: number; batchSize: number; eventsPerBatch: number; batchPause: number; relayInterval: number; wotBatch: number; wotEvents: number }> = {
-    aggressive: { lookback: 30, batchSize: 30, eventsPerBatch: 200, batchPause: 2, relayInterval: 1, wotBatch: 15, wotEvents: 50 },
-    balanced:   { lookback: 7,  batchSize: 10, eventsPerBatch: 50,  batchPause: 7, relayInterval: 3, wotBatch: 5,  wotEvents: 15 },
-    polite:     { lookback: 3,  batchSize: 5,  eventsPerBatch: 20,  batchPause: 15, relayInterval: 5, wotBatch: 3,  wotEvents: 10 },
+  // ── Sync presets (renamed: Light / Balanced / Power) ──
+  const SYNC_PRESETS: Record<string, { lookback: number; batchSize: number; eventsPerBatch: number; batchPause: number; relayInterval: number; wotBatch: number; wotEvents: number; wotDepth: number; interval: number }> = {
+    light:    { lookback: 7,  batchSize: 10, eventsPerBatch: 20,  batchPause: 15, relayInterval: 5, wotBatch: 3,  wotEvents: 10, wotDepth: 1, interval: 10 },
+    balanced: { lookback: 30, batchSize: 50, eventsPerBatch: 50,  batchPause: 7,  relayInterval: 3, wotBatch: 5,  wotEvents: 15, wotDepth: 2, interval: 5 },
+    power:    { lookback: 60, batchSize: 50, eventsPerBatch: 200, batchPause: 2,  relayInterval: 1, wotBatch: 15, wotEvents: 50, wotDepth: 3, interval: 2 },
   };
 
   function applySyncPreset(p: typeof SYNC_PRESETS[string]) {
@@ -515,9 +563,10 @@ export function renderSettings(container: HTMLElement): void {
     set("sync-relay-interval", p.relayInterval, "s");
     set("sync-wot-batch", p.wotBatch);
     set("sync-wot-events", p.wotEvents);
+    set("sync-wot-depth", p.wotDepth);
+    set("sync-interval", p.interval, " min");
   }
 
-  // Wire preset buttons
   container.querySelectorAll(".sync-preset-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
       const preset = (btn as HTMLElement).dataset.preset!;
@@ -525,7 +574,7 @@ export function renderSettings(container: HTMLElement): void {
     });
   });
 
-  // Wire slider value displays
+  // ── Wire slider value displays ──
   const syncSliderMap: [string, string][] = [
     ["sync-lookback", " days"],
     ["sync-batch-size", ""],
@@ -535,6 +584,7 @@ export function renderSettings(container: HTMLElement): void {
     ["sync-wot-batch", ""],
     ["sync-wot-events", ""],
     ["sync-interval", " min"],
+    ["sync-wot-depth", ""],
   ];
   for (const [id, suffix] of syncSliderMap) {
     const slider = document.getElementById(id) as HTMLInputElement | null;
@@ -546,7 +596,29 @@ export function renderSettings(container: HTMLElement): void {
     }
   }
 
-  // Wire save button
+  // ── Reset to defaults button ──
+  document.getElementById("btn-reset-defaults")?.addEventListener("click", () => {
+    const resultEl = document.getElementById("reset-defaults-result");
+    // Apply default values to all sync sliders
+    const set = (id: string, val: number, suffix?: string) => {
+      const el = document.getElementById(id) as HTMLInputElement | null;
+      const valEl = document.getElementById(id + "-val");
+      if (el) el.value = String(val);
+      if (valEl) valEl.textContent = suffix ? `${val}${suffix}` : String(val);
+    };
+    set("sync-lookback", DEFAULTS.sync_lookback_days, " days");
+    set("sync-batch-size", DEFAULTS.sync_batch_size);
+    set("sync-events-per-batch", DEFAULTS.sync_events_per_batch);
+    set("sync-batch-pause", DEFAULTS.sync_batch_pause_secs, "s");
+    set("sync-relay-interval", DEFAULTS.sync_relay_min_interval_secs, "s");
+    set("sync-wot-batch", DEFAULTS.sync_wot_batch_size);
+    set("sync-wot-events", DEFAULTS.sync_wot_events_per_batch);
+    set("sync-interval", Math.round(DEFAULTS.sync_interval_secs / 60), " min");
+    set("sync-wot-depth", DEFAULTS.wot_max_depth);
+    if (resultEl) resultEl.innerHTML = `<span style="color:#34d399"><span class="icon">${iconCheckCircle()}</span> Defaults restored — click "Save & Restart Sync" to apply</span>`;
+  });
+
+  // ── Wire sync save button ──
   document.getElementById("sync-save-btn")?.addEventListener("click", async () => {
     const resultEl = document.getElementById("sync-save-result");
     const btn = document.getElementById("sync-save-btn") as HTMLButtonElement | null;
@@ -564,6 +636,7 @@ export function renderSettings(container: HTMLElement): void {
       sync_wot_batch_size: getVal("sync-wot-batch"),
       sync_wot_events_per_batch: getVal("sync-wot-events"),
       sync_interval_secs: getVal("sync-interval") * 60,
+      wot_max_depth: getVal("sync-wot-depth"),
     };
 
     btn.disabled = true;
@@ -588,23 +661,47 @@ export function renderSettings(container: HTMLElement): void {
 let _currentSettings: Settings | null = null;
 let _selectedRelayAliases: Set<string> = new Set();
 
+function generateAvatarFallback(name: string, pubkey: string): string {
+  const letter = name ? name.charAt(0).toUpperCase() : pubkey.charAt(0).toUpperCase();
+  let hash = 0;
+  for (let i = 0; i < pubkey.length; i++) hash = ((hash << 5) - hash + pubkey.charCodeAt(i)) | 0;
+  const hue = Math.abs(hash) % 360;
+  return `<div style="width:38px;height:38px;border-radius:50%;background:hsl(${hue},45%,35%);display:flex;align-items:center;justify-content:center;font-size:0.85rem;font-weight:600;color:#fff;flex-shrink:0">${escapeHtml(letter)}</div>`;
+}
+
 async function loadTrackedProfiles(): Promise<void> {
   const listEl = document.getElementById("tracked-profiles-list");
   if (!listEl) return;
   try {
-    const profiles = await invoke<Array<{ pubkey: string; tracked_at: number; note: string | null }>>("get_tracked_profiles");
-    if (profiles.length === 0) {
+    const tracked = await invoke<Array<{ pubkey: string; tracked_at: number; note: string | null }>>("get_tracked_profiles");
+    if (tracked.length === 0) {
       listEl.innerHTML = `<div style="color:var(--text-muted);font-size:0.78rem;padding:4px 0">No tracked profiles yet.</div>`;
       return;
     }
-    listEl.innerHTML = profiles.map(p => {
+
+    const pubkeys = tracked.map(p => p.pubkey);
+    const profileMap = await getProfiles(pubkeys);
+
+    listEl.innerHTML = tracked.map(p => {
+      const profile = profileMap.get(p.pubkey);
+      const displayName = profileDisplayName(profile, p.pubkey);
       const short = p.pubkey.length > 16 ? p.pubkey.slice(0, 8) + "…" + p.pubkey.slice(-8) : p.pubkey;
-      const noteHtml = p.note ? ` <span style="color:var(--text-muted);font-size:0.72rem">(${p.note})</span>` : "";
-      return `<div style="display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border)">
-        <span style="font-family:var(--mono);font-size:0.78rem" title="${p.pubkey}">${short}${noteHtml}</span>
-        <button class="btn-untrack" data-pubkey="${p.pubkey}" style="font-size:0.72rem;padding:2px 8px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--text-dim);cursor:pointer">Untrack</button>
+      const hasPicture = profile?.picture;
+
+      const avatarHtml = hasPicture
+        ? `<img src="${escapeHtml(profile!.picture!)}" style="width:38px;height:38px;border-radius:50%;object-fit:cover;flex-shrink:0;background:var(--bg)" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'" alt=""><div style="width:38px;height:38px;border-radius:50%;background:hsl(0,0%,30%);display:none;align-items:center;justify-content:center;font-size:0.85rem;font-weight:600;color:#fff;flex-shrink:0">${escapeHtml(displayName.charAt(0).toUpperCase())}</div>`
+        : generateAvatarFallback(displayName, p.pubkey);
+
+      return `<div style="display:flex;align-items:center;gap:10px;padding:8px 4px;border-bottom:1px solid var(--border)">
+        ${avatarHtml}
+        <div style="flex:1;min-width:0;overflow:hidden">
+          <div style="font-weight:600;font-size:0.84rem;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml(displayName)}</div>
+          <div style="font-family:var(--mono);font-size:0.72rem;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${escapeHtml(p.pubkey)}">${escapeHtml(short)}</div>
+        </div>
+        <button class="btn-untrack" data-pubkey="${escapeHtml(p.pubkey)}" style="font-size:0.72rem;padding:4px 10px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--text-dim);cursor:pointer;flex-shrink:0;transition:border-color 0.2s,color 0.2s">Untrack</button>
       </div>`;
     }).join("");
+
     listEl.querySelectorAll(".btn-untrack").forEach(btn => {
       btn.addEventListener("click", async () => {
         const pk = (btn as HTMLElement).dataset.pubkey;
@@ -638,8 +735,6 @@ async function loadSettings(): Promise<void> {
     // Relays — card grid picker
     const relayGridEl = document.getElementById("settings-relay-grid");
     if (relayGridEl) {
-      // Convert stored relays to alias set for pre-selection
-      // Handles BOTH short aliases (e.g. "primal") and wss:// URLs
       const activeAliases = new Set<string>();
       for (const relay of settings.outbound_relays) {
         const isAlias = RELAYS.some(r => r.id === relay);
@@ -651,7 +746,6 @@ async function loadSettings(): Promise<void> {
         }
       }
 
-      // Track selected relays in module scope for the save button
       _selectedRelayAliases = new Set(activeAliases);
 
       relayGridEl.innerHTML = "";
@@ -682,13 +776,6 @@ async function loadSettings(): Promise<void> {
       }
     }
 
-    // WoT
-    const depthEl = document.getElementById("settings-wot-depth");
-    if (depthEl) depthEl.textContent = settings.wot_max_depth.toString();
-
-    const intervalEl = document.getElementById("settings-sync-interval");
-    if (intervalEl) intervalEl.textContent = `${Math.round(settings.sync_interval_secs / 60)} min`;
-
     // Advanced
     const portEl = document.getElementById("settings-port");
     if (portEl) portEl.textContent = settings.relay_port.toString();
@@ -698,31 +785,37 @@ async function loadSettings(): Promise<void> {
 
     // Storage sliders
     _currentSettings = settings;
-    const evSliderEl = document.getElementById("settings-others-events-slider") as HTMLInputElement | null;
-    const evValEl = document.getElementById("settings-others-events-val");
-    if (evSliderEl && evValEl) {
-      evSliderEl.value = String(Math.round(settings.storage_others_gb));
-      evValEl.textContent = `${Math.round(settings.storage_others_gb)} GB`;
-    }
-    const mdSliderEl = document.getElementById("settings-others-media-slider") as HTMLInputElement | null;
-    const mdValEl = document.getElementById("settings-others-media-val");
-    if (mdSliderEl && mdValEl) {
-      mdSliderEl.value = String(Math.round(settings.storage_media_gb));
-      mdValEl.textContent = `${Math.round(settings.storage_media_gb)} GB`;
+
+    const ownMediaValEl = document.getElementById("settings-own-media-val");
+    if (ownMediaValEl) {
+      ownMediaValEl.textContent = "∞ Unlimited";
     }
 
-    // Event retention slider
-    const ageSliderEl = document.getElementById("storage-max-age") as HTMLInputElement | null;
-    const ageValEl = document.getElementById("storage-max-age-val");
-    if (ageSliderEl && ageValEl) {
-      ageSliderEl.value = String(settings.max_event_age_days);
-      ageValEl.textContent = `${settings.max_event_age_days} days`;
+    const trackedMediaSliderEl = document.getElementById("settings-tracked-media-slider") as HTMLInputElement | null;
+    const trackedMediaValEl = document.getElementById("settings-tracked-media-val");
+    if (trackedMediaSliderEl && trackedMediaValEl) {
+      trackedMediaSliderEl.value = String(Math.round(settings.storage_tracked_media_gb));
+      trackedMediaValEl.textContent = `${Math.round(settings.storage_tracked_media_gb)} GB`;
+    }
+
+    const wotMediaSliderEl = document.getElementById("settings-wot-media-slider") as HTMLInputElement | null;
+    const wotMediaValEl = document.getElementById("settings-wot-media-val");
+    if (wotMediaSliderEl && wotMediaValEl) {
+      wotMediaSliderEl.value = String(Math.round(settings.storage_wot_media_gb));
+      wotMediaValEl.textContent = `${Math.round(settings.storage_wot_media_gb)} GB`;
+    }
+
+    const wotRetentionSliderEl = document.getElementById("storage-wot-retention") as HTMLInputElement | null;
+    const wotRetentionValEl = document.getElementById("storage-wot-retention-val");
+    if (wotRetentionSliderEl && wotRetentionValEl) {
+      wotRetentionSliderEl.value = String(settings.wot_event_retention_days);
+      wotRetentionValEl.textContent = `${settings.wot_event_retention_days} days`;
     }
 
     // Load tracked profiles
     loadTrackedProfiles();
 
-    // Sync sliders
+    // Sync sliders (in Advanced tab)
     const syncFields: [string, number, string][] = [
       ["sync-lookback", settings.sync_lookback_days, " days"],
       ["sync-batch-size", settings.sync_batch_size, ""],
@@ -732,6 +825,7 @@ async function loadSettings(): Promise<void> {
       ["sync-wot-batch", settings.sync_wot_batch_size, ""],
       ["sync-wot-events", settings.sync_wot_events_per_batch, ""],
       ["sync-interval", Math.round(settings.sync_interval_secs / 60), " min"],
+      ["sync-wot-depth", settings.wot_max_depth, ""],
     ];
     for (const [id, val, suffix] of syncFields) {
       const sl = document.getElementById(id) as HTMLInputElement | null;
@@ -764,7 +858,6 @@ async function loadSettings(): Promise<void> {
           if (resultEl) resultEl.innerHTML = "";
           try {
             await invoke("setup_browser_integration");
-            // Restart relay to pick up new TLS certs
             try {
               await invoke("stop_relay");
               await new Promise((r) => setTimeout(r, 500));

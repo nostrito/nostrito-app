@@ -383,6 +383,21 @@ impl Database {
         }
     }
 
+    /// Delete an app config key
+    pub fn delete_config(&self, key: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM app_config WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
+    /// Clear all sync_state rows (per-relay cursors)
+    pub fn clear_sync_state(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM sync_state", [])?;
+        info!("Cleared sync_state table");
+        Ok(())
+    }
+
     /// Store a nostr event. Returns Ok(true) if inserted, Ok(false) if duplicate.
     pub fn store_event(
         &self,
@@ -562,6 +577,41 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM nostr_events", [], |row| row.get(0))?;
         debug!("[db] event_count: {}", count);
+        Ok(count as u64)
+    }
+
+    /// Count events for a specific pubkey.
+    pub fn count_events_for_pubkey(&self, pubkey: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM nostr_events WHERE pubkey = ?1",
+            [pubkey],
+            |row| row.get(0),
+        )?;
+        debug!("[db] count_events_for_pubkey({}…): {}", &pubkey[..pubkey.len().min(8)], count);
+        Ok(count as u64)
+    }
+
+    /// Check if a pubkey has kind 0 (metadata) event stored.
+    pub fn has_profile_metadata(&self, pubkey: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM nostr_events WHERE pubkey = ?1 AND kind = 0",
+            [pubkey],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Count events of a specific kind.
+    pub fn count_events_by_kind(&self, kind: u32) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM nostr_events WHERE kind = ?1",
+            [kind],
+            |row| row.get(0),
+        )?;
+        debug!("[db] count_events_by_kind({}): {}", kind, count);
         Ok(count as u64)
     }
 
@@ -891,7 +941,7 @@ impl Database {
     pub fn media_list_lru_excluding_pubkey(&self, limit: usize, exclude_pubkey: &str) -> Result<Vec<(String, u64)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT hash, size_bytes FROM media_cache WHERE pubkey != ?1 ORDER BY last_accessed ASC LIMIT ?2"
+            "SELECT hash, size_bytes FROM media_cache WHERE pubkey != ?1 AND pubkey NOT IN (SELECT pubkey FROM tracked_profiles) ORDER BY last_accessed ASC LIMIT ?2"
         )?;
         let rows = stmt
             .query_map(params![exclude_pubkey, limit as i64], |row| {
@@ -954,6 +1004,21 @@ impl Database {
     /// Set the Tier 2 historical backfill cursor.
     pub fn set_history_cursor(&self, ts: u64) -> Result<()> {
         self.set_config("tier2_history_until", &ts.to_string())
+    }
+
+    /// Get the articles (kind 30023) historical backfill cursor.
+    /// Separate from the main history cursor so articles can backfill independently
+    /// without being crowded out by high-volume kinds (notes, reposts).
+    pub fn get_articles_history_cursor(&self) -> Result<Option<u64>> {
+        match self.get_config("tier2_history_until_articles")? {
+            Some(val) => Ok(val.parse::<u64>().ok()),
+            None => Ok(None),
+        }
+    }
+
+    /// Set the articles historical backfill cursor.
+    pub fn set_articles_history_cursor(&self, ts: u64) -> Result<()> {
+        self.set_config("tier2_history_until_articles", &ts.to_string())
     }
 
     /// Get the latest created_at timestamp from stored nostr events.
@@ -1019,10 +1084,135 @@ impl Database {
         Ok(rows)
     }
 
+    /// Get all own media records for the media explorer.
+    /// Returns (hash, url, mime_type, size_bytes, downloaded_at) sorted by downloaded_at DESC.
+    pub fn get_own_media(&self, own_pubkey: &str) -> Result<Vec<(String, String, String, u64, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT hash, url, mime_type, size_bytes, downloaded_at FROM media_cache \
+             WHERE pubkey = ?1 ORDER BY downloaded_at DESC"
+        )?;
+        let rows = stmt
+            .query_map(params![own_pubkey], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? as u64,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Get cached media for any pubkey (profile media explorer).
+    /// Returns (hash, url, mime_type, size_bytes, downloaded_at) sorted by downloaded_at DESC.
+    pub fn get_profile_media(&self, pubkey: &str) -> Result<Vec<(String, String, String, u64, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT hash, url, mime_type, size_bytes, downloaded_at FROM media_cache \
+             WHERE pubkey = ?1 ORDER BY downloaded_at DESC"
+        )?;
+        let rows = stmt
+            .query_map(params![pubkey], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? as u64,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Count own media files.
+    pub fn own_media_count(&self, own_pubkey: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM media_cache WHERE pubkey = ?1",
+            params![own_pubkey],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
     /// Count pending items in media queue.
     pub fn media_queue_count(&self) -> Result<u64> {
         let conn = self.conn.lock().unwrap();
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM media_queue", [], |row| row.get(0))?;
         Ok(count as u64)
+    }
+
+    // ── Ownership-based storage stats ─────────────────────────────
+
+    /// Count events authored by own pubkey.
+    pub fn own_event_count(&self, own_pubkey: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM nostr_events WHERE pubkey = ?1",
+            params![own_pubkey],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Total media bytes for own pubkey.
+    pub fn own_media_bytes(&self, own_pubkey: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let total: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(size_bytes), 0) FROM media_cache WHERE pubkey = ?1",
+            params![own_pubkey],
+            |row| row.get(0),
+        )?;
+        Ok(total as u64)
+    }
+
+    /// Count events from tracked profiles (excluding own pubkey).
+    pub fn tracked_event_count(&self, own_pubkey: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM nostr_events WHERE pubkey != ?1 AND pubkey IN (SELECT pubkey FROM tracked_profiles)",
+            params![own_pubkey],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Total media bytes from tracked profiles (excluding own pubkey).
+    pub fn tracked_media_bytes(&self, own_pubkey: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let total: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(size_bytes), 0) FROM media_cache WHERE pubkey != ?1 AND pubkey IN (SELECT pubkey FROM tracked_profiles)",
+            params![own_pubkey],
+            |row| row.get(0),
+        )?;
+        Ok(total as u64)
+    }
+
+    /// Count events from WoT profiles (not own, not tracked — everything else).
+    pub fn wot_event_count(&self, own_pubkey: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM nostr_events WHERE pubkey != ?1 AND pubkey NOT IN (SELECT pubkey FROM tracked_profiles)",
+            params![own_pubkey],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Total media bytes from WoT profiles (not own, not tracked).
+    pub fn wot_media_bytes(&self, own_pubkey: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let total: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(size_bytes), 0) FROM media_cache WHERE pubkey != ?1 AND pubkey NOT IN (SELECT pubkey FROM tracked_profiles)",
+            params![own_pubkey],
+            |row| row.get(0),
+        )?;
+        Ok(total as u64)
     }
 }

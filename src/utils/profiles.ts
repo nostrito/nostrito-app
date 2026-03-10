@@ -29,6 +29,11 @@ export function getCachedProfile(pubkey: string): ProfileInfo | undefined {
   return profileCache.get(pubkey);
 }
 
+/** Invalidate cached profile so the next getProfiles call re-fetches from DB */
+export function invalidateProfileCache(pubkey: string): void {
+  profileCache.delete(pubkey);
+}
+
 export function profileDisplayName(profile: ProfileInfo | undefined, pubkey: string): string {
   if (profile) {
     if (profile.name) return profile.name;

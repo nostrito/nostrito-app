@@ -1,6 +1,7 @@
 /** Feed — event feed view. All data from get_feed backend command. */
 
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getProfiles, profileDisplayName, type ProfileInfo } from "../utils/profiles";
 import { renderMediaHtml, stripMediaUrls, initMediaViewer } from "../utils/media";
 import { renderMarkdown } from "../utils/markdown";
@@ -270,6 +271,8 @@ const renderedEventIds = new Set<string>();
 let feedEvents: NostrEvent[] = [];
 let feedProfileMap: Map<string, ProfileInfo> = new Map();
 let searchDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+let feedRefreshInterval: ReturnType<typeof setInterval> | null = null;
+let unlistenTierComplete: UnlistenFn | null = null;
 
 /** Resolve NIP-05 identifier (name@domain) to hex pubkey */
 async function resolveNip05(nip05: string): Promise<string | null> {
@@ -292,7 +295,14 @@ function isNip05(input: string): boolean {
   return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(input);
 }
 
+/** Clean up feed refresh timers and listeners */
+export function cleanupFeed(): void {
+  if (feedRefreshInterval) { clearInterval(feedRefreshInterval); feedRefreshInterval = null; }
+  if (unlistenTierComplete) { unlistenTierComplete(); unlistenTierComplete = null; }
+}
+
 export function renderFeed(container: HTMLElement): void {
+  cleanupFeed();
   renderedEventIds.clear();
 
   initMediaViewer();
@@ -396,6 +406,16 @@ export function renderFeed(container: HTMLElement): void {
   }
 
   loadEvents(container);
+
+  // Refresh feed when sync completes a tier (new events likely stored)
+  listen<{ tier: number }>("sync:tier_complete", () => {
+    loadEvents(container);
+  }).then((unlisten) => { unlistenTierComplete = unlisten; });
+
+  // Also refresh on a 30s cadence as a fallback
+  feedRefreshInterval = setInterval(() => {
+    loadEvents(container);
+  }, 30000);
 }
 
 async function performSearch(query: string, container: HTMLElement): Promise<void> {

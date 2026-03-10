@@ -306,7 +306,7 @@
 }
 
 .blossom-section {
-  padding: 10px 16px;
+  padding: 10px 16px 8px;
   border-top: 1px solid var(--border);
   margin-top: auto;
 }
@@ -582,7 +582,7 @@
 }
 .storage-seg { height: 100%; transition: width 0.3s; }
 .storage-seg-notes { background: var(--accent); }
-.storage-seg-media { background: var(--purple); }
+.storage-seg-contacts { background: var(--purple); }
 .storage-seg-meta { background: var(--blue); }
 .storage-seg-other { background: var(--green); }
 .storage-legend { display: flex; gap: 16px; flex-wrap: wrap; }
@@ -799,7 +799,7 @@
 /* Own profile panel */
 .own-profile-panel {
   padding: 32px;
-  max-width: 480px;
+  max-width: 640px;
   margin: 0 auto;
 }
 .own-panel-close {
@@ -887,4 +887,161 @@
   cursor: not-allowed;
   opacity: 0.5;
   font-family: var(--font);
+}
+
+/* Profile fetch banner */
+.profile-fetch-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  background: var(--bg-card, #111113);
+  border: 1px solid var(--border, #1e1e24);
+  border-radius: 8px;
+  margin-bottom: 16px;
+}
+.profile-fetch-hint {
+  font-size: 12px;
+  color: var(--text-muted, #666);
+  flex: 1;
+  min-width: 120px;
+}
+.profile-fetch-btn {
+  padding: 6px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--accent, #6d5dfc);
+  background: transparent;
+  color: var(--accent, #6d5dfc);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: var(--font);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: background 0.15s, color 0.15s;
+}
+.profile-fetch-btn:hover:not(:disabled) {
+  background: var(--accent, #6d5dfc);
+  color: #fff;
+}
+.profile-fetch-btn:disabled {
+  opacity: 0.7;
+  cursor: wait;
+}
+.profile-fetch-spinner {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border: 2px solid rgba(109, 93, 252, 0.3);
+  border-top-color: var(--accent, #6d5dfc);
+  border-radius: 50%;
+  animation: fetch-spin 0.6s linear infinite;
+}
+@keyframes fetch-spin {
+  to { transform: rotate(360deg); }
+}
+.profile-fetch-result {
+  width: 100%;
+  font-size: 12px;
+  min-height: 0;
+}
+.profile-fetch-result:empty {
+  display: none;
+}
+.profile-fetch-success {
+  color: var(--green, #34d399);
+  padding-top: 4px;
+}
+.profile-fetch-empty {
+  color: var(--text-muted, #666);
+  padding-top: 4px;
+}
+.profile-fetch-error {
+  color: var(--red, #f87171);
+  padding-top: 4px;
+}
+
+/* Profile tabs */
+.profile-tabs {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid var(--border, #1e1e24);
+  margin-bottom: 16px;
+  margin-top: 8px;
+}
+.profile-tab {
+  flex: 1;
+  padding: 10px 16px;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-dim, #888);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: var(--font);
+  transition: color 0.15s, border-color 0.15s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+.profile-tab:hover {
+  color: var(--text, #fff);
+}
+.profile-tab.active {
+  color: var(--accent, #6366f1);
+  border-bottom-color: var(--accent, #6366f1);
+}
+.profile-tab .icon {
+  display: inline-flex;
+  width: 14px;
+  height: 14px;
+}
+.profile-tab-content {
+  min-height: 200px;
+}
+.profile-empty {
+  text-align: center;
+  padding: 40px 20px;
+  color: var(--text-muted, #666);
+  font-size: 13px;
+  line-height: 1.6;
+}
+.profile-note-card {
+  padding: 14px 0;
+  border-bottom: 1px solid var(--border, #1e1e24);
+}
+.profile-note-card:last-child {
+  border-bottom: none;
+}
+.profile-note-date {
+  font-size: 11px;
+  color: var(--text-muted, #666);
+  margin-bottom: 6px;
+}
+.profile-note-content {
+  font-size: 13px;
+  color: var(--text-dim, #aaa);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.profile-article-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text, #fff);
+  margin-bottom: 4px;
+}
+.profile-media-stats {
+  font-size: 12px;
+  color: var(--text-muted, #666);
+  margin-bottom: 12px;
+}
+.profile-tab-content .my-media-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 8px;
 }

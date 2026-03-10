@@ -3,7 +3,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getProfiles, profileDisplayName } from "../utils/profiles";
-import { iconChili, iconBlossom } from "../utils/icons";
+import { iconChili } from "../utils/icons";
 // Media viewer no longer needed on dashboard (compact live table instead of full cards)
 
 interface AppStatus {
@@ -18,11 +18,14 @@ interface AppStatus {
   sync_tier: number;
   sync_stats: {
     tier1_fetched: number;
+    tracked_fetched: number;
     tier2_fetched: number;
     tier3_fetched: number;
     tier4_fetched: number;
     current_tier: number;
+    current_layer: string; // "0", "0.5", "1", "2", "3", or ""
   };
+  // Mapped to layers: tier1→layer0, tracked→layer0.5, tier2→layer1, tier3→layer2
 }
 
 interface NostrEvent {
@@ -124,18 +127,11 @@ async function loadRelayStatus(): Promise<void> {
     console.log("[dashboard] Calling get_relay_status...");
     const relays = await invoke<RelayStatusInfo[]>("get_relay_status");
     console.log("[dashboard] get_relay_status response:", relays.length, "relays");
-    const container = document.getElementById("sync-tier-3-detail");
+    const container = document.getElementById("sync-relay-detail");
     if (container) {
       container.innerHTML = renderRelayItems(relays);
     }
   } catch (_) {}
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes === 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(1024));
-  return (bytes / Math.pow(1024, i)).toFixed(1) + " " + units[i];
 }
 
 async function loadStats(): Promise<void> {
@@ -159,7 +155,8 @@ async function loadStats(): Promise<void> {
     setTextContent("dash-events", status.events_stored.toLocaleString());
     setTextContent("dash-wot-peers", status.wot_nodes.toLocaleString());
     setTextContent("dash-media", "—");
-    setTextContent("dash-sync-rate", status.sync_tier > 0 ? "~syncing" : "idle");
+    const isSyncing = status.sync_tier > 0 || (status.sync_stats.current_layer || "") !== "";
+    setTextContent("dash-sync-rate", isSyncing ? "~syncing" : "idle");
     setTextContent("dash-uptime", uptimeStr);
 
     // Relay badge — show URL when running
@@ -183,15 +180,27 @@ async function loadStats(): Promise<void> {
         : `nostrito — Dashboard`;
     }
 
-    // Sync tiers
-    const ct = status.sync_tier;
-    for (let t = 1; t <= 4; t++) {
-      const badgeEl = document.getElementById(`sync-tier-${t}-badge`);
+    // Sync layers — use current_layer from backend for accurate display
+    // Layer IDs on dashboard: "0" = own, "05" = tracked, "1" = follows, "2" = WoT
+    // Backend current_layer values: "0", "0.5", "1", "2", "3", or "" (idle)
+    const s = status.sync_stats;
+    const cl = s.current_layer || "";
+    const layerIds = ["0", "05", "1", "2"];
+    // Map dashboard layer ID to backend current_layer value
+    const layerToBackend: Record<string, string> = { "0": "0", "05": "0.5", "1": "1", "2": "2" };
+    // Ordered layer progression for "done" detection
+    const layerOrder = ["0", "0.5", "1", "2", "3"];
+
+    for (const lid of layerIds) {
+      const backendLayer = layerToBackend[lid];
+      const badgeEl = document.getElementById(`sync-layer-${lid}-badge`);
       if (badgeEl) {
-        if (t === ct) {
+        if (cl === backendLayer) {
+          // Currently running this layer
           badgeEl.className = "sync-tier-badge fast";
           badgeEl.textContent = "FAST";
-        } else if (t < ct) {
+        } else if (cl !== "" && layerOrder.indexOf(backendLayer) < layerOrder.indexOf(cl)) {
+          // Engine has moved past this layer in the current cycle
           badgeEl.className = "sync-tier-badge done";
           badgeEl.textContent = "✓";
         } else {
@@ -201,34 +210,21 @@ async function loadStats(): Promise<void> {
       }
     }
 
-    // Sync detail
-    const s = status.sync_stats;
-    const details: Record<number, string> = {};
-    if (s.tier1_fetched > 0) details[1] = `${s.tier1_fetched} events`;
-    if (s.tier2_fetched > 0) details[2] = `${s.tier2_fetched} events`;
-    if (s.tier3_fetched > 0) details[3] = `${s.tier3_fetched} follow lists`;
-    if (s.tier4_fetched > 0) details[4] = `${s.tier4_fetched} items`;
-    for (let t = 1; t <= 4; t++) {
-      const el = document.getElementById(`sync-tier-${t}-detail`);
-      if (el && el.id !== "sync-tier-3-detail") {
-        // tier 3 detail is the relay list, handled separately
-        el.textContent = details[t] || (t <= ct ? "complete" : "—");
+    // Sync detail per layer — show event counts when available
+    const layerDetails: Record<string, string> = {};
+    if (s.tier1_fetched > 0) layerDetails["0"] = `${s.tier1_fetched} events`;
+    if ((s.tracked_fetched || 0) > 0) layerDetails["05"] = `${s.tracked_fetched} events`;
+    if (s.tier2_fetched > 0) layerDetails["1"] = `${s.tier2_fetched} events`;
+    if ((s.tier3_fetched || 0) + (s.tier4_fetched || 0) > 0)
+      layerDetails["2"] = `${(s.tier3_fetched || 0) + (s.tier4_fetched || 0)} events`;
+    for (const lid of layerIds) {
+      const backendLayer = layerToBackend[lid];
+      const el = document.getElementById(`sync-layer-${lid}-detail`);
+      if (el) {
+        const isDone = cl !== "" && layerOrder.indexOf(backendLayer) < layerOrder.indexOf(cl);
+        el.textContent = layerDetails[lid] || (isDone ? "complete" : "—");
       }
     }
-    // Blossom media stats
-    try {
-      const media = await invoke<{ total_bytes: number; file_count: number; limit_bytes: number }>("get_media_stats");
-      const countEl = document.getElementById("blossom-count");
-      const sizeEl = document.getElementById("blossom-size");
-      const pctEl = document.getElementById("blossom-pct");
-      const fillEl = document.getElementById("blossom-bar-fill");
-
-      if (countEl) countEl.textContent = media.file_count.toLocaleString();
-      if (sizeEl) sizeEl.textContent = formatBytes(media.total_bytes);
-      const pct = media.limit_bytes > 0 ? Math.min(100, (media.total_bytes / media.limit_bytes) * 100) : 0;
-      if (pctEl) pctEl.textContent = `${pct.toFixed(1)}%`;
-      if (fillEl) fillEl.style.width = `${pct}%`;
-    } catch (_) {}
   } catch (e) {
     console.error("[dashboard] Failed to load stats:", e);
   }
@@ -341,52 +337,38 @@ export async function renderDashboard(container: HTMLElement): Promise<void> {
         <div class="sync-engine-header">Sync Engine</div>
         <div class="sync-tier">
           <div class="sync-tier-head">
-            <span class="sync-tier-label">Tier 1 — Profile & Follows</span>
-            <span class="sync-tier-badge idle" id="sync-tier-1-badge">IDLE</span>
+            <span class="sync-tier-label">Layer 0 — Own Content</span>
+            <span class="sync-tier-badge idle" id="sync-layer-0-badge">IDLE</span>
           </div>
-          <div class="sync-tier-detail" id="sync-tier-1-detail">—</div>
+          <div class="sync-tier-detail" id="sync-layer-0-detail">—</div>
         </div>
         <div class="sync-tier">
           <div class="sync-tier-head">
-            <span class="sync-tier-label">Tier 2 — Recent Events</span>
-            <span class="sync-tier-badge idle" id="sync-tier-2-badge">IDLE</span>
+            <span class="sync-tier-label">Layer 0.5 — Tracked</span>
+            <span class="sync-tier-badge idle" id="sync-layer-05-badge">IDLE</span>
           </div>
-          <div class="sync-tier-detail" id="sync-tier-2-detail">—</div>
+          <div class="sync-tier-detail" id="sync-layer-05-detail">—</div>
         </div>
         <div class="sync-tier">
           <div class="sync-tier-head">
-            <span class="sync-tier-label">Tier 3 — Relays</span>
-            <span class="sync-tier-badge idle" id="sync-tier-3-badge" style="display:none">IDLE</span>
+            <span class="sync-tier-label">Layer 1 — Direct Follows</span>
+            <span class="sync-tier-badge idle" id="sync-layer-1-badge">IDLE</span>
           </div>
-          <div style="padding-top:4px" id="sync-tier-3-detail">
+          <div class="sync-tier-detail" id="sync-layer-1-detail">—</div>
+        </div>
+        <div class="sync-tier">
+          <div class="sync-tier-head">
+            <span class="sync-tier-label">Layer 2 — WoT Peers</span>
+            <span class="sync-tier-badge idle" id="sync-layer-2-badge">IDLE</span>
+          </div>
+          <div class="sync-tier-detail" id="sync-layer-2-detail">—</div>
+        </div>
+        <div class="sync-tier">
+          <div class="sync-tier-head">
+            <span class="sync-tier-label">Relays</span>
+          </div>
+          <div style="padding-top:4px" id="sync-relay-detail">
             <!-- Populated from get_relay_status -->
-          </div>
-        </div>
-        <div class="sync-tier dimmed">
-          <div class="sync-tier-head">
-            <span class="sync-tier-label">Tier 4 — Fallback</span>
-            <span class="sync-tier-badge idle" id="sync-tier-4-badge">IDLE</span>
-          </div>
-          <div class="sync-tier-detail" id="sync-tier-4-detail">—</div>
-        </div>
-        <div class="blossom-section">
-          <div class="blossom-title"><span class="icon">${iconBlossom()}</span> Blossom</div>
-          <div class="blossom-stats">
-            <div class="blossom-stat">
-              <span class="blossom-stat-val" id="blossom-count">—</span>
-              <span class="blossom-stat-label">files</span>
-            </div>
-            <div class="blossom-stat">
-              <span class="blossom-stat-val" id="blossom-size">—</span>
-              <span class="blossom-stat-label">cached</span>
-            </div>
-            <div class="blossom-stat">
-              <span class="blossom-stat-val" id="blossom-pct">—</span>
-              <span class="blossom-stat-label">of limit</span>
-            </div>
-          </div>
-          <div class="blossom-bar-wrap">
-            <div class="blossom-bar"><div class="blossom-bar-fill" id="blossom-bar-fill" style="width:0%"></div></div>
           </div>
         </div>
       </div>

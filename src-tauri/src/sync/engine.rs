@@ -13,6 +13,14 @@ use tracing::{debug, error, info, warn};
 use crate::storage::{Database, FollowUpdateBatch};
 use crate::wot::WotGraph;
 
+/// Hardcoded default relays — used as fallback when no relays are configured or
+/// all configured relays fail to connect. These should always be reachable.
+const DEFAULT_RELAYS: &[&str] = &[
+    "wss://relay.damus.io",
+    "wss://relay.primal.net",
+    "wss://nos.lol",
+];
+
 // ── Tier Definitions ───────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,10 +63,13 @@ pub struct TierComplete {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SyncStats {
     pub tier1_fetched: u64,
+    pub tracked_fetched: u64,
     pub tier2_fetched: u64,
     pub tier3_fetched: u64,
     pub tier4_fetched: u64,
     pub current_tier: u8,
+    /// Conceptual layer currently executing: "0", "0.5", "1", "2", "3", or "" (idle)
+    pub current_layer: String,
 }
 
 // ── Relay Policy ───────────────────────────────────────────────────
@@ -151,7 +162,9 @@ impl RelayPolicy {
 
 // ── Relay URL Resolution ───────────────────────────────────────────
 
-fn resolve_relay_url(alias: &str) -> &str {
+/// Resolve a relay alias (e.g. "primal") to its canonical wss:// URL.
+/// Returns the input unchanged if it's already a URL or unknown alias.
+pub fn resolve_relay_url(alias: &str) -> &str {
     match alias {
         "primal" => "wss://relay.primal.net",
         "damus" => "wss://relay.damus.io",
@@ -184,17 +197,22 @@ async fn subscribe_and_collect(
     filter: Vec<Filter>,
     timeout_secs: u64,
     policy: &mut RelayPolicy,
+    expected_eose: usize,
 ) -> Result<Vec<Event>> {
     // Respect rate limits before sending
     policy.wait_for_slot().await;
 
-    let sub_id = client.subscribe(filter, None).await?.val;
+    // Create notification receiver BEFORE subscribing so we don't miss
+    // events or EOSE that the relay sends immediately after receiving REQ.
     let mut notifications = client.notifications();
+    let sub_id = client.subscribe(filter, None).await?.val;
     let mut events: Vec<Event> = Vec::new();
     let deadline = tokio::time::sleep(Duration::from_secs(timeout_secs));
     tokio::pin!(deadline);
 
     let mut got_eose = false;
+    let mut eose_count: usize = 0;
+    let expected = expected_eose.max(1);
 
     loop {
         tokio::select! {
@@ -202,14 +220,36 @@ async fn subscribe_and_collect(
                 match result {
                     Ok(notification) => {
                         match notification {
-                            RelayPoolNotification::Event { event, .. } => {
-                                events.push(*event);
+                            RelayPoolNotification::Event { event, subscription_id: ref evt_sid, .. } => {
+                                // Only collect events for OUR subscription
+                                if *evt_sid == sub_id {
+                                    events.push(*event);
+                                }
                             }
                             RelayPoolNotification::Message { message, .. } => {
                                 match &message {
-                                    RelayMessage::EndOfStoredEvents(_) => {
-                                        got_eose = true;
-                                        break;
+                                    RelayMessage::EndOfStoredEvents(eose_sid) => {
+                                        // Only count EOSE for OUR subscription — ignore stale
+                                        // EOSE from previous (unsubscribed) subscriptions that
+                                        // arrived late on the broadcast channel.
+                                        if *eose_sid != sub_id {
+                                            debug!("Ignoring stale EOSE for sub {}, ours is {}", eose_sid, sub_id);
+                                            continue;
+                                        }
+                                        eose_count += 1;
+                                        if eose_count >= expected {
+                                            // All relays have finished — we have everything
+                                            got_eose = true;
+                                            break;
+                                        }
+                                        // First EOSE but more relays pending: shorten deadline
+                                        // to 3 seconds so we don't wait the full timeout but
+                                        // still give slower relays a chance to send events.
+                                        if eose_count == 1 {
+                                            deadline.as_mut().reset(
+                                                tokio::time::Instant::now() + Duration::from_secs(3)
+                                            );
+                                        }
                                     }
                                     RelayMessage::Notice { message: msg } => {
                                         policy.on_notice(msg);
@@ -228,7 +268,13 @@ async fn subscribe_and_collect(
                 }
             }
             _ = &mut deadline => {
-                warn!("Subscribe timeout after {}s, got {} events (no EOSE)", timeout_secs, events.len());
+                if eose_count > 0 {
+                    // Got EOSE from some relays, drain period expired for the rest
+                    got_eose = true;
+                    debug!("Drain timeout: EOSE from {}/{} relays, {} events", eose_count, expected, events.len());
+                } else {
+                    warn!("Subscribe timeout after {}s, got {} events (no EOSE from any relay)", timeout_secs, events.len());
+                }
                 break;
             }
         }
@@ -240,7 +286,7 @@ async fn subscribe_and_collect(
         policy.on_success();
     }
 
-    debug!("Collected {} events (EOSE={})", events.len(), got_eose);
+    debug!("Collected {} events (EOSE={}, {}/{} relays)", events.len(), got_eose, eose_count, expected);
     Ok(events)
 }
 
@@ -274,6 +320,49 @@ impl Default for SyncConfig {
 }
 
 // ── Sync Engine ────────────────────────────────────────────────────
+//
+// ╔═══════════════════════════════════════════════════════════════════╗
+// ║                 SYNC PRIORITY ORDER (STRICT)                     ║
+// ╠═══════════════════════════════════════════════════════════════════╣
+// ║                                                                   ║
+// ║  Layer 0 — Own Content (HIGHEST PRIORITY, always first)           ║
+// ║    Tier 1:  Own profile (kind 0) + contact list (kind 3)          ║
+// ║    Tier 1b: Full own event history (all kinds, no time limit)     ║
+// ║    Tier 1a: Own media download (all media from own events,        ║
+// ║             no size limit, never evicted)                         ║
+// ║    ► MUST complete before anything else starts.                   ║
+// ║                                                                   ║
+// ║  Layer 0.5 — Tracked Profiles                                     ║
+// ║    Events + media from tracked npubs — always kept, no age limit. ║
+// ║    Fetches kinds 0, 1, 3, 6, 30023 for all tracked pubkeys.      ║
+// ║    Media downloaded same as own (no eviction, no size limit).     ║
+// ║    ► Runs after Layer 0, before Layer 1.                          ║
+// ║                                                                   ║
+// ║  Layer 1 — Direct Follows Content                                 ║
+// ║    Tier 2:  Fetch events from direct follows                      ║
+// ║             (kinds 0, 1, 3, 6, 30023 + historical backfill)       ║
+// ║    ► Only starts after Layer 0.5 is done.                         ║
+// ║                                                                   ║
+// ║  Layer 2 — WoT / Follows-of-Follows                              ║
+// ║    Tier 1.5: Metadata refresh for WoT peers (every 3 cycles)     ║
+// ║    Tier 3:   WoT crawl — contact lists from follows-of-follows   ║
+// ║              (every 6 cycles, subject to storage limits)          ║
+// ║    ► Runs last. WoT content pruned first when storage is tight.  ║
+// ║                                                                   ║
+// ║  Layer 3 — Media Archive                                         ║
+// ║    Tier 4: Blossom media backup for others' content               ║
+// ║            (subject to storage limit, LRU eviction)               ║
+// ║    ► Own media is NEVER evicted regardless of storage limits.     ║
+// ║                                                                   ║
+// ║  Storage Pruning Rules:                                           ║
+// ║    • Own events: NEVER pruned, regardless of limits               ║
+// ║    • Tracked profile events: NEVER pruned                         ║
+// ║    • Tracked profile media: NEVER evicted (same as own media)     ║
+// ║    • WoT/others events: pruned when older than max_event_age_days ║
+// ║    • Own media: NEVER evicted from media cache                    ║
+// ║    • Others' media: LRU eviction when over storage_media_gb       ║
+// ║                                                                   ║
+// ╚═══════════════════════════════════════════════════════════════════╝
 
 pub struct SyncEngine {
     graph: Arc<WotGraph>,
@@ -285,7 +374,6 @@ pub struct SyncEngine {
     pub sync_stats: Arc<RwLock<SyncStats>>,
     app_handle: tauri::AppHandle,
     storage_media_gb: f64,
-    storage_others_gb: f64,
     sync_config: SyncConfig,
     max_event_age_days: u32,
 }
@@ -300,37 +388,144 @@ impl SyncEngine {
         sync_stats: Arc<RwLock<SyncStats>>,
         app_handle: tauri::AppHandle,
         storage_media_gb: f64,
-        storage_others_gb: f64,
         sync_config: SyncConfig,
         max_event_age_days: u32,
     ) -> Self {
+        // Filter out empty/whitespace-only relay URLs and fall back to defaults
+        let valid_relays: Vec<String> = relay_aliases.into_iter()
+            .filter(|r| !r.trim().is_empty())
+            .collect();
+        let final_relays = if valid_relays.is_empty() {
+            warn!("SyncEngine: No valid relay URLs provided, using defaults");
+            vec![
+                "wss://relay.damus.io".to_string(),
+                "wss://relay.primal.net".to_string(),
+                "wss://nos.lol".to_string(),
+            ]
+        } else {
+            valid_relays
+        };
+        info!("SyncEngine: initialized with {} relays: {:?}", final_relays.len(), final_relays);
+
         Self {
             graph,
             db,
-            relay_aliases,
+            relay_aliases: final_relays,
             cancel: CancellationToken::new(),
             hex_pubkey,
             sync_tier,
             sync_stats,
             app_handle,
             storage_media_gb,
-            storage_others_gb,
             sync_config,
             max_event_age_days,
         }
     }
+
+    // ──────────────────────────────────────────────────────────────────
+    // SELF-HEALING DESIGN PRINCIPLE
+    // ──────────────────────────────────────────────────────────────────
+    // The sync engine is designed to be unbreakable and self-healing.
+    // Users should never need to manually intervene in the sync process.
+    // All cursor resets, backfills, and recovery logic must happen
+    // automatically. If a cursor is stale, the engine detects it and
+    // resets it. If articles are missing, the engine re-fetches them.
+    // No buttons, no manual triggers, no user action required.
+    // ──────────────────────────────────────────────────────────────────
 
     /// Start sync as a background task. Returns a cancellation token to stop it.
     pub fn start(self: Arc<Self>) -> CancellationToken {
         let cancel = self.cancel.clone();
 
         tokio::spawn(async move {
+            // Run self-healing checks before starting the main sync loop
+            self.run_self_healing_checks();
+
             if let Err(e) = self.run().await {
                 error!("Sync engine error: {}", e);
             }
         });
 
         cancel
+    }
+
+    /// Self-healing checks that run on every startup.
+    /// Detects and fixes stale or missing cursors so users never have to
+    /// manually reset anything.
+    fn run_self_healing_checks(&self) {
+        info!("[self-healing] Running startup checks");
+
+        // ── Check 1: Zero articles with existing follows ──
+        // If we have follows but zero kind 30023 events, reset the articles
+        // cursor so backfill starts fresh.
+        let article_count = self.db.count_events_by_kind(30023).unwrap_or(0);
+        let follows_count = self.graph.get_follows(&self.hex_pubkey)
+            .map(|f| f.len())
+            .unwrap_or(0);
+
+        if article_count == 0 && follows_count > 0 {
+            info!(
+                "[self-healing] Zero articles (kind 30023) with {} follows — resetting articles cursor",
+                follows_count
+            );
+            self.db.delete_config("tier2_history_until_articles").ok();
+        }
+
+        // ── Check 2: Suspiciously low article count ──
+        // If follows > 10 but articles < 10, the cursor may be stuck.
+        // Reset it so backfill reruns from now.
+        if follows_count > 10 && article_count > 0 && article_count < 10 {
+            info!(
+                "[self-healing] Suspiciously low article count ({}) with {} follows — resetting articles cursor",
+                article_count, follows_count
+            );
+            let now = chrono::Utc::now().timestamp() as u64;
+            self.db.set_articles_history_cursor(now).ok();
+        }
+
+        // ── Check 3: Frozen cursors (>24h without advancing) ──
+        // If a history cursor exists but hasn't moved in over 24 hours,
+        // it may be stuck. Reset it.
+        let now_epoch = chrono::Utc::now().timestamp() as u64;
+        let twenty_four_hours = 24 * 3600;
+
+        if let Ok(Some(_articles_cursor)) = self.db.get_articles_history_cursor() {
+            // The cursor walks backward in time. If it's set but the difference
+            // between now and the cursor is less than 24h, it means the cursor
+            // hasn't walked back at all — it might be stuck right near "now".
+            // We check: if cursor > now - 24h AND article count is still low,
+            // something is wrong. But a more reliable check: if the cursor value
+            // itself hasn't changed in 24h. Since we can't track "last changed"
+            // without extra state, we use a proxy: if cursor exists but articles
+            // are still very low after 24h+ of app runtime, reset.
+            // For simplicity: if cursor is set and articles < 10 and follows > 5,
+            // always reset — the backfill clearly didn't complete successfully.
+            if article_count < 10 && follows_count > 5 {
+                info!(
+                    "[self-healing] Articles cursor exists but count still low ({}) — resetting for fresh backfill",
+                    article_count
+                );
+                self.db.delete_config("tier2_history_until_articles").ok();
+            }
+        }
+
+        if let Ok(Some(history_cursor)) = self.db.get_history_cursor() {
+            // If main history cursor exists and is suspiciously close to now
+            // (within 24h), but we have very few events, something may be stuck.
+            let age = now_epoch.saturating_sub(history_cursor);
+            if age < twenty_four_hours {
+                let total_events = self.db.event_count().unwrap_or(0);
+                if total_events < 50 && follows_count > 5 {
+                    warn!(
+                        "[self-healing] Main history cursor only {}h old with {} total events and {} follows — resetting",
+                        age / 3600, total_events, follows_count
+                    );
+                    self.db.delete_config("tier2_history_until").ok();
+                }
+            }
+        }
+
+        info!("[self-healing] Startup checks complete");
     }
 
     /// Stop the sync engine
@@ -341,6 +536,12 @@ impl SyncEngine {
 
     fn set_tier(&self, tier: SyncTier) {
         self.sync_tier.store(tier as u8, Ordering::Relaxed);
+    }
+
+    /// Update the current conceptual layer in SyncStats for dashboard display.
+    async fn set_layer(&self, layer: &str) {
+        let mut stats = self.sync_stats.write().await;
+        stats.current_layer = layer.to_string();
     }
 
     fn all_relay_urls(&self) -> Vec<String> {
@@ -372,10 +573,16 @@ impl SyncEngine {
 
     async fn run(&self) -> Result<()> {
         info!(
-            "Starting tiered sync from {} relays for pubkey {}",
+            "Starting tiered sync from {} relays for pubkey {}: {:?}",
             self.relay_aliases.len(),
-            &self.hex_pubkey[..8]
+            &self.hex_pubkey[..8],
+            self.relay_aliases,
         );
+
+        if self.relay_aliases.is_empty() {
+            error!("FATAL: No relay URLs configured — sync engine cannot operate. Aborting.");
+            return Ok(());
+        }
 
         let min_interval = self.sync_config.relay_min_interval_secs as u64;
 
@@ -395,39 +602,177 @@ impl SyncEngine {
 
             info!("Sync cycle {} starting (fresh relay policies)", cycle);
 
-            // Tier 1: Critical — always run (fast, own profile + follows)
+            // ── Defensive relay pre-flight check ───────────────────
+            // Before running any tier, verify we can connect to at least
+            // one relay. If the configured list is empty or all connections
+            // fail, fall back to DEFAULT_RELAYS. This catches:
+            //   - Empty relay config (DB corruption, wizard skip, etc.)
+            //   - All configured relays being unreachable
+            //   - Network-down scenarios (fail fast, retry next cycle)
+            {
+                let relay_urls = self.all_relay_urls();
+                if relay_urls.is_empty() {
+                    warn!(
+                        "Sync cycle {}: relay_aliases is EMPTY — this indicates a config issue \
+                         (relays not saved to DB or loaded incorrectly).",
+                        cycle
+                    );
+                }
+
+                let preflight_client = Client::default();
+                let urls_to_try: Vec<String> = if relay_urls.is_empty() {
+                    DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect()
+                } else {
+                    relay_urls.clone()
+                };
+
+                let mut any_added = false;
+                for url in &urls_to_try {
+                    if preflight_client.add_relay(url.as_str()).await.is_ok() {
+                        any_added = true;
+                    }
+                }
+
+                // If no configured relays could be added and we haven't tried defaults yet
+                if !any_added && !relay_urls.is_empty() {
+                    warn!("Sync cycle {}: No configured relays could be added, trying DEFAULT_RELAYS", cycle);
+                    for url in DEFAULT_RELAYS {
+                        if preflight_client.add_relay(*url).await.is_ok() {
+                            any_added = true;
+                        }
+                    }
+                }
+
+                if any_added {
+                    preflight_client.connect().await;
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+
+                    let connected = preflight_client.relays().await;
+                    if connected.is_empty() {
+                        warn!(
+                            "Sync cycle {}: Pre-flight relay check FAILED — added relays but \
+                             none connected. Retrying in 60s. Configured: {:?}",
+                            cycle, urls_to_try
+                        );
+                        preflight_client.disconnect().await.ok();
+                        cycle += 1;
+                        tokio::select! {
+                            _ = self.cancel.cancelled() => break,
+                            _ = tokio::time::sleep(Duration::from_secs(60)) => {}
+                        }
+                        continue;
+                    }
+                    info!(
+                        "Sync cycle {}: Pre-flight OK — {} relays connected",
+                        cycle, connected.len()
+                    );
+                    preflight_client.disconnect().await.ok();
+                } else {
+                    error!(
+                        "Sync cycle {}: Pre-flight CRITICAL — could not add ANY relay URL. \
+                         Configured: {:?}, Defaults: {:?}. Retrying in 60s.",
+                        cycle, relay_urls, DEFAULT_RELAYS
+                    );
+                    cycle += 1;
+                    tokio::select! {
+                        _ = self.cancel.cancelled() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(60)) => {}
+                    }
+                    continue;
+                }
+            }
+
+            // ────────────────────────────────────────────────────────
+            // LAYER 0 — OWN CONTENT (highest priority, always first)
+            // Must complete before ANY other layer starts.
+            // ────────────────────────────────────────────────────────
+
+            // Tier 1: Own profile (kind 0) + contact list (kind 3) + full event history
             if !self.cancel.is_cancelled() {
+                self.set_layer("0").await;
                 if let Err(e) = self.run_tier1(&mut relay_policies).await {
                     error!("Sync cycle {}: Tier 1 error: {}", cycle, e);
                 }
             }
 
-            // Tier 1.5: Metadata refresh — refresh profiles + contact lists for WoT peers
-            // Run every 3 cycles to keep display names, avatars, and follows fresh
+            // Tier 1a: Own media download — ALL media from own events, no size limit, never evicted
+            if !self.cancel.is_cancelled() {
+                info!("Sync cycle {}: Running Tier 1a (own media download)", cycle);
+                if let Err(e) = self.run_own_media_download().await {
+                    error!("Sync cycle {}: Tier 1a error: {}", cycle, e);
+                }
+            }
+
+            // ────────────────────────────────────────────────────────
+            // LAYER 0.5 — TRACKED PROFILES
+            // Events + media from tracked npubs. Always kept, no age
+            // limit. Runs after Layer 0, before Layer 1.
+            // ────────────────────────────────────────────────────────
+
+            if !self.cancel.is_cancelled() {
+                self.set_layer("0.5").await;
+                if let Err(e) = self.run_tracked_profiles_sync(&mut relay_policies).await {
+                    error!("Sync cycle {}: Tracked profiles sync error: {}", cycle, e);
+                }
+            }
+
+            // Tracked profiles media download (same rules as own media — never evicted)
+            if !self.cancel.is_cancelled() {
+                if let Err(e) = self.run_tracked_media_download().await {
+                    error!("Sync cycle {}: Tracked media download error: {}", cycle, e);
+                }
+            }
+
+            // ────────────────────────────────────────────────────────
+            // LAYER 1 — DIRECT FOLLOWS CONTENT
+            // Only starts after Layer 0.5 (tracked profiles) is complete.
+            // ────────────────────────────────────────────────────────
+
+            // Tier 2: Fetch recent events from direct follows (kinds 0,1,3,6,30023)
+            // Includes incremental sync + historical backfill
+            if !self.cancel.is_cancelled() {
+                self.set_layer("1").await;
+                if let Err(e) = self.run_tier2(&mut relay_policies).await {
+                    error!("Sync cycle {}: Tier 2 error: {}", cycle, e);
+                }
+            }
+
+            // ────────────────────────────────────────────────────────
+            // LAYER 2 — WoT / FOLLOWS-OF-FOLLOWS (lowest content priority)
+            // Runs after Layer 1. Subject to storage limits.
+            // WoT content is pruned first when storage is tight.
+            // ────────────────────────────────────────────────────────
+
+            // Tier 1.5: WoT metadata refresh — profiles + contact lists for WoT peers
+            // Runs every 3 cycles to keep display names, avatars, and follows fresh.
+            // Placed in Layer 2 because it serves WoT graph, not direct follows.
             if !self.cancel.is_cancelled() && cycle % 3 == 0 {
+                self.set_layer("2").await;
                 info!("Sync cycle {}: Running Tier 1.5 (WoT metadata refresh)", cycle);
                 if let Err(e) = self.run_metadata_refresh(&mut relay_policies).await {
                     error!("Sync cycle {}: Tier 1.5 error: {}", cycle, e);
                 }
             }
 
-            // Tier 2: Important — always run (incremental via sync cursor)
-            if !self.cancel.is_cancelled() {
-                if let Err(e) = self.run_tier2(&mut relay_policies).await {
-                    error!("Sync cycle {}: Tier 2 error: {}", cycle, e);
-                }
-            }
-
-            // Tier 3: Background — every 6 cycles (~30 min)
+            // Tier 3: WoT crawl — contact lists from follows-of-follows
+            // Runs every 6 cycles (~30 min). Subject to storage limits.
             if !self.cancel.is_cancelled() && cycle % 6 == 0 {
+                self.set_layer("2").await;
                 info!("Sync cycle {}: Running Tier 3 (WoT crawl, every 6 cycles)", cycle);
                 if let Err(e) = self.run_tier3(&mut relay_policies).await {
                     error!("Sync cycle {}: Tier 3 error: {}", cycle, e);
                 }
             }
 
-            // Tier 4: Archive (media backup) — every cycle
+            // ────────────────────────────────────────────────────────
+            // LAYER 3 — MEDIA ARCHIVE (others' media, subject to limits)
+            // Own media was already handled in Layer 0 (Tier 1a).
+            // Others' media: LRU eviction when over storage_media_gb.
+            // ────────────────────────────────────────────────────────
+
+            // Tier 4: Blossom media backup for others' content
             if !self.cancel.is_cancelled() {
+                self.set_layer("3").await;
                 info!("Sync cycle {}: Running Tier 4 (media backup)", cycle);
                 if let Err(e) = self.run_tier4(&mut relay_policies).await {
                     error!("Sync cycle {}: Tier 4 error: {}", cycle, e);
@@ -435,6 +780,7 @@ impl SyncEngine {
             }
 
             self.set_tier(SyncTier::Idle);
+            self.set_layer("").await;
             info!("Sync cycle {} complete, waiting 5 minutes before next cycle", cycle);
 
             cycle += 1;
@@ -454,7 +800,11 @@ impl SyncEngine {
         Ok(())
     }
 
-    // ── Tier 1: Critical ──────────────────────────────────────────
+    // ── Tier 1: Critical (LAYER 0 — Own Content) ────────────────
+    // HIGHEST PRIORITY. Runs at the START of every sync cycle.
+    // Fetches: own profile (kind 0), own contact list (kind 3),
+    // and full own event history (Tier 1b: all kinds, no time limit).
+    // This MUST complete before Tier 2/3/4 start.
     // Stagger across relays: connect to one relay at a time, fetch, disconnect, wait.
 
     async fn run_tier1(&self, policies: &mut HashMap<String, RelayPolicy>) -> Result<()> {
@@ -504,7 +854,7 @@ impl SyncEngine {
             // Let WebSocket handshake settle
             tokio::time::sleep(Duration::from_secs(2)).await;
 
-            match subscribe_and_collect(&client, vec![filter.clone()], 15, policy).await {
+            match subscribe_and_collect(&client, vec![filter.clone()], 15, policy, 1).await {
                 Ok(events) => {
                     info!("Tier 1: Got {} events from {}", events.len(), url);
                     for event in events {
@@ -636,7 +986,7 @@ impl SyncEngine {
             client.connect().await;
             tokio::time::sleep(Duration::from_secs(2)).await;
 
-            match subscribe_and_collect(&client, vec![all_own_filter.clone()], 30, policy).await {
+            match subscribe_and_collect(&client, vec![all_own_filter.clone()], 30, policy, 1).await {
                 Ok(events) => {
                     info!("Tier 1b: Got {} own events from {}", events.len(), url);
                     for event in &events {
@@ -679,10 +1029,350 @@ impl SyncEngine {
         Ok(())
     }
 
-    // ── Tier 1.5: WoT Metadata Refresh ──────────────────────────
-    // Refresh kind:0 (profiles) and kind:3 (contact lists) for all known
-    // pubkeys in the WoT graph. Keeps display names, avatars, and follow
-    // lists fresh without waiting for Tier 3's full crawl.
+    // ── Tier 1a: Own Media Download (LAYER 0 — Own Content) ─────
+    // Part of Layer 0: runs immediately after Tier 1, before any
+    // follows or WoT work. Scans ALL own events for media URLs and
+    // downloads them immediately.
+    // Own media has NO size limit, NO eviction — always kept.
+
+    async fn run_own_media_download(&self) -> Result<()> {
+        info!("Tier 1a: Downloading own media (no limits, never evicted)");
+
+        // Extract all media URLs from own events
+        let own_media_urls = self.extract_own_media_urls().await;
+        if own_media_urls.is_empty() {
+            info!("Tier 1a: No own media URLs found");
+            return Ok(());
+        }
+
+        info!("Tier 1a: Found {} own media URLs to check", own_media_urls.len());
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .user_agent("nostrito/0.1.0")
+            .build()
+            .unwrap_or_default();
+
+        let mut downloaded: u64 = 0;
+        let mut skipped: u64 = 0;
+        let mut already_cached: u64 = 0;
+
+        for (url, pubkey) in &own_media_urls {
+            if self.cancel.is_cancelled() {
+                break;
+            }
+
+            let hash = extract_sha256_from_url(url)
+                .unwrap_or_else(|| sha256_of_string(url));
+
+            if self.db.media_exists(&hash) {
+                already_cached += 1;
+                continue;
+            }
+
+            // Own media: is_own=true, limit_bytes is irrelevant (ignored for own)
+            match self.download_media(&client, url, &hash, pubkey, u64::MAX, true).await {
+                Ok(true) => {
+                    downloaded += 1;
+                }
+                Ok(false) => {
+                    skipped += 1;
+                }
+                Err(e) => {
+                    warn!("Tier 1a: download failed for {}: {}", url, e);
+                    skipped += 1;
+                }
+            }
+
+            // Brief pause between downloads
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        info!(
+            "Tier 1a complete: {} downloaded, {} skipped, {} already cached (of {} total own media URLs)",
+            downloaded, skipped, already_cached, own_media_urls.len()
+        );
+        Ok(())
+    }
+
+    // ── Layer 0.5: Tracked Profiles Sync ──────────────────────────
+    // Fetches events from all tracked profiles (kinds 0, 1, 3, 6, 30023).
+    // Uses an incremental cursor (tracked_since) stored in config.
+    // Events from tracked profiles are NEVER pruned.
+    // Runs every sync cycle, after Layer 0 and before Layer 1.
+
+    async fn run_tracked_profiles_sync(&self, policies: &mut HashMap<String, RelayPolicy>) -> Result<()> {
+        let tracked_pubkeys = self.db.get_tracked_pubkeys().unwrap_or_default();
+        if tracked_pubkeys.is_empty() {
+            debug!("Layer 0.5: No tracked profiles, skipping");
+            return Ok(());
+        }
+
+        info!("Layer 0.5: Syncing {} tracked profiles", tracked_pubkeys.len());
+
+        // Incremental cursor — shared across all tracked profiles
+        let now_epoch = chrono::Utc::now().timestamp() as u64;
+        let since_ts = match self.db.get_config("tracked_since")? {
+            Some(val) => val.parse::<u64>().unwrap_or(0).saturating_sub(60),
+            None => {
+                // First run: look back 30 days for tracked profiles
+                now_epoch.saturating_sub(30 * 86400)
+            }
+        };
+        let since = Timestamp::from(since_ts);
+
+        info!(
+            "Layer 0.5: since={} ({}), {} tracked pubkeys",
+            since_ts,
+            chrono::DateTime::from_timestamp(since_ts as i64, 0)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                .unwrap_or_else(|| "?".into()),
+            tracked_pubkeys.len(),
+        );
+
+        let relay_urls = self.all_relay_urls();
+        let mut fetched: u64 = 0;
+        let mut total_new: u64 = 0;
+
+        // ONE persistent client for this tier
+        let client = Client::default();
+        for url in &relay_urls {
+            if let Err(e) = client.add_relay(url.as_str()).await {
+                warn!("Layer 0.5: Failed to add relay {}: {}", url, e);
+            }
+        }
+        client.connect().await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let policy_url = relay_urls.first().cloned().unwrap_or_default();
+
+        // Process in batches of 10 tracked pubkeys
+        for (batch_idx, chunk) in tracked_pubkeys.chunks(10).enumerate() {
+            if self.cancel.is_cancelled() {
+                break;
+            }
+
+            let authors: Vec<PublicKey> = chunk
+                .iter()
+                .filter_map(|hex| PublicKey::from_hex(hex).ok())
+                .collect();
+
+            if authors.is_empty() {
+                continue;
+            }
+
+            let main_filter = Filter::new()
+                .authors(authors.clone())
+                .kinds(vec![
+                    Kind::Metadata,           // 0
+                    Kind::TextNote,           // 1
+                    Kind::ContactList,        // 3
+                    Kind::Repost,             // 6
+                ])
+                .since(since)
+                .limit(200);
+
+            let articles_filter = Filter::new()
+                .authors(authors)
+                .kinds(vec![Kind::LongFormTextNote]) // 30023
+                .since(since)
+                .limit(50);
+
+            let policy = policies
+                .entry(policy_url.clone())
+                .or_insert_with(|| RelayPolicy::new(self.sync_config.relay_min_interval_secs as u64));
+
+            match subscribe_and_collect(&client, vec![main_filter, articles_filter], 15, policy, relay_urls.len().max(1)).await {
+                Ok(events) => {
+                    let mut batch_new: u64 = 0;
+                    for event in events.iter() {
+                        let tags: Vec<Vec<String>> = event
+                            .tags
+                            .iter()
+                            .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
+                            .collect();
+                        let tags_json = serde_json::to_string(&tags).unwrap_or_default();
+                        let inserted = self.db
+                            .store_event(
+                                &event.id.to_hex(),
+                                &event.pubkey.to_hex(),
+                                event.created_at.as_u64() as i64,
+                                event.kind.as_u16() as u32,
+                                &tags_json,
+                                &event.content.to_string(),
+                                &event.sig.to_string(),
+                            )
+                            .unwrap_or(false);
+
+                        if inserted {
+                            batch_new += 1;
+                            self.queue_media_for_event(&event.pubkey.to_hex(), &event.content.to_string(), &tags_json);
+                        }
+
+                        // Process kind:3 → update WoT graph
+                        if event.kind == Kind::ContactList {
+                            if let Some(update) = process_contact_event(event) {
+                                let updated = self.graph.update_follows(
+                                    &update.pubkey,
+                                    &update.follows,
+                                    Some(update.event_id.clone()),
+                                    Some(update.created_at),
+                                );
+                                if updated {
+                                    let batch = vec![FollowUpdateBatch {
+                                        pubkey: &update.pubkey,
+                                        follows: &update.follows,
+                                        event_id: Some(&update.event_id),
+                                        created_at: Some(update.created_at),
+                                    }];
+                                    self.db.update_follows_batch(&batch).ok();
+                                }
+                            }
+                        }
+                    }
+                    fetched += events.len() as u64;
+                    total_new += batch_new;
+                    info!(
+                        "Layer 0.5: batch {}: {} tracked → {} events ({} new)",
+                        batch_idx + 1,
+                        chunk.len(),
+                        events.len(),
+                        batch_new,
+                    );
+                }
+                Err(e) => {
+                    warn!("Layer 0.5: batch {} failed: {}", batch_idx + 1, e);
+                }
+            }
+
+            // Pause between batches
+            if batch_idx + 1 < tracked_pubkeys.chunks(10).len() {
+                tokio::time::sleep(Duration::from_secs(self.sync_config.batch_pause_secs as u64)).await;
+            }
+        }
+
+        client.disconnect().await.ok();
+
+        // Advance cursor
+        self.db.set_config("tracked_since", &now_epoch.to_string())?;
+
+        {
+            let mut stats = self.sync_stats.write().await;
+            stats.tracked_fetched = fetched;
+        }
+
+        self.emit_progress(15, fetched, fetched, ""); // tier 15 = layer 0.5 indicator
+        self.emit_tier_complete(15);
+
+        info!(
+            "Layer 0.5 complete: {} events fetched ({} new) from {} tracked profiles",
+            fetched, total_new, tracked_pubkeys.len()
+        );
+        Ok(())
+    }
+
+    // ── Layer 0.5: Tracked Profiles Media Download ──────────────
+    // Downloads media from tracked profiles' events. Same rules as own
+    // media: no size limit, never evicted.
+
+    async fn run_tracked_media_download(&self) -> Result<()> {
+        let tracked_pubkeys = self.db.get_tracked_pubkeys().unwrap_or_default();
+        if tracked_pubkeys.is_empty() {
+            return Ok(());
+        }
+
+        info!("Layer 0.5 media: Downloading media for {} tracked profiles", tracked_pubkeys.len());
+
+        let events = self.db.query_events(
+            None,
+            Some(&tracked_pubkeys),
+            None,  // all kinds
+            None,
+            None,
+            5000,
+        ).unwrap_or_default();
+
+        let mut urls = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for (_id, pubkey, _created_at, _kind, tags_json, content, _sig) in &events {
+            for url in extract_urls_from_text(content) {
+                let is_media = extract_sha256_from_url(&url).is_some()
+                    || mime_type_from_url(&url).is_some()
+                    || is_nostr_media_cdn(&url);
+                if is_media && seen.insert(url.clone()) {
+                    urls.push((url, pubkey.clone()));
+                }
+            }
+            for url in extract_urls_from_tags(tags_json) {
+                let is_media = extract_sha256_from_url(&url).is_some()
+                    || mime_type_from_url(&url).is_some()
+                    || is_nostr_media_cdn(&url);
+                if is_media && seen.insert(url.clone()) {
+                    urls.push((url, pubkey.clone()));
+                }
+            }
+        }
+
+        if urls.is_empty() {
+            info!("Layer 0.5 media: No media URLs found for tracked profiles");
+            return Ok(());
+        }
+
+        info!("Layer 0.5 media: Found {} media URLs to check", urls.len());
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .user_agent("nostrito/0.1.0")
+            .build()
+            .unwrap_or_default();
+
+        let mut downloaded: u64 = 0;
+        let mut skipped: u64 = 0;
+        let mut already_cached: u64 = 0;
+
+        for (url, pubkey) in &urls {
+            if self.cancel.is_cancelled() {
+                break;
+            }
+
+            let hash = extract_sha256_from_url(url)
+                .unwrap_or_else(|| sha256_of_string(url));
+
+            if self.db.media_exists(&hash) {
+                already_cached += 1;
+                continue;
+            }
+
+            // Tracked media: is_own=true (never evicted), no size limit
+            match self.download_media(&client, url, &hash, pubkey, u64::MAX, true).await {
+                Ok(true) => {
+                    downloaded += 1;
+                }
+                Ok(false) => {
+                    skipped += 1;
+                }
+                Err(e) => {
+                    warn!("Layer 0.5 media: download failed for {}: {}", url, e);
+                    skipped += 1;
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        info!(
+            "Layer 0.5 media complete: {} downloaded, {} skipped, {} already cached (of {} total)",
+            downloaded, skipped, already_cached, urls.len()
+        );
+        Ok(())
+    }
+
+    // ── Tier 1.5: WoT Metadata Refresh (LAYER 2 — WoT) ─────────
+    // Part of Layer 2: runs AFTER Tier 2 (direct follows content).
+    // Refreshes kind:0 (profiles) and kind:3 (contact lists) for all
+    // known pubkeys in the WoT graph. Keeps display names, avatars,
+    // and follow lists fresh without waiting for Tier 3's full crawl.
 
     async fn run_metadata_refresh(&self, policies: &mut HashMap<String, RelayPolicy>) -> Result<()> {
         info!("Tier 1.5: Refreshing metadata for WoT peers");
@@ -733,7 +1423,7 @@ impl SyncEngine {
                 .entry(policy_url.clone())
                 .or_insert_with(|| RelayPolicy::new(self.sync_config.relay_min_interval_secs as u64));
 
-            match subscribe_and_collect(&client, vec![filter], 10, policy).await {
+            match subscribe_and_collect(&client, vec![filter], 10, policy, relay_urls.len().max(1)).await {
                 Ok(events) => {
                     let mut batch_new: u64 = 0;
 
@@ -819,17 +1509,22 @@ impl SyncEngine {
         Ok(())
     }
 
-    // ── Tier 2: Important ─────────────────────────────────────────
-    // Fetch recent notes from follows. ONE persistent client per sync session.
-    // Connect once, send all subscription batches on that connection with pauses,
-    // disconnect once at the end.
+    // ── Tier 2: Important (LAYER 1 — Direct Follows) ────────────
+    // Part of Layer 1: runs AFTER Layer 0 (own content) is complete.
+    // Fetches recent notes from direct follows (kinds 0,1,3,6,30023).
+    // Includes incremental sync via cursor + historical backfill.
+    // ONE persistent client per sync session. Connect once, send all
+    // subscription batches on that connection with pauses, disconnect
+    // once at the end.
 
     async fn run_tier2(&self, policies: &mut HashMap<String, RelayPolicy>) -> Result<()> {
         self.set_tier(SyncTier::Important);
         info!("Tier 2: Fetching recent events from follows");
 
         // ── Storage pruning: time-based event retention ──
-        // Prune others' events older than max_event_age_days, respecting tracked profiles
+        // Prune others' events older than max_event_age_days.
+        // NEVER prunes: own events (pubkey == hex_pubkey) or tracked profile events.
+        // Only WoT/others' events are eligible for pruning.
         let max_age_secs = self.max_event_age_days as u64 * 86400;
         let pruned = self.db.prune_old_events(&self.hex_pubkey, max_age_secs).unwrap_or(0);
         if pruned > 0 {
@@ -859,14 +1554,17 @@ impl SyncEngine {
         let lookback_floor = now_epoch.saturating_sub(self.sync_config.lookback_days as u64 * 86400);
 
         let cursor = self.db.get_sync_cursor().unwrap_or(None);
-        // Use the OLDER of (cursor - 60s) or (now - lookback_days)
-        // This ensures we always look back at least lookback_days for newly added follows
+        // Use the MORE RECENT of (cursor - 60s) or (now - lookback_days).
+        // The cursor tracks our last successful sync position: use it when it's
+        // recent so we only fetch new events (incremental sync). Fall back to
+        // lookback_floor when there's no cursor or when it's very old (e.g. after
+        // account change or first run).
         let since_ts = match cursor {
             Some(ts) => {
                 let cursor_ts = ts.saturating_sub(60);
-                let chosen = cursor_ts.min(lookback_floor); // use whichever is OLDER
+                let chosen = cursor_ts.max(lookback_floor); // use whichever is NEWER
                 info!(
-                    "Tier 2: cursor={}, lookback_floor={}, using since={} (older of both)",
+                    "Tier 2: cursor={}, lookback_floor={}, using since={} (newer of both)",
                     ts, lookback_floor, chosen
                 );
                 chosen
@@ -930,23 +1628,31 @@ impl SyncEngine {
             // Excluded: kind 4 (DMs — own events only), kind 7 (reactions — noisy,
             // low value for feed), kind 9735 (zaps — noise). This keeps the event
             // store focused on actual content and WoT-relevant data.
-            let filter = Filter::new()
-                .authors(authors)
+            //
+            // Long-form articles (kind 30023) get their own filter so they aren't
+            // crowded out by the much higher volume of metadata/contacts/notes.
+            let main_filter = Filter::new()
+                .authors(authors.clone())
                 .kinds(vec![
                     Kind::Metadata,           // 0 — profiles
                     Kind::TextNote,           // 1 — notes
                     Kind::ContactList,        // 3 — follows (for WoT)
                     Kind::Repost,             // 6 — reposts
-                    Kind::LongFormTextNote,   // 30023 — articles
                 ])
                 .since(since)
                 .limit(self.sync_config.events_per_batch as usize);
+
+            let articles_filter = Filter::new()
+                .authors(authors)
+                .kinds(vec![Kind::LongFormTextNote]) // 30023 — articles
+                .since(since)
+                .limit(20);
 
             let policy = policies
                 .entry(policy_url.clone())
                 .or_insert_with(|| RelayPolicy::new(self.sync_config.relay_min_interval_secs as u64));
 
-            match subscribe_and_collect(&client, vec![filter], 10, policy).await {
+            match subscribe_and_collect(&client, vec![main_filter, articles_filter], 10, policy, relay_urls.len().max(1)).await {
                 Ok(events) => {
                     let mut batch_new: u64 = 0;
                     let mut batch_dupe: u64 = 0;
@@ -1036,20 +1742,20 @@ impl SyncEngine {
         client.disconnect().await.ok();
         info!("Tier 2: Disconnected persistent client");
 
-        // Only advance sync cursor if we actually processed batches and fetched events.
-        // This prevents the cursor from racing ahead when relays return 0 events,
-        // which would cause the next cycle to use a too-narrow since window.
-        if batches_processed > 0 && total_new > 0 {
+        // Advance sync cursor when we successfully communicated with relays.
+        // Advance even when total_new == 0 (all duplicates) — that means the
+        // window was fully covered and we can move forward. Only hold the cursor
+        // when NO batches ran at all (relay connectivity failure).
+        if batches_processed > 0 {
             let cursor_ts = chrono::Utc::now().timestamp() as u64;
             self.db.set_sync_cursor(cursor_ts.saturating_sub(60)).ok();
             info!(
-                "Tier 2: Updated sync cursor to {} ({} new events across {} batches)",
-                cursor_ts.saturating_sub(60), total_new, batches_processed
+                "Tier 2: Updated sync cursor to {} ({} new, {} dupe across {} batches)",
+                cursor_ts.saturating_sub(60), total_new, total_dupe, batches_processed
             );
         } else {
             info!(
-                "Tier 2: Cursor NOT advanced (batches={}, new={}, dupe={}) — will retry same window next cycle",
-                batches_processed, total_new, total_dupe
+                "Tier 2: Cursor NOT advanced — no batches processed (relay connectivity issue?)"
             );
         }
 
@@ -1066,28 +1772,12 @@ impl SyncEngine {
         );
 
         // ── Historical backfill: fetch older events going backward in time ──
+        // Two separate passes: notes/reposts (high volume) and articles (low volume).
+        // Each has its own cursor so articles aren't crowded out by common kinds.
         if !self.cancel.is_cancelled() && !follows.is_empty() {
-            let history_until = self.db.get_history_cursor().unwrap_or(None).unwrap_or_else(|| {
-                // Default: start from lookback floor, go backward
-                chrono::Utc::now().timestamp() as u64 - (self.sync_config.lookback_days as u64 * 86400)
-            });
-
-            let age_secs = now_epoch.saturating_sub(history_until);
-            let age_days = age_secs / 86400;
-            info!(
-                "Tier 2: Historical backfill until={} (~{}d ago)",
-                history_until, age_days
-            );
-
             let authors: Vec<PublicKey> = follows.iter()
                 .filter_map(|hex| PublicKey::from_hex(hex).ok())
                 .collect();
-
-            let hist_filter = Filter::new()
-                .authors(authors)
-                .kinds(vec![Kind::TextNote, Kind::Repost, Kind::LongFormTextNote])
-                .until(Timestamp::from(history_until))
-                .limit(500);
 
             // Use fresh client for historical fetch
             let hist_client = Client::default();
@@ -1098,55 +1788,113 @@ impl SyncEngine {
             tokio::time::sleep(Duration::from_secs(2)).await;
 
             let hist_policy_url = relay_urls.first().cloned().unwrap_or_default();
+
+            // ── Pass 1: Notes & reposts (main history cursor) ──
+            let history_until = self.db.get_history_cursor().unwrap_or(None).unwrap_or_else(|| {
+                chrono::Utc::now().timestamp() as u64 - (self.sync_config.lookback_days as u64 * 86400)
+            });
+
+            let age_days = now_epoch.saturating_sub(history_until) / 86400;
+            info!("Tier 2: Historical notes backfill until={} (~{}d ago)", history_until, age_days);
+
+            let notes_filter = Filter::new()
+                .authors(authors.clone())
+                .kinds(vec![Kind::TextNote, Kind::Repost])
+                .until(Timestamp::from(history_until))
+                .limit(500);
+
             let hist_policy = policies
                 .entry(hist_policy_url.clone())
                 .or_insert_with(|| RelayPolicy::new(self.sync_config.relay_min_interval_secs as u64));
 
-            match subscribe_and_collect(&hist_client, vec![hist_filter], 30, hist_policy).await {
+            match subscribe_and_collect(&hist_client, vec![notes_filter], 30, hist_policy, relay_urls.len().max(1)).await {
                 Ok(hist_events) if !hist_events.is_empty() => {
                     let mut oldest_ts = history_until;
                     let mut hist_new: u64 = 0;
 
                     for event in &hist_events {
-                        let tags: Vec<Vec<String>> = event
-                            .tags
-                            .iter()
+                        let tags: Vec<Vec<String>> = event.tags.iter()
                             .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
                             .collect();
                         let tags_json = serde_json::to_string(&tags).unwrap_or_default();
-                        let inserted = self.db
-                            .store_event(
-                                &event.id.to_hex(),
-                                &event.pubkey.to_hex(),
-                                event.created_at.as_u64() as i64,
-                                event.kind.as_u16() as u32,
-                                &tags_json,
-                                &event.content.to_string(),
-                                &event.sig.to_string(),
-                            )
-                            .unwrap_or(false);
+                        let inserted = self.db.store_event(
+                            &event.id.to_hex(), &event.pubkey.to_hex(),
+                            event.created_at.as_u64() as i64, event.kind.as_u16() as u32,
+                            &tags_json, &event.content.to_string(), &event.sig.to_string(),
+                        ).unwrap_or(false);
                         if inserted {
                             hist_new += 1;
                             self.queue_media_for_event(&event.pubkey.to_hex(), &event.content.to_string(), &tags_json);
                         }
                         let ts = event.created_at.as_u64();
-                        if ts < oldest_ts {
-                            oldest_ts = ts;
-                        }
+                        if ts < oldest_ts { oldest_ts = ts; }
                     }
 
-                    // Move cursor back
                     self.db.set_history_cursor(oldest_ts.saturating_sub(1)).ok();
                     info!(
-                        "Tier 2: Historical: {} events ({} new), cursor now at {} (~{}d ago)",
-                        hist_events.len(),
-                        hist_new,
-                        oldest_ts,
-                        now_epoch.saturating_sub(oldest_ts) / 86400
+                        "Tier 2: Historical notes: {} events ({} new), cursor → {} (~{}d ago)",
+                        hist_events.len(), hist_new, oldest_ts, now_epoch.saturating_sub(oldest_ts) / 86400
                     );
                 }
-                Ok(_) => info!("Tier 2: Historical: no more events at this cursor position"),
-                Err(e) => warn!("Tier 2: Historical fetch error: {}", e),
+                Ok(_) => info!("Tier 2: Historical notes: no more events at this cursor position"),
+                Err(e) => warn!("Tier 2: Historical notes fetch error: {}", e),
+            }
+
+            // Polite pause between passes
+            tokio::time::sleep(Duration::from_secs(3)).await;
+
+            // ── Pass 2: Articles (separate cursor — never crowded out by notes) ──
+            if !self.cancel.is_cancelled() {
+                let articles_until = self.db.get_articles_history_cursor().unwrap_or(None).unwrap_or_else(|| {
+                    // First run: start from now and walk backward through all history
+                    chrono::Utc::now().timestamp() as u64
+                });
+
+                let art_age_days = now_epoch.saturating_sub(articles_until) / 86400;
+                info!("Tier 2: Historical articles backfill until={} (~{}d ago)", articles_until, art_age_days);
+
+                let articles_filter = Filter::new()
+                    .authors(authors)
+                    .kinds(vec![Kind::LongFormTextNote]) // 30023
+                    .until(Timestamp::from(articles_until))
+                    .limit(200);
+
+                let art_policy = policies
+                    .entry(hist_policy_url.clone())
+                    .or_insert_with(|| RelayPolicy::new(self.sync_config.relay_min_interval_secs as u64));
+
+                match subscribe_and_collect(&hist_client, vec![articles_filter], 30, art_policy, relay_urls.len().max(1)).await {
+                    Ok(art_events) if !art_events.is_empty() => {
+                        let mut oldest_ts = articles_until;
+                        let mut art_new: u64 = 0;
+
+                        for event in &art_events {
+                            let tags: Vec<Vec<String>> = event.tags.iter()
+                                .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
+                                .collect();
+                            let tags_json = serde_json::to_string(&tags).unwrap_or_default();
+                            let inserted = self.db.store_event(
+                                &event.id.to_hex(), &event.pubkey.to_hex(),
+                                event.created_at.as_u64() as i64, event.kind.as_u16() as u32,
+                                &tags_json, &event.content.to_string(), &event.sig.to_string(),
+                            ).unwrap_or(false);
+                            if inserted {
+                                art_new += 1;
+                                self.queue_media_for_event(&event.pubkey.to_hex(), &event.content.to_string(), &tags_json);
+                            }
+                            let ts = event.created_at.as_u64();
+                            if ts < oldest_ts { oldest_ts = ts; }
+                        }
+
+                        self.db.set_articles_history_cursor(oldest_ts.saturating_sub(1)).ok();
+                        info!(
+                            "Tier 2: Historical articles: {} events ({} new), cursor → {} (~{}d ago)",
+                            art_events.len(), art_new, oldest_ts, now_epoch.saturating_sub(oldest_ts) / 86400
+                        );
+                    }
+                    Ok(_) => info!("Tier 2: Historical articles: no more events at this cursor position"),
+                    Err(e) => warn!("Tier 2: Historical articles fetch error: {}", e),
+                }
             }
 
             hist_client.disconnect().await.ok();
@@ -1161,8 +1909,12 @@ impl SyncEngine {
         Ok(())
     }
 
-    // ── Tier 3: Background ────────────────────────────────────────
-    // WoT crawl. ONE persistent client per sync session.
+    // ── Tier 3: Background (LAYER 2 — WoT Crawl) ────────────────
+    // Part of Layer 2: runs AFTER Tier 2 (direct follows content).
+    // WoT crawl — fetches contact lists from follows-of-follows.
+    // Subject to storage limits; WoT content is pruned first when
+    // storage is tight. Runs every 6 cycles (~30 min).
+    // ONE persistent client per sync session.
     // Connect once, send all subscription batches, disconnect once.
 
     async fn run_tier3(&self, policies: &mut HashMap<String, RelayPolicy>) -> Result<()> {
@@ -1247,7 +1999,7 @@ impl SyncEngine {
                 .entry(policy_url.clone())
                 .or_insert_with(|| RelayPolicy::new(self.sync_config.relay_min_interval_secs as u64));
 
-            match subscribe_and_collect(&client, vec![filter], 10, policy).await {
+            match subscribe_and_collect(&client, vec![filter], 10, policy, relay_urls.len().max(1)).await {
                 Ok(events) => {
                     for event in events.iter() {
                         // Store every event in DB (metadata + contact lists)
@@ -1335,7 +2087,11 @@ impl SyncEngine {
         Ok(())
     }
 
-    // ── Tier 4: Archive (Blossom Media Backup) ──────────────────
+    // ── Tier 4: Archive (LAYER 3 — Others' Media Backup) ────────
+    // Runs last. Downloads media from others' events, subject to
+    // storage_media_gb limit. Own media was already downloaded in
+    // Tier 1a (Layer 0) with no limits. Others' media uses LRU
+    // eviction when over limit — own media is NEVER evicted.
 
     async fn run_tier4(&self, _policies: &mut HashMap<String, RelayPolicy>) -> Result<()> {
         self.set_tier(SyncTier::Archive);
@@ -1460,7 +2216,6 @@ impl SyncEngine {
     }
 
     /// Extract media URLs from ALL own events (full history, no limit cap)
-    #[allow(dead_code)]
     async fn extract_own_media_urls(&self) -> Vec<(String, String)> {
         let own_pubkey = vec![self.hex_pubkey.clone()];
         let events = self.db.query_events(
@@ -1617,8 +2372,8 @@ impl SyncEngine {
                 }
             });
 
-        // Only cache images and videos
-        if !mime.starts_with("image/") && !mime.starts_with("video/") {
+        // Only cache images, videos, and audio
+        if !mime.starts_with("image/") && !mime.starts_with("video/") && !mime.starts_with("audio/") {
             debug!("Tier 4: skipping {} — mime={}", url, mime);
             return Ok(false);
         }
@@ -1669,7 +2424,8 @@ impl SyncEngine {
     }
 
     /// Enforce media storage limit — evict LRU items if over 95% of limit.
-    /// Only counts and evicts OTHERS' media — own media is never evicted.
+    /// Only counts and evicts OTHERS' media — own media is NEVER evicted.
+    /// Tracked profile media follows the same LRU policy as other non-own media.
     async fn enforce_media_limit(&self, limit_bytes: u64) {
         let used = match self.db.media_others_bytes(&self.hex_pubkey) {
             Ok(b) => b,
