@@ -335,6 +335,13 @@ export async function renderDashboard(container: HTMLElement): Promise<void> {
         </div>
         <div class="sync-tier">
           <div class="sync-tier-head">
+            <span class="sync-tier-label">Layer 0.5 — Tracked</span>
+            <span class="sync-tier-badge idle" id="sync-layer-05-badge">IDLE</span>
+          </div>
+          <div class="sync-tier-detail" id="sync-layer-05-detail">—</div>
+        </div>
+        <div class="sync-tier">
+          <div class="sync-tier-head">
             <span class="sync-tier-label">Layer 1 — Direct Follows</span>
             <span class="sync-tier-badge idle" id="sync-layer-1-badge">IDLE</span>
           </div>

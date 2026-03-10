@@ -1436,7 +1436,7 @@ async fn fetch_profile(pubkey: String, state: State<'_, AppState>) -> Result<Pro
 
     // Recent events filter
     let events_filter = Filter::new()
-        .kinds(vec![Kind::TextNote, Kind::Repost, Kind::Custom(30023)])
+        .kinds(vec![Kind::TextNote, Kind::Repost, Kind::LongFormTextNote])
         .authors(vec![PublicKey::from_hex(&pubkey).map_err(|e| format!("Invalid pubkey: {}", e))?])
         .limit(100);
 
@@ -1497,8 +1497,8 @@ async fn fetch_profile(pubkey: String, state: State<'_, AppState>) -> Result<Pro
         tracing::info!("[fetch_profile] Got {} events from {}", all_events.len(), url);
 
         // If we got metadata + contacts, skip remaining relays
-        let has_meta = all_events.iter().any(|e| e.kind == Kind::Metadata && e.author().to_hex() == pubkey);
-        let has_contacts = all_events.iter().any(|e| e.kind == Kind::ContactList && e.author().to_hex() == pubkey);
+        let has_meta = all_events.iter().any(|e| e.kind == Kind::Metadata && e.pubkey.to_hex() == pubkey);
+        let has_contacts = all_events.iter().any(|e| e.kind == Kind::ContactList && e.pubkey.to_hex() == pubkey);
         if has_meta && has_contacts && all_events.len() >= 10 {
             break;
         }
@@ -1513,16 +1513,16 @@ async fn fetch_profile(pubkey: String, state: State<'_, AppState>) -> Result<Pro
 
     for event in &all_events {
         let tags_json = serde_json::to_string(
-            &event.tags.iter().map(|t| t.as_slice().to_vec()).collect::<Vec<Vec<String>>>()
+            &event.tags.iter().map(|t| t.as_slice().iter().map(|s| s.to_string()).collect::<Vec<String>>()).collect::<Vec<Vec<String>>>()
         ).unwrap_or_else(|_| "[]".to_string());
 
         match state.db.store_event(
             &event.id.to_hex(),
-            &event.author().to_hex(),
+            &event.pubkey.to_hex(),
             event.created_at.as_u64() as i64,
             event.kind.as_u16() as u32,
             &tags_json,
-            &event.content,
+            &event.content.to_string(),
             &event.sig.to_string(),
         ) {
             Ok(true) => stored_count += 1,
@@ -1537,20 +1537,22 @@ async fn fetch_profile(pubkey: String, state: State<'_, AppState>) -> Result<Pro
                     let slice = t.as_slice();
                     slice.len() >= 2 && slice[0] == "p"
                 })
-                .map(|t| t.as_slice()[1].clone())
+                .map(|t| t.as_slice()[1].to_string())
                 .collect();
 
+            let pk_hex = event.pubkey.to_hex();
+            let ev_id = event.id.to_hex();
             let updated = state.wot_graph.update_follows(
-                &event.author().to_hex(),
+                &pk_hex,
                 &follows,
-                Some(event.id.to_hex()),
+                Some(ev_id.clone()),
                 Some(event.created_at.as_u64() as i64),
             );
             if updated {
                 let batch = vec![storage::FollowUpdateBatch {
-                    pubkey: &event.author().to_hex(),
+                    pubkey: &pk_hex,
                     follows: &follows,
-                    event_id: Some(&event.id.to_hex()),
+                    event_id: Some(&ev_id),
                     created_at: Some(event.created_at.as_u64() as i64),
                 }];
                 state.db.update_follows_batch(&batch).ok();

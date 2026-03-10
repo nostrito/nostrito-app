@@ -185,6 +185,7 @@ async fn subscribe_and_collect(
     filter: Vec<Filter>,
     timeout_secs: u64,
     policy: &mut RelayPolicy,
+    expected_eose: usize,
 ) -> Result<Vec<Event>> {
     // Respect rate limits before sending
     policy.wait_for_slot().await;
@@ -198,6 +199,8 @@ async fn subscribe_and_collect(
     tokio::pin!(deadline);
 
     let mut got_eose = false;
+    let mut eose_count: usize = 0;
+    let expected = expected_eose.max(1);
 
     loop {
         tokio::select! {
@@ -211,8 +214,20 @@ async fn subscribe_and_collect(
                             RelayPoolNotification::Message { message, .. } => {
                                 match &message {
                                     RelayMessage::EndOfStoredEvents(_) => {
-                                        got_eose = true;
-                                        break;
+                                        eose_count += 1;
+                                        if eose_count >= expected {
+                                            // All relays have finished — we have everything
+                                            got_eose = true;
+                                            break;
+                                        }
+                                        // First EOSE but more relays pending: shorten deadline
+                                        // to 3 seconds so we don't wait the full timeout but
+                                        // still give slower relays a chance to send events.
+                                        if eose_count == 1 {
+                                            deadline.as_mut().reset(
+                                                tokio::time::Instant::now() + Duration::from_secs(3)
+                                            );
+                                        }
                                     }
                                     RelayMessage::Notice { message: msg } => {
                                         policy.on_notice(msg);
@@ -231,7 +246,13 @@ async fn subscribe_and_collect(
                 }
             }
             _ = &mut deadline => {
-                warn!("Subscribe timeout after {}s, got {} events (no EOSE)", timeout_secs, events.len());
+                if eose_count > 0 {
+                    // Got EOSE from some relays, drain period expired for the rest
+                    got_eose = true;
+                    debug!("Drain timeout: EOSE from {}/{} relays, {} events", eose_count, expected, events.len());
+                } else {
+                    warn!("Subscribe timeout after {}s, got {} events (no EOSE from any relay)", timeout_secs, events.len());
+                }
                 break;
             }
         }
@@ -243,7 +264,7 @@ async fn subscribe_and_collect(
         policy.on_success();
     }
 
-    debug!("Collected {} events (EOSE={})", events.len(), got_eose);
+    debug!("Collected {} events (EOSE={}, {}/{} relays)", events.len(), got_eose, eose_count, expected);
     Ok(events)
 }
 
@@ -696,7 +717,7 @@ impl SyncEngine {
             // Let WebSocket handshake settle
             tokio::time::sleep(Duration::from_secs(2)).await;
 
-            match subscribe_and_collect(&client, vec![filter.clone()], 15, policy).await {
+            match subscribe_and_collect(&client, vec![filter.clone()], 15, policy, 1).await {
                 Ok(events) => {
                     info!("Tier 1: Got {} events from {}", events.len(), url);
                     for event in events {
@@ -828,7 +849,7 @@ impl SyncEngine {
             client.connect().await;
             tokio::time::sleep(Duration::from_secs(2)).await;
 
-            match subscribe_and_collect(&client, vec![all_own_filter.clone()], 30, policy).await {
+            match subscribe_and_collect(&client, vec![all_own_filter.clone()], 30, policy, 1).await {
                 Ok(events) => {
                     info!("Tier 1b: Got {} own events from {}", events.len(), url);
                     for event in &events {
@@ -1024,7 +1045,7 @@ impl SyncEngine {
                 .entry(policy_url.clone())
                 .or_insert_with(|| RelayPolicy::new(self.sync_config.relay_min_interval_secs as u64));
 
-            match subscribe_and_collect(&client, vec![main_filter, articles_filter], 15, policy).await {
+            match subscribe_and_collect(&client, vec![main_filter, articles_filter], 15, policy, relay_urls.len().max(1)).await {
                 Ok(events) => {
                     let mut batch_new: u64 = 0;
                     for event in events.iter() {

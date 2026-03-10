@@ -941,7 +941,7 @@ impl Database {
     pub fn media_list_lru_excluding_pubkey(&self, limit: usize, exclude_pubkey: &str) -> Result<Vec<(String, u64)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT hash, size_bytes FROM media_cache WHERE pubkey != ?1 ORDER BY last_accessed ASC LIMIT ?2"
+            "SELECT hash, size_bytes FROM media_cache WHERE pubkey != ?1 AND pubkey NOT IN (SELECT pubkey FROM tracked_profiles) ORDER BY last_accessed ASC LIMIT ?2"
         )?;
         let rows = stmt
             .query_map(params![exclude_pubkey, limit as i64], |row| {

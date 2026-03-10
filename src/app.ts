@@ -10,7 +10,7 @@ import { renderMyMedia } from "./screens/my-media";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { getProfiles, profileDisplayName, type ProfileInfo } from "./utils/profiles";
+import { getProfiles, profileDisplayName, invalidateProfileCache, type ProfileInfo } from "./utils/profiles";
 import { initMediaViewer } from "./utils/media";
 import { iconDashboard, iconFeed, iconMessageCircle, iconNetwork, iconDatabase, iconSettings, iconCheckCircle, iconX, iconImage } from "./utils/icons";
 
@@ -316,6 +316,7 @@ function renderProfileView(
           fetchBtn.disabled = false;
         } else {
           // Refresh the entire profile view with new data
+          invalidateProfileCache(pubkey);
           const updatedProfileMap = await getProfiles([pubkey]);
           const updatedProfile = updatedProfileMap.get(pubkey) || null;
           const newStatus = await invoke<{ event_count: number; has_metadata: boolean }>("get_profile_cache_status", { pubkey });
