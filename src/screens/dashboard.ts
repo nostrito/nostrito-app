@@ -2,7 +2,8 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { getProfiles, profileDisplayName, type ProfileInfo } from "../utils/profiles";
+import { getProfiles, profileDisplayName } from "../utils/profiles";
+import { iconChili, iconBlossom } from "../utils/icons";
 // Media viewer no longer needed on dashboard (compact live table instead of full cards)
 
 interface AppStatus {
@@ -62,10 +63,6 @@ function avatarClass(pubkey: string): string {
   return AVATAR_CLASSES[Math.abs(hash) % AVATAR_CLASSES.length];
 }
 
-function shortPubkey(pk: string): string {
-  if (pk.length > 12) return pk.slice(0, 6) + "..." + pk.slice(-4);
-  return pk;
-}
 
 function timeAgo(ts: number): string {
   const diff = Math.floor(Date.now() / 1000) - ts;
@@ -309,7 +306,7 @@ export async function renderDashboard(container: HTMLElement): Promise<void> {
     <!-- Header -->
     <div class="dash-header">
       <div class="dash-header-left">
-        <span class="dash-header-name">🌶️ nostrito</span>
+        <span class="dash-header-name"><span class="icon">${iconChili()}</span> nostrito</span>
         <span class="status-badge" id="dash-relay-badge"><span class="status-dot"></span> Live</span>
       </div>
     </div>
@@ -373,7 +370,7 @@ export async function renderDashboard(container: HTMLElement): Promise<void> {
           <div class="sync-tier-detail" id="sync-tier-4-detail">—</div>
         </div>
         <div class="blossom-section">
-          <div class="blossom-title">🌸 Blossom</div>
+          <div class="blossom-title"><span class="icon">${iconBlossom()}</span> Blossom</div>
           <div class="blossom-stats">
             <div class="blossom-stat">
               <span class="blossom-stat-val" id="blossom-count">—</span>

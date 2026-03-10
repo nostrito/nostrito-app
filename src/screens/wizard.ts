@@ -5,6 +5,7 @@
 import { showAppShell } from "../app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { RELAYS } from "../relays";
+import { iconCheck, iconBookOpen, iconKey, iconCastle, iconPlug, iconSparkles, iconLock, iconImage, iconVideo, iconVolume, iconClipboard, iconParty } from "../utils/icons";
 
 export interface WizardConfig {
   identityMode: "readonly" | "full";
@@ -105,7 +106,11 @@ export class WizardScreen {
 
       const dotNum = document.createElement("span");
       dotNum.className = "wiz-dot-num";
-      dotNum.textContent = i < this.step ? "✓" : String(i);
+      if (i < this.step) {
+        dotNum.innerHTML = iconCheck();
+      } else {
+        dotNum.textContent = String(i);
+      }
       dotWrap.appendChild(dotNum);
 
       const dotLabel = document.createElement("span");
@@ -207,11 +212,11 @@ export class WizardScreen {
 
       <div style="display:flex;flex-direction:column;gap:10px;margin-bottom:20px;width:100%;max-width:480px">
         <div class="wiz-identity-option${this.identityMode === "readonly" ? " selected" : ""}" id="opt-readonly">
-          <div class="wiz-identity-title">📖 Read-only <span class="wiz-identity-badge">Recommended</span></div>
+          <div class="wiz-identity-title"><span class="icon">${iconBookOpen()}</span> Read-only <span class="wiz-identity-badge">Recommended</span></div>
           <div class="wiz-identity-desc">Paste your npub. DMs disabled, everything else works.</div>
         </div>
         <div class="wiz-identity-option${this.identityMode === "full" ? " selected" : ""}" id="opt-full">
-          <div class="wiz-identity-title">🔑 Full access</div>
+          <div class="wiz-identity-title"><span class="icon">${iconKey()}</span> Full access</div>
           <div class="wiz-identity-desc">Connect nsec, NBunker, or Nostr Connect. Unlocks DMs.</div>
         </div>
       </div>
@@ -222,10 +227,10 @@ export class WizardScreen {
       </div>
 
       <div id="wiz-full-input" style="${this.identityMode !== "full" ? "display:none;" : "display:flex;"}flex-direction:column;gap:10px;width:100%;max-width:480px">
-        <div class="wiz-signer-option${this.signerType === "nsec" ? " selected" : ""}" data-signer="nsec">🔑 Paste nsec</div>
-        <div class="wiz-signer-option${this.signerType === "bunker" ? " selected" : ""}" data-signer="bunker">🏰 NBunker / NIP-46</div>
-        <div class="wiz-signer-option${this.signerType === "connect" ? " selected" : ""}" data-signer="connect">🔌 Nostr Connect</div>
-        <div class="wiz-signer-option${this.signerType === "new" ? " selected" : ""}" data-signer="new">✨ Create new account</div>
+        <div class="wiz-signer-option${this.signerType === "nsec" ? " selected" : ""}" data-signer="nsec"><span class="icon">${iconKey()}</span> Paste nsec</div>
+        <div class="wiz-signer-option${this.signerType === "bunker" ? " selected" : ""}" data-signer="bunker"><span class="icon">${iconCastle()}</span> NBunker / NIP-46</div>
+        <div class="wiz-signer-option${this.signerType === "connect" ? " selected" : ""}" data-signer="connect"><span class="icon">${iconPlug()}</span> Nostr Connect</div>
+        <div class="wiz-signer-option${this.signerType === "new" ? " selected" : ""}" data-signer="new"><span class="icon">${iconSparkles()}</span> Create new account</div>
       </div>
     `;
 
@@ -330,7 +335,7 @@ export class WizardScreen {
         <div class="storage-row locked">
           <div class="storage-row-info">
             <span class="storage-row-label">Your events & media</span>
-            <span class="storage-row-meta">🔒 Always stored. No exceptions.</span>
+            <span class="storage-row-meta"><span class="icon">${iconLock()}</span> Always stored. No exceptions.</span>
           </div>
           <div class="storage-bar-wrap">
             <div class="storage-bar"><div class="storage-bar-fill"></div></div>
@@ -364,9 +369,9 @@ export class WizardScreen {
           </div>
         </div>
         <div class="media-toggles" id="mediaToggles">
-          <div class="media-toggle${this.mediaTypes.images ? " active" : ""}" data-media="images">🖼️ Images</div>
-          <div class="media-toggle${this.mediaTypes.videos ? " active" : ""}" data-media="videos">🎬 Videos</div>
-          <div class="media-toggle${this.mediaTypes.audio ? " active" : ""}" data-media="audio">🔊 Audio</div>
+          <div class="media-toggle${this.mediaTypes.images ? " active" : ""}" data-media="images"><span class="icon">${iconImage()}</span> Images</div>
+          <div class="media-toggle${this.mediaTypes.videos ? " active" : ""}" data-media="videos"><span class="icon">${iconVideo()}</span> Videos</div>
+          <div class="media-toggle${this.mediaTypes.audio ? " active" : ""}" data-media="audio"><span class="icon">${iconVolume()}</span> Audio</div>
         </div>
       </div>
 
@@ -423,28 +428,28 @@ export class WizardScreen {
     const relayUrl = `${protocol}://localhost:${this.relayPort}`;
 
     const CLIENTS = [
-      { name: "Damus", emoji: "🟣" },
-      { name: "Amethyst", emoji: "💜" },
-      { name: "Primal", emoji: "🔶" },
-      { name: "Coracle", emoji: "🐚" },
-      { name: "Snort", emoji: "⚡" },
+      { name: "Damus", icon: "D" },
+      { name: "Amethyst", icon: "A" },
+      { name: "Primal", icon: "P" },
+      { name: "Coracle", icon: "C" },
+      { name: "Snort", icon: "S" },
     ];
 
     container.innerHTML = `
       <div class="wiz-ready-content">
-        <h3 class="wiz-title wiz-ready-title">Your local relay is running 🎉</h3>
+        <h3 class="wiz-title wiz-ready-title">Your local relay is running <span class="icon">${iconParty()}</span></h3>
         <p class="wiz-subtitle">Add this address to your favorite Nostr clients to start using your WoT-filtered feed:</p>
 
         <div class="wiz-relay-url-box">
           <code class="wiz-relay-url-text" id="relay-url-text">${escapeHtml(relayUrl)}</code>
-          <button class="btn btn-secondary wiz-relay-copy-btn" id="btn-copy-relay" title="Copy to clipboard">📋 Copy</button>
+          <button class="btn btn-secondary wiz-relay-copy-btn" id="btn-copy-relay" title="Copy to clipboard"><span class="icon">${iconClipboard()}</span> Copy</button>
         </div>
         <span class="wiz-copy-feedback" id="copy-feedback"></span>
 
         <div class="wiz-clients-section">
           <p class="wiz-clients-label">Works with:</p>
           <ul class="wiz-clients-list">
-            ${CLIENTS.map((c) => `<li class="wiz-client-item"><span class="wiz-client-emoji">${c.emoji}</span> ${escapeHtml(c.name)}</li>`).join("")}
+            ${CLIENTS.map((c) => `<li class="wiz-client-item"><span class="wiz-client-initial">${c.icon}</span> ${escapeHtml(c.name)}</li>`).join("")}
           </ul>
         </div>
 

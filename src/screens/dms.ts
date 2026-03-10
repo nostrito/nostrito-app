@@ -2,6 +2,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { getProfiles, getCachedProfile, profileDisplayName } from "../utils/profiles";
+import { iconMessageCircle, iconLock } from "../utils/icons";
 
 interface NostrEvent {
   id: string;
@@ -148,7 +149,7 @@ function getPartner(event: NostrEvent, ownPk: string): string | null {
 function renderEmpty(message: string): string {
   return `
     <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;padding:48px 24px;color:var(--text-muted);text-align:center;gap:12px;">
-      <div style="font-size:2rem;">💬</div>
+      <div style="font-size:2rem;"><span class="icon">${iconMessageCircle()}</span></div>
       <div style="font-size:0.95rem;font-weight:500;color:var(--text-dim);">${message}</div>
     </div>
   `;
@@ -157,7 +158,7 @@ function renderEmpty(message: string): string {
 function renderReadOnlyNotice(): string {
   return `
     <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;padding:48px 24px;text-align:center;gap:16px;">
-      <div style="font-size:2rem;">🔒</div>
+      <div style="font-size:2rem;"><span class="icon">${iconLock()}</span></div>
       <div style="font-size:0.95rem;font-weight:500;color:var(--text-dim);">
         You have DMs but your configuration is read-only.
       </div>
@@ -177,7 +178,7 @@ function renderConversationList(root: HTMLElement): void {
 
   let html = `
     <div class="dms-banner">
-      <span>💬 ${count} encrypted conversation${count !== 1 ? "s" : ""} · ${totalMsgs} messages · Connect a signer to read</span>
+      <span><span class="icon">${iconMessageCircle()}</span> ${count} encrypted conversation${count !== 1 ? "s" : ""} · ${totalMsgs} messages · Connect a signer to read</span>
     </div>
     <div class="dms-conversation-list">
   `;
@@ -197,7 +198,7 @@ function renderConversationList(root: HTMLElement): void {
         </div>
         <div class="dms-conv-info">
           <div class="dms-conv-name">${escapeHtml(name)}</div>
-          <div class="dms-conv-preview">🔒 Encrypted</div>
+          <div class="dms-conv-preview"><span class="icon">${iconLock()}</span> Encrypted</div>
         </div>
         <div class="dms-conv-meta">
           <div class="dms-conv-time">${timeStr}</div>
@@ -245,7 +246,7 @@ function renderThread(root: HTMLElement, partnerPubkey: string): void {
     html += `
       <div class="dms-msg ${isSent ? "dms-msg-sent" : "dms-msg-received"}">
         <div class="dms-msg-bubble">
-          <div class="dms-msg-content">🔒 Encrypted message — NIP-04</div>
+          <div class="dms-msg-content"><span class="icon">${iconLock()}</span> Encrypted message — NIP-04</div>
           <div class="dms-msg-time">${timeStr}</div>
         </div>
       </div>

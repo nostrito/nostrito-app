@@ -1,4 +1,5 @@
 /** Media URL extraction and viewer utilities */
+import { iconX } from "./icons";
 
 export interface MediaUrls {
   images: string[];
@@ -81,7 +82,7 @@ export function initMediaViewer(): void {
   viewer.id = "media-viewer";
   viewer.innerHTML = `
     <img id="media-viewer-img">
-    <button id="media-viewer-close">✕</button>
+    <button id="media-viewer-close"><span class="icon">${iconX()}</span></button>
   `;
   document.body.appendChild(viewer);
 

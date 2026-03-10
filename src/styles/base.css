@@ -76,6 +76,15 @@ pre {
   border-radius: 3px;
 }
 
+/* Inline SVG icons — size relative to parent font-size */
+.icon svg, svg.icon {
+  width: 1em;
+  height: 1em;
+  vertical-align: -0.125em;
+  display: inline-block;
+  flex-shrink: 0;
+}
+
 @keyframes pulse-live {
   0%,100% { opacity: 1; }
   50% { opacity: 0.4; }

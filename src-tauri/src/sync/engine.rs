@@ -536,30 +536,42 @@ impl SyncEngine {
             }
         }
 
+        // Sort newest-first so replaceable events (kind:3) are processed in
+        // correct order — the WoT timestamp guard rejects older duplicates.
+        all_events.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
         info!("Tier 1: Processing {} total events", all_events.len());
 
         for event in all_events.iter() {
             if event.kind == Kind::ContactList {
                 if let Some(update) = process_contact_event(event) {
-                    self.graph.update_follows(
+                    let updated = self.graph.update_follows(
                         &update.pubkey,
                         &update.follows,
                         Some(update.event_id.clone()),
                         Some(update.created_at),
                     );
 
-                    let batch = vec![FollowUpdateBatch {
-                        pubkey: &update.pubkey,
-                        follows: &update.follows,
-                        event_id: Some(&update.event_id),
-                        created_at: Some(update.created_at),
-                    }];
-                    self.db.update_follows_batch(&batch).ok();
+                    if updated {
+                        let batch = vec![FollowUpdateBatch {
+                            pubkey: &update.pubkey,
+                            follows: &update.follows,
+                            event_id: Some(&update.event_id),
+                            created_at: Some(update.created_at),
+                        }];
+                        self.db.update_follows_batch(&batch).ok();
 
-                    info!(
-                        "Tier 1: Loaded {} follows from own contact list",
-                        update.follows.len()
-                    );
+                        info!(
+                            "Tier 1: Loaded {} follows from own contact list (ts={})",
+                            update.follows.len(),
+                            update.created_at,
+                        );
+                    } else {
+                        debug!(
+                            "Tier 1: Skipped older contact list event (ts={})",
+                            update.created_at,
+                        );
+                    }
                 }
             }
 

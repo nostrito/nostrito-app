@@ -2,6 +2,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { RELAYS, resolveRelayUrl, urlToAlias } from "../relays";
+import { iconKey, iconRadio, iconNetwork, iconDatabase, iconZap, iconSettings, iconLock, iconCastle, iconPlug, iconRocket, iconScale, iconTurtle, iconAlertTriangle, iconCheckCircle } from "../utils/icons";
 
 interface Settings {
   npub: string;
@@ -20,6 +21,7 @@ interface Settings {
   sync_relay_min_interval_secs: number;
   sync_wot_batch_size: number;
   sync_wot_events_per_batch: number;
+  max_event_age_days: number;
 }
 
 function escapeHtml(str: string): string {
@@ -34,12 +36,12 @@ export function renderSettings(container: HTMLElement): void {
   container.innerHTML = `
     <div class="settings-container">
       <div class="settings-sub-nav">
-        <div class="settings-sub-item active" data-settings="identity">🔑 Identity</div>
-        <div class="settings-sub-item" data-settings="relays">📡 Relays</div>
-        <div class="settings-sub-item" data-settings="wot-settings">🕸️ WoT</div>
-        <div class="settings-sub-item" data-settings="storage">💾 Storage</div>
-        <div class="settings-sub-item" data-settings="sync">⚡ Sync</div>
-        <div class="settings-sub-item" data-settings="advanced">⚙️ Advanced</div>
+        <div class="settings-sub-item active" data-settings="identity"><span class="icon">${iconKey()}</span> Identity</div>
+        <div class="settings-sub-item" data-settings="relays"><span class="icon">${iconRadio()}</span> Relays</div>
+        <div class="settings-sub-item" data-settings="wot-settings"><span class="icon">${iconNetwork()}</span> WoT</div>
+        <div class="settings-sub-item" data-settings="storage"><span class="icon">${iconDatabase()}</span> Storage</div>
+        <div class="settings-sub-item" data-settings="sync"><span class="icon">${iconZap()}</span> Sync</div>
+        <div class="settings-sub-item" data-settings="advanced"><span class="icon">${iconSettings()}</span> Advanced</div>
       </div>
       <div class="settings-panel">
         <!-- Identity -->
@@ -51,15 +53,15 @@ export function renderSettings(container: HTMLElement): void {
 
           <div class="settings-field" style="border-bottom:none;padding-bottom:8px"><div class="settings-field-info"><span class="settings-field-label">Signing Mode</span><span class="settings-field-desc">How events are signed</span></div></div>
           <div style="background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:14px 18px;margin-bottom:16px">
-            <div style="font-size:0.85rem;color:var(--text-dim);margin-bottom:2px">🔒 Read-only mode</div>
+            <div style="font-size:0.85rem;color:var(--text-dim);margin-bottom:2px"><span class="icon">${iconLock()}</span> Read-only mode</div>
             <div style="font-size:0.75rem;color:var(--text-muted)">DMs disabled. Connect a signer to unlock full access.</div>
           </div>
 
           <div class="settings-field" style="border-bottom:none;padding-bottom:8px"><div class="settings-field-info"><span class="settings-field-label">Connect Signer</span><span class="settings-field-desc">Upgrade to full access</span></div></div>
           <div style="display:flex;flex-direction:column;gap:8px">
-            <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:var(--bg);border:1px solid var(--border);border-radius:10px;cursor:pointer;transition:border-color 0.2s"><span style="font-size:0.85rem;font-weight:500">🔑 Paste nsec</span><span style="font-size:0.72rem;color:var(--text-muted)">Full access</span></div>
-            <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:var(--bg);border:1px solid var(--border);border-radius:10px;cursor:pointer;transition:border-color 0.2s"><span style="font-size:0.85rem;font-weight:500">🏰 NBunker</span><span style="font-size:0.72rem;color:var(--text-muted)">Remote signer</span></div>
-            <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:var(--bg);border:1px solid var(--border);border-radius:10px;cursor:pointer;transition:border-color 0.2s"><span style="font-size:0.85rem;font-weight:500">🔌 Nostr Connect</span><span style="font-size:0.72rem;color:var(--text-muted)">NIP-46</span></div>
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:var(--bg);border:1px solid var(--border);border-radius:10px;cursor:pointer;transition:border-color 0.2s"><span style="font-size:0.85rem;font-weight:500"><span class="icon">${iconKey()}</span> Paste nsec</span><span style="font-size:0.72rem;color:var(--text-muted)">Full access</span></div>
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:var(--bg);border:1px solid var(--border);border-radius:10px;cursor:pointer;transition:border-color 0.2s"><span style="font-size:0.85rem;font-weight:500"><span class="icon">${iconCastle()}</span> NBunker</span><span style="font-size:0.72rem;color:var(--text-muted)">Remote signer</span></div>
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:var(--bg);border:1px solid var(--border);border-radius:10px;cursor:pointer;transition:border-color 0.2s"><span style="font-size:0.85rem;font-weight:500"><span class="icon">${iconPlug()}</span> Nostr Connect</span><span style="font-size:0.72rem;color:var(--text-muted)">NIP-46</span></div>
           </div>
         </div>
         <!-- Relays -->
@@ -86,7 +88,7 @@ export function renderSettings(container: HTMLElement): void {
             <div class="storage-row locked">
               <div class="storage-row-info">
                 <span class="storage-row-label">Your events & media</span>
-                <span class="storage-row-meta">🔒 Always stored. No exceptions.</span>
+                <span class="storage-row-meta"><span class="icon">${iconLock()}</span> Always stored. No exceptions.</span>
               </div>
               <div class="storage-bar-wrap">
                 <div class="storage-bar"><div class="storage-bar-fill"></div></div>
@@ -177,9 +179,9 @@ export function renderSettings(container: HTMLElement): void {
           <div class="settings-pane-desc">Tune how the sync engine fetches events. Use aggressive settings to build the initial database, then switch to conservative for ongoing sync.</div>
 
           <div class="sync-presets">
-            <button class="sync-preset-btn" data-preset="aggressive">🚀 Aggressive (initial build)</button>
-            <button class="sync-preset-btn" data-preset="balanced">⚖️ Balanced (default)</button>
-            <button class="sync-preset-btn" data-preset="polite">🐢 Polite (background)</button>
+            <button class="sync-preset-btn" data-preset="aggressive"><span class="icon">${iconRocket()}</span> Aggressive (initial build)</button>
+            <button class="sync-preset-btn" data-preset="balanced"><span class="icon">${iconScale()}</span> Balanced (default)</button>
+            <button class="sync-preset-btn" data-preset="polite"><span class="icon">${iconTurtle()}</span> Polite (background)</button>
           </div>
 
           <div class="settings-field">
@@ -293,7 +295,7 @@ export function renderSettings(container: HTMLElement): void {
           </div>
 
           <div class="danger-zone">
-            <div class="danger-zone-title">⚠️ Danger Zone</div>
+            <div class="danger-zone-title"><span class="icon">${iconAlertTriangle()}</span> Danger Zone</div>
             <div class="danger-zone-row">
               <div>
                 <div class="danger-zone-label">Reset App Data</div>
@@ -451,7 +453,7 @@ export function renderSettings(container: HTMLElement): void {
       _currentSettings = updated;
       btn.textContent = "Save Storage Settings";
       btn.disabled = false;
-      if (resultEl) resultEl.innerHTML = `<span style="color:#34d399">✅ Storage settings saved</span>`;
+      if (resultEl) resultEl.innerHTML = `<span style="color:#34d399"><span class="icon">${iconCheckCircle()}</span> Storage settings saved</span>`;
     } catch (e) {
       btn.textContent = "Save Storage Settings";
       btn.disabled = false;
@@ -483,7 +485,7 @@ export function renderSettings(container: HTMLElement): void {
       await invoke("restart_sync");
       btn.textContent = "Save Relays";
       btn.disabled = false;
-      if (resultEl) resultEl.innerHTML = `<span style="color:#34d399">✅ Relays saved — sync restarted</span>`;
+      if (resultEl) resultEl.innerHTML = `<span style="color:#34d399"><span class="icon">${iconCheckCircle()}</span> Relays saved — sync restarted</span>`;
     } catch (e) {
       btn.textContent = "Save Relays";
       btn.disabled = false;
@@ -574,7 +576,7 @@ export function renderSettings(container: HTMLElement): void {
       await invoke("restart_sync");
       btn.textContent = "Save & Restart Sync";
       btn.disabled = false;
-      if (resultEl) resultEl.innerHTML = `<span style="color:#34d399">✅ Saved — sync restarted with new config</span>`;
+      if (resultEl) resultEl.innerHTML = `<span style="color:#34d399"><span class="icon">${iconCheckCircle()}</span> Saved — sync restarted with new config</span>`;
     } catch (e) {
       btn.textContent = "Save & Restart Sync";
       btn.disabled = false;
@@ -747,7 +749,7 @@ async function loadSettings(): Promise<void> {
 
       if (statusEl && detailEl && btnEl) {
         if (browserEnabled) {
-          statusEl.textContent = "✅ Enabled";
+          statusEl.innerHTML = `<span class="icon">${iconCheckCircle()}</span> Enabled`;
           detailEl.textContent = "wss://localhost:" + settings.relay_port + " available for web clients";
           btnEl.textContent = "Regenerate";
         } else {
@@ -770,12 +772,12 @@ async function loadSettings(): Promise<void> {
             } catch (relayErr) {
               console.warn("[settings] Relay restart after mkcert failed:", relayErr);
             }
-            if (statusEl) statusEl.textContent = "✅ wss://localhost:" + settings.relay_port + " active";
+            if (statusEl) statusEl.innerHTML = `<span class="icon">${iconCheckCircle()}</span> wss://localhost:${settings.relay_port} active`;
             if (detailEl) detailEl.textContent = "Web clients can connect securely";
             btnEl.textContent = "Regenerate";
             btnEl.disabled = false;
             if (resultEl) {
-              resultEl.innerHTML = `<div style="font-size:0.78rem;color:#34d399;margin-top:6px">✅ wss://localhost:${settings.relay_port} active — relay restarted with TLS</div>`;
+              resultEl.innerHTML = `<div style="font-size:0.78rem;color:#34d399;margin-top:6px"><span class="icon">${iconCheckCircle()}</span> wss://localhost:${settings.relay_port} active — relay restarted with TLS</div>`;
             }
           } catch (e) {
             btnEl.disabled = false;

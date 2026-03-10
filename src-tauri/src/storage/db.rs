@@ -216,8 +216,16 @@ impl Database {
                 INSERT INTO nodes (pubkey, kind3_event_id, kind3_created_at, updated_at)
                 VALUES (?1, ?2, ?3, ?4)
                 ON CONFLICT(pubkey) DO UPDATE SET
-                    kind3_event_id = COALESCE(?2, kind3_event_id),
-                    kind3_created_at = COALESCE(?3, kind3_created_at),
+                    kind3_event_id = CASE
+                        WHEN ?3 IS NOT NULL AND (kind3_created_at IS NULL OR ?3 > kind3_created_at)
+                        THEN COALESCE(?2, kind3_event_id)
+                        ELSE kind3_event_id
+                    END,
+                    kind3_created_at = CASE
+                        WHEN ?3 IS NOT NULL AND (kind3_created_at IS NULL OR ?3 > kind3_created_at)
+                        THEN ?3
+                        ELSE kind3_created_at
+                    END,
                     updated_at = ?4
                 "#,
             )?;

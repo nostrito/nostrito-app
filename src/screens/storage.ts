@@ -1,6 +1,7 @@
 /** Storage — database stats view. All data from backend commands. */
 
 import { invoke } from "@tauri-apps/api/core";
+import { iconFileText, iconBookOpen, iconZap, iconRepeat, iconHeart, iconTag, iconUsers, iconMessageCircle, iconBlossom } from "../utils/icons";
 
 interface StorageStats {
   total_events: number;
@@ -33,19 +34,19 @@ export function renderStorage(container: HTMLElement): void {
         </div>
       </div>
       <div class="kind-grid-page" id="kind-grid">
-        <div class="kind-card-p"><div class="kind-card-top"><span class="kind-icon">📝</span><span class="kind-name">Notes</span><span class="kind-count" id="kc-1">—</span></div><span class="kind-meta">kind 1</span></div>
-        <div class="kind-card-p"><div class="kind-card-top"><span class="kind-icon">📰</span><span class="kind-name">Long-form</span><span class="kind-count" id="kc-30023">—</span></div><span class="kind-meta">kind 30023</span></div>
-        <div class="kind-card-p"><div class="kind-card-top"><span class="kind-icon">⚡</span><span class="kind-name">Zaps</span><span class="kind-count" id="kc-9735">—</span></div><span class="kind-meta">kind 9735</span></div>
-        <div class="kind-card-p"><div class="kind-card-top"><span class="kind-icon">🔁</span><span class="kind-name">Reposts</span><span class="kind-count" id="kc-6">—</span></div><span class="kind-meta">kind 6</span></div>
-        <div class="kind-card-p"><div class="kind-card-top"><span class="kind-icon">❤️</span><span class="kind-name">Reactions</span><span class="kind-count" id="kc-7">—</span></div><span class="kind-meta">kind 7</span></div>
-        <div class="kind-card-p"><div class="kind-card-top"><span class="kind-icon">🏷️</span><span class="kind-name">Metadata</span><span class="kind-count" id="kc-0">—</span></div><span class="kind-meta">kind 0</span></div>
-        <div class="kind-card-p"><div class="kind-card-top"><span class="kind-icon">👥</span><span class="kind-name">Contacts</span><span class="kind-count" id="kc-3">—</span></div><span class="kind-meta">kind 3</span></div>
-        <div class="kind-card-p"><div class="kind-card-top"><span class="kind-icon">💬</span><span class="kind-name">DMs</span><span class="kind-count" id="kc-dms">—</span></div><span class="kind-meta">kind 4 + 1059</span></div>
+        <div class="kind-card-p"><div class="kind-card-top"><span class="kind-icon">${iconFileText()}</span><span class="kind-name">Notes</span><span class="kind-count" id="kc-1">—</span></div><span class="kind-meta">kind 1</span></div>
+        <div class="kind-card-p"><div class="kind-card-top"><span class="kind-icon">${iconBookOpen()}</span><span class="kind-name">Long-form</span><span class="kind-count" id="kc-30023">—</span></div><span class="kind-meta">kind 30023</span></div>
+        <div class="kind-card-p"><div class="kind-card-top"><span class="kind-icon">${iconZap()}</span><span class="kind-name">Zaps</span><span class="kind-count" id="kc-9735">—</span></div><span class="kind-meta">kind 9735</span></div>
+        <div class="kind-card-p"><div class="kind-card-top"><span class="kind-icon">${iconRepeat()}</span><span class="kind-name">Reposts</span><span class="kind-count" id="kc-6">—</span></div><span class="kind-meta">kind 6</span></div>
+        <div class="kind-card-p"><div class="kind-card-top"><span class="kind-icon">${iconHeart()}</span><span class="kind-name">Reactions</span><span class="kind-count" id="kc-7">—</span></div><span class="kind-meta">kind 7</span></div>
+        <div class="kind-card-p"><div class="kind-card-top"><span class="kind-icon">${iconTag()}</span><span class="kind-name">Metadata</span><span class="kind-count" id="kc-0">—</span></div><span class="kind-meta">kind 0</span></div>
+        <div class="kind-card-p"><div class="kind-card-top"><span class="kind-icon">${iconUsers()}</span><span class="kind-name">Contacts</span><span class="kind-count" id="kc-3">—</span></div><span class="kind-meta">kind 3</span></div>
+        <div class="kind-card-p"><div class="kind-card-top"><span class="kind-icon">${iconMessageCircle()}</span><span class="kind-name">DMs</span><span class="kind-count" id="kc-dms">—</span></div><span class="kind-meta">kind 4 + 1059</span></div>
       </div>
       <div id="storage-db-info" style="font-size:0.8rem;color:var(--text-muted);margin-top:12px">
       </div>
       <div class="storage-media-section" id="storage-media-section" style="margin-top:20px">
-        <div class="storage-usage-title">🌸 Blossom Media Cache</div>
+        <div class="storage-usage-title"><span class="icon">${iconBlossom()}</span> Blossom Media Cache</div>
         <div class="storage-usage-visual" style="margin:8px 0">
           <div class="storage-seg" id="media-seg-fill" style="width:0%;background:var(--purple)"></div>
         </div>

@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getProfiles, profileDisplayName, type ProfileInfo } from "../utils/profiles";
 import { renderMediaHtml, stripMediaUrls, initMediaViewer } from "../utils/media";
 import { renderMarkdown } from "../utils/markdown";
+import { iconMessageCircle, iconRepeat, iconZap, iconX } from "../utils/icons";
 
 interface NostrEvent {
   id: string;
@@ -23,10 +24,6 @@ function avatarClass(pubkey: string): string {
   return AVATAR_CLASSES[Math.abs(hash) % AVATAR_CLASSES.length];
 }
 
-function shortPubkey(pk: string): string {
-  if (pk.length > 12) return pk.slice(0, 6) + "..." + pk.slice(-4);
-  return pk;
-}
 
 function timeAgo(ts: number): string {
   const diff = Math.floor(Date.now() / 1000) - ts;
@@ -177,15 +174,15 @@ function renderEventCard(event: NostrEvent, profile?: ProfileInfo): string {
         <div class="ev-content">
           <div class="ev-meta">
             <span class="ev-npub" onclick="window.showProfilePopup('${event.pubkey}')" style="cursor:pointer">${escapeHtml(displayName)}</span>
-            <span class="ev-kind-tag ${k.cls}">🔁 repost</span>
+            <span class="ev-kind-tag ${k.cls}"><span class="icon">${iconRepeat()}</span> repost</span>
             <span class="ev-time">${timeAgo(event.created_at)}</span>
           </div>
           <div class="ev-text">${escapeHtml(repostContent.cleaned)}</div>
           ${repostContent.mediaHtml}
           <div class="ev-actions">
-            <button class="ev-action"><span class="icon">💬</span> 0</button>
-            <button class="ev-action"><span class="icon">🔁</span> 0</button>
-            <button class="ev-action"><span class="icon">⚡</span> 0</button>
+            <button class="ev-action"><span class="icon">${iconMessageCircle()}</span> 0</button>
+            <button class="ev-action"><span class="icon">${iconRepeat()}</span> 0</button>
+            <button class="ev-action"><span class="icon">${iconZap()}</span> 0</button>
           </div>
         </div>
       </div>
@@ -210,9 +207,9 @@ function renderEventCard(event: NostrEvent, profile?: ProfileInfo): string {
         <div class="ev-text">${escapeHtml(eventContent.cleaned)}</div>
         ${eventContent.mediaHtml}
         <div class="ev-actions">
-          <button class="ev-action"><span class="icon">💬</span> 0</button>
-          <button class="ev-action"><span class="icon">🔁</span> 0</button>
-          <button class="ev-action"><span class="icon">⚡</span> 0</button>
+          <button class="ev-action"><span class="icon">${iconMessageCircle()}</span> 0</button>
+          <button class="ev-action"><span class="icon">${iconRepeat()}</span> 0</button>
+          <button class="ev-action"><span class="icon">${iconZap()}</span> 0</button>
         </div>
       </div>
     </div>
@@ -273,7 +270,6 @@ const renderedEventIds = new Set<string>();
 let feedEvents: NostrEvent[] = [];
 let feedProfileMap: Map<string, ProfileInfo> = new Map();
 let searchDebounceTimer: ReturnType<typeof setTimeout> | null = null;
-let isSearchActive = false;
 
 /** Resolve NIP-05 identifier (name@domain) to hex pubkey */
 async function resolveNip05(nip05: string): Promise<string | null> {
@@ -298,7 +294,7 @@ function isNip05(input: string): boolean {
 
 export function renderFeed(container: HTMLElement): void {
   renderedEventIds.clear();
-  isSearchActive = false;
+
   initMediaViewer();
   container.className = "main-content";
   container.innerHTML = `
@@ -311,7 +307,7 @@ export function renderFeed(container: HTMLElement): void {
       </div>
       <div class="feed-search-wrap">
         <input type="text" class="feed-search-input" placeholder="Search notes, npub, name@domain…" id="feed-search" />
-        <button class="feed-search-clear" id="feed-search-clear" style="display:none">✕</button>
+        <button class="feed-search-clear" id="feed-search-clear" style="display:none"><span class="icon">${iconX()}</span></button>
       </div>
     </div>
     <div id="feed-search-status" class="feed-search-status" style="display:none"></div>
@@ -373,7 +369,7 @@ export function renderFeed(container: HTMLElement): void {
 
       if (!val) {
         // Revert to normal feed
-        isSearchActive = false;
+      
         searchStatus.style.display = "none";
         renderedEventIds.clear();
         const feedEl = container.querySelector("#feedList");
@@ -390,7 +386,7 @@ export function renderFeed(container: HTMLElement): void {
     searchClear.addEventListener("click", () => {
       searchInput.value = "";
       searchClear.style.display = "none";
-      isSearchActive = false;
+    
       searchStatus.style.display = "none";
       renderedEventIds.clear();
       const feedEl = container.querySelector("#feedList");
@@ -407,7 +403,7 @@ async function performSearch(query: string, container: HTMLElement): Promise<voi
   const feedEl = container.querySelector("#feedList");
   if (!feedEl) return;
 
-  isSearchActive = true;
+
   searchStatus.style.display = "block";
   searchStatus.textContent = "Searching…";
 
@@ -472,6 +468,7 @@ async function performSearch(query: string, container: HTMLElement): Promise<voi
     searchStatus.textContent = "Search failed";
     feedEl.innerHTML = `<div class="event-card" style="justify-content:center;color:var(--text-muted);padding:32px;">Search error</div>`;
   }
+}
 
 async function loadEvents(container: HTMLElement): Promise<void> {
   if (feedLoading) return;

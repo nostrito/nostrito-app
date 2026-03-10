@@ -10,6 +10,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getProfiles, profileDisplayName, type ProfileInfo } from "./utils/profiles";
+import { iconDashboard, iconFeed, iconMessageCircle, iconNetwork, iconDatabase, iconSettings, iconCheckCircle, iconX } from "./utils/icons";
 
 let currentScreen: Screen = "wizard";
 
@@ -66,12 +67,12 @@ export async function initApp(root: HTMLElement): Promise<void> {
     </div>
     <div class="app-container">
       <aside class="app-sidebar-nav" id="sidebar" style="display: none;">
-        <div class="app-nav-item" data-screen="dashboard">📊 Dashboard</div>
-        <div class="app-nav-item" data-screen="feed">📰 Feed</div>
-        <div class="app-nav-item" data-screen="dms">💬 DMs</div>
-        <div class="app-nav-item" data-screen="wot">🕸️ WoT</div>
-        <div class="app-nav-item" data-screen="storage">💾 Storage</div>
-        <div class="app-nav-item" data-screen="settings">⚙️ Settings</div>
+        <div class="app-nav-item" data-screen="dashboard"><span class="icon">${iconDashboard()}</span> Dashboard</div>
+        <div class="app-nav-item" data-screen="feed"><span class="icon">${iconFeed()}</span> Feed</div>
+        <div class="app-nav-item" data-screen="dms"><span class="icon">${iconMessageCircle()}</span> DMs</div>
+        <div class="app-nav-item" data-screen="wot"><span class="icon">${iconNetwork()}</span> WoT</div>
+        <div class="app-nav-item" data-screen="storage"><span class="icon">${iconDatabase()}</span> Storage</div>
+        <div class="app-nav-item" data-screen="settings"><span class="icon">${iconSettings()}</span> Settings</div>
         <div class="sidebar-spacer"></div>
         <div class="own-profile" id="own-profile" style="display:none"></div>
         <div class="sidebar-status"><span class="pulse-dot"></span> Live · wss://localhost:4869</div>
@@ -203,7 +204,7 @@ async function showOwnProfilePanel(profile: ProfileInfo): Promise<void> {
         ${avatarHtml}
         <div class="own-panel-name">${escapeHtml(name)}</div>
         <div class="own-panel-npub">${escapeHtml(npub)}</div>
-        ${profile.nip05 ? `<div class="own-panel-nip05">✅ ${escapeHtml(profile.nip05)}</div>` : ""}
+        ${profile.nip05 ? `<div class="own-panel-nip05"><span class="icon">${iconCheckCircle()}</span> ${escapeHtml(profile.nip05)}</div>` : ""}
       </div>
       ${(profile as any).about ? `<div class="own-panel-about">${escapeHtml((profile as any).about)}</div>` : ""}
       <div class="own-panel-stats">
@@ -227,7 +228,7 @@ async function showProfilePopup(pubkey: string): Promise<void> {
     overlay.className = "profile-popup-overlay";
     overlay.innerHTML = `
       <div class="profile-popup-card">
-        <button id="popup-close" class="popup-close-btn">✕</button>
+        <button id="popup-close" class="popup-close-btn"><span class="icon">${iconX()}</span></button>
         <div id="popup-content" class="popup-content">
           <div class="popup-loading">Loading...</div>
         </div>
@@ -267,7 +268,7 @@ async function showProfilePopup(pubkey: string): Promise<void> {
       ${avatarHtml}
       <div class="popup-name">${escapeHtml(name)}</div>
       <div class="popup-npub">${escapeHtml(npub)}</div>
-      ${profile?.nip05 ? `<div class="popup-nip05">✅ ${escapeHtml(profile.nip05)}</div>` : ""}
+      ${profile?.nip05 ? `<div class="popup-nip05"><span class="icon">${iconCheckCircle()}</span> ${escapeHtml(profile.nip05)}</div>` : ""}
       ${(profile as any)?.about ? `<div class="popup-about">${escapeHtml((profile as any).about)}</div>` : ""}
     `;
   } catch (e) {

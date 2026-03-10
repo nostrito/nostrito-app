@@ -1,6 +1,7 @@
 /** Web of Trust — interactive canvas-based graph explorer with lazy expansion. */
 
 import { invoke } from "@tauri-apps/api/core";
+import { iconSearch } from "../utils/icons";
 
 interface WotNode {
   pubkey: string;
@@ -434,7 +435,7 @@ function updateNodeInfo(node: WotNode | null): void {
   if (node.expanded && node.followCount === 0 && !isYou) {
     infoEl.innerHTML += `
       <div class="wot-info-no-data">
-        <span style="font-size:1.2rem">🔍</span>
+        <span style="font-size:1.2rem"><span class="icon">${iconSearch()}</span></span>
         <span>Not synced yet</span>
         <span class="wot-info-no-data-hint">This account's follow list hasn't been discovered. It will appear after deeper WoT sync.</span>
       </div>
