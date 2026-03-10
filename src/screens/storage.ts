@@ -1,17 +1,17 @@
-/** Storage — database stats view. All data from backend commands. */
+/** Storage — ownership-based breakdown view. All data from backend commands. */
 
 import { invoke } from "@tauri-apps/api/core";
-import { iconFileText, iconBookOpen, iconZap, iconRepeat, iconHeart, iconTag, iconUsers, iconMessageCircle, iconBlossom } from "../utils/icons";
+import { iconBlossom } from "../utils/icons";
 
-interface StorageStats {
+interface OwnershipStorageStats {
+  own_events_count: number;
+  own_media_bytes: number;
+  tracked_events_count: number;
+  tracked_media_bytes: number;
+  wot_events_count: number;
+  wot_media_bytes: number;
   total_events: number;
   db_size_bytes: number;
-  oldest_event: number;
-  newest_event: number;
-}
-
-interface KindCounts {
-  counts: Record<string, number>;
 }
 
 export function renderStorage(container: HTMLElement): void {
@@ -21,32 +21,78 @@ export function renderStorage(container: HTMLElement): void {
       <div class="storage-usage-bar">
         <div class="storage-usage-title" id="storage-title">Storage Usage — calculating...</div>
         <div class="storage-usage-visual">
-          <div class="storage-seg storage-seg-notes" id="seg-notes" style="width:0%"></div>
-          <div class="storage-seg storage-seg-contacts" id="seg-contacts" style="width:0%"></div>
-          <div class="storage-seg storage-seg-meta" id="seg-meta" style="width:0%"></div>
-          <div class="storage-seg storage-seg-other" id="seg-other" style="width:0%"></div>
+          <div class="storage-seg" id="seg-own" style="width:0%;background:var(--accent)"></div>
+          <div class="storage-seg" id="seg-tracked" style="width:0%;background:var(--purple)"></div>
+          <div class="storage-seg" id="seg-wot" style="width:0%;background:var(--blue)"></div>
         </div>
         <div class="storage-legend">
-          <div class="storage-legend-item"><div class="storage-legend-dot" style="background:var(--accent)"></div><span id="legend-notes">Notes</span></div>
-          <div class="storage-legend-item"><div class="storage-legend-dot" style="background:var(--purple)"></div><span id="legend-contacts">Contacts</span></div>
-          <div class="storage-legend-item"><div class="storage-legend-dot" style="background:var(--blue)"></div><span id="legend-meta">Metadata</span></div>
-          <div class="storage-legend-item"><div class="storage-legend-dot" style="background:var(--green)"></div><span id="legend-other">Other</span></div>
+          <div class="storage-legend-item"><div class="storage-legend-dot" style="background:var(--accent)"></div><span>Own Events</span></div>
+          <div class="storage-legend-item"><div class="storage-legend-dot" style="background:var(--purple)"></div><span>Tracked Profiles</span></div>
+          <div class="storage-legend-item"><div class="storage-legend-dot" style="background:var(--blue)"></div><span>WoT Profiles</span></div>
         </div>
       </div>
-      <div class="kind-grid-page" id="kind-grid">
-        <div class="kind-card-p"><div class="kind-card-top"><span class="kind-icon">${iconFileText()}</span><span class="kind-name">Notes</span><span class="kind-count" id="kc-1">—</span></div><span class="kind-meta">kind 1</span></div>
-        <div class="kind-card-p"><div class="kind-card-top"><span class="kind-icon">${iconBookOpen()}</span><span class="kind-name">Long-form</span><span class="kind-count" id="kc-30023">—</span></div><span class="kind-meta">kind 30023</span></div>
-        <div class="kind-card-p"><div class="kind-card-top"><span class="kind-icon">${iconZap()}</span><span class="kind-name">Zaps</span><span class="kind-count" id="kc-9735">—</span></div><span class="kind-meta">kind 9735</span></div>
-        <div class="kind-card-p"><div class="kind-card-top"><span class="kind-icon">${iconRepeat()}</span><span class="kind-name">Reposts</span><span class="kind-count" id="kc-6">—</span></div><span class="kind-meta">kind 6</span></div>
-        <div class="kind-card-p"><div class="kind-card-top"><span class="kind-icon">${iconHeart()}</span><span class="kind-name">Reactions</span><span class="kind-count" id="kc-7">—</span></div><span class="kind-meta">kind 7</span></div>
-        <div class="kind-card-p"><div class="kind-card-top"><span class="kind-icon">${iconTag()}</span><span class="kind-name">Metadata</span><span class="kind-count" id="kc-0">—</span></div><span class="kind-meta">kind 0</span></div>
-        <div class="kind-card-p"><div class="kind-card-top"><span class="kind-icon">${iconUsers()}</span><span class="kind-name">Contacts</span><span class="kind-count" id="kc-3">—</span></div><span class="kind-meta">kind 3</span></div>
-        <div class="kind-card-p"><div class="kind-card-top"><span class="kind-icon">${iconMessageCircle()}</span><span class="kind-name">DMs</span><span class="kind-count" id="kc-dms">—</span></div><span class="kind-meta">kind 4 + 1059</span></div>
+
+      <div class="ownership-grid" id="ownership-grid">
+        <!-- Own Events -->
+        <div class="ownership-card own">
+          <div class="ownership-card-header">
+            <span class="ownership-card-label">Own Events</span>
+            <span class="ownership-card-badge own">YOU</span>
+          </div>
+          <div class="ownership-card-body">
+            <div class="ownership-stat">
+              <span class="ownership-stat-value" id="own-events-count">—</span>
+              <span class="ownership-stat-label">events</span>
+            </div>
+            <div class="ownership-stat">
+              <span class="ownership-stat-value" id="own-media-size">—</span>
+              <span class="ownership-stat-label">media</span>
+            </div>
+          </div>
+          <div class="ownership-card-footer">Always kept — never pruned</div>
+        </div>
+
+        <!-- Tracked Profiles -->
+        <div class="ownership-card tracked">
+          <div class="ownership-card-header">
+            <span class="ownership-card-label">Tracked Profiles</span>
+            <span class="ownership-card-badge tracked">TRACKED</span>
+          </div>
+          <div class="ownership-card-body">
+            <div class="ownership-stat">
+              <span class="ownership-stat-value" id="tracked-events-count">—</span>
+              <span class="ownership-stat-label">events</span>
+            </div>
+            <div class="ownership-stat">
+              <span class="ownership-stat-value" id="tracked-media-size">—</span>
+              <span class="ownership-stat-label">media</span>
+            </div>
+          </div>
+          <div class="ownership-card-footer">Always kept — never pruned</div>
+        </div>
+
+        <!-- WoT Profiles -->
+        <div class="ownership-card wot">
+          <div class="ownership-card-header">
+            <span class="ownership-card-label">WoT Profiles</span>
+            <span class="ownership-card-badge wot">WOT</span>
+          </div>
+          <div class="ownership-card-body">
+            <div class="ownership-stat">
+              <span class="ownership-stat-value" id="wot-events-count">—</span>
+              <span class="ownership-stat-label">events</span>
+            </div>
+            <div class="ownership-stat">
+              <span class="ownership-stat-value" id="wot-media-size">—</span>
+              <span class="ownership-stat-label">cached media</span>
+            </div>
+          </div>
+          <div class="ownership-card-footer">Subject to retention limits</div>
+        </div>
       </div>
-      <div id="storage-db-info" style="font-size:0.8rem;color:var(--text-muted);margin-top:12px">
-      </div>
+
       <div class="storage-media-section" id="storage-media-section" style="margin-top:20px">
-        <div class="storage-usage-title"><span class="icon">${iconBlossom()}</span> Blossom Media Cache</div>
+        <div class="storage-usage-title"><span class="icon">${iconBlossom()}</span> Blossom Media Cache (Total)</div>
         <div class="storage-usage-visual" style="margin:8px 0">
           <div class="storage-seg" id="media-seg-fill" style="width:0%;background:var(--purple)"></div>
         </div>
@@ -56,10 +102,12 @@ export function renderStorage(container: HTMLElement): void {
           <span>limit: <span id="media-size-limit">—</span></span>
         </div>
       </div>
+
+      <div id="storage-db-info" style="font-size:0.8rem;color:var(--text-muted);margin-top:12px"></div>
     </div>
   `;
 
-  loadStorageStats();
+  loadOwnershipStats();
 }
 
 function formatBytes(bytes: number): string {
@@ -69,78 +117,54 @@ function formatBytes(bytes: number): string {
   return (bytes / Math.pow(1024, i)).toFixed(1) + " " + units[i];
 }
 
-async function loadStorageStats(): Promise<void> {
+async function loadOwnershipStats(): Promise<void> {
   try {
-    // Get real storage stats
-    console.log("[storage] Calling get_storage_stats...");
-    const stats = await invoke<StorageStats>("get_storage_stats");
-    console.log("[storage] get_storage_stats response:", JSON.stringify(stats));
+    const stats = await invoke<OwnershipStorageStats>("get_ownership_storage_stats");
 
+    // Title
     const titleEl = document.getElementById("storage-title");
     if (titleEl) {
       titleEl.textContent = `Storage Usage — ${stats.total_events.toLocaleString()} events · ${formatBytes(stats.db_size_bytes)}`;
     }
 
-    // Get real kind counts
-    try {
-      console.log("[storage] Calling get_kind_counts...");
-      const kindData = await invoke<KindCounts>("get_kind_counts");
-      console.log("[storage] get_kind_counts response:", JSON.stringify(kindData));
-      const counts = kindData.counts;
+    // Own
+    const ownCountEl = document.getElementById("own-events-count");
+    const ownMediaEl = document.getElementById("own-media-size");
+    if (ownCountEl) ownCountEl.textContent = stats.own_events_count.toLocaleString();
+    if (ownMediaEl) ownMediaEl.textContent = formatBytes(stats.own_media_bytes);
 
-      // Populate kind cards
-      const kindIds = ["0", "1", "3", "6", "7", "9735", "30023"];
-      for (const k of kindIds) {
-        const el = document.getElementById(`kc-${k}`);
-        if (el) {
-          const count = counts[k] || 0;
-          el.textContent = count.toLocaleString();
-        }
-      }
+    // Tracked
+    const trackedCountEl = document.getElementById("tracked-events-count");
+    const trackedMediaEl = document.getElementById("tracked-media-size");
+    if (trackedCountEl) trackedCountEl.textContent = stats.tracked_events_count.toLocaleString();
+    if (trackedMediaEl) trackedMediaEl.textContent = formatBytes(stats.tracked_media_bytes);
 
-      // DMs: sum kind 4 (NIP-04) + kind 1059 (NIP-17 gift wrap)
-      const dmCount = (counts["4"] || 0) + (counts["1059"] || 0);
-      const dmEl = document.getElementById("kc-dms");
-      if (dmEl) {
-        dmEl.textContent = dmCount.toLocaleString();
-      }
+    // WoT
+    const wotCountEl = document.getElementById("wot-events-count");
+    const wotMediaEl = document.getElementById("wot-media-size");
+    if (wotCountEl) wotCountEl.textContent = stats.wot_events_count.toLocaleString();
+    if (wotMediaEl) wotMediaEl.textContent = formatBytes(stats.wot_media_bytes);
 
-      // Compute storage bar segments from real data
-      const total = stats.total_events || 1;
-      const notes = (counts["1"] || 0) / total * 100;
-      const meta = (counts["0"] || 0) / total * 100;
-      const contacts = (counts["3"] || 0) / total * 100;
-      const other = Math.max(0, 100 - notes - meta - contacts);
+    // Usage bar segments
+    const total = stats.total_events || 1;
+    const ownPct = (stats.own_events_count / total) * 100;
+    const trackedPct = (stats.tracked_events_count / total) * 100;
+    const wotPct = Math.max(0, 100 - ownPct - trackedPct);
 
-      const segNotes = document.getElementById("seg-notes");
-      const segContacts = document.getElementById("seg-contacts");
-      const segMeta = document.getElementById("seg-meta");
-      const segOther = document.getElementById("seg-other");
-      if (segNotes) segNotes.style.width = `${notes}%`;
-      if (segContacts) segContacts.style.width = `${contacts}%`;
-      if (segMeta) segMeta.style.width = `${meta}%`;
-      if (segOther) segOther.style.width = `${other}%`;
-    } catch (_) {
-      // Kind counts not available yet
-    }
+    const segOwn = document.getElementById("seg-own");
+    const segTracked = document.getElementById("seg-tracked");
+    const segWot = document.getElementById("seg-wot");
+    if (segOwn) segOwn.style.width = `${ownPct}%`;
+    if (segTracked) segTracked.style.width = `${trackedPct}%`;
+    if (segWot) segWot.style.width = `${wotPct}%`;
 
-    // Show DB info
-    const dbInfo = document.getElementById("storage-db-info");
-    if (dbInfo) {
-      const oldest = stats.oldest_event > 0
-        ? new Date(stats.oldest_event * 1000).toLocaleDateString()
-        : "—";
-      const newest = stats.newest_event > 0
-        ? new Date(stats.newest_event * 1000).toLocaleDateString()
-        : "—";
-      dbInfo.textContent = `Event range: ${oldest} → ${newest}`;
-    }
-  } catch (_) {
+  } catch (e) {
     const titleEl = document.getElementById("storage-title");
     if (titleEl) titleEl.textContent = "Storage Usage — no data";
+    console.error("[storage] get_ownership_storage_stats failed:", e);
   }
 
-  // Media cache stats
+  // Media cache stats (total)
   try {
     const media = await invoke<{ total_bytes: number; file_count: number; limit_bytes: number }>("get_media_stats");
     const countEl = document.getElementById("media-file-count");
@@ -152,5 +176,20 @@ async function loadStorageStats(): Promise<void> {
     if (limitEl) limitEl.textContent = formatBytes(media.limit_bytes);
     const pct = media.limit_bytes > 0 ? Math.min(100, (media.total_bytes / media.limit_bytes) * 100) : 0;
     if (fillEl) fillEl.style.width = `${pct}%`;
+  } catch (_) {}
+
+  // DB info (event time range)
+  try {
+    const stats = await invoke<{ total_events: number; db_size_bytes: number; oldest_event: number; newest_event: number }>("get_storage_stats");
+    const dbInfo = document.getElementById("storage-db-info");
+    if (dbInfo) {
+      const oldest = stats.oldest_event > 0
+        ? new Date(stats.oldest_event * 1000).toLocaleDateString()
+        : "—";
+      const newest = stats.newest_event > 0
+        ? new Date(stats.newest_event * 1000).toLocaleDateString()
+        : "—";
+      dbInfo.textContent = `Event range: ${oldest} → ${newest}`;
+    }
   } catch (_) {}
 }

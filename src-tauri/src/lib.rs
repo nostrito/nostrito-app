@@ -1095,6 +1095,10 @@ async fn save_settings(settings: Settings, state: State<'_, AppState>) -> Result
     config.max_storage_mb = settings.max_storage_mb;
     config.storage_others_gb = settings.storage_others_gb;
     config.storage_media_gb = settings.storage_media_gb;
+    config.storage_own_media_gb = settings.storage_own_media_gb;
+    config.storage_tracked_media_gb = settings.storage_tracked_media_gb;
+    config.storage_wot_media_gb = settings.storage_wot_media_gb;
+    config.wot_event_retention_days = settings.wot_event_retention_days;
     config.wot_max_depth = settings.wot_max_depth;
     config.sync_interval_secs = settings.sync_interval_secs;
     config.outbound_relays = settings.outbound_relays;
@@ -1119,6 +1123,10 @@ async fn save_settings(settings: Settings, state: State<'_, AppState>) -> Result
     db.set_config("sync_wot_batch_size", &settings.sync_wot_batch_size.to_string()).ok();
     db.set_config("sync_wot_events_per_batch", &settings.sync_wot_events_per_batch.to_string()).ok();
     db.set_config("max_event_age_days", &settings.max_event_age_days.to_string()).ok();
+    db.set_config("storage_own_media_gb", &settings.storage_own_media_gb.to_string()).ok();
+    db.set_config("storage_tracked_media_gb", &settings.storage_tracked_media_gb.to_string()).ok();
+    db.set_config("storage_wot_media_gb", &settings.storage_wot_media_gb.to_string()).ok();
+    db.set_config("wot_event_retention_days", &settings.wot_event_retention_days.to_string()).ok();
 
     Ok(())
 }
@@ -1368,6 +1376,10 @@ pub fn run() {
     if let Ok(Some(v)) = db.get_config("sync_wot_batch_size") { if let Ok(n) = v.parse::<u32>() { config.sync_wot_batch_size = n; } }
     if let Ok(Some(v)) = db.get_config("sync_wot_events_per_batch") { if let Ok(n) = v.parse::<u32>() { config.sync_wot_events_per_batch = n; } }
     if let Ok(Some(v)) = db.get_config("max_event_age_days") { if let Ok(n) = v.parse::<u32>() { config.max_event_age_days = n; } }
+    if let Ok(Some(v)) = db.get_config("storage_own_media_gb") { if let Ok(n) = v.parse::<f64>() { config.storage_own_media_gb = n; } }
+    if let Ok(Some(v)) = db.get_config("storage_tracked_media_gb") { if let Ok(n) = v.parse::<f64>() { config.storage_tracked_media_gb = n; } }
+    if let Ok(Some(v)) = db.get_config("storage_wot_media_gb") { if let Ok(n) = v.parse::<f64>() { config.storage_wot_media_gb = n; } }
+    if let Ok(Some(v)) = db.get_config("wot_event_retention_days") { if let Ok(n) = v.parse::<u32>() { config.wot_event_retention_days = n; } }
 
     tracing::info!("[init] Config: npub={:?}, relays={:?}, port={}", config.npub, config.outbound_relays, config.relay_port);
 
@@ -1510,6 +1522,7 @@ pub fn run() {
             get_feed,
             search_events,
             get_storage_stats,
+            get_ownership_storage_stats,
             get_settings,
             save_settings,
             start_sync,

@@ -11,6 +11,10 @@ interface Settings {
   max_storage_mb: number;
   storage_others_gb: number;
   storage_media_gb: number;
+  storage_own_media_gb: number;
+  storage_tracked_media_gb: number;
+  storage_wot_media_gb: number;
+  wot_event_retention_days: number;
   wot_max_depth: number;
   sync_interval_secs: number;
   outbound_relays: string[];
@@ -83,90 +87,112 @@ export function renderSettings(container: HTMLElement): void {
         <!-- Storage -->
         <div class="settings-pane" id="pane-storage">
           <div class="settings-pane-title">Storage</div>
-          <div class="settings-pane-desc">Control what gets stored and how much space to use.</div>
+          <div class="settings-pane-desc">Control what gets stored, organized by ownership.</div>
 
-          <div class="storage-section">
-            <div class="storage-row locked">
-              <div class="storage-row-info">
-                <span class="storage-row-label">Your events & media</span>
-                <span class="storage-row-meta"><span class="icon">${iconLock()}</span> Always stored. No exceptions.</span>
+          <!-- Own Events Section -->
+          <div class="storage-category-section">
+            <div class="storage-category-header">
+              <span class="storage-category-badge own">YOU</span>
+              <span class="storage-category-title">Own Events</span>
+            </div>
+            <div class="storage-section">
+              <div class="storage-row locked">
+                <div class="storage-row-info">
+                  <span class="storage-row-label">Event retention</span>
+                  <span class="storage-row-meta"><span class="icon">${iconLock()}</span> Own events are always kept</span>
+                </div>
               </div>
-              <div class="storage-bar-wrap">
-                <div class="storage-bar"><div class="storage-bar-fill"></div></div>
-                <span class="storage-bar-label">100%</span>
+            </div>
+            <div class="storage-section">
+              <div class="storage-row">
+                <div class="storage-row-info">
+                  <span class="storage-row-label">Own media limit</span>
+                  <span class="storage-row-meta">Blossom media from your own events</span>
+                </div>
+                <div class="storage-slider-wrap">
+                  <input type="range" class="storage-slider" min="1" max="50" value="5" id="settings-own-media-slider">
+                  <span class="storage-slider-value" id="settings-own-media-val">5 GB</span>
+                </div>
               </div>
             </div>
           </div>
 
-          <div class="storage-section">
-            <div class="storage-row">
-              <div class="storage-row-info">
-                <span class="storage-row-label">Others' events</span>
-                <span class="storage-row-meta">From your Web of Trust</span>
+          <!-- Tracked Profiles Section -->
+          <div class="storage-category-section">
+            <div class="storage-category-header">
+              <span class="storage-category-badge tracked">TRACKED</span>
+              <span class="storage-category-title">Tracked Profiles</span>
+            </div>
+            <div class="storage-section">
+              <div class="storage-row locked">
+                <div class="storage-row-info">
+                  <span class="storage-row-label">Event retention</span>
+                  <span class="storage-row-meta"><span class="icon">${iconLock()}</span> Tracked profiles are always kept</span>
+                </div>
               </div>
-              <div class="storage-slider-wrap">
-                <input type="range" class="storage-slider" min="1" max="50" value="5" id="settings-others-events-slider">
-                <span class="storage-slider-value" id="settings-others-events-val">5 GB</span>
+            </div>
+            <div class="storage-section">
+              <div class="storage-row">
+                <div class="storage-row-info">
+                  <span class="storage-row-label">Tracked media limit</span>
+                  <span class="storage-row-meta">Blossom media from tracked profiles</span>
+                </div>
+                <div class="storage-slider-wrap">
+                  <input type="range" class="storage-slider" min="1" max="50" value="3" id="settings-tracked-media-slider">
+                  <span class="storage-slider-value" id="settings-tracked-media-val">3 GB</span>
+                </div>
+              </div>
+            </div>
+            <div class="storage-section">
+              <div class="storage-row">
+                <div class="storage-row-info">
+                  <span class="storage-row-label">Manage tracked profiles</span>
+                  <span class="storage-row-meta">These profiles are never pruned. Perfect for important follows.</span>
+                </div>
+                <div id="tracked-profiles-list" style="margin:8px 0;max-height:400px;overflow-y:auto;font-size:0.82rem;color:var(--text-dim)">Loading...</div>
+                <div style="display:flex;gap:8px;margin-top:8px">
+                  <input type="text" id="track-profile-input" placeholder="npub or hex pubkey" style="flex:1;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:0.82rem;font-family:var(--mono)">
+                  <button class="btn btn-primary" id="btn-track-profile" style="font-size:0.82rem;padding:8px 16px">Track</button>
+                </div>
               </div>
             </div>
           </div>
 
-          <div class="storage-section">
-            <div class="storage-row">
-              <div class="storage-row-info">
-                <span class="storage-row-label">Others' media (Blossom)</span>
-                <span class="storage-row-meta">Images, videos, audio from your network</span>
-              </div>
-              <div class="storage-slider-wrap">
-                <input type="range" class="storage-slider" min="1" max="50" value="2" id="settings-others-media-slider">
-                <span class="storage-slider-value" id="settings-others-media-val">2 GB</span>
+          <!-- WoT Profiles Section -->
+          <div class="storage-category-section">
+            <div class="storage-category-header">
+              <span class="storage-category-badge wot">WOT</span>
+              <span class="storage-category-title">WoT Profiles</span>
+            </div>
+            <div class="storage-section">
+              <div class="storage-row">
+                <div class="storage-row-info">
+                  <span class="storage-row-label">Event retention</span>
+                  <span class="storage-row-meta">How long to keep WoT events before pruning</span>
+                </div>
+                <div class="storage-slider-wrap">
+                  <input type="range" class="storage-slider" min="7" max="365" step="1" value="30" id="storage-wot-retention">
+                  <span class="storage-slider-value" id="storage-wot-retention-val">30 days</span>
+                </div>
+                <div style="display:flex;gap:8px;margin-top:8px">
+                  <button class="btn btn-secondary wot-age-preset" data-days="7" style="font-size:0.75rem;padding:4px 10px">7d</button>
+                  <button class="btn btn-secondary wot-age-preset" data-days="14" style="font-size:0.75rem;padding:4px 10px">14d</button>
+                  <button class="btn btn-secondary wot-age-preset" data-days="30" style="font-size:0.75rem;padding:4px 10px">30d</button>
+                  <button class="btn btn-secondary wot-age-preset" data-days="90" style="font-size:0.75rem;padding:4px 10px">90d</button>
+                  <button class="btn btn-secondary wot-age-preset" data-days="365" style="font-size:0.75rem;padding:4px 10px">1yr</button>
+                </div>
               </div>
             </div>
-          </div>
-
-          <div class="storage-section">
-            <div class="storage-row">
-              <div class="storage-row-info">
-                <span class="storage-row-label">Auto-cleanup</span>
-                <span class="storage-row-meta">When storage limit is reached</span>
-              </div>
-              <div class="cleanup-group" id="settings-cleanup-group">
-                <div class="cleanup-radio active" data-cleanup="oldest">Oldest first</div>
-                <div class="cleanup-radio" data-cleanup="least-interacted">Least interacted</div>
-              </div>
-            </div>
-          </div>
-
-          <div class="storage-section">
-            <div class="storage-row">
-              <div class="storage-row-info">
-                <span class="storage-row-label">Event retention</span>
-                <span class="storage-row-meta">How long to keep others' events. Own events and tracked profiles are kept forever.</span>
-              </div>
-              <div class="storage-slider-wrap">
-                <input type="range" class="storage-slider" min="7" max="365" step="1" value="30" id="storage-max-age">
-                <span class="storage-slider-value" id="storage-max-age-val">30 days</span>
-              </div>
-              <div style="display:flex;gap:8px;margin-top:8px">
-                <button class="btn btn-secondary age-preset" data-days="7" style="font-size:0.75rem;padding:4px 10px">7d</button>
-                <button class="btn btn-secondary age-preset" data-days="14" style="font-size:0.75rem;padding:4px 10px">14d</button>
-                <button class="btn btn-secondary age-preset" data-days="30" style="font-size:0.75rem;padding:4px 10px">30d</button>
-                <button class="btn btn-secondary age-preset" data-days="90" style="font-size:0.75rem;padding:4px 10px">90d</button>
-                <button class="btn btn-secondary age-preset" data-days="365" style="font-size:0.75rem;padding:4px 10px">1yr</button>
-              </div>
-            </div>
-          </div>
-
-          <div class="storage-section">
-            <div class="storage-row">
-              <div class="storage-row-info">
-                <span class="storage-row-label">Tracked Profiles</span>
-                <span class="storage-row-meta">These profiles are always kept — no age limit, never pruned. Perfect for important follows.</span>
-              </div>
-              <div id="tracked-profiles-list" style="margin:8px 0;max-height:400px;overflow-y:auto;font-size:0.82rem;color:var(--text-dim)">Loading...</div>
-              <div style="display:flex;gap:8px;margin-top:8px">
-                <input type="text" id="track-profile-input" placeholder="npub or hex pubkey" style="flex:1;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:0.82rem;font-family:var(--mono)">
-                <button class="btn btn-primary" id="btn-track-profile" style="font-size:0.82rem;padding:8px 16px">Track</button>
+            <div class="storage-section">
+              <div class="storage-row">
+                <div class="storage-row-info">
+                  <span class="storage-row-label">WoT media limit</span>
+                  <span class="storage-row-meta">Blossom media from WoT profiles</span>
+                </div>
+                <div class="storage-slider-wrap">
+                  <input type="range" class="storage-slider" min="1" max="50" value="2" id="settings-wot-media-slider">
+                  <span class="storage-slider-value" id="settings-wot-media-val">2 GB</span>
+                </div>
               </div>
             </div>
           </div>
@@ -342,50 +368,47 @@ export function renderSettings(container: HTMLElement): void {
     });
   });
 
-  // Wire storage sliders
-  const evSlider = document.getElementById("settings-others-events-slider") as HTMLInputElement | null;
-  const evVal = document.getElementById("settings-others-events-val");
-  if (evSlider && evVal) {
-    evSlider.addEventListener("input", () => {
-      evVal.textContent = `${evSlider.value} GB`;
+  // Wire storage sliders (per-category)
+  const ownMediaSlider = document.getElementById("settings-own-media-slider") as HTMLInputElement | null;
+  const ownMediaVal = document.getElementById("settings-own-media-val");
+  if (ownMediaSlider && ownMediaVal) {
+    ownMediaSlider.addEventListener("input", () => {
+      ownMediaVal.textContent = `${ownMediaSlider.value} GB`;
     });
   }
 
-  const mdSlider = document.getElementById("settings-others-media-slider") as HTMLInputElement | null;
-  const mdVal = document.getElementById("settings-others-media-val");
-  if (mdSlider && mdVal) {
-    mdSlider.addEventListener("input", () => {
-      mdVal.textContent = `${mdSlider.value} GB`;
+  const trackedMediaSlider = document.getElementById("settings-tracked-media-slider") as HTMLInputElement | null;
+  const trackedMediaVal = document.getElementById("settings-tracked-media-val");
+  if (trackedMediaSlider && trackedMediaVal) {
+    trackedMediaSlider.addEventListener("input", () => {
+      trackedMediaVal.textContent = `${trackedMediaSlider.value} GB`;
     });
   }
 
-  // Wire cleanup radios
-  const cleanupGroup = document.getElementById("settings-cleanup-group");
-  if (cleanupGroup) {
-    cleanupGroup.querySelectorAll(".cleanup-radio").forEach((radio) => {
-      radio.addEventListener("click", () => {
-        cleanupGroup.querySelectorAll(".cleanup-radio").forEach((r) => r.classList.remove("active"));
-        radio.classList.add("active");
-      });
+  const wotMediaSlider = document.getElementById("settings-wot-media-slider") as HTMLInputElement | null;
+  const wotMediaVal = document.getElementById("settings-wot-media-val");
+  if (wotMediaSlider && wotMediaVal) {
+    wotMediaSlider.addEventListener("input", () => {
+      wotMediaVal.textContent = `${wotMediaSlider.value} GB`;
     });
   }
 
-  // Wire event retention slider
-  const ageSlider = document.getElementById("storage-max-age") as HTMLInputElement | null;
-  const ageVal = document.getElementById("storage-max-age-val");
-  if (ageSlider && ageVal) {
-    ageSlider.addEventListener("input", () => {
-      ageVal.textContent = `${ageSlider.value} days`;
+  // Wire WoT event retention slider
+  const wotRetentionSlider = document.getElementById("storage-wot-retention") as HTMLInputElement | null;
+  const wotRetentionVal = document.getElementById("storage-wot-retention-val");
+  if (wotRetentionSlider && wotRetentionVal) {
+    wotRetentionSlider.addEventListener("input", () => {
+      wotRetentionVal.textContent = `${wotRetentionSlider.value} days`;
     });
   }
 
-  // Wire age preset buttons
-  container.querySelectorAll(".age-preset").forEach((btn) => {
+  // Wire WoT age preset buttons
+  container.querySelectorAll(".wot-age-preset").forEach((btn) => {
     btn.addEventListener("click", () => {
       const days = (btn as HTMLElement).dataset.days;
-      if (days && ageSlider && ageVal) {
-        ageSlider.value = days;
-        ageVal.textContent = `${days} days`;
+      if (days && wotRetentionSlider && wotRetentionVal) {
+        wotRetentionSlider.value = days;
+        wotRetentionVal.textContent = `${days} days`;
       }
     });
   });
@@ -464,15 +487,18 @@ export function renderSettings(container: HTMLElement): void {
     const btn = document.getElementById("btn-save-storage") as HTMLButtonElement | null;
     if (!_currentSettings || !btn) return;
 
-    const evSliderEl = document.getElementById("settings-others-events-slider") as HTMLInputElement;
-    const mdSliderEl = document.getElementById("settings-others-media-slider") as HTMLInputElement;
+    const ownMediaEl = document.getElementById("settings-own-media-slider") as HTMLInputElement;
+    const trackedMediaEl = document.getElementById("settings-tracked-media-slider") as HTMLInputElement;
+    const wotMediaEl = document.getElementById("settings-wot-media-slider") as HTMLInputElement;
+    const wotRetentionEl = document.getElementById("storage-wot-retention") as HTMLInputElement;
 
-    const ageSliderSave = document.getElementById("storage-max-age") as HTMLInputElement;
     const updated = {
       ..._currentSettings,
-      storage_others_gb: parseFloat(evSliderEl.value),
-      storage_media_gb: parseFloat(mdSliderEl.value),
-      max_event_age_days: parseInt(ageSliderSave?.value || "30", 10),
+      storage_own_media_gb: parseFloat(ownMediaEl?.value || "5"),
+      storage_tracked_media_gb: parseFloat(trackedMediaEl?.value || "3"),
+      storage_wot_media_gb: parseFloat(wotMediaEl?.value || "2"),
+      wot_event_retention_days: parseInt(wotRetentionEl?.value || "30", 10),
+      max_event_age_days: parseInt(wotRetentionEl?.value || "30", 10),
     };
 
     btn.disabled = true;
@@ -753,27 +779,39 @@ async function loadSettings(): Promise<void> {
     const autostartEl = document.getElementById("settings-autostart") as HTMLInputElement | null;
     if (autostartEl) autostartEl.checked = settings.auto_start;
 
-    // Storage sliders
+    // Storage sliders (per-category)
     _currentSettings = settings;
-    const evSliderEl = document.getElementById("settings-others-events-slider") as HTMLInputElement | null;
-    const evValEl = document.getElementById("settings-others-events-val");
-    if (evSliderEl && evValEl) {
-      evSliderEl.value = String(Math.round(settings.storage_others_gb));
-      evValEl.textContent = `${Math.round(settings.storage_others_gb)} GB`;
-    }
-    const mdSliderEl = document.getElementById("settings-others-media-slider") as HTMLInputElement | null;
-    const mdValEl = document.getElementById("settings-others-media-val");
-    if (mdSliderEl && mdValEl) {
-      mdSliderEl.value = String(Math.round(settings.storage_media_gb));
-      mdValEl.textContent = `${Math.round(settings.storage_media_gb)} GB`;
+
+    // Own media slider
+    const ownMediaSliderEl = document.getElementById("settings-own-media-slider") as HTMLInputElement | null;
+    const ownMediaValEl = document.getElementById("settings-own-media-val");
+    if (ownMediaSliderEl && ownMediaValEl) {
+      ownMediaSliderEl.value = String(Math.round(settings.storage_own_media_gb));
+      ownMediaValEl.textContent = `${Math.round(settings.storage_own_media_gb)} GB`;
     }
 
-    // Event retention slider
-    const ageSliderEl = document.getElementById("storage-max-age") as HTMLInputElement | null;
-    const ageValEl = document.getElementById("storage-max-age-val");
-    if (ageSliderEl && ageValEl) {
-      ageSliderEl.value = String(settings.max_event_age_days);
-      ageValEl.textContent = `${settings.max_event_age_days} days`;
+    // Tracked media slider
+    const trackedMediaSliderEl = document.getElementById("settings-tracked-media-slider") as HTMLInputElement | null;
+    const trackedMediaValEl = document.getElementById("settings-tracked-media-val");
+    if (trackedMediaSliderEl && trackedMediaValEl) {
+      trackedMediaSliderEl.value = String(Math.round(settings.storage_tracked_media_gb));
+      trackedMediaValEl.textContent = `${Math.round(settings.storage_tracked_media_gb)} GB`;
+    }
+
+    // WoT media slider
+    const wotMediaSliderEl = document.getElementById("settings-wot-media-slider") as HTMLInputElement | null;
+    const wotMediaValEl = document.getElementById("settings-wot-media-val");
+    if (wotMediaSliderEl && wotMediaValEl) {
+      wotMediaSliderEl.value = String(Math.round(settings.storage_wot_media_gb));
+      wotMediaValEl.textContent = `${Math.round(settings.storage_wot_media_gb)} GB`;
+    }
+
+    // WoT event retention slider
+    const wotRetentionSliderEl = document.getElementById("storage-wot-retention") as HTMLInputElement | null;
+    const wotRetentionValEl = document.getElementById("storage-wot-retention-val");
+    if (wotRetentionSliderEl && wotRetentionValEl) {
+      wotRetentionSliderEl.value = String(settings.wot_event_retention_days);
+      wotRetentionValEl.textContent = `${settings.wot_event_retention_days} days`;
     }
 
     // Load tracked profiles
