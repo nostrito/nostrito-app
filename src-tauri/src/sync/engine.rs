@@ -927,23 +927,31 @@ impl SyncEngine {
             // Excluded: kind 4 (DMs — own events only), kind 7 (reactions — noisy,
             // low value for feed), kind 9735 (zaps — noise). This keeps the event
             // store focused on actual content and WoT-relevant data.
-            let filter = Filter::new()
-                .authors(authors)
+            //
+            // Long-form articles (kind 30023) get their own filter so they aren't
+            // crowded out by the much higher volume of metadata/contacts/notes.
+            let main_filter = Filter::new()
+                .authors(authors.clone())
                 .kinds(vec![
                     Kind::Metadata,           // 0 — profiles
                     Kind::TextNote,           // 1 — notes
                     Kind::ContactList,        // 3 — follows (for WoT)
                     Kind::Repost,             // 6 — reposts
-                    Kind::LongFormTextNote,   // 30023 — articles
                 ])
                 .since(since)
                 .limit(self.sync_config.events_per_batch as usize);
+
+            let articles_filter = Filter::new()
+                .authors(authors)
+                .kinds(vec![Kind::LongFormTextNote]) // 30023 — articles
+                .since(since)
+                .limit(20);
 
             let policy = policies
                 .entry(policy_url.clone())
                 .or_insert_with(|| RelayPolicy::new(self.sync_config.relay_min_interval_secs as u64));
 
-            match subscribe_and_collect(&client, vec![filter], 10, policy).await {
+            match subscribe_and_collect(&client, vec![main_filter, articles_filter], 10, policy).await {
                 Ok(events) => {
                     let mut batch_new: u64 = 0;
                     let mut batch_dupe: u64 = 0;
