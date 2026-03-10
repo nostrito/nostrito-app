@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use tracing::{debug, info};
 
+use crate::storage::migrations;
 use crate::wot::WotGraph;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,7 +143,13 @@ impl Database {
             "CREATE INDEX IF NOT EXISTS idx_events_stored ON nostr_events(stored_at);"
         )?;
 
-        info!("Database schema initialized");
+        // Create v2 tables (idempotent — IF NOT EXISTS)
+        migrations::create_v2_tables(&conn)?;
+
+        // Run pending migrations (v1→v2 rename, bootstrap data)
+        migrations::run_migrations(&conn)?;
+
+        info!("Database schema initialized (v{})", migrations::SCHEMA_VERSION);
         Ok(())
     }
 
@@ -1214,5 +1221,549 @@ impl Database {
             |row| row.get(0),
         )?;
         Ok(total as u64)
+    }
+
+    // ── V2: User Relays ──────────────────────────────────────────
+
+    /// Upsert a user relay, respecting source priority (higher source wins).
+    pub fn upsert_user_relay(
+        &self,
+        pubkey: &str,
+        relay_url: &str,
+        direction: &str,
+        source: &str,
+        source_ts: i64,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        // Only replace if new source has equal or higher priority
+        let source_priority = |s: &str| -> i32 {
+            match s {
+                "nip65" => 2,
+                "nip05" => 1,
+                "kind3_hint" => 0,
+                _ => -1,
+            }
+        };
+
+        // Check existing
+        let existing: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT source, source_ts FROM user_relays WHERE pubkey = ?1 AND relay_url = ?2",
+                params![pubkey, relay_url],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok();
+
+        if let Some((existing_source, existing_ts)) = existing {
+            if source_priority(source) < source_priority(&existing_source) {
+                return Ok(false); // Lower priority source, skip
+            }
+            if source == existing_source && source_ts <= existing_ts {
+                return Ok(false); // Same source, not newer
+            }
+        }
+
+        conn.execute(
+            "INSERT INTO user_relays (pubkey, relay_url, direction, source, source_ts)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(pubkey, relay_url) DO UPDATE SET
+                direction = ?3, source = ?4, source_ts = ?5",
+            params![pubkey, relay_url, direction, source, source_ts],
+        )?;
+        Ok(true)
+    }
+
+    /// Get write relays for a pubkey (for outbox routing).
+    pub fn get_write_relays(&self, pubkey: &str) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT relay_url, source FROM user_relays
+             WHERE pubkey = ?1 AND direction IN ('write', 'both')
+             ORDER BY CASE source WHEN 'nip65' THEN 0 WHEN 'nip05' THEN 1 ELSE 2 END",
+        )?;
+        let rows = stmt
+            .query_map(params![pubkey], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Get read relays for a pubkey.
+    pub fn get_read_relays(&self, pubkey: &str) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT relay_url, source FROM user_relays
+             WHERE pubkey = ?1 AND direction IN ('read', 'both')
+             ORDER BY CASE source WHEN 'nip65' THEN 0 WHEN 'nip05' THEN 1 ELSE 2 END",
+        )?;
+        let rows = stmt
+            .query_map(params![pubkey], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Replace all relays for a pubkey from a given source (e.g. when processing a new kind:10002).
+    pub fn replace_user_relays(
+        &self,
+        pubkey: &str,
+        source: &str,
+        source_ts: i64,
+        relays: &[(String, String)], // (relay_url, direction)
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM user_relays WHERE pubkey = ?1 AND source = ?2",
+            params![pubkey, source],
+        )?;
+        let mut stmt = conn.prepare(
+            "INSERT OR REPLACE INTO user_relays (pubkey, relay_url, direction, source, source_ts)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for (relay_url, direction) in relays {
+            stmt.execute(params![pubkey, relay_url, direction, source, source_ts])?;
+        }
+        Ok(())
+    }
+
+    // ── V2: User Cursors ─────────────────────────────────────────
+
+    /// Get the cursor for a pubkey.
+    pub fn get_user_cursor(&self, pubkey: &str) -> Result<Option<(i64, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT last_event_ts, last_fetched_at FROM user_cursors WHERE pubkey = ?1",
+            params![pubkey],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        );
+        match result {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Advance cursor — only moves forward, never backward.
+    pub fn advance_user_cursor(&self, pubkey: &str, event_ts: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO user_cursors (pubkey, last_event_ts, last_fetched_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(pubkey) DO UPDATE SET
+                last_event_ts = MAX(last_event_ts, ?2),
+                last_fetched_at = ?3",
+            params![pubkey, event_ts, now],
+        )?;
+        Ok(())
+    }
+
+    /// Get all cursors for batch processing (e.g. cursor banding).
+    pub fn get_all_cursors(&self) -> Result<Vec<(String, i64, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT pubkey, last_event_ts, last_fetched_at FROM user_cursors",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Clear all user cursors (used on account change).
+    pub fn clear_user_cursors(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM user_cursors", [])?;
+        Ok(())
+    }
+
+    // ── V2: Relay Stats ──────────────────────────────────────────
+
+    /// Record a successful relay interaction.
+    pub fn record_relay_success(&self, relay_url: &str, events_received: u32, latency_ms: u32) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO relay_stats (relay_url, success_count, total_events, avg_latency_ms, last_success)
+             VALUES (?1, 1, ?2, ?3, ?4)
+             ON CONFLICT(relay_url) DO UPDATE SET
+                success_count = success_count + 1,
+                total_events = total_events + ?2,
+                avg_latency_ms = (avg_latency_ms + ?3) / 2,
+                last_success = ?4",
+            params![relay_url, events_received as i64, latency_ms as i64, now],
+        )?;
+        Ok(())
+    }
+
+    /// Record a relay failure.
+    pub fn record_relay_failure(&self, relay_url: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO relay_stats (relay_url, failure_count, last_failure)
+             VALUES (?1, 1, ?2)
+             ON CONFLICT(relay_url) DO UPDATE SET
+                failure_count = failure_count + 1,
+                last_failure = ?2",
+            params![relay_url, now],
+        )?;
+        Ok(())
+    }
+
+    /// Record a relay rate limit.
+    pub fn record_relay_rate_limit(&self, relay_url: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO relay_stats (relay_url, last_rate_limited)
+             VALUES (?1, ?2)
+             ON CONFLICT(relay_url) DO UPDATE SET
+                last_rate_limited = ?2",
+            params![relay_url, now],
+        )?;
+        Ok(())
+    }
+
+    /// Compute reliability score for a relay.
+    pub fn get_relay_reliability(&self, relay_url: &str) -> Result<f64> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT success_count, failure_count, avg_latency_ms, last_rate_limited
+             FROM relay_stats WHERE relay_url = ?1",
+            params![relay_url],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            },
+        );
+
+        match result {
+            Ok((success, failure, latency, last_rl)) => {
+                let base = success as f64 / (success as f64 + failure as f64 + 1.0);
+                let rl_penalty = if let Some(rl_ts) = last_rl {
+                    let hours = (chrono::Utc::now().timestamp() - rl_ts) as f64 / 3600.0;
+                    1.0 - (0.0_f64.max(1.0 - hours / 24.0) * 0.3)
+                } else {
+                    1.0
+                };
+                let latency_factor = 1.0 / (1.0 + latency as f64 / 1000.0);
+                Ok(base * rl_penalty * latency_factor)
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0.5), // Unknown relay gets neutral score
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    // ── V2: Deletion Tombstones ──────────────────────────────────
+
+    /// Check if an event has been deleted.
+    pub fn is_tombstoned(&self, event_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM deletion_tombstones WHERE event_id = ?1",
+            params![event_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Create a deletion tombstone (and delete the actual event if it exists).
+    pub fn create_tombstone(
+        &self,
+        event_id: &str,
+        deleted_by: &str,
+        deletion_event_id: &str,
+        deleted_at: i64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO deletion_tombstones (event_id, deleted_by, deletion_event_id, deleted_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![event_id, deleted_by, deletion_event_id, deleted_at],
+        )?;
+        // Also delete the event itself from storage
+        conn.execute("DELETE FROM nostr_events WHERE id = ?1", params![event_id])?;
+        Ok(())
+    }
+
+    // ── V2: Retention Config ─────────────────────────────────────
+
+    /// Get retention config for a tier.
+    pub fn get_retention_config(&self, tier: &str) -> Result<Option<(u32, u64)>> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT min_events, time_window_secs FROM retention_config WHERE tier = ?1",
+            params![tier],
+            |row| Ok((row.get::<_, i64>(0)? as u32, row.get::<_, i64>(1)? as u64)),
+        );
+        match result {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Update retention config for a tier.
+    pub fn set_retention_config(&self, tier: &str, min_events: u32, time_window_secs: u64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO retention_config (tier, min_events, time_window_secs)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(tier) DO UPDATE SET min_events = ?2, time_window_secs = ?3",
+            params![tier, min_events as i64, time_window_secs as i64],
+        )?;
+        Ok(())
+    }
+
+    // ── V2: Mute Tables ──────────────────────────────────────────
+
+    /// Rebuild all mute tables from a kind:10000 event's tags.
+    pub fn rebuild_mute_lists(&self, tags_json: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+
+        // Clear existing mute data
+        conn.execute_batch(
+            "DELETE FROM muted_users; DELETE FROM muted_events;
+             DELETE FROM muted_words; DELETE FROM muted_hashtags;",
+        )?;
+
+        let tags: Vec<Vec<String>> = serde_json::from_str(tags_json).unwrap_or_default();
+
+        for tag in &tags {
+            if tag.len() < 2 {
+                continue;
+            }
+            match tag[0].as_str() {
+                "p" => {
+                    conn.execute(
+                        "INSERT OR IGNORE INTO muted_users (pubkey, muted_at) VALUES (?1, ?2)",
+                        params![&tag[1], now],
+                    )?;
+                }
+                "e" => {
+                    conn.execute(
+                        "INSERT OR IGNORE INTO muted_events (event_id, muted_at) VALUES (?1, ?2)",
+                        params![&tag[1], now],
+                    )?;
+                }
+                "word" => {
+                    conn.execute(
+                        "INSERT OR IGNORE INTO muted_words (word, muted_at) VALUES (?1, ?2)",
+                        params![tag[1].to_lowercase(), now],
+                    )?;
+                }
+                "t" => {
+                    let hashtag = tag[1].trim_start_matches('#').to_lowercase();
+                    conn.execute(
+                        "INSERT OR IGNORE INTO muted_hashtags (hashtag, muted_at) VALUES (?1, ?2)",
+                        params![hashtag, now],
+                    )?;
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check if a pubkey is muted.
+    pub fn is_pubkey_muted(&self, pubkey: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM muted_users WHERE pubkey = ?1",
+            params![pubkey],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Check if an event is muted.
+    pub fn is_event_muted(&self, event_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM muted_events WHERE event_id = ?1",
+            params![event_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Get all muted words (for content filtering).
+    pub fn get_muted_words(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT word FROM muted_words")?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Get all muted hashtags (for content filtering).
+    pub fn get_muted_hashtags(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT hashtag FROM muted_hashtags")?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    // ── V2: Relay Info ───────────────────────────────────────────
+
+    /// Store or update NIP-11 relay info.
+    pub fn upsert_relay_info(
+        &self,
+        relay_url: &str,
+        name: Option<&str>,
+        description: Option<&str>,
+        supported_nips: Option<&str>,
+        software: Option<&str>,
+        version: Option<&str>,
+        payment_required: bool,
+        auth_required: bool,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO relay_info (relay_url, name, description, supported_nips, software, version,
+             limitation_payment_required, limitation_auth_required, fetched_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(relay_url) DO UPDATE SET
+                name = ?2, description = ?3, supported_nips = ?4, software = ?5, version = ?6,
+                limitation_payment_required = ?7, limitation_auth_required = ?8, fetched_at = ?9",
+            params![
+                relay_url, name, description, supported_nips, software, version,
+                payment_required as i64, auth_required as i64, now
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Check if a relay requires payment.
+    pub fn relay_requires_payment(&self, relay_url: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT limitation_payment_required FROM relay_info WHERE relay_url = ?1",
+            params![relay_url],
+            |row| row.get::<_, i64>(0),
+        );
+        match result {
+            Ok(v) => Ok(v != 0),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    // ── V2: Thread Refs ───────────────────────────────────────────
+
+    /// Insert thread references for an event (e-tag references).
+    pub fn insert_thread_refs(&self, referencing_id: &str, referenced_ids: &[String]) -> Result<()> {
+        if referenced_ids.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "INSERT OR IGNORE INTO thread_refs (referenced_id, referencing_id) VALUES (?1, ?2)",
+        )?;
+        for ref_id in referenced_ids {
+            stmt.execute(params![ref_id, referencing_id])?;
+        }
+        Ok(())
+    }
+
+    /// Delete thread_refs where this event is the referencing side (called when event is pruned).
+    pub fn delete_thread_refs_by_referencing(&self, referencing_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM thread_refs WHERE referencing_id = ?1",
+            params![referencing_id],
+        )?;
+        Ok(())
+    }
+
+    // ── V2: Tiered Pruning ───────────────────────────────────────
+
+    /// Delete events for a specific pubkey older than cutoff, keeping at least min_events.
+    /// Never deletes replaceable metadata (kinds 0, 3, 10000, 10002).
+    pub fn prune_pubkey_events(
+        &self,
+        pubkey: &str,
+        cutoff_ts: i64,
+        min_events: u32,
+    ) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+
+        // Count non-metadata events for this pubkey
+        let total: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM nostr_events WHERE pubkey = ?1 AND kind NOT IN (0, 3, 10000, 10002)",
+            params![pubkey],
+            |row| row.get(0),
+        )?;
+
+        if total <= min_events as i64 {
+            return Ok(0); // Already at or below minimum
+        }
+
+        // First collect IDs that will be deleted (for thread_refs cleanup)
+        let ids_to_delete: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM nostr_events WHERE pubkey = ?1
+                 AND kind NOT IN (0, 3, 10000, 10002)
+                 AND created_at < ?2
+                 AND id NOT IN (
+                    SELECT id FROM nostr_events
+                    WHERE pubkey = ?1 AND kind NOT IN (0, 3, 10000, 10002)
+                    ORDER BY created_at DESC LIMIT ?3
+                 )
+                 AND id NOT IN (SELECT referenced_id FROM thread_refs)",
+            )?;
+            let rows = stmt.query_map(params![pubkey, cutoff_ts, min_events as i64], |row| {
+                row.get::<_, String>(0)
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+            rows
+        };
+
+        if ids_to_delete.is_empty() {
+            return Ok(0);
+        }
+
+        // Delete events
+        for chunk in ids_to_delete.chunks(500) {
+            let placeholders: Vec<String> = (0..chunk.len()).map(|i| format!("?{}", i + 1)).collect();
+            let sql = format!("DELETE FROM nostr_events WHERE id IN ({})", placeholders.join(","));
+            let params_vec: Vec<&dyn rusqlite::ToSql> = chunk.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+            conn.execute(&sql, params_vec.as_slice())?;
+        }
+
+        // Clean up thread_refs for deleted events (as referencing side)
+        for chunk in ids_to_delete.chunks(500) {
+            let placeholders: Vec<String> = (0..chunk.len()).map(|i| format!("?{}", i + 1)).collect();
+            let sql = format!("DELETE FROM thread_refs WHERE referencing_id IN ({})", placeholders.join(","));
+            let params_vec: Vec<&dyn rusqlite::ToSql> = chunk.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+            conn.execute(&sql, params_vec.as_slice())?;
+        }
+
+        Ok(ids_to_delete.len() as u64)
     }
 }

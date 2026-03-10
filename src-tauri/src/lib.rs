@@ -1,4 +1,5 @@
 mod relay;
+mod search;
 mod storage;
 mod sync;
 mod wot;
@@ -12,7 +13,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use storage::{Database, ProfileInfo};
-use sync::{resolve_relay_alias, SyncConfig, SyncEngine, SyncStats, SyncTier};
+use sync::{resolve_relay_alias, SyncConfig, SyncEngine, SyncEngineV2, SyncStats, SyncTier};
 use wot::WotGraph;
 
 // ── App State ──────────────────────────────────────────────────────
@@ -55,6 +56,10 @@ pub struct AppConfig {
     pub sync_wot_batch_size: u32,
     pub sync_wot_events_per_batch: u32,
     pub max_event_age_days: u32,
+    /// "v1" for legacy SyncEngine, "v2" for relay-centric SyncEngineV2
+    pub sync_engine_version: String,
+    /// Cached nsec (loaded from system keychain on startup)
+    pub nsec: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -86,6 +91,8 @@ impl Default for AppConfig {
             sync_wot_batch_size: 5,
             sync_wot_events_per_batch: 15,
             max_event_age_days: 30,
+            sync_engine_version: "v2".to_string(),
+            nsec: None,
         }
     }
 }
@@ -196,6 +203,38 @@ pub struct WotDistanceResponse {
     pub path_count: u64,
     pub mutual_follow: bool,
     pub bridges: Option<Vec<String>>,
+}
+
+// ── Sync Engine Factory ───────────────────────────────────────────
+
+/// Start the appropriate sync engine based on config version.
+/// Returns a CancellationToken for stopping the engine.
+fn start_sync_engine(
+    version: &str,
+    wot_graph: Arc<WotGraph>,
+    db: Arc<Database>,
+    relays: Vec<String>,
+    hex_pubkey: String,
+    sync_tier: Arc<AtomicU8>,
+    sync_stats: Arc<RwLock<SyncStats>>,
+    app_handle: tauri::AppHandle,
+    media_gb: f64,
+    sync_config: SyncConfig,
+    max_event_age_days: u32,
+) -> CancellationToken {
+    if version == "v1" {
+        let engine = Arc::new(SyncEngine::new(
+            wot_graph, db, relays, hex_pubkey, sync_tier, sync_stats,
+            app_handle, media_gb, sync_config, max_event_age_days,
+        ));
+        engine.start()
+    } else {
+        let engine = Arc::new(SyncEngineV2::new(
+            wot_graph, db, relays, hex_pubkey, sync_tier, sync_stats,
+            app_handle, media_gb, sync_config, max_event_age_days,
+        ));
+        engine.start()
+    }
 }
 
 // ── Tauri Commands ─────────────────────────────────────────────────
@@ -315,7 +354,8 @@ async fn init_nostrito(
         wot_events_per_batch: config.sync_wot_events_per_batch,
         cycle_interval_secs: config.sync_interval_secs,
     };
-    let sync_engine = Arc::new(SyncEngine::new(
+    let cancel = start_sync_engine(
+        &config.sync_engine_version,
         state.wot_graph.clone(),
         state.db.clone(),
         config.outbound_relays.clone(),
@@ -326,9 +366,7 @@ async fn init_nostrito(
         config.storage_media_gb,
         sync_config,
         config.max_event_age_days,
-    ));
-
-    let cancel = sync_engine.start();
+    );
     *state.sync_cancel.write().await = Some(cancel);
 
     // Auto-setup mkcert if certs don't exist (first launch)
@@ -493,7 +531,8 @@ async fn start_sync(
         wot_events_per_batch: config.sync_wot_events_per_batch,
         cycle_interval_secs: config.sync_interval_secs,
     };
-    let sync_engine = Arc::new(SyncEngine::new(
+    let cancel = start_sync_engine(
+        &config.sync_engine_version,
         state.wot_graph.clone(),
         state.db.clone(),
         config.outbound_relays.clone(),
@@ -504,9 +543,7 @@ async fn start_sync(
         config.storage_media_gb,
         sync_config,
         config.max_event_age_days,
-    ));
-
-    let cancel = sync_engine.start();
+    );
     *state.sync_cancel.write().await = Some(cancel);
 
     Ok(())
@@ -552,7 +589,8 @@ async fn restart_sync(state: State<'_, AppState>, app_handle: tauri::AppHandle) 
         cycle_interval_secs: config.sync_interval_secs,
     };
 
-    let sync_engine = Arc::new(SyncEngine::new(
+    let cancel = start_sync_engine(
+        &config.sync_engine_version,
         state.wot_graph.clone(),
         state.db.clone(),
         config.outbound_relays.clone(),
@@ -563,10 +601,9 @@ async fn restart_sync(state: State<'_, AppState>, app_handle: tauri::AppHandle) 
         config.storage_media_gb,
         sync_config,
         config.max_event_age_days,
-    ));
+    );
     drop(config);
 
-    let cancel = sync_engine.start();
     *state.sync_cancel.write().await = Some(cancel);
 
     tracing::info!("[cmd:restart_sync] Sync restarted with new config");
@@ -889,6 +926,14 @@ async fn change_account(
         cancel.cancel();
     }
 
+    // Clear nsec from keychain
+    {
+        let config = state.config.read().await;
+        if let Some(ref npub) = config.npub {
+            delete_nsec_from_keychain(npub);
+        }
+    }
+
     // Clear only identity keys and sync cursors from DB config
     // Keep: outbound_relays, sync tuning params, storage settings, etc.
     let identity_keys = [
@@ -912,6 +957,12 @@ async fn change_account(
         .clear_sync_state()
         .map_err(|e| format!("Failed to clear sync_state: {}", e))?;
 
+    // Clear v2 user cursors for fresh start
+    state
+        .db
+        .clear_user_cursors()
+        .map_err(|e| format!("Failed to clear user_cursors: {}", e))?;
+
     // Reset sync stats
     {
         let mut stats = state.sync_stats.write().await;
@@ -923,6 +974,7 @@ async fn change_account(
         let mut config = state.config.write().await;
         config.npub = None;
         config.hex_pubkey = None;
+        config.nsec = None;
     }
 
     // Emit event to frontend to show wizard
@@ -1198,7 +1250,8 @@ async fn save_settings(settings: Settings, app_handle: tauri::AppHandle, state: 
             wot_events_per_batch: config.sync_wot_events_per_batch,
             cycle_interval_secs: config.sync_interval_secs,
         };
-        let sync_engine = Arc::new(SyncEngine::new(
+        let cancel = start_sync_engine(
+            &config.sync_engine_version,
             state.wot_graph.clone(),
             state.db.clone(),
             config.outbound_relays.clone(),
@@ -1209,10 +1262,9 @@ async fn save_settings(settings: Settings, app_handle: tauri::AppHandle, state: 
             config.storage_media_gb,
             sync_config,
             config.max_event_age_days,
-        ));
+        );
         drop(config);
 
-        let cancel = sync_engine.start();
         *state.sync_cancel.write().await = Some(cancel);
         tracing::info!("[cmd:save_settings] Sync engine restarted with new settings");
     }
@@ -1648,6 +1700,84 @@ async fn check_browser_integration() -> Result<bool, String> {
     Ok(cert_path.exists())
 }
 
+// ── nsec Keychain Helpers ────────────────────────────────────────────
+
+fn save_nsec_to_keychain(npub: &str, nsec: &str) -> Result<(), String> {
+    let entry = keyring::Entry::new("nostrito", npub).map_err(|e| format!("Keychain error: {}", e))?;
+    entry.set_password(nsec).map_err(|e| format!("Failed to save to keychain: {}", e))
+}
+
+fn load_nsec_from_keychain(npub: &str) -> Option<String> {
+    let entry = keyring::Entry::new("nostrito", npub).ok()?;
+    entry.get_password().ok()
+}
+
+fn delete_nsec_from_keychain(npub: &str) {
+    if let Ok(entry) = keyring::Entry::new("nostrito", npub) {
+        entry.delete_credential().ok();
+    }
+}
+
+#[tauri::command]
+async fn set_nsec(nsec: String, state: State<'_, AppState>) -> Result<(), String> {
+    use nostr_sdk::prelude::*;
+
+    let nsec_trimmed = nsec.trim();
+
+    // Decode nsec to secret key
+    let secret_key = SecretKey::from_bech32(nsec_trimmed)
+        .map_err(|e| format!("Invalid nsec: {}", e))?;
+
+    // Derive public key
+    let keys = Keys::new(secret_key);
+    let derived_hex = keys.public_key().to_hex();
+
+    // Verify matches current hex_pubkey
+    let config = state.config.read().await;
+    let current_hex = config.hex_pubkey.clone().ok_or("No pubkey set")?;
+    let current_npub = config.npub.clone().ok_or("No npub set")?;
+    drop(config);
+
+    if derived_hex != current_hex {
+        return Err("nsec doesn't match your npub".into());
+    }
+
+    // Save to keychain
+    save_nsec_to_keychain(&current_npub, nsec_trimmed)?;
+
+    // Cache in memory
+    {
+        let mut config = state.config.write().await;
+        config.nsec = Some(nsec_trimmed.to_string());
+    }
+
+    tracing::info!("[cmd:set_nsec] nsec saved for {}...", &current_hex[..8]);
+    Ok(())
+}
+
+#[tauri::command]
+async fn clear_nsec(state: State<'_, AppState>) -> Result<(), String> {
+    let config = state.config.read().await;
+    if let Some(ref npub) = config.npub {
+        delete_nsec_from_keychain(npub);
+    }
+    drop(config);
+
+    {
+        let mut config = state.config.write().await;
+        config.nsec = None;
+    }
+
+    tracing::info!("[cmd:clear_nsec] nsec cleared");
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_signing_mode(state: State<'_, AppState>) -> Result<String, String> {
+    let config = state.config.read().await;
+    Ok(if config.nsec.is_some() { "nsec".to_string() } else { "read-only".to_string() })
+}
+
 // ── App Entry ──────────────────────────────────────────────────────
 
 pub fn run() {
@@ -1773,8 +1903,17 @@ pub fn run() {
     if let Ok(Some(v)) = db.get_config("storage_media_gb") { if let Ok(n) = v.parse::<f64>() { config.storage_media_gb = n; } }
     if let Ok(Some(v)) = db.get_config("wot_max_depth") { if let Ok(n) = v.parse::<u32>() { config.wot_max_depth = n; } }
     if let Ok(Some(v)) = db.get_config("sync_interval_secs") { if let Ok(n) = v.parse::<u32>() { config.sync_interval_secs = n; } }
+    if let Ok(Some(v)) = db.get_config("sync_engine_version") { config.sync_engine_version = v; }
 
-    tracing::info!("[init] Config: npub={:?}, relays={:?}, port={}", config.npub, config.outbound_relays, config.relay_port);
+    // Load nsec from system keychain
+    if let Some(ref npub) = config.npub {
+        if let Some(nsec) = load_nsec_from_keychain(npub) {
+            tracing::info!("[init] Loaded nsec from keychain");
+            config.nsec = Some(nsec);
+        }
+    }
+
+    tracing::info!("[init] Config: npub={:?}, relays={:?}, port={}, engine={}, signing={}", config.npub, config.outbound_relays, config.relay_port, config.sync_engine_version, if config.nsec.is_some() { "nsec" } else { "read-only" });
 
     // ── STARTUP LOG ──
     {
@@ -1867,8 +2006,10 @@ pub fn run() {
                         wot_events_per_batch: cfg2.sync_wot_events_per_batch,
                         cycle_interval_secs: cfg2.sync_interval_secs,
                     };
+                    let engine_version = cfg2.sync_engine_version.clone();
                     drop(cfg2);
-                    let sync_engine = Arc::new(SyncEngine::new(
+                    let cancel = start_sync_engine(
+                        &engine_version,
                         wot_graph,
                         db,
                         relays,
@@ -1879,9 +2020,7 @@ pub fn run() {
                         media_gb,
                         sync_config,
                         max_age_days,
-                    ));
-
-                    let cancel = sync_engine.start();
+                    );
                     *sync_cancel.write().await = Some(cancel);
 
                     // Auto-setup mkcert if certs don't exist
@@ -1977,6 +2116,9 @@ pub fn run() {
             get_tracked_profiles,
             fetch_profile,
             get_profile_cache_status,
+            set_nsec,
+            clear_nsec,
+            get_signing_mode,
         ])
         .run(tauri::generate_context!())
         .expect("error while running nostrito");

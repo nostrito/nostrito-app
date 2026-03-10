@@ -199,6 +199,13 @@ export const Settings: React.FC = () => {
   const [trackedLoading, setTrackedLoading] = useState(true);
   const [trackInput, setTrackInput] = useState("");
 
+  /* --- nsec identity ------------------------------------------------ */
+  const [nsecExpanded, setNsecExpanded] = useState(false);
+  const [nsecInput, setNsecInput] = useState("");
+  const [nsecSaving, setNsecSaving] = useState(false);
+  const [nsecFeedback, setNsecFeedback] = useState<SaveFeedback | null>(null);
+  const [signingMode, setSigningMode] = useState("read-only");
+
   /* --- load settings on mount --------------------------------------- */
   useEffect(() => {
     loadSettings();
@@ -247,6 +254,14 @@ export const Settings: React.FC = () => {
         setBrowserEnabled(enabled);
       } catch (e) {
         console.error("[settings] Browser integration check failed:", e);
+      }
+
+      // Signing mode
+      try {
+        const mode = await invoke<string>("get_signing_mode");
+        setSigningMode(mode);
+      } catch (e) {
+        console.error("[settings] Signing mode check failed:", e);
       }
 
       // Tracked profiles
@@ -413,6 +428,33 @@ export const Settings: React.FC = () => {
   }, []);
 
   /* --- danger zone -------------------------------------------------- */
+  const handleSaveNsec = useCallback(async () => {
+    if (!nsecInput.trim()) return;
+    setNsecSaving(true);
+    setNsecFeedback(null);
+    try {
+      await invoke("set_nsec", { nsec: nsecInput.trim() });
+      setSigningMode("nsec");
+      setNsecExpanded(false);
+      setNsecInput("");
+      setNsecFeedback({ type: "success", message: "nsec saved to system keychain" });
+    } catch (e: any) {
+      setNsecFeedback({ type: "error", message: String(e) });
+    } finally {
+      setNsecSaving(false);
+    }
+  }, [nsecInput]);
+
+  const handleClearNsec = useCallback(async () => {
+    try {
+      await invoke("clear_nsec");
+      setSigningMode("read-only");
+      setNsecFeedback({ type: "success", message: "nsec removed" });
+    } catch (e: any) {
+      setNsecFeedback({ type: "error", message: String(e) });
+    }
+  }, []);
+
   const handleChangeAccount = useCallback(async () => {
     if (
       confirm(
@@ -556,15 +598,37 @@ export const Settings: React.FC = () => {
               marginBottom: 16,
             }}
           >
-            <div style={{ fontSize: "0.85rem", color: "var(--text-dim)", marginBottom: 2 }}>
-              <span className="icon">
-                <IconLock />
-              </span>{" "}
-              Read-only mode
-            </div>
-            <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
-              DMs disabled. Connect a signer to unlock full access.
-            </div>
+            {signingMode === "nsec" ? (
+              <>
+                <div style={{ fontSize: "0.85rem", color: "var(--accent)", marginBottom: 2 }}>
+                  <span className="icon">
+                    <IconKey />
+                  </span>{" "}
+                  nsec (full access)
+                </div>
+                <div style={{ fontSize: "0.75rem", color: "var(--text-muted)", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                  <span>Key stored in system keychain</span>
+                  <button
+                    onClick={handleClearNsec}
+                    style={{ background: "none", border: "none", color: "var(--danger)", cursor: "pointer", fontSize: "0.72rem", textDecoration: "underline" }}
+                  >
+                    Remove
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <div style={{ fontSize: "0.85rem", color: "var(--text-dim)", marginBottom: 2 }}>
+                  <span className="icon">
+                    <IconLock />
+                  </span>{" "}
+                  Read-only mode
+                </div>
+                <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
+                  DMs disabled. Connect a signer to unlock full access.
+                </div>
+              </>
+            )}
           </div>
 
           <div className="settings-field" style={{ borderBottom: "none", paddingBottom: 8 }}>
@@ -575,14 +639,15 @@ export const Settings: React.FC = () => {
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 24 }}>
             <div
+              onClick={() => setNsecExpanded(!nsecExpanded)}
               style={{
                 display: "flex",
                 alignItems: "center",
                 justifyContent: "space-between",
                 padding: "12px 16px",
                 background: "var(--bg)",
-                border: "1px solid var(--border)",
-                borderRadius: 10,
+                border: nsecExpanded ? "1px solid var(--accent)" : "1px solid var(--border)",
+                borderRadius: nsecExpanded ? "10px 10px 0 0" : 10,
                 cursor: "pointer",
                 transition: "border-color 0.2s",
               }}
@@ -595,6 +660,65 @@ export const Settings: React.FC = () => {
               </span>
               <span style={{ fontSize: "0.72rem", color: "var(--text-muted)" }}>Full access</span>
             </div>
+            {nsecExpanded && (
+              <div
+                style={{
+                  padding: "12px 16px",
+                  background: "var(--bg)",
+                  border: "1px solid var(--accent)",
+                  borderTop: "none",
+                  borderRadius: "0 0 10px 10px",
+                  marginTop: -1,
+                }}
+              >
+                <input
+                  type="password"
+                  value={nsecInput}
+                  onChange={(e) => setNsecInput(e.target.value)}
+                  placeholder="nsec1..."
+                  style={{
+                    width: "100%",
+                    padding: "8px 12px",
+                    fontSize: "0.82rem",
+                    fontFamily: "monospace",
+                    background: "var(--bg-card)",
+                    border: "1px solid var(--border)",
+                    borderRadius: 6,
+                    color: "var(--text)",
+                    outline: "none",
+                    marginBottom: 8,
+                    boxSizing: "border-box",
+                  }}
+                />
+                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  <button
+                    className="btn btn-primary"
+                    onClick={(e) => { e.stopPropagation(); handleSaveNsec(); }}
+                    disabled={nsecSaving || !nsecInput.trim().startsWith("nsec1")}
+                    style={{ fontSize: "0.8rem", padding: "6px 16px" }}
+                  >
+                    {nsecSaving ? "Saving..." : "Save to Keychain"}
+                  </button>
+                  <button
+                    onClick={(e) => { e.stopPropagation(); setNsecExpanded(false); setNsecInput(""); setNsecFeedback(null); }}
+                    style={{ background: "none", border: "none", color: "var(--text-muted)", cursor: "pointer", fontSize: "0.78rem" }}
+                  >
+                    Cancel
+                  </button>
+                </div>
+                {nsecFeedback && (
+                  <div
+                    style={{
+                      marginTop: 8,
+                      fontSize: "0.78rem",
+                      color: nsecFeedback.type === "success" ? "var(--accent)" : "var(--danger)",
+                    }}
+                  >
+                    {nsecFeedback.message}
+                  </div>
+                )}
+              </div>
+            )}
             <div
               style={{
                 display: "flex",

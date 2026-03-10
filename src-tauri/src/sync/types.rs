@@ -1,0 +1,297 @@
+#![allow(dead_code)]
+use serde::{Deserialize, Serialize};
+
+// ── Sync Phases ──────────────────────────────────────────────────
+
+/// The five phases of a v2 sync cycle, executed in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum SyncPhase {
+    OwnData = 1,
+    Discovery = 2,
+    ContentFetch = 3,
+    ThreadContext = 4,
+    MediaDownload = 5,
+}
+
+impl SyncPhase {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::OwnData => "Own Data",
+            Self::Discovery => "Discovery",
+            Self::ContentFetch => "Content Fetch",
+            Self::ThreadContext => "Thread Context",
+            Self::MediaDownload => "Media Download",
+        }
+    }
+}
+
+// ── Retention Tiers ──────────────────────────────────────────────
+
+/// Retention tier based on WoT hop distance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RetentionTier {
+    /// Hop 0 — own pubkey. Keep everything forever.
+    Own,
+    /// Explicitly tracked profiles. Keep everything forever.
+    Tracked,
+    /// Hop 1 — direct follows.
+    Follows,
+    /// Hop 2 — follows of follows.
+    FollowsOfFollows,
+    /// Hop 3+ or not in WoT.
+    Others,
+}
+
+impl RetentionTier {
+    /// DB key used in the `retention_config` table.
+    pub fn config_key(&self) -> Option<&'static str> {
+        match self {
+            Self::Follows => Some("follows"),
+            Self::FollowsOfFollows => Some("fof"),
+            Self::Others => Some("others"),
+            _ => None, // Own and Tracked have no configurable limits
+        }
+    }
+
+    /// Default minimum events to keep per user.
+    pub fn default_min_events(&self) -> Option<u32> {
+        match self {
+            Self::Follows => Some(50),
+            Self::FollowsOfFollows => Some(10),
+            Self::Others => Some(5),
+            _ => None,
+        }
+    }
+
+    /// Default time window in seconds.
+    pub fn default_time_window_secs(&self) -> Option<u64> {
+        match self {
+            Self::Follows => Some(2_592_000),         // 30 days
+            Self::FollowsOfFollows => Some(604_800),  // 7 days
+            Self::Others => Some(259_200),             // 3 days
+            _ => None,
+        }
+    }
+}
+
+// ── Relay Direction & Source ─────────────────────────────────────
+
+/// NIP-65 relay direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RelayDirection {
+    Read,
+    Write,
+    Both,
+}
+
+impl RelayDirection {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Both => "both",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "read" => Self::Read,
+            "write" => Self::Write,
+            _ => Self::Both,
+        }
+    }
+}
+
+/// How we discovered a user's relay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum RelaySource {
+    /// Lowest priority
+    Kind3Hint = 0,
+    Nip05 = 1,
+    /// Highest priority
+    Nip65 = 2,
+}
+
+impl RelaySource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Kind3Hint => "kind3_hint",
+            Self::Nip05 => "nip05",
+            Self::Nip65 => "nip65",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "kind3_hint" => Some(Self::Kind3Hint),
+            "nip05" => Some(Self::Nip05),
+            "nip65" => Some(Self::Nip65),
+            _ => None,
+        }
+    }
+}
+
+// ── Event Source ─────────────────────────────────────────────────
+
+/// How an event arrived in our local store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EventSource {
+    Sync,
+    ThreadContext,
+    Search,
+}
+
+impl EventSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Sync => "sync",
+            Self::ThreadContext => "thread_context",
+            Self::Search => "search",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "thread_context" => Self::ThreadContext,
+            "search" => Self::Search,
+            _ => Self::Sync,
+        }
+    }
+}
+
+// ── Cursor Bands ─────────────────────────────────────────────────
+
+/// Groups users by recency of their last event for batched fetching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CursorBand {
+    /// Last event < 1 hour ago
+    Hot,
+    /// Last event 1h–24h ago
+    Warm,
+    /// Last event > 24h ago or no cursor
+    Cold,
+}
+
+impl CursorBand {
+    /// Classify a user based on the age of their last event.
+    /// `age_secs` is `now - last_event_ts`.
+    pub fn from_age(age_secs: Option<u64>) -> Self {
+        match age_secs {
+            Some(s) if s < 3_600 => Self::Hot,
+            Some(s) if s < 86_400 => Self::Warm,
+            _ => Self::Cold,
+        }
+    }
+}
+
+// ── Relay Routing ────────────────────────────────────────────────
+
+/// A relay and the set of pubkeys we should query it for.
+#[derive(Debug, Clone)]
+pub struct RelayRoute {
+    pub relay_url: String,
+    pub pubkeys: Vec<String>,
+    pub reliability_score: f64,
+}
+
+/// A complete routing plan: which relays to query for which pubkeys.
+#[derive(Debug, Clone, Default)]
+pub struct RoutingPlan {
+    pub routes: Vec<RelayRoute>,
+}
+
+// ── Constants ────────────────────────────────────────────────────
+
+/// Relay polite interval between requests (seconds).
+pub const RELAY_MIN_INTERVAL_SECS: u64 = 3;
+/// Pause between relay subscription batches (seconds).
+pub const BATCH_PAUSE_SECS: u64 = 2;
+/// Disconnect idle NIP-65 relays after this (seconds).
+pub const IDLE_DISCONNECT_SECS: u64 = 300;
+/// Safety overlap when using cursors (seconds).
+pub const CURSOR_OVERLAP_SECS: u64 = 60;
+/// Run WoT crawl every N sync cycles.
+pub const WOT_CRAWL_FREQUENCY: u32 = 6;
+/// Stop backfilling a relay after this many empty cycles.
+pub const HISTORY_EXHAUSTION_CYCLES: u32 = 3;
+/// Max missing thread roots to fetch per cycle.
+pub const THREAD_CONTEXT_LIMIT: u32 = 500;
+/// Max simultaneous WebSocket connections.
+pub const MAX_CONNECTIONS: usize = 25;
+/// Rate-limit NOTICE pause (seconds).
+pub const RATE_LIMIT_PAUSE_SECS: u64 = 90;
+/// Generic NOTICE pause (seconds).
+pub const GENERIC_NOTICE_PAUSE_SECS: u64 = 5;
+/// Connection backoff sequence (seconds).
+pub const BACKOFF_SEQUENCE: &[u64] = &[10, 30, 60, 120, 300];
+
+/// Hardcoded default relays.
+pub const DEFAULT_RELAYS: &[&str] = &[
+    "wss://relay.damus.io",
+    "wss://relay.primal.net",
+    "wss://nos.lol",
+];
+
+/// Discovery relay for NIP-65 lookups.
+pub const DISCOVERY_RELAY: &str = "wss://purplepag.es";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sync_phase_labels() {
+        assert_eq!(SyncPhase::OwnData.label(), "Own Data");
+        assert_eq!(SyncPhase::MediaDownload.label(), "Media Download");
+    }
+
+    #[test]
+    fn test_retention_tier_defaults() {
+        assert_eq!(RetentionTier::Follows.default_min_events(), Some(50));
+        assert_eq!(RetentionTier::FollowsOfFollows.default_time_window_secs(), Some(604_800));
+        assert_eq!(RetentionTier::Own.config_key(), None);
+        assert_eq!(RetentionTier::Others.config_key(), Some("others"));
+    }
+
+    #[test]
+    fn test_relay_source_priority() {
+        assert!(RelaySource::Nip65 > RelaySource::Nip05);
+        assert!(RelaySource::Nip05 > RelaySource::Kind3Hint);
+    }
+
+    #[test]
+    fn test_relay_direction_roundtrip() {
+        for dir in [RelayDirection::Read, RelayDirection::Write, RelayDirection::Both] {
+            assert_eq!(RelayDirection::from_str(dir.as_str()), dir);
+        }
+    }
+
+    #[test]
+    fn test_event_source_roundtrip() {
+        for src in [EventSource::Sync, EventSource::ThreadContext, EventSource::Search] {
+            assert_eq!(EventSource::from_str(src.as_str()), src);
+        }
+    }
+
+    #[test]
+    fn test_cursor_band_classification() {
+        assert_eq!(CursorBand::from_age(Some(60)), CursorBand::Hot);
+        assert_eq!(CursorBand::from_age(Some(3_599)), CursorBand::Hot);
+        assert_eq!(CursorBand::from_age(Some(3_600)), CursorBand::Warm);
+        assert_eq!(CursorBand::from_age(Some(43_200)), CursorBand::Warm);
+        assert_eq!(CursorBand::from_age(Some(86_400)), CursorBand::Cold);
+        assert_eq!(CursorBand::from_age(None), CursorBand::Cold);
+    }
+
+    #[test]
+    fn test_relay_route_construction() {
+        let route = RelayRoute {
+            relay_url: "wss://relay.damus.io".into(),
+            pubkeys: vec!["abc123".into()],
+            reliability_score: 0.95,
+        };
+        assert_eq!(route.pubkeys.len(), 1);
+        assert!(route.reliability_score > 0.9);
+    }
+}

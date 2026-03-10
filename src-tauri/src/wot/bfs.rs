@@ -1,6 +1,8 @@
 use super::WotGraph;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 const VISITED_CAPACITY: usize = 8192;
@@ -306,5 +308,149 @@ fn bidirectional_bfs(
             }
         }
         Some(_) | None => DistanceResult::not_found(from_arc, to_arc),
+    }
+}
+
+/// Forward-only BFS from a root pubkey. Returns hop distance for every reachable node
+/// within `max_hops`. Used by the pruning algorithm to classify pubkeys into retention tiers.
+///
+/// Complexity: O(V+E) single BFS traversal.
+pub fn get_all_hop_distances(
+    graph: &WotGraph,
+    root: &str,
+    max_hops: u8,
+) -> HashMap<Arc<str>, u8> {
+    let root_id = match graph.get_node_id(root) {
+        Some(id) => id,
+        None => return HashMap::new(),
+    };
+
+    graph.with_adjacency(|follows, _followers| {
+        let mut distances: FxHashMap<u32, u8> = FxHashMap::default();
+        let mut queue = VecDeque::with_capacity(FRONTIER_CAPACITY);
+
+        distances.insert(root_id, 0);
+        queue.push_back(root_id);
+
+        while let Some(node) = queue.pop_front() {
+            let dist = distances[&node];
+            if dist >= max_hops {
+                continue;
+            }
+
+            if let Some(neighbors) = follows.get(node as usize) {
+                for &neighbor in neighbors {
+                    if !distances.contains_key(&neighbor) {
+                        distances.insert(neighbor, dist + 1);
+                        queue.push_back(neighbor);
+                    }
+                }
+            }
+        }
+
+        // Convert node IDs to pubkey Arcs
+        distances
+            .into_iter()
+            .filter_map(|(id, dist)| {
+                graph.get_pubkey_arc(id).map(|pk| (pk, dist))
+            })
+            .collect()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_test_graph() -> WotGraph {
+        // A -> B -> C -> D (linear chain)
+        // A -> E (direct follow, E is a leaf)
+        let graph = WotGraph::new();
+        let a = "aaaa";
+        let b = "bbbb";
+        let c = "cccc";
+        let d = "dddd";
+        let e = "eeee";
+
+        graph.get_or_create_node(a);
+        graph.get_or_create_node(b);
+        graph.get_or_create_node(c);
+        graph.get_or_create_node(d);
+        graph.get_or_create_node(e);
+
+        graph.update_follows(a, &[b.to_string(), e.to_string()], None, None);
+        graph.update_follows(b, &[c.to_string()], None, None);
+        graph.update_follows(c, &[d.to_string()], None, None);
+
+        graph
+    }
+
+    /// Helper to look up a distance by &str key in a HashMap<Arc<str>, u8>.
+    fn get_dist(map: &HashMap<Arc<str>, u8>, key: &str) -> Option<u8> {
+        map.iter()
+            .find(|(k, _)| k.as_ref() == key)
+            .map(|(_, &v)| v)
+    }
+
+    #[test]
+    fn test_hop_distances_simple() {
+        let graph = build_test_graph();
+        let distances = get_all_hop_distances(&graph, "aaaa", 4);
+
+        assert_eq!(get_dist(&distances, "aaaa"), Some(0));
+        assert_eq!(get_dist(&distances, "bbbb"), Some(1));
+        assert_eq!(get_dist(&distances, "cccc"), Some(2));
+        assert_eq!(get_dist(&distances, "dddd"), Some(3));
+        assert_eq!(get_dist(&distances, "eeee"), Some(1));
+    }
+
+    #[test]
+    fn test_max_hops_cutoff() {
+        let graph = build_test_graph();
+        let distances = get_all_hop_distances(&graph, "aaaa", 2);
+
+        assert_eq!(get_dist(&distances, "aaaa"), Some(0));
+        assert_eq!(get_dist(&distances, "bbbb"), Some(1));
+        assert_eq!(get_dist(&distances, "cccc"), Some(2));
+        assert!(get_dist(&distances, "dddd").is_none()); // Beyond max_hops
+        assert_eq!(get_dist(&distances, "eeee"), Some(1));
+    }
+
+    #[test]
+    fn test_disconnected_nodes() {
+        let graph = WotGraph::new();
+        graph.get_or_create_node("aaaa");
+        graph.get_or_create_node("bbbb"); // No edges
+
+        let distances = get_all_hop_distances(&graph, "aaaa", 4);
+        assert_eq!(distances.len(), 1); // Only root
+        assert_eq!(get_dist(&distances, "aaaa"), Some(0));
+    }
+
+    #[test]
+    fn test_diamond_graph() {
+        // A -> B, A -> C, B -> D, C -> D
+        let graph = WotGraph::new();
+        graph.get_or_create_node("aaaa");
+        graph.get_or_create_node("bbbb");
+        graph.get_or_create_node("cccc");
+        graph.get_or_create_node("dddd");
+
+        graph.update_follows("aaaa", &["bbbb".into(), "cccc".into()], None, None);
+        graph.update_follows("bbbb", &["dddd".into()], None, None);
+        graph.update_follows("cccc", &["dddd".into()], None, None);
+
+        let distances = get_all_hop_distances(&graph, "aaaa", 4);
+        assert_eq!(get_dist(&distances, "aaaa"), Some(0));
+        assert_eq!(get_dist(&distances, "bbbb"), Some(1));
+        assert_eq!(get_dist(&distances, "cccc"), Some(1));
+        assert_eq!(get_dist(&distances, "dddd"), Some(2)); // Shortest path via B or C
+    }
+
+    #[test]
+    fn test_unknown_root() {
+        let graph = WotGraph::new();
+        let distances = get_all_hop_distances(&graph, "nonexistent", 4);
+        assert!(distances.is_empty());
     }
 }
