@@ -208,12 +208,22 @@ async fn subscribe_and_collect(
                 match result {
                     Ok(notification) => {
                         match notification {
-                            RelayPoolNotification::Event { event, .. } => {
-                                events.push(*event);
+                            RelayPoolNotification::Event { event, subscription_id: ref evt_sid, .. } => {
+                                // Only collect events for OUR subscription
+                                if *evt_sid == sub_id {
+                                    events.push(*event);
+                                }
                             }
                             RelayPoolNotification::Message { message, .. } => {
                                 match &message {
-                                    RelayMessage::EndOfStoredEvents(_) => {
+                                    RelayMessage::EndOfStoredEvents(eose_sid) => {
+                                        // Only count EOSE for OUR subscription — ignore stale
+                                        // EOSE from previous (unsubscribed) subscriptions that
+                                        // arrived late on the broadcast channel.
+                                        if *eose_sid != sub_id {
+                                            debug!("Ignoring stale EOSE for sub {}, ours is {}", eose_sid, sub_id);
+                                            continue;
+                                        }
                                         eose_count += 1;
                                         if eose_count >= expected {
                                             // All relays have finished — we have everything
