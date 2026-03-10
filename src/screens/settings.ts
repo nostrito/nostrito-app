@@ -294,6 +294,17 @@ export function renderSettings(container: HTMLElement): void {
             <div id="browser-integration-result" style="margin-top:10px"></div>
           </div>
 
+          <div class="setting-group" style="margin-bottom:20px">
+            <div class="setting-group-title">Sync Tools</div>
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0">
+              <div>
+                <div style="font-weight:500;color:var(--text-primary)">Resync Articles</div>
+                <div style="font-size:0.85rem;color:var(--text-secondary)">Reset article backfill cursors so historical long-form articles (kind 30023) are re-fetched from all relays.</div>
+              </div>
+              <button class="btn-secondary" id="btn-resync-articles" style="white-space:nowrap">Resync Articles</button>
+            </div>
+          </div>
+
           <div class="danger-zone">
             <div class="danger-zone-title"><span class="icon">${iconAlertTriangle()}</span> Danger Zone</div>
             <div class="danger-zone-row">
@@ -389,6 +400,24 @@ export function renderSettings(container: HTMLElement): void {
       loadTrackedProfiles();
     } catch (e) {
       console.error("[settings] track_profile failed:", e);
+    }
+  });
+
+  // Wire resync articles button
+  document.getElementById("btn-resync-articles")?.addEventListener("click", async () => {
+    const btn = document.getElementById("btn-resync-articles") as HTMLButtonElement;
+    if (!btn) return;
+    try {
+      btn.disabled = true;
+      btn.textContent = "Resetting...";
+      const msg = await invoke("resync_articles") as string;
+      btn.textContent = "✓ Done";
+      console.log("[settings] resync_articles:", msg);
+      setTimeout(() => { btn.textContent = "Resync Articles"; btn.disabled = false; }, 3000);
+    } catch (e) {
+      console.error("[settings] Resync articles failed:", e);
+      btn.textContent = "Failed";
+      setTimeout(() => { btn.textContent = "Resync Articles"; btn.disabled = false; }, 3000);
     }
   });
 

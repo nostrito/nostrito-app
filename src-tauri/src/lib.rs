@@ -41,6 +41,11 @@ pub struct AppConfig {
     pub auto_start: bool,
     pub storage_others_gb: f64,
     pub storage_media_gb: f64,
+    // Per-category storage limits
+    pub storage_own_media_gb: f64,
+    pub storage_tracked_media_gb: f64,
+    pub storage_wot_media_gb: f64,
+    pub wot_event_retention_days: u32,
     // Sync tuning
     pub sync_lookback_days: u32,
     pub sync_batch_size: u32,
@@ -70,6 +75,10 @@ impl Default for AppConfig {
             auto_start: true,
             storage_others_gb: 5.0,
             storage_media_gb: 2.0,
+            storage_own_media_gb: 5.0,
+            storage_tracked_media_gb: 3.0,
+            storage_wot_media_gb: 2.0,
+            wot_event_retention_days: 30,
             sync_lookback_days: 7,
             sync_batch_size: 10,
             sync_events_per_batch: 50,
@@ -135,6 +144,18 @@ pub struct StorageStats {
     pub newest_event: u64,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OwnershipStorageStats {
+    pub own_events_count: u64,
+    pub own_media_bytes: u64,
+    pub tracked_events_count: u64,
+    pub tracked_media_bytes: u64,
+    pub wot_events_count: u64,
+    pub wot_media_bytes: u64,
+    pub total_events: u64,
+    pub db_size_bytes: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub npub: String,
@@ -142,6 +163,10 @@ pub struct Settings {
     pub max_storage_mb: u32,
     pub storage_others_gb: f64,
     pub storage_media_gb: f64,
+    pub storage_own_media_gb: f64,
+    pub storage_tracked_media_gb: f64,
+    pub storage_wot_media_gb: f64,
+    pub wot_event_retention_days: u32,
     pub wot_max_depth: u32,
     pub sync_interval_secs: u32,
     pub outbound_relays: Vec<String>,
@@ -543,6 +568,25 @@ async fn restart_sync(state: State<'_, AppState>, app_handle: tauri::AppHandle) 
     Ok(())
 }
 
+/// Reset the articles (kind 30023) backfill cursor so historical articles are re-fetched.
+/// Also resets the main history cursor to trigger a full re-crawl of notes too.
+/// The next sync cycle will start backfilling from now, walking backward through all history.
+#[tauri::command]
+async fn resync_articles(state: State<'_, AppState>) -> Result<String, String> {
+    tracing::info!("[cmd:resync_articles] Resetting article sync cursors");
+
+    // Reset articles-specific cursor (kind 30023 backfill)
+    state.db.delete_config("tier2_history_until_articles")
+        .map_err(|e| format!("Failed to reset articles cursor: {}", e))?;
+
+    // Also reset the main history cursor so notes/reposts re-backfill too
+    state.db.delete_config("tier2_history_until")
+        .map_err(|e| format!("Failed to reset history cursor: {}", e))?;
+
+    tracing::info!("[cmd:resync_articles] Cursors reset — next sync cycle will re-backfill all history");
+    Ok("Article sync cursors reset. Historical backfill will restart on next sync cycle.".to_string())
+}
+
 #[tauri::command]
 async fn get_feed(filter: FeedFilter, state: State<'_, AppState>) -> Result<Vec<NostrEvent>, String> {
     tracing::debug!("[cmd:get_feed] called with filter: kinds={:?}, limit={:?}, since={:?}, wot_only={:?}", filter.kinds, filter.limit, filter.since, filter.wot_only);
@@ -649,6 +693,46 @@ async fn get_storage_stats(state: State<'_, AppState>) -> Result<StorageStats, S
         db_size_bytes,
         oldest_event,
         newest_event,
+    })
+}
+
+#[tauri::command]
+async fn get_ownership_storage_stats(state: State<'_, AppState>) -> Result<OwnershipStorageStats, String> {
+    tracing::debug!("[cmd:get_ownership_storage_stats] called");
+    let config = state.config.read().await;
+    let own_pubkey = config.hex_pubkey.clone().unwrap_or_default();
+    drop(config);
+
+    if own_pubkey.is_empty() {
+        return Err("Not initialized — no pubkey set".into());
+    }
+
+    let db = &state.db;
+    let own_events_count = db.own_event_count(&own_pubkey).map_err(|e| e.to_string())?;
+    let own_media_bytes = db.own_media_bytes(&own_pubkey).map_err(|e| e.to_string())?;
+    let tracked_events_count = db.tracked_event_count(&own_pubkey).map_err(|e| e.to_string())?;
+    let tracked_media_bytes = db.tracked_media_bytes(&own_pubkey).map_err(|e| e.to_string())?;
+    let wot_events_count = db.wot_event_count(&own_pubkey).map_err(|e| e.to_string())?;
+    let wot_media_bytes = db.wot_media_bytes(&own_pubkey).map_err(|e| e.to_string())?;
+    let total_events = db.event_count().map_err(|e| e.to_string())?;
+    let db_size_bytes = db.db_size_bytes().map_err(|e| e.to_string())?;
+
+    tracing::info!(
+        "[cmd:get_ownership_storage_stats] own={}/{}, tracked={}/{}, wot={}/{}",
+        own_events_count, own_media_bytes,
+        tracked_events_count, tracked_media_bytes,
+        wot_events_count, wot_media_bytes,
+    );
+
+    Ok(OwnershipStorageStats {
+        own_events_count,
+        own_media_bytes,
+        tracked_events_count,
+        tracked_media_bytes,
+        wot_events_count,
+        wot_media_bytes,
+        total_events,
+        db_size_bytes,
     })
 }
 
@@ -799,6 +883,7 @@ async fn change_account(
         "hex_pubkey",
         "tier2_since",
         "tier2_history_until",
+        "tier2_history_until_articles",
         "sync_tier3_checkpoint",
     ];
     for key in &identity_keys {
@@ -983,6 +1068,10 @@ async fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
         max_storage_mb: config.max_storage_mb,
         storage_others_gb: config.storage_others_gb,
         storage_media_gb: config.storage_media_gb,
+        storage_own_media_gb: config.storage_own_media_gb,
+        storage_tracked_media_gb: config.storage_tracked_media_gb,
+        storage_wot_media_gb: config.storage_wot_media_gb,
+        wot_event_retention_days: config.wot_event_retention_days,
         wot_max_depth: config.wot_max_depth,
         sync_interval_secs: config.sync_interval_secs,
         outbound_relays: config.outbound_relays.clone(),
@@ -1440,6 +1529,7 @@ pub fn run() {
             check_browser_integration,
             get_media_stats,
             restart_sync,
+            resync_articles,
             track_profile,
             untrack_profile,
             get_tracked_profiles,

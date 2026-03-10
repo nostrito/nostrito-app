@@ -1071,28 +1071,12 @@ impl SyncEngine {
         );
 
         // ── Historical backfill: fetch older events going backward in time ──
+        // Two separate passes: notes/reposts (high volume) and articles (low volume).
+        // Each has its own cursor so articles aren't crowded out by common kinds.
         if !self.cancel.is_cancelled() && !follows.is_empty() {
-            let history_until = self.db.get_history_cursor().unwrap_or(None).unwrap_or_else(|| {
-                // Default: start from lookback floor, go backward
-                chrono::Utc::now().timestamp() as u64 - (self.sync_config.lookback_days as u64 * 86400)
-            });
-
-            let age_secs = now_epoch.saturating_sub(history_until);
-            let age_days = age_secs / 86400;
-            info!(
-                "Tier 2: Historical backfill until={} (~{}d ago)",
-                history_until, age_days
-            );
-
             let authors: Vec<PublicKey> = follows.iter()
                 .filter_map(|hex| PublicKey::from_hex(hex).ok())
                 .collect();
-
-            let hist_filter = Filter::new()
-                .authors(authors)
-                .kinds(vec![Kind::TextNote, Kind::Repost, Kind::LongFormTextNote])
-                .until(Timestamp::from(history_until))
-                .limit(500);
 
             // Use fresh client for historical fetch
             let hist_client = Client::default();
@@ -1103,55 +1087,113 @@ impl SyncEngine {
             tokio::time::sleep(Duration::from_secs(2)).await;
 
             let hist_policy_url = relay_urls.first().cloned().unwrap_or_default();
+
+            // ── Pass 1: Notes & reposts (main history cursor) ──
+            let history_until = self.db.get_history_cursor().unwrap_or(None).unwrap_or_else(|| {
+                chrono::Utc::now().timestamp() as u64 - (self.sync_config.lookback_days as u64 * 86400)
+            });
+
+            let age_days = now_epoch.saturating_sub(history_until) / 86400;
+            info!("Tier 2: Historical notes backfill until={} (~{}d ago)", history_until, age_days);
+
+            let notes_filter = Filter::new()
+                .authors(authors.clone())
+                .kinds(vec![Kind::TextNote, Kind::Repost])
+                .until(Timestamp::from(history_until))
+                .limit(500);
+
             let hist_policy = policies
                 .entry(hist_policy_url.clone())
                 .or_insert_with(|| RelayPolicy::new(self.sync_config.relay_min_interval_secs as u64));
 
-            match subscribe_and_collect(&hist_client, vec![hist_filter], 30, hist_policy).await {
+            match subscribe_and_collect(&hist_client, vec![notes_filter], 30, hist_policy).await {
                 Ok(hist_events) if !hist_events.is_empty() => {
                     let mut oldest_ts = history_until;
                     let mut hist_new: u64 = 0;
 
                     for event in &hist_events {
-                        let tags: Vec<Vec<String>> = event
-                            .tags
-                            .iter()
+                        let tags: Vec<Vec<String>> = event.tags.iter()
                             .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
                             .collect();
                         let tags_json = serde_json::to_string(&tags).unwrap_or_default();
-                        let inserted = self.db
-                            .store_event(
-                                &event.id.to_hex(),
-                                &event.pubkey.to_hex(),
-                                event.created_at.as_u64() as i64,
-                                event.kind.as_u16() as u32,
-                                &tags_json,
-                                &event.content.to_string(),
-                                &event.sig.to_string(),
-                            )
-                            .unwrap_or(false);
+                        let inserted = self.db.store_event(
+                            &event.id.to_hex(), &event.pubkey.to_hex(),
+                            event.created_at.as_u64() as i64, event.kind.as_u16() as u32,
+                            &tags_json, &event.content.to_string(), &event.sig.to_string(),
+                        ).unwrap_or(false);
                         if inserted {
                             hist_new += 1;
                             self.queue_media_for_event(&event.pubkey.to_hex(), &event.content.to_string(), &tags_json);
                         }
                         let ts = event.created_at.as_u64();
-                        if ts < oldest_ts {
-                            oldest_ts = ts;
-                        }
+                        if ts < oldest_ts { oldest_ts = ts; }
                     }
 
-                    // Move cursor back
                     self.db.set_history_cursor(oldest_ts.saturating_sub(1)).ok();
                     info!(
-                        "Tier 2: Historical: {} events ({} new), cursor now at {} (~{}d ago)",
-                        hist_events.len(),
-                        hist_new,
-                        oldest_ts,
-                        now_epoch.saturating_sub(oldest_ts) / 86400
+                        "Tier 2: Historical notes: {} events ({} new), cursor → {} (~{}d ago)",
+                        hist_events.len(), hist_new, oldest_ts, now_epoch.saturating_sub(oldest_ts) / 86400
                     );
                 }
-                Ok(_) => info!("Tier 2: Historical: no more events at this cursor position"),
-                Err(e) => warn!("Tier 2: Historical fetch error: {}", e),
+                Ok(_) => info!("Tier 2: Historical notes: no more events at this cursor position"),
+                Err(e) => warn!("Tier 2: Historical notes fetch error: {}", e),
+            }
+
+            // Polite pause between passes
+            tokio::time::sleep(Duration::from_secs(3)).await;
+
+            // ── Pass 2: Articles (separate cursor — never crowded out by notes) ──
+            if !self.cancel.is_cancelled() {
+                let articles_until = self.db.get_articles_history_cursor().unwrap_or(None).unwrap_or_else(|| {
+                    // First run: start from now and walk backward through all history
+                    chrono::Utc::now().timestamp() as u64
+                });
+
+                let art_age_days = now_epoch.saturating_sub(articles_until) / 86400;
+                info!("Tier 2: Historical articles backfill until={} (~{}d ago)", articles_until, art_age_days);
+
+                let articles_filter = Filter::new()
+                    .authors(authors)
+                    .kinds(vec![Kind::LongFormTextNote]) // 30023
+                    .until(Timestamp::from(articles_until))
+                    .limit(200);
+
+                let art_policy = policies
+                    .entry(hist_policy_url.clone())
+                    .or_insert_with(|| RelayPolicy::new(self.sync_config.relay_min_interval_secs as u64));
+
+                match subscribe_and_collect(&hist_client, vec![articles_filter], 30, art_policy).await {
+                    Ok(art_events) if !art_events.is_empty() => {
+                        let mut oldest_ts = articles_until;
+                        let mut art_new: u64 = 0;
+
+                        for event in &art_events {
+                            let tags: Vec<Vec<String>> = event.tags.iter()
+                                .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
+                                .collect();
+                            let tags_json = serde_json::to_string(&tags).unwrap_or_default();
+                            let inserted = self.db.store_event(
+                                &event.id.to_hex(), &event.pubkey.to_hex(),
+                                event.created_at.as_u64() as i64, event.kind.as_u16() as u32,
+                                &tags_json, &event.content.to_string(), &event.sig.to_string(),
+                            ).unwrap_or(false);
+                            if inserted {
+                                art_new += 1;
+                                self.queue_media_for_event(&event.pubkey.to_hex(), &event.content.to_string(), &tags_json);
+                            }
+                            let ts = event.created_at.as_u64();
+                            if ts < oldest_ts { oldest_ts = ts; }
+                        }
+
+                        self.db.set_articles_history_cursor(oldest_ts.saturating_sub(1)).ok();
+                        info!(
+                            "Tier 2: Historical articles: {} events ({} new), cursor → {} (~{}d ago)",
+                            art_events.len(), art_new, oldest_ts, now_epoch.saturating_sub(oldest_ts) / 86400
+                        );
+                    }
+                    Ok(_) => info!("Tier 2: Historical articles: no more events at this cursor position"),
+                    Err(e) => warn!("Tier 2: Historical articles fetch error: {}", e),
+                }
             }
 
             hist_client.disconnect().await.ok();

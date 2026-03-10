@@ -971,6 +971,21 @@ impl Database {
         self.set_config("tier2_history_until", &ts.to_string())
     }
 
+    /// Get the articles (kind 30023) historical backfill cursor.
+    /// Separate from the main history cursor so articles can backfill independently
+    /// without being crowded out by high-volume kinds (notes, reposts).
+    pub fn get_articles_history_cursor(&self) -> Result<Option<u64>> {
+        match self.get_config("tier2_history_until_articles")? {
+            Some(val) => Ok(val.parse::<u64>().ok()),
+            None => Ok(None),
+        }
+    }
+
+    /// Set the articles historical backfill cursor.
+    pub fn set_articles_history_cursor(&self, ts: u64) -> Result<()> {
+        self.set_config("tier2_history_until_articles", &ts.to_string())
+    }
+
     /// Get the latest created_at timestamp from stored nostr events.
     pub fn get_latest_event_timestamp(&self) -> Result<Option<u64>> {
         let conn = self.conn.lock().unwrap();
@@ -1039,5 +1054,73 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM media_queue", [], |row| row.get(0))?;
         Ok(count as u64)
+    }
+
+    // ── Ownership-based storage stats ─────────────────────────────
+
+    /// Count events authored by own pubkey.
+    pub fn own_event_count(&self, own_pubkey: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM nostr_events WHERE pubkey = ?1",
+            params![own_pubkey],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Total media bytes for own pubkey.
+    pub fn own_media_bytes(&self, own_pubkey: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let total: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(size_bytes), 0) FROM media_cache WHERE pubkey = ?1",
+            params![own_pubkey],
+            |row| row.get(0),
+        )?;
+        Ok(total as u64)
+    }
+
+    /// Count events from tracked profiles (excluding own pubkey).
+    pub fn tracked_event_count(&self, own_pubkey: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM nostr_events WHERE pubkey != ?1 AND pubkey IN (SELECT pubkey FROM tracked_profiles)",
+            params![own_pubkey],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Total media bytes from tracked profiles (excluding own pubkey).
+    pub fn tracked_media_bytes(&self, own_pubkey: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let total: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(size_bytes), 0) FROM media_cache WHERE pubkey != ?1 AND pubkey IN (SELECT pubkey FROM tracked_profiles)",
+            params![own_pubkey],
+            |row| row.get(0),
+        )?;
+        Ok(total as u64)
+    }
+
+    /// Count events from WoT profiles (not own, not tracked — everything else).
+    pub fn wot_event_count(&self, own_pubkey: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM nostr_events WHERE pubkey != ?1 AND pubkey NOT IN (SELECT pubkey FROM tracked_profiles)",
+            params![own_pubkey],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Total media bytes from WoT profiles (not own, not tracked).
+    pub fn wot_media_bytes(&self, own_pubkey: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let total: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(size_bytes), 0) FROM media_cache WHERE pubkey != ?1 AND pubkey NOT IN (SELECT pubkey FROM tracked_profiles)",
+            params![own_pubkey],
+            |row| row.get(0),
+        )?;
+        Ok(total as u64)
     }
 }
