@@ -285,7 +285,6 @@ pub struct SyncEngine {
     pub sync_stats: Arc<RwLock<SyncStats>>,
     app_handle: tauri::AppHandle,
     storage_media_gb: f64,
-    storage_others_gb: f64,
     sync_config: SyncConfig,
     max_event_age_days: u32,
 }
@@ -300,7 +299,6 @@ impl SyncEngine {
         sync_stats: Arc<RwLock<SyncStats>>,
         app_handle: tauri::AppHandle,
         storage_media_gb: f64,
-        storage_others_gb: f64,
         sync_config: SyncConfig,
         max_event_age_days: u32,
     ) -> Self {
@@ -314,7 +312,6 @@ impl SyncEngine {
             sync_stats,
             app_handle,
             storage_media_gb,
-            storage_others_gb,
             sync_config,
             max_event_age_days,
         }

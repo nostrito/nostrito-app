@@ -294,7 +294,6 @@ async fn init_nostrito(
         state.sync_stats.clone(),
         app_handle.clone(),
         config.storage_media_gb,
-        config.storage_others_gb,
         sync_config,
         config.max_event_age_days,
     ));
@@ -473,7 +472,6 @@ async fn start_sync(
         state.sync_stats.clone(),
         app_handle,
         config.storage_media_gb,
-        config.storage_others_gb,
         sync_config,
         config.max_event_age_days,
     ));
@@ -533,7 +531,6 @@ async fn restart_sync(state: State<'_, AppState>, app_handle: tauri::AppHandle) 
         state.sync_stats.clone(),
         app_handle.clone(),
         config.storage_media_gb,
-        config.storage_others_gb,
         sync_config,
         config.max_event_age_days,
     ));
@@ -918,7 +915,6 @@ async fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
         npub: config.npub.clone().unwrap_or_default(),
         relay_port: config.relay_port,
         max_storage_mb: config.max_storage_mb,
-        storage_others_gb: config.storage_others_gb,
         storage_media_gb: config.storage_media_gb,
         wot_max_depth: config.wot_max_depth,
         sync_interval_secs: config.sync_interval_secs,
@@ -1264,7 +1260,6 @@ pub fn run() {
 
                     let cfg2 = config.read().await;
                     let media_gb = cfg2.storage_media_gb;
-                    let others_gb = cfg2.storage_others_gb;
                     let max_age_days = cfg2.max_event_age_days;
                     let sync_config = SyncConfig {
                         lookback_days: cfg2.sync_lookback_days,
@@ -1286,7 +1281,6 @@ pub fn run() {
                         sync_stats,
                         app_handle.clone(),
                         media_gb,
-                        others_gb,
                         sync_config,
                         max_age_days,
                     ));
