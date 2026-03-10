@@ -63,7 +63,7 @@ impl Default for AppConfig {
             npub: None,
             hex_pubkey: None,
             relay_port: 4869,
-            max_storage_mb: 10240,
+            max_storage_mb: 2048,
             wot_max_depth: 2,
             sync_interval_secs: 300,
             outbound_relays: vec![
@@ -1609,10 +1609,39 @@ async fn check_browser_integration() -> Result<bool, String> {
 // ── App Entry ──────────────────────────────────────────────────────
 
 pub fn run() {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
-        .with_target(true)
-        .init();
+    // Set up dual logging: console (INFO+) and rotating file (~/.nostrito/nostrito.log, max ~10MB)
+    {
+        use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+        let log_dir = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".nostrito");
+        std::fs::create_dir_all(&log_dir).ok();
+
+        // Rotating file appender: daily rotation, keep up to 3 files (~10MB effective cap)
+        let file_appender = tracing_appender::rolling::daily(&log_dir, "nostrito.log");
+        let (file_writer, _guard) = tracing_appender::non_blocking(file_appender);
+        // Leak the guard so it lives for the entire process lifetime
+        std::mem::forget(_guard);
+
+        let env_filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("info,nostrito_lib=info"));
+
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(
+                fmt::layer()
+                    .with_target(true)
+                    .with_ansi(true),
+            )
+            .with(
+                fmt::layer()
+                    .with_target(true)
+                    .with_ansi(false)
+                    .with_writer(file_writer),
+            )
+            .init();
+    }
 
     tracing::info!("[init] Starting nostrito");
 
@@ -1693,6 +1722,41 @@ pub fn run() {
     if let Ok(Some(v)) = db.get_config("sync_interval_secs") { if let Ok(n) = v.parse::<u32>() { config.sync_interval_secs = n; } }
 
     tracing::info!("[init] Config: npub={:?}, relays={:?}, port={}", config.npub, config.outbound_relays, config.relay_port);
+
+    // ── STARTUP LOG ──
+    {
+        let event_count = db.event_count().unwrap_or(0);
+        let wot_stats = wot_graph.stats();
+        let follows_count = config.hex_pubkey.as_ref()
+            .and_then(|pk| wot_graph.get_follows(pk))
+            .map(|f| f.len())
+            .unwrap_or(0);
+        let tracked_count = db.get_tracked_pubkeys().map(|t| t.len()).unwrap_or(0);
+        let npub_display = config.npub.as_deref().unwrap_or("(not set)");
+        let relay_list: Vec<&str> = config.outbound_relays.iter().map(|s| s.as_str()).collect();
+
+        let tier2_since_display = db.get_sync_cursor().ok().flatten()
+            .and_then(|ts| chrono::DateTime::from_timestamp(ts as i64, 0))
+            .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+            .unwrap_or_else(|| "(none)".into());
+        let articles_cursor_display = db.get_articles_history_cursor().ok().flatten()
+            .and_then(|ts| chrono::DateTime::from_timestamp(ts as i64, 0))
+            .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+            .unwrap_or_else(|| "(none)".into());
+
+        tracing::info!(
+            "\n[NOSTRITO STARTUP]\n  npub: {}\n  relays configured: {} → {:?}\n  own events in DB: {}\n  follows: {}\n  tracked profiles: {}\n  wot peers: {}\n  tier2_since cursor: {}\n  articles cursor: {}\n  cycle interval: {}s",
+            npub_display,
+            relay_list.len(), relay_list,
+            event_count,
+            follows_count,
+            tracked_count,
+            wot_stats.node_count,
+            tier2_since_display,
+            articles_cursor_display,
+            config.sync_interval_secs,
+        );
+    }
 
     let app_state = AppState {
         wot_graph,
