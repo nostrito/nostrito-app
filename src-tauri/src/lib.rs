@@ -981,6 +981,7 @@ async fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
         npub: config.npub.clone().unwrap_or_default(),
         relay_port: config.relay_port,
         max_storage_mb: config.max_storage_mb,
+        storage_others_gb: config.storage_others_gb,
         storage_media_gb: config.storage_media_gb,
         wot_max_depth: config.wot_max_depth,
         sync_interval_secs: config.sync_interval_secs,
