@@ -12,7 +12,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use storage::{Database, ProfileInfo};
-use sync::{SyncEngine, SyncStats, SyncTier};
+use sync::{SyncConfig, SyncEngine, SyncStats, SyncTier};
 use wot::WotGraph;
 
 // ── App State ──────────────────────────────────────────────────────
@@ -41,6 +41,15 @@ pub struct AppConfig {
     pub auto_start: bool,
     pub storage_others_gb: f64,
     pub storage_media_gb: f64,
+    // Sync tuning
+    pub sync_lookback_days: u32,
+    pub sync_batch_size: u32,
+    pub sync_events_per_batch: u32,
+    pub sync_batch_pause_secs: u32,
+    pub sync_relay_min_interval_secs: u32,
+    pub sync_wot_batch_size: u32,
+    pub sync_wot_events_per_batch: u32,
+    pub max_event_age_days: u32,
 }
 
 impl Default for AppConfig {
@@ -53,13 +62,22 @@ impl Default for AppConfig {
             wot_max_depth: 3,
             sync_interval_secs: 300,
             outbound_relays: vec![
+                "wss://relay.primal.net".into(),
                 "wss://relay.damus.io".into(),
-                "wss://nos.lol".into(),
-                "wss://relay.nostr.band".into(),
+                "wss://nostr.wine".into(),
+                "wss://relay.yakihonne.com".into(),
             ],
             auto_start: true,
             storage_others_gb: 5.0,
             storage_media_gb: 2.0,
+            sync_lookback_days: 7,
+            sync_batch_size: 10,
+            sync_events_per_batch: 50,
+            sync_batch_pause_secs: 7,
+            sync_relay_min_interval_secs: 3,
+            sync_wot_batch_size: 5,
+            sync_wot_events_per_batch: 15,
+            max_event_age_days: 30,
         }
     }
 }
@@ -105,6 +123,8 @@ pub struct FeedFilter {
     pub limit: Option<u32>,
     pub since: Option<u64>,
     pub wot_only: Option<bool>,
+    pub search: Option<String>,
+    pub author: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -120,10 +140,20 @@ pub struct Settings {
     pub npub: String,
     pub relay_port: u16,
     pub max_storage_mb: u32,
+    pub storage_others_gb: f64,
+    pub storage_media_gb: f64,
     pub wot_max_depth: u32,
     pub sync_interval_secs: u32,
     pub outbound_relays: Vec<String>,
     pub auto_start: bool,
+    pub sync_lookback_days: u32,
+    pub sync_batch_size: u32,
+    pub sync_events_per_batch: u32,
+    pub sync_batch_pause_secs: u32,
+    pub sync_relay_min_interval_secs: u32,
+    pub sync_wot_batch_size: u32,
+    pub sync_wot_events_per_batch: u32,
+    pub max_event_age_days: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -245,6 +275,16 @@ async fn init_nostrito(
 
     // Start tiered sync engine
     let config = state.config.read().await;
+    let sync_config = SyncConfig {
+        lookback_days: config.sync_lookback_days,
+        batch_size: config.sync_batch_size,
+        events_per_batch: config.sync_events_per_batch,
+        batch_pause_secs: config.sync_batch_pause_secs,
+        relay_min_interval_secs: config.sync_relay_min_interval_secs,
+        wot_batch_size: config.sync_wot_batch_size,
+        wot_events_per_batch: config.sync_wot_events_per_batch,
+        cycle_interval_secs: config.sync_interval_secs,
+    };
     let sync_engine = Arc::new(SyncEngine::new(
         state.wot_graph.clone(),
         state.db.clone(),
@@ -253,6 +293,10 @@ async fn init_nostrito(
         state.sync_tier.clone(),
         state.sync_stats.clone(),
         app_handle.clone(),
+        config.storage_media_gb,
+        config.storage_others_gb,
+        sync_config,
+        config.max_event_age_days,
     ));
 
     let cancel = sync_engine.start();
@@ -320,6 +364,35 @@ async fn init_nostrito(
 }
 
 #[tauri::command]
+async fn get_follows(pubkey: String, state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    tracing::debug!("[cmd:get_follows] pubkey={}...", &pubkey[..pubkey.len().min(8)]);
+    match state.wot_graph.get_follows(&pubkey) {
+        Some(follows) => Ok(follows),
+        None => Ok(vec![]),
+    }
+}
+
+#[tauri::command]
+async fn get_profiles_batch(pubkeys: Vec<String>, state: State<'_, AppState>) -> Result<Vec<serde_json::Value>, String> {
+    tracing::debug!("[cmd:get_profiles_batch] called for {} pubkeys", pubkeys.len());
+    let profiles = state.db.get_profiles(&pubkeys).map_err(|e| e.to_string())?;
+    let map: std::collections::HashMap<String, _> = profiles.into_iter().map(|p| (p.pubkey.clone(), p)).collect();
+    let result = pubkeys.iter().map(|pk| {
+        if let Some(p) = map.get(pk) {
+            serde_json::json!({
+                "pubkey": pk,
+                "name": p.name,
+                "display_name": p.display_name,
+                "picture": p.picture,
+            })
+        } else {
+            serde_json::json!({ "pubkey": pk, "name": null, "display_name": null, "picture": null })
+        }
+    }).collect();
+    Ok(result)
+}
+
+#[tauri::command]
 async fn get_wot(state: State<'_, AppState>) -> Result<WotStatus, String> {
     tracing::debug!("[cmd:get_wot] called");
     let config = state.config.read().await;
@@ -381,6 +454,16 @@ async fn start_sync(
         .clone()
         .ok_or("Not initialized — no pubkey set")?;
 
+    let sync_config = SyncConfig {
+        lookback_days: config.sync_lookback_days,
+        batch_size: config.sync_batch_size,
+        events_per_batch: config.sync_events_per_batch,
+        batch_pause_secs: config.sync_batch_pause_secs,
+        relay_min_interval_secs: config.sync_relay_min_interval_secs,
+        wot_batch_size: config.sync_wot_batch_size,
+        wot_events_per_batch: config.sync_wot_events_per_batch,
+        cycle_interval_secs: config.sync_interval_secs,
+    };
     let sync_engine = Arc::new(SyncEngine::new(
         state.wot_graph.clone(),
         state.db.clone(),
@@ -389,6 +472,10 @@ async fn start_sync(
         state.sync_tier.clone(),
         state.sync_stats.clone(),
         app_handle,
+        config.storage_media_gb,
+        config.storage_others_gb,
+        sync_config,
+        config.max_event_age_days,
     ));
 
     let cancel = sync_engine.start();
@@ -406,6 +493,56 @@ async fn stop_sync(state: State<'_, AppState>) -> Result<(), String> {
         state.sync_tier.store(SyncTier::Idle as u8, Ordering::Relaxed);
         tracing::info!("Sync engine stopped");
     }
+    Ok(())
+}
+
+#[tauri::command]
+async fn restart_sync(state: State<'_, AppState>, app_handle: tauri::AppHandle) -> Result<(), String> {
+    tracing::info!("[cmd:restart_sync] called");
+    // Cancel existing sync
+    if let Some(cancel) = state.sync_cancel.write().await.take() {
+        cancel.cancel();
+        state.sync_tier.store(SyncTier::Idle as u8, Ordering::Relaxed);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    // Read current config and restart
+    let config = state.config.read().await;
+    let hex_pubkey = match &config.hex_pubkey {
+        Some(pk) => pk.clone(),
+        None => return Ok(()), // not initialized yet
+    };
+
+    let sync_config = SyncConfig {
+        lookback_days: config.sync_lookback_days,
+        batch_size: config.sync_batch_size,
+        events_per_batch: config.sync_events_per_batch,
+        batch_pause_secs: config.sync_batch_pause_secs,
+        relay_min_interval_secs: config.sync_relay_min_interval_secs,
+        wot_batch_size: config.sync_wot_batch_size,
+        wot_events_per_batch: config.sync_wot_events_per_batch,
+        cycle_interval_secs: config.sync_interval_secs,
+    };
+
+    let sync_engine = Arc::new(SyncEngine::new(
+        state.wot_graph.clone(),
+        state.db.clone(),
+        config.outbound_relays.clone(),
+        hex_pubkey,
+        state.sync_tier.clone(),
+        state.sync_stats.clone(),
+        app_handle.clone(),
+        config.storage_media_gb,
+        config.storage_others_gb,
+        sync_config,
+        config.max_event_age_days,
+    ));
+    drop(config);
+
+    let cancel = sync_engine.start();
+    *state.sync_cancel.write().await = Some(cancel);
+
+    tracing::info!("[cmd:restart_sync] Sync restarted with new config");
     Ok(())
 }
 
@@ -430,6 +567,59 @@ async fn get_feed(filter: FeedFilter, state: State<'_, AppState>) -> Result<Vec<
         })?;
 
     tracing::info!("[cmd:get_feed] returning {} events", events.len());
+
+    Ok(events
+        .into_iter()
+        .map(|(id, pubkey, created_at, kind, tags_json, content, sig)| {
+            let tags: Vec<Vec<String>> = serde_json::from_str(&tags_json).unwrap_or_default();
+            NostrEvent {
+                id,
+                pubkey,
+                created_at: created_at as u64,
+                kind: kind as u32,
+                tags,
+                content,
+                sig,
+            }
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn search_events(query: String, limit: Option<u32>, state: State<'_, AppState>) -> Result<Vec<NostrEvent>, String> {
+    tracing::info!("[cmd:search_events] query={:?}, limit={:?}", query, limit);
+    let lim = limit.unwrap_or(50);
+
+    // Determine if query is an npub/hex pubkey or a keyword search
+    let mut author_filter: Option<String> = None;
+    let mut keyword: Option<String> = None;
+
+    let trimmed = query.trim();
+
+    if trimmed.starts_with("npub1") {
+        // Decode npub to hex
+        use nostr_sdk::prelude::*;
+        match PublicKey::from_bech32(trimmed) {
+            Ok(pk) => { author_filter = Some(pk.to_hex()); },
+            Err(_) => { keyword = Some(trimmed.to_string()); },
+        }
+    } else if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        // Hex pubkey
+        author_filter = Some(trimmed.to_string());
+    } else {
+        // Keyword search
+        keyword = Some(trimmed.to_string());
+    }
+
+    let events = state
+        .db
+        .search_events(keyword.as_deref(), author_filter.as_deref(), lim)
+        .map_err(|e| {
+            tracing::error!("[cmd:search_events] query failed: {}", e);
+            format!("Search failed: {}", e)
+        })?;
+
+    tracing::info!("[cmd:search_events] returning {} events", events.len());
 
     Ok(events
         .into_iter()
@@ -607,25 +797,76 @@ async fn get_activity_data(state: State<'_, AppState>) -> Result<Vec<u64>, Strin
 async fn get_relay_status(state: State<'_, AppState>) -> Result<Vec<RelayStatusInfo>, String> {
     tracing::debug!("[cmd:get_relay_status] called");
     let config = state.config.read().await;
-    tracing::debug!("[cmd:get_relay_status] returning {} relays", config.outbound_relays.len());
-    Ok(config
-        .outbound_relays
+    let relays = config.outbound_relays.clone();
+    drop(config);
+
+    tracing::debug!("[cmd:get_relay_status] checking {} relays concurrently", relays.len());
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .user_agent("nostrito/0.1.0")
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+
+    // Check all relays concurrently via NIP-11 info endpoint
+    let futures: Vec<_> = relays
         .iter()
         .map(|url| {
-            let name = url
-                .replace("wss://", "")
-                .replace("ws://", "")
-                .replace("relay.", "")
-                .trim_end_matches('/')
-                .to_string();
-            RelayStatusInfo {
-                url: url.clone(),
-                name,
-                connected: true, // reflects configured status; real connectivity TBD
-                latency_ms: None, // TODO: measure actual latency
+            let client = client.clone();
+            let url = url.clone();
+            async move {
+                let name = url
+                    .replace("wss://", "")
+                    .replace("ws://", "")
+                    .replace("relay.", "")
+                    .trim_end_matches('/')
+                    .to_string();
+
+                // Convert wss:// → https:// or ws:// → http:// for NIP-11 info request
+                let http_url = url
+                    .replace("wss://", "https://")
+                    .replace("ws://", "http://");
+
+                let start = std::time::Instant::now();
+                let result = client
+                    .get(&http_url)
+                    .header("Accept", "application/nostr+json")
+                    .send()
+                    .await;
+
+                match result {
+                    Ok(_response) => {
+                        let latency = start.elapsed().as_millis() as u32;
+                        tracing::debug!("[relay_status] {} — connected ({}ms)", url, latency);
+                        RelayStatusInfo {
+                            url,
+                            name,
+                            connected: true,
+                            latency_ms: Some(latency),
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("[relay_status] {} — failed: {}", url, e);
+                        RelayStatusInfo {
+                            url,
+                            name,
+                            connected: false,
+                            latency_ms: None,
+                        }
+                    }
+                }
             }
         })
-        .collect())
+        .collect();
+
+    let results = futures_util::future::join_all(futures).await;
+    tracing::info!(
+        "[cmd:get_relay_status] {} relays checked: {} connected",
+        results.len(),
+        results.iter().filter(|r| r.connected).count()
+    );
+
+    Ok(results)
 }
 
 #[tauri::command]
@@ -677,10 +918,20 @@ async fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
         npub: config.npub.clone().unwrap_or_default(),
         relay_port: config.relay_port,
         max_storage_mb: config.max_storage_mb,
+        storage_others_gb: config.storage_others_gb,
+        storage_media_gb: config.storage_media_gb,
         wot_max_depth: config.wot_max_depth,
         sync_interval_secs: config.sync_interval_secs,
         outbound_relays: config.outbound_relays.clone(),
         auto_start: config.auto_start,
+        sync_lookback_days: config.sync_lookback_days,
+        sync_batch_size: config.sync_batch_size,
+        sync_events_per_batch: config.sync_events_per_batch,
+        sync_batch_pause_secs: config.sync_batch_pause_secs,
+        sync_relay_min_interval_secs: config.sync_relay_min_interval_secs,
+        sync_wot_batch_size: config.sync_wot_batch_size,
+        sync_wot_events_per_batch: config.sync_wot_events_per_batch,
+        max_event_age_days: config.max_event_age_days,
     })
 }
 
@@ -690,11 +941,59 @@ async fn save_settings(settings: Settings, state: State<'_, AppState>) -> Result
     let mut config = state.config.write().await;
     config.relay_port = settings.relay_port;
     config.max_storage_mb = settings.max_storage_mb;
+    config.storage_others_gb = settings.storage_others_gb;
+    config.storage_media_gb = settings.storage_media_gb;
     config.wot_max_depth = settings.wot_max_depth;
     config.sync_interval_secs = settings.sync_interval_secs;
     config.outbound_relays = settings.outbound_relays;
     config.auto_start = settings.auto_start;
+    config.sync_lookback_days = settings.sync_lookback_days;
+    config.sync_batch_size = settings.sync_batch_size;
+    config.sync_events_per_batch = settings.sync_events_per_batch;
+    config.sync_batch_pause_secs = settings.sync_batch_pause_secs;
+    config.sync_relay_min_interval_secs = settings.sync_relay_min_interval_secs;
+    config.sync_wot_batch_size = settings.sync_wot_batch_size;
+    config.sync_wot_events_per_batch = settings.sync_wot_events_per_batch;
+    config.max_event_age_days = settings.max_event_age_days;
+
+    // Persist sync config to DB
+    drop(config);
+    let db = &state.db;
+    db.set_config("sync_lookback_days", &settings.sync_lookback_days.to_string()).ok();
+    db.set_config("sync_batch_size", &settings.sync_batch_size.to_string()).ok();
+    db.set_config("sync_events_per_batch", &settings.sync_events_per_batch.to_string()).ok();
+    db.set_config("sync_batch_pause_secs", &settings.sync_batch_pause_secs.to_string()).ok();
+    db.set_config("sync_relay_min_interval_secs", &settings.sync_relay_min_interval_secs.to_string()).ok();
+    db.set_config("sync_wot_batch_size", &settings.sync_wot_batch_size.to_string()).ok();
+    db.set_config("sync_wot_events_per_batch", &settings.sync_wot_events_per_batch.to_string()).ok();
+    db.set_config("max_event_age_days", &settings.max_event_age_days.to_string()).ok();
+
     Ok(())
+}
+
+#[tauri::command]
+async fn track_profile(pubkey: String, note: Option<String>, state: State<'_, AppState>) -> Result<(), String> {
+    tracing::info!("[cmd:track_profile] pubkey={}...", &pubkey[..pubkey.len().min(12)]);
+    state.db.track_profile(&pubkey, note.as_deref()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn untrack_profile(pubkey: String, state: State<'_, AppState>) -> Result<(), String> {
+    tracing::info!("[cmd:untrack_profile] pubkey={}...", &pubkey[..pubkey.len().min(12)]);
+    state.db.untrack_profile(&pubkey).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_tracked_profiles(state: State<'_, AppState>) -> Result<Vec<serde_json::Value>, String> {
+    tracing::debug!("[cmd:get_tracked_profiles] called");
+    let profiles = state.db.get_tracked_profiles().map_err(|e| e.to_string())?;
+    Ok(profiles.into_iter().map(|(pubkey, tracked_at, note)| {
+        serde_json::json!({
+            "pubkey": pubkey,
+            "tracked_at": tracked_at,
+            "note": note,
+        })
+    }).collect())
 }
 
 #[tauri::command]
@@ -820,6 +1119,27 @@ async fn setup_browser_integration(app: tauri::AppHandle) -> Result<String, Stri
     Ok(result)
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MediaStats {
+    pub total_bytes: u64,
+    pub file_count: u64,
+    pub limit_bytes: u64,
+}
+
+#[tauri::command]
+async fn get_media_stats(state: State<'_, AppState>) -> Result<MediaStats, String> {
+    let db = &state.db;
+    let config = state.config.read().await;
+    let total_bytes = db.media_total_bytes().map_err(|e| e.to_string())?;
+    let file_count = db.media_file_count().map_err(|e| e.to_string())?;
+    let limit_bytes = (config.storage_media_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+    Ok(MediaStats {
+        total_bytes,
+        file_count,
+        limit_bytes,
+    })
+}
+
 #[tauri::command]
 async fn check_browser_integration() -> Result<bool, String> {
     let cert_path = dirs::home_dir()
@@ -887,6 +1207,16 @@ pub fn run() {
             config.outbound_relays = relays;
         }
     }
+    // Load sync tuning config
+    if let Ok(Some(v)) = db.get_config("sync_lookback_days") { if let Ok(n) = v.parse::<u32>() { config.sync_lookback_days = n; } }
+    if let Ok(Some(v)) = db.get_config("sync_batch_size") { if let Ok(n) = v.parse::<u32>() { config.sync_batch_size = n; } }
+    if let Ok(Some(v)) = db.get_config("sync_events_per_batch") { if let Ok(n) = v.parse::<u32>() { config.sync_events_per_batch = n; } }
+    if let Ok(Some(v)) = db.get_config("sync_batch_pause_secs") { if let Ok(n) = v.parse::<u32>() { config.sync_batch_pause_secs = n; } }
+    if let Ok(Some(v)) = db.get_config("sync_relay_min_interval_secs") { if let Ok(n) = v.parse::<u32>() { config.sync_relay_min_interval_secs = n; } }
+    if let Ok(Some(v)) = db.get_config("sync_wot_batch_size") { if let Ok(n) = v.parse::<u32>() { config.sync_wot_batch_size = n; } }
+    if let Ok(Some(v)) = db.get_config("sync_wot_events_per_batch") { if let Ok(n) = v.parse::<u32>() { config.sync_wot_events_per_batch = n; } }
+    if let Ok(Some(v)) = db.get_config("max_event_age_days") { if let Ok(n) = v.parse::<u32>() { config.max_event_age_days = n; } }
+
     tracing::info!("[init] Config: npub={:?}, relays={:?}, port={}", config.npub, config.outbound_relays, config.relay_port);
 
     let app_state = AppState {
@@ -932,6 +1262,21 @@ pub fn run() {
 
                     tracing::info!("Auto-resuming sync for {}...", &hex[..8]);
 
+                    let cfg2 = config.read().await;
+                    let media_gb = cfg2.storage_media_gb;
+                    let others_gb = cfg2.storage_others_gb;
+                    let max_age_days = cfg2.max_event_age_days;
+                    let sync_config = SyncConfig {
+                        lookback_days: cfg2.sync_lookback_days,
+                        batch_size: cfg2.sync_batch_size,
+                        events_per_batch: cfg2.sync_events_per_batch,
+                        batch_pause_secs: cfg2.sync_batch_pause_secs,
+                        relay_min_interval_secs: cfg2.sync_relay_min_interval_secs,
+                        wot_batch_size: cfg2.sync_wot_batch_size,
+                        wot_events_per_batch: cfg2.sync_wot_events_per_batch,
+                        cycle_interval_secs: cfg2.sync_interval_secs,
+                    };
+                    drop(cfg2);
                     let sync_engine = Arc::new(SyncEngine::new(
                         wot_graph,
                         db,
@@ -940,6 +1285,10 @@ pub fn run() {
                         sync_tier,
                         sync_stats,
                         app_handle.clone(),
+                        media_gb,
+                        others_gb,
+                        sync_config,
+                        max_age_days,
                     ));
 
                     let cancel = sync_engine.start();
@@ -1005,8 +1354,11 @@ pub fn run() {
             get_status,
             init_nostrito,
             get_wot,
+            get_follows,
+            get_profiles_batch,
             get_wot_distance,
             get_feed,
+            search_events,
             get_storage_stats,
             get_settings,
             save_settings,
@@ -1024,6 +1376,11 @@ pub fn run() {
             get_own_profile,
             setup_browser_integration,
             check_browser_integration,
+            get_media_stats,
+            restart_sync,
+            track_profile,
+            untrack_profile,
+            get_tracked_profiles,
         ])
         .run(tauri::generate_context!())
         .expect("error while running nostrito");

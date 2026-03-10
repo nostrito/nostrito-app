@@ -99,6 +99,30 @@ impl Database {
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS media_cache (
+                hash        TEXT PRIMARY KEY,
+                url         TEXT NOT NULL,
+                mime_type   TEXT NOT NULL,
+                size_bytes  INTEGER NOT NULL,
+                pubkey      TEXT NOT NULL,
+                downloaded_at INTEGER NOT NULL,
+                last_accessed INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_media_lru ON media_cache(last_accessed);
+            CREATE INDEX IF NOT EXISTS idx_media_pubkey ON media_cache(pubkey);
+
+            CREATE TABLE IF NOT EXISTS media_queue (
+                url TEXT PRIMARY KEY,
+                pubkey TEXT NOT NULL,
+                queued_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS tracked_profiles (
+                pubkey TEXT PRIMARY KEY,
+                tracked_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                note TEXT
+            );
         "#,
         )?;
 
@@ -466,6 +490,65 @@ impl Database {
         Ok(rows)
     }
 
+    /// Search events by keyword in content and/or by author pubkey.
+    /// Returns feed-worthy kinds (1, 6, 30023) ordered by created_at DESC.
+    pub fn search_events(
+        &self,
+        keyword: Option<&str>,
+        author: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<(String, String, i64, i64, String, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+
+        let mut sql = String::from(
+            "SELECT id, pubkey, created_at, kind, tags, content, sig FROM nostr_events WHERE kind IN (1, 6, 30023)",
+        );
+        let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        if let Some(q) = keyword {
+            let idx = param_values.len() + 1;
+            sql.push_str(&format!(" AND content LIKE ?{}", idx));
+            param_values.push(Box::new(format!("%{}%", q)));
+        }
+
+        if let Some(author_pk) = author {
+            let idx = param_values.len() + 1;
+            sql.push_str(&format!(" AND pubkey = ?{}", idx));
+            param_values.push(Box::new(author_pk.to_string()));
+        }
+
+        sql.push_str(" ORDER BY created_at DESC");
+
+        {
+            let idx = param_values.len() + 1;
+            sql.push_str(&format!(" LIMIT ?{}", idx));
+            param_values.push(Box::new(limit as i64));
+        }
+
+        debug!("[db] search_events: keyword={:?}, author={:?}, limit={}", keyword, author, limit);
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(rows)
+    }
+
     /// Get event count
     pub fn event_count(&self) -> Result<u64> {
         let conn = self.conn.lock().unwrap();
@@ -646,9 +729,292 @@ impl Database {
             DELETE FROM nostr_events;
             DELETE FROM sync_state;
             DELETE FROM app_config;
+            DELETE FROM media_cache;
         "#,
         )?;
         info!("Database cleared — all data deleted");
         Ok(())
+    }
+
+    // ── Tracked Profiles ──────────────────────────────────────────
+
+    /// Track a profile — its events are never pruned.
+    pub fn track_profile(&self, pubkey: &str, note: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO tracked_profiles (pubkey, tracked_at, note) VALUES (?1, strftime('%s','now'), ?2)",
+            params![pubkey, note],
+        )?;
+        info!("[db] track_profile: {}", &pubkey[..std::cmp::min(12, pubkey.len())]);
+        Ok(())
+    }
+
+    /// Untrack a profile.
+    pub fn untrack_profile(&self, pubkey: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM tracked_profiles WHERE pubkey = ?1", params![pubkey])?;
+        info!("[db] untrack_profile: {}", &pubkey[..std::cmp::min(12, pubkey.len())]);
+        Ok(())
+    }
+
+    /// Check if a profile is tracked.
+    pub fn is_tracked(&self, pubkey: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM tracked_profiles WHERE pubkey = ?1",
+            params![pubkey],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Get all tracked profiles: (pubkey, tracked_at, note).
+    pub fn get_tracked_profiles(&self) -> Result<Vec<(String, i64, Option<String>)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT pubkey, tracked_at, note FROM tracked_profiles ORDER BY tracked_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Get just the tracked pubkeys (for pruning exclusion).
+    pub fn get_tracked_pubkeys(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT pubkey FROM tracked_profiles")?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Prune events older than max_age_secs, excluding own events and tracked profiles.
+    pub fn prune_old_events(&self, own_pubkey: &str, max_age_secs: u64) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let cutoff = chrono::Utc::now().timestamp() as i64 - max_age_secs as i64;
+        let deleted = conn.execute(
+            "DELETE FROM nostr_events WHERE created_at < ?1 AND pubkey != ?2 AND pubkey NOT IN (SELECT pubkey FROM tracked_profiles)",
+            params![cutoff, own_pubkey],
+        )?;
+        Ok(deleted as u64)
+    }
+
+    // ── Media Cache Methods ────────────────────────────────────────
+
+    /// Check if a media blob is already cached
+    pub fn media_exists(&self, hash: &str) -> bool {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM media_cache WHERE hash = ?1",
+                params![hash],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        count > 0
+    }
+
+    /// Record a downloaded media item (file already written to disk)
+    pub fn store_media_record(
+        &self,
+        hash: &str,
+        url: &str,
+        mime_type: &str,
+        size_bytes: u64,
+        pubkey: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT OR REPLACE INTO media_cache (hash, url, mime_type, size_bytes, pubkey, downloaded_at, last_accessed) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![hash, url, mime_type, size_bytes as i64, pubkey, now, now],
+        )?;
+        debug!("[db] store_media_record: hash={}… size={}", &hash[..std::cmp::min(12, hash.len())], size_bytes);
+        Ok(())
+    }
+
+    /// Number of cached media files
+    pub fn media_file_count(&self) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM media_cache", [], |row| row.get(0))?;
+        Ok(count as u64)
+    }
+
+    /// Total bytes used by cached media
+    pub fn media_total_bytes(&self) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let total: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(size_bytes), 0) FROM media_cache",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(total as u64)
+    }
+
+    /// List media ordered by last_accessed ASC (oldest first = evict first), limited to `limit` rows
+    /// Returns Vec<(hash, size_bytes)>
+    pub fn media_list_lru(&self, limit: usize) -> Result<Vec<(String, u64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT hash, size_bytes FROM media_cache ORDER BY last_accessed ASC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// List media ordered by last_accessed ASC, EXCLUDING items from a specific pubkey (never evict own media)
+    pub fn media_list_lru_excluding_pubkey(&self, limit: usize, exclude_pubkey: &str) -> Result<Vec<(String, u64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT hash, size_bytes FROM media_cache WHERE pubkey != ?1 ORDER BY last_accessed ASC LIMIT ?2"
+        )?;
+        let rows = stmt
+            .query_map(params![exclude_pubkey, limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Total bytes used by others' media (excluding own pubkey)
+    pub fn media_others_bytes(&self, exclude_pubkey: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let total: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(size_bytes), 0) FROM media_cache WHERE pubkey != ?1",
+            params![exclude_pubkey],
+            |row| row.get(0),
+        )?;
+        Ok(total as u64)
+    }
+
+    /// Delete oldest events from others (NOT from own pubkey) — used for storage enforcement
+    pub fn delete_oldest_others_events(&self, own_pubkey: &str, count: u32) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let deleted: usize = conn.execute(
+            "DELETE FROM nostr_events WHERE id IN (
+                SELECT id FROM nostr_events
+                WHERE pubkey != ?1
+                ORDER BY created_at ASC
+                LIMIT ?2
+            )",
+            params![own_pubkey, count as i64],
+        )?;
+        Ok(deleted as u64)
+    }
+
+    /// Get the Tier 2 sync cursor (wall-clock timestamp of last successful sync).
+    /// Stored in app_config under key "tier2_since".
+    pub fn get_sync_cursor(&self) -> Result<Option<u64>> {
+        match self.get_config("tier2_since")? {
+            Some(val) => Ok(val.parse::<u64>().ok()),
+            None => Ok(None),
+        }
+    }
+
+    /// Set the Tier 2 sync cursor to a wall-clock timestamp.
+    pub fn set_sync_cursor(&self, ts: u64) -> Result<()> {
+        self.set_config("tier2_since", &ts.to_string())
+    }
+
+    /// Get the Tier 2 historical backfill cursor (walks backward in time).
+    /// Stored in app_config under key "tier2_history_until".
+    pub fn get_history_cursor(&self) -> Result<Option<u64>> {
+        match self.get_config("tier2_history_until")? {
+            Some(val) => Ok(val.parse::<u64>().ok()),
+            None => Ok(None),
+        }
+    }
+
+    /// Set the Tier 2 historical backfill cursor.
+    pub fn set_history_cursor(&self, ts: u64) -> Result<()> {
+        self.set_config("tier2_history_until", &ts.to_string())
+    }
+
+    /// Get the latest created_at timestamp from stored nostr events.
+    pub fn get_latest_event_timestamp(&self) -> Result<Option<u64>> {
+        let conn = self.conn.lock().unwrap();
+        let result: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(created_at), 0) FROM nostr_events",
+            [],
+            |row| row.get(0),
+        )?;
+        if result == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(result as u64))
+        }
+    }
+
+    /// Delete media records by hash (caller must also delete the file)
+    pub fn media_delete_records(&self, hashes: &[String]) -> Result<()> {
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap();
+        for hash in hashes {
+            conn.execute("DELETE FROM media_cache WHERE hash = ?1", params![hash])?;
+        }
+        debug!("[db] media_delete_records: deleted {} records", hashes.len());
+        Ok(())
+    }
+
+    // ── Media queue ─────────────────────────────────────────────
+
+    /// Queue a media URL for later download (INSERT OR IGNORE to dedup).
+    pub fn queue_media_url(&self, url: &str, pubkey: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO media_queue (url, pubkey) VALUES (?1, ?2)",
+            params![url, pubkey],
+        )?;
+        Ok(())
+    }
+
+    /// Dequeue up to `limit` media URLs (FIFO by queued_at). Deletes them from the queue.
+    pub fn dequeue_media_urls(&self, limit: usize) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT url, pubkey FROM media_queue ORDER BY queued_at ASC LIMIT ?1",
+        )?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if !rows.is_empty() {
+            let placeholders: Vec<String> = rows.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+            let sql = format!("DELETE FROM media_queue WHERE url IN ({})", placeholders.join(","));
+            let param_refs: Vec<&dyn rusqlite::ToSql> = rows.iter().map(|(u, _)| u as &dyn rusqlite::ToSql).collect();
+            conn.execute(&sql, param_refs.as_slice())?;
+        }
+
+        Ok(rows)
+    }
+
+    /// Count pending items in media queue.
+    pub fn media_queue_count(&self) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM media_queue", [], |row| row.get(0))?;
+        Ok(count as u64)
     }
 }

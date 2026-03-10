@@ -1,22 +1,25 @@
 /** Settings — app configuration. Loads real data via get_settings/save_settings. */
 
 import { invoke } from "@tauri-apps/api/core";
+import { RELAYS, resolveRelayUrl, urlToAlias } from "../relays";
 
 interface Settings {
   npub: string;
   relay_port: number;
   max_storage_mb: number;
+  storage_others_gb: number;
+  storage_media_gb: number;
   wot_max_depth: number;
   sync_interval_secs: number;
   outbound_relays: string[];
   auto_start: boolean;
-}
-
-interface RelayStatusInfo {
-  url: string;
-  name: string;
-  connected: boolean;
-  latency_ms: number | null;
+  sync_lookback_days: number;
+  sync_batch_size: number;
+  sync_events_per_batch: number;
+  sync_batch_pause_secs: number;
+  sync_relay_min_interval_secs: number;
+  sync_wot_batch_size: number;
+  sync_wot_events_per_batch: number;
 }
 
 function escapeHtml(str: string): string {
@@ -34,6 +37,8 @@ export function renderSettings(container: HTMLElement): void {
         <div class="settings-sub-item active" data-settings="identity">🔑 Identity</div>
         <div class="settings-sub-item" data-settings="relays">📡 Relays</div>
         <div class="settings-sub-item" data-settings="wot-settings">🕸️ WoT</div>
+        <div class="settings-sub-item" data-settings="storage">💾 Storage</div>
+        <div class="settings-sub-item" data-settings="sync">⚡ Sync</div>
         <div class="settings-sub-item" data-settings="advanced">⚙️ Advanced</div>
       </div>
       <div class="settings-panel">
@@ -60,15 +65,213 @@ export function renderSettings(container: HTMLElement): void {
         <!-- Relays -->
         <div class="settings-pane" id="pane-relays">
           <div class="settings-pane-title">Relays</div>
-          <div class="settings-pane-desc">Manage relay connections.</div>
-          <div id="settings-relay-list">Loading relays...</div>
+          <div class="settings-pane-desc">Pick which relays to sync from. Changes take effect after saving.</div>
+          <div id="settings-relay-grid" class="relay-grid" style="margin-bottom:16px"></div>
+          <button class="btn btn-primary" id="btn-save-relays" style="width:100%">Save Relays</button>
+          <div id="relay-save-result" style="margin-top:8px;font-size:0.78rem;text-align:center"></div>
         </div>
         <!-- WoT Settings -->
         <div class="settings-pane" id="pane-wot-settings">
           <div class="settings-pane-title">Web of Trust</div>
           <div class="settings-pane-desc">Configure trust graph computation.</div>
           <div class="settings-field"><div class="settings-field-info"><span class="settings-field-label">Max depth</span><span class="settings-field-desc">How many hops to compute</span></div><span style="font-family:var(--mono);font-size:0.85rem;color:var(--accent-light)" id="settings-wot-depth">—</span></div>
-          <div class="settings-field"><div class="settings-field-info"><span class="settings-field-label">Sync interval</span><span class="settings-field-desc">Seconds between sync cycles</span></div><span style="font-family:var(--mono);font-size:0.85rem;color:var(--text-dim)" id="settings-sync-interval">—</span></div>
+          <div class="settings-field"><div class="settings-field-info"><span class="settings-field-label">Sync interval</span><span class="settings-field-desc">Minutes between full sync cycles. Lower = more real-time, higher = more polite.</span></div><span style="font-family:var(--mono);font-size:0.85rem;color:var(--text-dim)" id="settings-sync-interval">—</span></div>
+        </div>
+        <!-- Storage -->
+        <div class="settings-pane" id="pane-storage">
+          <div class="settings-pane-title">Storage</div>
+          <div class="settings-pane-desc">Control what gets stored and how much space to use.</div>
+
+          <div class="storage-section">
+            <div class="storage-row locked">
+              <div class="storage-row-info">
+                <span class="storage-row-label">Your events & media</span>
+                <span class="storage-row-meta">🔒 Always stored. No exceptions.</span>
+              </div>
+              <div class="storage-bar-wrap">
+                <div class="storage-bar"><div class="storage-bar-fill"></div></div>
+                <span class="storage-bar-label">100%</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="storage-section">
+            <div class="storage-row">
+              <div class="storage-row-info">
+                <span class="storage-row-label">Others' events</span>
+                <span class="storage-row-meta">From your Web of Trust</span>
+              </div>
+              <div class="storage-slider-wrap">
+                <input type="range" class="storage-slider" min="1" max="50" value="5" id="settings-others-events-slider">
+                <span class="storage-slider-value" id="settings-others-events-val">5 GB</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="storage-section">
+            <div class="storage-row">
+              <div class="storage-row-info">
+                <span class="storage-row-label">Others' media (Blossom)</span>
+                <span class="storage-row-meta">Images, videos, audio from your network</span>
+              </div>
+              <div class="storage-slider-wrap">
+                <input type="range" class="storage-slider" min="1" max="50" value="2" id="settings-others-media-slider">
+                <span class="storage-slider-value" id="settings-others-media-val">2 GB</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="storage-section">
+            <div class="storage-row">
+              <div class="storage-row-info">
+                <span class="storage-row-label">Auto-cleanup</span>
+                <span class="storage-row-meta">When storage limit is reached</span>
+              </div>
+              <div class="cleanup-group" id="settings-cleanup-group">
+                <div class="cleanup-radio active" data-cleanup="oldest">Oldest first</div>
+                <div class="cleanup-radio" data-cleanup="least-interacted">Least interacted</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="storage-section">
+            <div class="storage-row">
+              <div class="storage-row-info">
+                <span class="storage-row-label">Event retention</span>
+                <span class="storage-row-meta">How long to keep others' events. Own events and tracked profiles are kept forever.</span>
+              </div>
+              <div class="storage-slider-wrap">
+                <input type="range" class="storage-slider" min="7" max="365" step="1" value="30" id="storage-max-age">
+                <span class="storage-slider-value" id="storage-max-age-val">30 days</span>
+              </div>
+              <div style="display:flex;gap:8px;margin-top:8px">
+                <button class="btn btn-secondary age-preset" data-days="7" style="font-size:0.75rem;padding:4px 10px">7d</button>
+                <button class="btn btn-secondary age-preset" data-days="14" style="font-size:0.75rem;padding:4px 10px">14d</button>
+                <button class="btn btn-secondary age-preset" data-days="30" style="font-size:0.75rem;padding:4px 10px">30d</button>
+                <button class="btn btn-secondary age-preset" data-days="90" style="font-size:0.75rem;padding:4px 10px">90d</button>
+                <button class="btn btn-secondary age-preset" data-days="365" style="font-size:0.75rem;padding:4px 10px">1yr</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="storage-section">
+            <div class="storage-row">
+              <div class="storage-row-info">
+                <span class="storage-row-label">Tracked Profiles</span>
+                <span class="storage-row-meta">These profiles are always kept — no age limit, never pruned. Perfect for important follows.</span>
+              </div>
+              <div id="tracked-profiles-list" style="margin:8px 0;font-size:0.82rem;color:var(--text-dim)">Loading...</div>
+              <div style="display:flex;gap:8px;margin-top:8px">
+                <input type="text" id="track-profile-input" placeholder="npub or hex pubkey" style="flex:1;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:0.82rem;font-family:var(--mono)">
+                <button class="btn btn-primary" id="btn-track-profile" style="font-size:0.82rem;padding:8px 16px">Track</button>
+              </div>
+            </div>
+          </div>
+
+          <button class="btn btn-primary" id="btn-save-storage" style="margin-top:16px;width:100%">Save Storage Settings</button>
+          <div id="storage-save-result" style="margin-top:8px;font-size:0.78rem;text-align:center"></div>
+        </div>
+        <!-- Sync -->
+        <div class="settings-pane" id="pane-sync">
+          <div class="settings-pane-title">Sync Configuration</div>
+          <div class="settings-pane-desc">Tune how the sync engine fetches events. Use aggressive settings to build the initial database, then switch to conservative for ongoing sync.</div>
+
+          <div class="sync-presets">
+            <button class="sync-preset-btn" data-preset="aggressive">🚀 Aggressive (initial build)</button>
+            <button class="sync-preset-btn" data-preset="balanced">⚖️ Balanced (default)</button>
+            <button class="sync-preset-btn" data-preset="polite">🐢 Polite (background)</button>
+          </div>
+
+          <div class="settings-field">
+            <div class="settings-field-info">
+              <span class="settings-field-label">Lookback window</span>
+              <span class="settings-field-desc">How many days back to fetch in Tier 2</span>
+            </div>
+            <div class="sync-slider-wrap">
+              <input type="range" class="sync-slider" id="sync-lookback" min="1" max="90" value="7">
+              <span class="sync-slider-val" id="sync-lookback-val">7 days</span>
+            </div>
+          </div>
+
+          <div class="settings-field">
+            <div class="settings-field-info">
+              <span class="settings-field-label">Authors per batch</span>
+              <span class="settings-field-desc">How many authors per subscription request (Tier 2). Higher = faster but more likely to get rate-limited.</span>
+            </div>
+            <div class="sync-slider-wrap">
+              <input type="range" class="sync-slider" id="sync-batch-size" min="1" max="50" value="10">
+              <span class="sync-slider-val" id="sync-batch-size-val">10</span>
+            </div>
+          </div>
+
+          <div class="settings-field">
+            <div class="settings-field-info">
+              <span class="settings-field-label">Events per request</span>
+              <span class="settings-field-desc">Max events per REQ (limit). Higher = more data per round trip.</span>
+            </div>
+            <div class="sync-slider-wrap">
+              <input type="range" class="sync-slider" id="sync-events-per-batch" min="10" max="500" step="10" value="50">
+              <span class="sync-slider-val" id="sync-events-per-batch-val">50</span>
+            </div>
+          </div>
+
+          <div class="settings-field">
+            <div class="settings-field-info">
+              <span class="settings-field-label">Pause between batches</span>
+              <span class="settings-field-desc">Seconds to wait between subscription batches. Lower = faster, higher = more polite.</span>
+            </div>
+            <div class="sync-slider-wrap">
+              <input type="range" class="sync-slider" id="sync-batch-pause" min="0" max="30" value="7">
+              <span class="sync-slider-val" id="sync-batch-pause-val">7s</span>
+            </div>
+          </div>
+
+          <div class="settings-field">
+            <div class="settings-field-info">
+              <span class="settings-field-label">Min relay interval</span>
+              <span class="settings-field-desc">Minimum seconds between requests to the same relay.</span>
+            </div>
+            <div class="sync-slider-wrap">
+              <input type="range" class="sync-slider" id="sync-relay-interval" min="0" max="10" value="3">
+              <span class="sync-slider-val" id="sync-relay-interval-val">3s</span>
+            </div>
+          </div>
+
+          <div class="settings-field">
+            <div class="settings-field-info">
+              <span class="settings-field-label">WoT authors per batch</span>
+              <span class="settings-field-desc">Authors per batch in Tier 3 (WoT crawl).</span>
+            </div>
+            <div class="sync-slider-wrap">
+              <input type="range" class="sync-slider" id="sync-wot-batch" min="1" max="30" value="5">
+              <span class="sync-slider-val" id="sync-wot-batch-val">5</span>
+            </div>
+          </div>
+
+          <div class="settings-field">
+            <div class="settings-field-info">
+              <span class="settings-field-label">WoT events per request</span>
+              <span class="settings-field-desc">Max events per REQ in Tier 3 WoT crawl.</span>
+            </div>
+            <div class="sync-slider-wrap">
+              <input type="range" class="sync-slider" id="sync-wot-events" min="5" max="100" value="15">
+              <span class="sync-slider-val" id="sync-wot-events-val">15</span>
+            </div>
+          </div>
+
+          <div class="settings-field">
+            <div class="settings-field-info">
+              <span class="settings-field-label">Sync cycle interval</span>
+              <span class="settings-field-desc">Minutes between full sync cycles. Lower = more real-time, higher = more polite.</span>
+            </div>
+            <div class="sync-slider-wrap">
+              <input type="range" class="sync-slider" id="sync-interval" min="1" max="60" value="5">
+              <span class="sync-slider-val" id="sync-interval-val">5 min</span>
+            </div>
+          </div>
+
+          <button class="btn btn-primary" id="sync-save-btn" style="margin-top:16px">Save & Restart Sync</button>
+          <div id="sync-save-result" style="margin-top:8px;font-size:0.78rem"></div>
         </div>
         <!-- Advanced -->
         <div class="settings-pane" id="pane-advanced">
@@ -76,7 +279,6 @@ export function renderSettings(container: HTMLElement): void {
           <div class="settings-pane-desc">Low-level configuration options.</div>
           <div class="settings-field"><div class="settings-field-info"><span class="settings-field-label">Relay port</span><span class="settings-field-desc">Local WebSocket relay port</span></div><span style="font-family:var(--mono);font-size:0.85rem;color:var(--text-dim)" id="settings-port">—</span></div>
           <div class="settings-field"><div class="settings-field-info"><span class="settings-field-label">Auto-start</span><span class="settings-field-desc">Start nostrito on login</span></div><label class="toggle"><input type="checkbox" id="settings-autostart"><span class="toggle-slider"></span></label></div>
-          <div class="settings-field"><div class="settings-field-info"><span class="settings-field-label">Max storage</span><span class="settings-field-desc">Database size limit</span></div><span style="font-family:var(--mono);font-size:0.85rem;color:var(--text-dim)" id="settings-max-storage">—</span></div>
 
           <div class="settings-field" style="border-bottom:none;padding-bottom:8px"><div class="settings-field-info"><span class="settings-field-label">Browser Integration</span><span class="settings-field-desc">Enable wss:// for web Nostr clients (Coracle, Snort, Primal)</span></div></div>
           <div style="background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:14px 18px;margin-bottom:16px">
@@ -126,6 +328,68 @@ export function renderSettings(container: HTMLElement): void {
     });
   });
 
+  // Wire storage sliders
+  const evSlider = document.getElementById("settings-others-events-slider") as HTMLInputElement | null;
+  const evVal = document.getElementById("settings-others-events-val");
+  if (evSlider && evVal) {
+    evSlider.addEventListener("input", () => {
+      evVal.textContent = `${evSlider.value} GB`;
+    });
+  }
+
+  const mdSlider = document.getElementById("settings-others-media-slider") as HTMLInputElement | null;
+  const mdVal = document.getElementById("settings-others-media-val");
+  if (mdSlider && mdVal) {
+    mdSlider.addEventListener("input", () => {
+      mdVal.textContent = `${mdSlider.value} GB`;
+    });
+  }
+
+  // Wire cleanup radios
+  const cleanupGroup = document.getElementById("settings-cleanup-group");
+  if (cleanupGroup) {
+    cleanupGroup.querySelectorAll(".cleanup-radio").forEach((radio) => {
+      radio.addEventListener("click", () => {
+        cleanupGroup.querySelectorAll(".cleanup-radio").forEach((r) => r.classList.remove("active"));
+        radio.classList.add("active");
+      });
+    });
+  }
+
+  // Wire event retention slider
+  const ageSlider = document.getElementById("storage-max-age") as HTMLInputElement | null;
+  const ageVal = document.getElementById("storage-max-age-val");
+  if (ageSlider && ageVal) {
+    ageSlider.addEventListener("input", () => {
+      ageVal.textContent = `${ageSlider.value} days`;
+    });
+  }
+
+  // Wire age preset buttons
+  container.querySelectorAll(".age-preset").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const days = (btn as HTMLElement).dataset.days;
+      if (days && ageSlider && ageVal) {
+        ageSlider.value = days;
+        ageVal.textContent = `${days} days`;
+      }
+    });
+  });
+
+  // Wire track profile button
+  document.getElementById("btn-track-profile")?.addEventListener("click", async () => {
+    const input = document.getElementById("track-profile-input") as HTMLInputElement | null;
+    if (!input || !input.value.trim()) return;
+    const pubkey = input.value.trim();
+    try {
+      await invoke("track_profile", { pubkey, note: null });
+      input.value = "";
+      loadTrackedProfiles();
+    } catch (e) {
+      console.error("[settings] track_profile failed:", e);
+    }
+  });
+
   // Wire danger zone buttons
   document.getElementById("btn-reset-app")?.addEventListener("click", async () => {
     if (confirm("Are you sure? This will delete ALL data and return to the setup wizard.")) {
@@ -160,6 +424,201 @@ export function renderSettings(container: HTMLElement): void {
   });
 
   loadSettings();
+
+  // Wire storage save button (needs to be after loadSettings call to use _currentSettings)
+  document.getElementById("btn-save-storage")?.addEventListener("click", async () => {
+    const resultEl = document.getElementById("storage-save-result");
+    const btn = document.getElementById("btn-save-storage") as HTMLButtonElement | null;
+    if (!_currentSettings || !btn) return;
+
+    const evSliderEl = document.getElementById("settings-others-events-slider") as HTMLInputElement;
+    const mdSliderEl = document.getElementById("settings-others-media-slider") as HTMLInputElement;
+
+    const ageSliderSave = document.getElementById("storage-max-age") as HTMLInputElement;
+    const updated = {
+      ..._currentSettings,
+      storage_others_gb: parseFloat(evSliderEl.value),
+      storage_media_gb: parseFloat(mdSliderEl.value),
+      max_event_age_days: parseInt(ageSliderSave?.value || "30", 10),
+    };
+
+    btn.disabled = true;
+    btn.textContent = "Saving...";
+    if (resultEl) resultEl.innerHTML = "";
+
+    try {
+      await invoke("save_settings", { settings: updated });
+      _currentSettings = updated;
+      btn.textContent = "Save Storage Settings";
+      btn.disabled = false;
+      if (resultEl) resultEl.innerHTML = `<span style="color:#34d399">✅ Storage settings saved</span>`;
+    } catch (e) {
+      btn.textContent = "Save Storage Settings";
+      btn.disabled = false;
+      if (resultEl) resultEl.innerHTML = `<span style="color:#ef4444">Failed: ${e}</span>`;
+    }
+  });
+
+  // Wire relay save button
+  document.getElementById("btn-save-relays")?.addEventListener("click", async () => {
+    const resultEl = document.getElementById("relay-save-result");
+    const btn = document.getElementById("btn-save-relays") as HTMLButtonElement | null;
+    if (!_currentSettings || !btn) return;
+
+    if (_selectedRelayAliases.size === 0) {
+      if (resultEl) resultEl.innerHTML = `<span style="color:#ef4444">Select at least one relay</span>`;
+      return;
+    }
+
+    const outboundRelays = Array.from(_selectedRelayAliases).map(resolveRelayUrl);
+    const updated: Settings = { ..._currentSettings, outbound_relays: outboundRelays };
+
+    btn.disabled = true;
+    btn.textContent = "Saving...";
+    if (resultEl) resultEl.innerHTML = "";
+
+    try {
+      await invoke("save_settings", { settings: updated });
+      _currentSettings = updated;
+      await invoke("restart_sync");
+      btn.textContent = "Save Relays";
+      btn.disabled = false;
+      if (resultEl) resultEl.innerHTML = `<span style="color:#34d399">✅ Relays saved — sync restarted</span>`;
+    } catch (e) {
+      btn.textContent = "Save Relays";
+      btn.disabled = false;
+      if (resultEl) resultEl.innerHTML = `<span style="color:#ef4444">Failed: ${e}</span>`;
+    }
+  });
+
+  // ── Sync pane: sliders, presets, save ──
+
+  const SYNC_PRESETS: Record<string, { lookback: number; batchSize: number; eventsPerBatch: number; batchPause: number; relayInterval: number; wotBatch: number; wotEvents: number }> = {
+    aggressive: { lookback: 30, batchSize: 30, eventsPerBatch: 200, batchPause: 2, relayInterval: 1, wotBatch: 15, wotEvents: 50 },
+    balanced:   { lookback: 7,  batchSize: 10, eventsPerBatch: 50,  batchPause: 7, relayInterval: 3, wotBatch: 5,  wotEvents: 15 },
+    polite:     { lookback: 3,  batchSize: 5,  eventsPerBatch: 20,  batchPause: 15, relayInterval: 5, wotBatch: 3,  wotEvents: 10 },
+  };
+
+  function applySyncPreset(p: typeof SYNC_PRESETS[string]) {
+    const set = (id: string, val: number, suffix?: string) => {
+      const el = document.getElementById(id) as HTMLInputElement | null;
+      const valEl = document.getElementById(id + "-val");
+      if (el) el.value = String(val);
+      if (valEl) valEl.textContent = suffix ? `${val}${suffix}` : String(val);
+    };
+    set("sync-lookback", p.lookback, " days");
+    set("sync-batch-size", p.batchSize);
+    set("sync-events-per-batch", p.eventsPerBatch);
+    set("sync-batch-pause", p.batchPause, "s");
+    set("sync-relay-interval", p.relayInterval, "s");
+    set("sync-wot-batch", p.wotBatch);
+    set("sync-wot-events", p.wotEvents);
+  }
+
+  // Wire preset buttons
+  container.querySelectorAll(".sync-preset-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const preset = (btn as HTMLElement).dataset.preset!;
+      if (SYNC_PRESETS[preset]) applySyncPreset(SYNC_PRESETS[preset]);
+    });
+  });
+
+  // Wire slider value displays
+  const syncSliderMap: [string, string][] = [
+    ["sync-lookback", " days"],
+    ["sync-batch-size", ""],
+    ["sync-events-per-batch", ""],
+    ["sync-batch-pause", "s"],
+    ["sync-relay-interval", "s"],
+    ["sync-wot-batch", ""],
+    ["sync-wot-events", ""],
+    ["sync-interval", " min"],
+  ];
+  for (const [id, suffix] of syncSliderMap) {
+    const slider = document.getElementById(id) as HTMLInputElement | null;
+    const valEl = document.getElementById(id + "-val");
+    if (slider && valEl) {
+      slider.addEventListener("input", () => {
+        valEl.textContent = suffix ? `${slider.value}${suffix}` : slider.value;
+      });
+    }
+  }
+
+  // Wire save button
+  document.getElementById("sync-save-btn")?.addEventListener("click", async () => {
+    const resultEl = document.getElementById("sync-save-result");
+    const btn = document.getElementById("sync-save-btn") as HTMLButtonElement | null;
+    if (!_currentSettings || !btn) return;
+
+    const getVal = (id: string) => parseInt((document.getElementById(id) as HTMLInputElement)?.value || "0", 10);
+
+    const updated: Settings = {
+      ..._currentSettings,
+      sync_lookback_days: getVal("sync-lookback"),
+      sync_batch_size: getVal("sync-batch-size"),
+      sync_events_per_batch: getVal("sync-events-per-batch"),
+      sync_batch_pause_secs: getVal("sync-batch-pause"),
+      sync_relay_min_interval_secs: getVal("sync-relay-interval"),
+      sync_wot_batch_size: getVal("sync-wot-batch"),
+      sync_wot_events_per_batch: getVal("sync-wot-events"),
+      sync_interval_secs: getVal("sync-interval") * 60,
+    };
+
+    btn.disabled = true;
+    btn.textContent = "Saving...";
+    if (resultEl) resultEl.innerHTML = "";
+
+    try {
+      await invoke("save_settings", { settings: updated });
+      _currentSettings = updated;
+      await invoke("restart_sync");
+      btn.textContent = "Save & Restart Sync";
+      btn.disabled = false;
+      if (resultEl) resultEl.innerHTML = `<span style="color:#34d399">✅ Saved — sync restarted with new config</span>`;
+    } catch (e) {
+      btn.textContent = "Save & Restart Sync";
+      btn.disabled = false;
+      if (resultEl) resultEl.innerHTML = `<span style="color:#ef4444">Failed: ${e}</span>`;
+    }
+  });
+}
+
+let _currentSettings: Settings | null = null;
+let _selectedRelayAliases: Set<string> = new Set();
+
+async function loadTrackedProfiles(): Promise<void> {
+  const listEl = document.getElementById("tracked-profiles-list");
+  if (!listEl) return;
+  try {
+    const profiles = await invoke<Array<{ pubkey: string; tracked_at: number; note: string | null }>>("get_tracked_profiles");
+    if (profiles.length === 0) {
+      listEl.innerHTML = `<div style="color:var(--text-muted);font-size:0.78rem;padding:4px 0">No tracked profiles yet.</div>`;
+      return;
+    }
+    listEl.innerHTML = profiles.map(p => {
+      const short = p.pubkey.length > 16 ? p.pubkey.slice(0, 8) + "…" + p.pubkey.slice(-8) : p.pubkey;
+      const noteHtml = p.note ? ` <span style="color:var(--text-muted);font-size:0.72rem">(${p.note})</span>` : "";
+      return `<div style="display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border)">
+        <span style="font-family:var(--mono);font-size:0.78rem" title="${p.pubkey}">${short}${noteHtml}</span>
+        <button class="btn-untrack" data-pubkey="${p.pubkey}" style="font-size:0.72rem;padding:2px 8px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--text-dim);cursor:pointer">Untrack</button>
+      </div>`;
+    }).join("");
+    listEl.querySelectorAll(".btn-untrack").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const pk = (btn as HTMLElement).dataset.pubkey;
+        if (!pk) return;
+        try {
+          await invoke("untrack_profile", { pubkey: pk });
+          loadTrackedProfiles();
+        } catch (e) {
+          console.error("[settings] untrack_profile failed:", e);
+        }
+      });
+    });
+  } catch (e) {
+    listEl.innerHTML = `<div style="color:#ef4444;font-size:0.78rem">Failed to load tracked profiles</div>`;
+    console.error("[settings] get_tracked_profiles failed:", e);
+  }
 }
 
 async function loadSettings(): Promise<void> {
@@ -174,38 +633,50 @@ async function loadSettings(): Promise<void> {
       npubEl.textContent = settings.npub || "Not configured";
     }
 
-    // Relays — from real config
-    const relayListEl = document.getElementById("settings-relay-list");
-    if (relayListEl) {
-      if (settings.outbound_relays.length === 0) {
-        relayListEl.innerHTML = `<div style="color:var(--text-muted);font-size:0.85rem">No relays configured</div>`;
-      } else {
-        // Try to get relay status for latency info
-        let relayStatus: RelayStatusInfo[] = [];
-        try {
-          console.log("[settings] Calling get_relay_status...");
-          relayStatus = await invoke<RelayStatusInfo[]>("get_relay_status");
-          console.log("[settings] get_relay_status response:", relayStatus.length, "relays");
-        } catch (_) {}
+    // Relays — card grid picker
+    const relayGridEl = document.getElementById("settings-relay-grid");
+    if (relayGridEl) {
+      // Convert stored relays to alias set for pre-selection
+      // Handles BOTH short aliases (e.g. "primal") and wss:// URLs
+      const activeAliases = new Set<string>();
+      for (const relay of settings.outbound_relays) {
+        const isAlias = RELAYS.some(r => r.id === relay);
+        if (isAlias) {
+          activeAliases.add(relay);
+        } else {
+          const alias = urlToAlias(relay);
+          if (alias) activeAliases.add(alias);
+        }
+      }
 
-        const statusMap = new Map(relayStatus.map((r) => [r.url, r]));
+      // Track selected relays in module scope for the save button
+      _selectedRelayAliases = new Set(activeAliases);
 
-        relayListEl.innerHTML = settings.outbound_relays
-          .map((url) => {
-            const info = statusMap.get(url);
-            const name = info?.name || url.replace("wss://", "").replace("ws://", "");
-            const latency = info?.latency_ms != null ? `${info.latency_ms}ms` : "";
-            return `
-              <div class="settings-field">
-                <div class="settings-field-info">
-                  <span class="settings-field-label">${escapeHtml(name)}</span>
-                  <span class="settings-field-desc">${escapeHtml(url)}${latency ? ` · ${latency}` : ""}</span>
-                </div>
-                <label class="toggle"><input type="checkbox" checked><span class="toggle-slider"></span></label>
-              </div>
-            `;
-          })
-          .join("");
+      relayGridEl.innerHTML = "";
+      for (const relay of RELAYS) {
+        const isOn = activeAliases.has(relay.id);
+        const card = document.createElement("div");
+        card.className = `relay-card${isOn ? " selected" : ""}`;
+        card.setAttribute("data-relay", relay.id);
+        card.innerHTML = `
+          <div class="relay-card-info">
+            <span class="relay-card-name">${escapeHtml(relay.name)}</span>
+            <span class="relay-card-desc">${escapeHtml(relay.description)}</span>
+          </div>
+          <div class="relay-check">${isOn ? "✓" : ""}</div>
+        `;
+        card.addEventListener("click", () => {
+          const selected = _selectedRelayAliases.has(relay.id);
+          if (selected) {
+            _selectedRelayAliases.delete(relay.id);
+          } else {
+            _selectedRelayAliases.add(relay.id);
+          }
+          card.classList.toggle("selected");
+          const check = card.querySelector(".relay-check")!;
+          check.textContent = _selectedRelayAliases.has(relay.id) ? "✓" : "";
+        });
+        relayGridEl.appendChild(card);
       }
     }
 
@@ -214,7 +685,7 @@ async function loadSettings(): Promise<void> {
     if (depthEl) depthEl.textContent = settings.wot_max_depth.toString();
 
     const intervalEl = document.getElementById("settings-sync-interval");
-    if (intervalEl) intervalEl.textContent = `${settings.sync_interval_secs}s`;
+    if (intervalEl) intervalEl.textContent = `${Math.round(settings.sync_interval_secs / 60)} min`;
 
     // Advanced
     const portEl = document.getElementById("settings-port");
@@ -223,13 +694,50 @@ async function loadSettings(): Promise<void> {
     const autostartEl = document.getElementById("settings-autostart") as HTMLInputElement | null;
     if (autostartEl) autostartEl.checked = settings.auto_start;
 
-    const maxStorageEl = document.getElementById("settings-max-storage");
-    if (maxStorageEl) {
-      maxStorageEl.textContent =
-        settings.max_storage_mb >= 1024
-          ? `${(settings.max_storage_mb / 1024).toFixed(1)} GB`
-          : `${settings.max_storage_mb} MB`;
+    // Storage sliders
+    _currentSettings = settings;
+    const evSliderEl = document.getElementById("settings-others-events-slider") as HTMLInputElement | null;
+    const evValEl = document.getElementById("settings-others-events-val");
+    if (evSliderEl && evValEl) {
+      evSliderEl.value = String(Math.round(settings.storage_others_gb));
+      evValEl.textContent = `${Math.round(settings.storage_others_gb)} GB`;
     }
+    const mdSliderEl = document.getElementById("settings-others-media-slider") as HTMLInputElement | null;
+    const mdValEl = document.getElementById("settings-others-media-val");
+    if (mdSliderEl && mdValEl) {
+      mdSliderEl.value = String(Math.round(settings.storage_media_gb));
+      mdValEl.textContent = `${Math.round(settings.storage_media_gb)} GB`;
+    }
+
+    // Event retention slider
+    const ageSliderEl = document.getElementById("storage-max-age") as HTMLInputElement | null;
+    const ageValEl = document.getElementById("storage-max-age-val");
+    if (ageSliderEl && ageValEl) {
+      ageSliderEl.value = String(settings.max_event_age_days);
+      ageValEl.textContent = `${settings.max_event_age_days} days`;
+    }
+
+    // Load tracked profiles
+    loadTrackedProfiles();
+
+    // Sync sliders
+    const syncFields: [string, number, string][] = [
+      ["sync-lookback", settings.sync_lookback_days, " days"],
+      ["sync-batch-size", settings.sync_batch_size, ""],
+      ["sync-events-per-batch", settings.sync_events_per_batch, ""],
+      ["sync-batch-pause", settings.sync_batch_pause_secs, "s"],
+      ["sync-relay-interval", settings.sync_relay_min_interval_secs, "s"],
+      ["sync-wot-batch", settings.sync_wot_batch_size, ""],
+      ["sync-wot-events", settings.sync_wot_events_per_batch, ""],
+      ["sync-interval", Math.round(settings.sync_interval_secs / 60), " min"],
+    ];
+    for (const [id, val, suffix] of syncFields) {
+      const sl = document.getElementById(id) as HTMLInputElement | null;
+      const valEl = document.getElementById(id + "-val");
+      if (sl) sl.value = String(val);
+      if (valEl) valEl.textContent = suffix ? `${val}${suffix}` : String(val);
+    }
+
     // Browser integration
     try {
       const browserEnabled = await invoke<boolean>("check_browser_integration");

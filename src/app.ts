@@ -29,7 +29,10 @@ export function navigateTo(screen: Screen): void {
   const content = document.getElementById("main-content");
   if (content) {
     content.innerHTML = "";
-    screens[currentScreen](content);
+    const result = screens[currentScreen](content);
+    if (result && typeof (result as Promise<void>).catch === "function") {
+      (result as Promise<void>).catch(console.error);
+    }
   }
   // Update sidebar active state
   document.querySelectorAll(".app-nav-item").forEach((el) => {

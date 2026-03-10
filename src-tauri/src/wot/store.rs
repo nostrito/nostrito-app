@@ -238,6 +238,12 @@ impl WotGraph {
         self.lock_metrics.snapshot()
     }
 
+    /// Return all known pubkeys in the graph (hex strings).
+    pub fn all_pubkeys(&self) -> Vec<String> {
+        let id_to_pubkey = self.id_to_pubkey.read();
+        id_to_pubkey.iter().map(|arc| arc.to_string()).collect()
+    }
+
     /// Clear all graph data (used on app reset)
     pub fn clear(&self) {
         self.pubkey_to_id.clear();

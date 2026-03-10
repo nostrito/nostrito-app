@@ -44,6 +44,17 @@ export function renderStorage(container: HTMLElement): void {
       </div>
       <div id="storage-db-info" style="font-size:0.8rem;color:var(--text-muted);margin-top:12px">
       </div>
+      <div class="storage-media-section" id="storage-media-section" style="margin-top:20px">
+        <div class="storage-usage-title">🌸 Blossom Media Cache</div>
+        <div class="storage-usage-visual" style="margin:8px 0">
+          <div class="storage-seg" id="media-seg-fill" style="width:0%;background:var(--purple)"></div>
+        </div>
+        <div style="display:flex;gap:24px;font-size:0.82rem;color:var(--text-dim);margin-top:6px">
+          <span><span id="media-file-count">—</span> files</span>
+          <span><span id="media-size-used">—</span> used</span>
+          <span>limit: <span id="media-size-limit">—</span></span>
+        </div>
+      </div>
     </div>
   `;
 
@@ -127,4 +138,18 @@ async function loadStorageStats(): Promise<void> {
     const titleEl = document.getElementById("storage-title");
     if (titleEl) titleEl.textContent = "Storage Usage — no data";
   }
+
+  // Media cache stats
+  try {
+    const media = await invoke<{ total_bytes: number; file_count: number; limit_bytes: number }>("get_media_stats");
+    const countEl = document.getElementById("media-file-count");
+    const usedEl = document.getElementById("media-size-used");
+    const limitEl = document.getElementById("media-size-limit");
+    const fillEl = document.getElementById("media-seg-fill");
+    if (countEl) countEl.textContent = media.file_count.toLocaleString();
+    if (usedEl) usedEl.textContent = formatBytes(media.total_bytes);
+    if (limitEl) limitEl.textContent = formatBytes(media.limit_bytes);
+    const pct = media.limit_bytes > 0 ? Math.min(100, (media.total_bytes / media.limit_bytes) * 100) : 0;
+    if (fillEl) fillEl.style.width = `${pct}%`;
+  } catch (_) {}
 }

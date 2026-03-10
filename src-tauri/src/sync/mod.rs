@@ -1,3 +1,3 @@
 pub mod engine;
 
-pub use engine::{SyncEngine, SyncStats, SyncTier};
+pub use engine::{SyncConfig, SyncEngine, SyncStats, SyncTier};

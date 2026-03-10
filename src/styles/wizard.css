@@ -533,6 +533,119 @@
   pointer-events: none;
 }
 
+/* Step 4 — Relay URL / Ready screen */
+.wiz-panel-ready {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.wiz-ready-content {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  max-width: 520px;
+  width: 100%;
+}
+
+.wiz-ready-title {
+  font-size: 1.5rem;
+}
+
+.wiz-ready-content .wiz-subtitle {
+  margin-bottom: 24px;
+}
+
+.wiz-relay-url-box {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 20px;
+  background: var(--bg);
+  border: 1.5px solid rgba(124, 58, 237, 0.35);
+  border-radius: 12px;
+  width: 100%;
+  max-width: 420px;
+}
+
+.wiz-relay-url-text {
+  flex: 1;
+  font-family: var(--mono);
+  font-size: 1.05rem;
+  font-weight: 600;
+  color: var(--accent-light);
+  word-break: break-all;
+  text-align: left;
+}
+
+.wiz-relay-copy-btn {
+  flex-shrink: 0;
+  font-size: 0.82rem !important;
+  padding: 8px 14px !important;
+}
+
+.wiz-copy-feedback {
+  font-size: 0.78rem;
+  color: var(--green);
+  margin-top: 6px;
+  height: 18px;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+
+.wiz-copy-feedback.visible {
+  opacity: 1;
+}
+
+.wiz-clients-section {
+  margin-top: 24px;
+  width: 100%;
+  max-width: 420px;
+}
+
+.wiz-clients-label {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--text-dim);
+  margin-bottom: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.wiz-clients-list {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 10px;
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.wiz-client-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 14px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 0.82rem;
+  font-weight: 500;
+  color: var(--text);
+}
+
+.wiz-client-emoji {
+  font-size: 1rem;
+}
+
+.wiz-open-btn {
+  margin-top: 32px;
+  font-size: 1rem !important;
+  padding: 14px 36px !important;
+}
+
 /* Responsive */
 @media (max-width: 520px) {
   .relay-grid {

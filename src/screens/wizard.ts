@@ -4,6 +4,7 @@
 
 import { showAppShell } from "../app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { RELAYS } from "../relays";
 
 export interface WizardConfig {
   identityMode: "readonly" | "full";
@@ -18,24 +19,6 @@ export interface WizardConfig {
   };
 }
 
-interface RelayOption {
-  id: string;
-  name: string;
-  description: string;
-  defaultOn: boolean;
-}
-
-const RELAYS: RelayOption[] = [
-  { id: "primal", name: "primal", description: "Fast global relay", defaultOn: true },
-  { id: "damus", name: "damus", description: "iOS community hub", defaultOn: true },
-  { id: "nos", name: "nos", description: "Curated social relay", defaultOn: false },
-  { id: "snort", name: "snort", description: "Web client relay", defaultOn: false },
-  { id: "coracle", name: "coracle", description: "Discovery-focused", defaultOn: false },
-  { id: "nostr.wine", name: "nostr.wine", description: "Premium paid relay", defaultOn: true },
-  { id: "amethyst", name: "amethyst", description: "Android community", defaultOn: false },
-  { id: "yakihonne", name: "yakihonne", description: "Long-form content", defaultOn: true },
-];
-
 const STEP_LABELS = ["Identity", "Relays", "Storage"];
 
 export class WizardScreen {
@@ -48,6 +31,8 @@ export class WizardScreen {
   private npub = "";
   private npubError = "";
   private signerType: "nsec" | "bunker" | "connect" | "new" | null = null;
+  private relayPort = 4869;
+  private browserIntegration = false;
   private selectedRelays: Set<string> = new Set(
     RELAYS.filter((r) => r.defaultOn).map((r) => r.id)
   );
@@ -66,7 +51,8 @@ export class WizardScreen {
   }
 
   private draw(): void {
-    console.log(`[wizard] Drawing step ${this.step}/${STEP_LABELS.length}: ${STEP_LABELS[this.step - 1]}`);
+    const stepLabel = this.step <= STEP_LABELS.length ? STEP_LABELS[this.step - 1] : "Ready";
+    console.log(`[wizard] Drawing step ${this.step}: ${stepLabel}`);
     const c = this.container;
     c.innerHTML = "";
     c.className = "wizard-root";
@@ -91,6 +77,18 @@ export class WizardScreen {
     titlebar.querySelector("#wiz-close")?.addEventListener("click", () => appWindow.close());
     titlebar.querySelector("#wiz-minimize")?.addEventListener("click", () => appWindow.minimize());
     titlebar.querySelector("#wiz-maximize")?.addEventListener("click", () => appWindow.toggleMaximize());
+
+    // Step 4 = relay URL screen (no progress bar, no nav)
+    if (this.step === 4) {
+      const wizContainer = document.createElement("div");
+      wizContainer.className = "wizard-container";
+      const panel = document.createElement("div");
+      panel.className = "wiz-panel wiz-panel-ready";
+      this.renderRelayUrl(panel);
+      wizContainer.appendChild(panel);
+      c.appendChild(wizContainer);
+      return;
+    }
 
     // Wizard container
     const wizContainer = document.createElement("div");
@@ -420,6 +418,61 @@ export class WizardScreen {
     });
   }
 
+  private renderRelayUrl(container: HTMLElement): void {
+    const protocol = this.browserIntegration ? "wss" : "ws";
+    const relayUrl = `${protocol}://localhost:${this.relayPort}`;
+
+    const CLIENTS = [
+      { name: "Damus", emoji: "🟣" },
+      { name: "Amethyst", emoji: "💜" },
+      { name: "Primal", emoji: "🔶" },
+      { name: "Coracle", emoji: "🐚" },
+      { name: "Snort", emoji: "⚡" },
+    ];
+
+    container.innerHTML = `
+      <div class="wiz-ready-content">
+        <h3 class="wiz-title wiz-ready-title">Your local relay is running 🎉</h3>
+        <p class="wiz-subtitle">Add this address to your favorite Nostr clients to start using your WoT-filtered feed:</p>
+
+        <div class="wiz-relay-url-box">
+          <code class="wiz-relay-url-text" id="relay-url-text">${escapeHtml(relayUrl)}</code>
+          <button class="btn btn-secondary wiz-relay-copy-btn" id="btn-copy-relay" title="Copy to clipboard">📋 Copy</button>
+        </div>
+        <span class="wiz-copy-feedback" id="copy-feedback"></span>
+
+        <div class="wiz-clients-section">
+          <p class="wiz-clients-label">Works with:</p>
+          <ul class="wiz-clients-list">
+            ${CLIENTS.map((c) => `<li class="wiz-client-item"><span class="wiz-client-emoji">${c.emoji}</span> ${escapeHtml(c.name)}</li>`).join("")}
+          </ul>
+        </div>
+
+        <button class="btn btn-primary wiz-open-btn" id="btn-open-nostrito">Open nostrito →</button>
+      </div>
+    `;
+
+    // Copy button
+    container.querySelector("#btn-copy-relay")?.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(relayUrl);
+        const feedback = container.querySelector("#copy-feedback") as HTMLElement | null;
+        if (feedback) {
+          feedback.textContent = "✓ Copied!";
+          feedback.classList.add("visible");
+          setTimeout(() => feedback.classList.remove("visible"), 2000);
+        }
+      } catch (err) {
+        console.warn("[wizard] Clipboard write failed:", err);
+      }
+    });
+
+    // Open nostrito button
+    container.querySelector("#btn-open-nostrito")?.addEventListener("click", () => {
+      showAppShell();
+    });
+  }
+
   private async finish(): Promise<void> {
     const config: WizardConfig = {
       identityMode: this.identityMode,
@@ -461,7 +514,22 @@ export class WizardScreen {
         this.completeCallback(config);
       }
 
-      showAppShell();
+      // Fetch relay port and browser integration status for the relay URL screen
+      try {
+        const status = await invoke<{ relay_port: number }>("get_status");
+        this.relayPort = status.relay_port;
+      } catch (_) {
+        // Fall back to default port
+      }
+      try {
+        this.browserIntegration = await invoke<boolean>("check_browser_integration");
+      } catch (_) {
+        this.browserIntegration = false;
+      }
+
+      // Show relay URL screen (step 4)
+      this.step = 4;
+      this.draw();
     } catch (e) {
       console.error("[nostrito] Failed to initialize:", e);
       const errEl = document.createElement("p");
