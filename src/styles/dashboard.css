@@ -582,7 +582,7 @@
 }
 .storage-seg { height: 100%; transition: width 0.3s; }
 .storage-seg-notes { background: var(--accent); }
-.storage-seg-media { background: var(--purple); }
+.storage-seg-contacts { background: var(--purple); }
 .storage-seg-meta { background: var(--blue); }
 .storage-seg-other { background: var(--green); }
 .storage-legend { display: flex; gap: 16px; flex-wrap: wrap; }

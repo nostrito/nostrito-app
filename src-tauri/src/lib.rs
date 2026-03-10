@@ -768,6 +768,72 @@ async fn reset_app_data(
     Ok(())
 }
 
+/// Change account: clears only identity (npub/hex_pubkey) and sync cursors,
+/// keeps all event data, WoT graph edges, settings, and media intact.
+/// When the user re-enters an npub that already has events in the DB,
+/// the existing data is reused (fast account switching).
+#[tauri::command]
+async fn change_account(
+    app_handle: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    tracing::info!("Changing account — clearing identity, keeping event data");
+
+    // Stop sync if running
+    if let Some(cancel) = state.sync_cancel.write().await.take() {
+        cancel.cancel();
+        state
+            .sync_tier
+            .store(SyncTier::Idle as u8, Ordering::Relaxed);
+    }
+
+    // Stop relay if running
+    if let Some(cancel) = state.relay_cancel.write().await.take() {
+        cancel.cancel();
+    }
+
+    // Clear only identity keys and sync cursors from DB config
+    // Keep: outbound_relays, sync tuning params, storage settings, etc.
+    let identity_keys = [
+        "npub",
+        "hex_pubkey",
+        "tier2_since",
+        "tier2_history_until",
+        "sync_tier3_checkpoint",
+    ];
+    for key in &identity_keys {
+        state
+            .db
+            .delete_config(key)
+            .map_err(|e| format!("Failed to delete config key {}: {}", key, e))?;
+    }
+
+    // Clear sync_state (per-relay cursors) so new account starts fresh
+    state
+        .db
+        .clear_sync_state()
+        .map_err(|e| format!("Failed to clear sync_state: {}", e))?;
+
+    // Reset sync stats
+    {
+        let mut stats = state.sync_stats.write().await;
+        *stats = SyncStats::default();
+    }
+
+    // Clear identity from in-memory config (keep all other settings)
+    {
+        let mut config = state.config.write().await;
+        config.npub = None;
+        config.hex_pubkey = None;
+    }
+
+    // Emit event to frontend to show wizard
+    app_handle.emit("app:reset", ()).ok();
+
+    tracing::info!("Account change complete — identity cleared, events preserved");
+    Ok(())
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RelayStatusInfo {
     pub url: String,
@@ -1362,6 +1428,7 @@ pub fn run() {
             stop_relay,
             get_uptime,
             reset_app_data,
+            change_account,
             get_activity_data,
             get_relay_status,
             get_kind_counts,

@@ -411,16 +411,17 @@ export function renderSettings(container: HTMLElement): void {
   });
 
   document.getElementById("btn-change-account")?.addEventListener("click", async () => {
-    if (confirm("Remove your npub and start over? Event data will be kept.")) {
+    if (confirm("You will be signed out and redirected to the setup wizard.\n\nYour event data will be preserved — if you re-enter the same npub later, it will resume where you left off.\n\nContinue?")) {
       try {
-        console.log("[settings] Calling reset_app_data (change account)...");
-        await invoke("reset_app_data");
-        console.log("[settings] reset_app_data (change account) complete");
+        console.log("[settings] Calling change_account...");
+        await invoke("change_account");
+        console.log("[settings] change_account complete — identity cleared, events preserved");
         localStorage.removeItem("nostrito_initialized");
         localStorage.removeItem("nostrito_config");
         window.dispatchEvent(new CustomEvent("nostrito:reset"));
       } catch (e) {
         console.error("[settings] Change account failed:", e);
+        alert("Failed to change account: " + e);
       }
     }
   });

@@ -383,6 +383,21 @@ impl Database {
         }
     }
 
+    /// Delete an app config key
+    pub fn delete_config(&self, key: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM app_config WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
+    /// Clear all sync_state rows (per-relay cursors)
+    pub fn clear_sync_state(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM sync_state", [])?;
+        info!("Cleared sync_state table");
+        Ok(())
+    }
+
     /// Store a nostr event. Returns Ok(true) if inserted, Ok(false) if duplicate.
     pub fn store_event(
         &self,

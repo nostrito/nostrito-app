@@ -22,13 +22,13 @@ export function renderStorage(container: HTMLElement): void {
         <div class="storage-usage-title" id="storage-title">Storage Usage — calculating...</div>
         <div class="storage-usage-visual">
           <div class="storage-seg storage-seg-notes" id="seg-notes" style="width:0%"></div>
-          <div class="storage-seg storage-seg-media" id="seg-media" style="width:0%"></div>
+          <div class="storage-seg storage-seg-contacts" id="seg-contacts" style="width:0%"></div>
           <div class="storage-seg storage-seg-meta" id="seg-meta" style="width:0%"></div>
           <div class="storage-seg storage-seg-other" id="seg-other" style="width:0%"></div>
         </div>
         <div class="storage-legend">
           <div class="storage-legend-item"><div class="storage-legend-dot" style="background:var(--accent)"></div><span id="legend-notes">Notes</span></div>
-          <div class="storage-legend-item"><div class="storage-legend-dot" style="background:var(--purple)"></div><span id="legend-media">Media</span></div>
+          <div class="storage-legend-item"><div class="storage-legend-dot" style="background:var(--purple)"></div><span id="legend-contacts">Contacts</span></div>
           <div class="storage-legend-item"><div class="storage-legend-dot" style="background:var(--blue)"></div><span id="legend-meta">Metadata</span></div>
           <div class="storage-legend-item"><div class="storage-legend-dot" style="background:var(--green)"></div><span id="legend-other">Other</span></div>
         </div>
@@ -50,7 +50,7 @@ export function renderStorage(container: HTMLElement): void {
         <div class="storage-usage-visual" style="margin:8px 0">
           <div class="storage-seg" id="media-seg-fill" style="width:0%;background:var(--purple)"></div>
         </div>
-        <div style="display:flex;gap:24px;font-size:0.82rem;color:var(--text-dim);margin-top:6px">
+        <div style="display:flex;gap:24px;font-size:0.82rem;color:var(--text-dim);margin-top:6px;flex-wrap:wrap">
           <span><span id="media-file-count">—</span> files</span>
           <span><span id="media-size-used">—</span> used</span>
           <span>limit: <span id="media-size-limit">—</span></span>
@@ -113,11 +113,11 @@ async function loadStorageStats(): Promise<void> {
       const other = Math.max(0, 100 - notes - meta - contacts);
 
       const segNotes = document.getElementById("seg-notes");
-      const segMedia = document.getElementById("seg-media");
+      const segContacts = document.getElementById("seg-contacts");
       const segMeta = document.getElementById("seg-meta");
       const segOther = document.getElementById("seg-other");
       if (segNotes) segNotes.style.width = `${notes}%`;
-      if (segMedia) segMedia.style.width = `${contacts}%`; // reuse for contacts
+      if (segContacts) segContacts.style.width = `${contacts}%`;
       if (segMeta) segMeta.style.width = `${meta}%`;
       if (segOther) segOther.style.width = `${other}%`;
     } catch (_) {
