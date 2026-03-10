@@ -1286,7 +1286,7 @@ impl SyncEngine {
                 .entry(policy_url.clone())
                 .or_insert_with(|| RelayPolicy::new(self.sync_config.relay_min_interval_secs as u64));
 
-            match subscribe_and_collect(&client, vec![filter], 10, policy).await {
+            match subscribe_and_collect(&client, vec![filter], 10, policy, relay_urls.len().max(1)).await {
                 Ok(events) => {
                     let mut batch_new: u64 = 0;
 
@@ -1515,7 +1515,7 @@ impl SyncEngine {
                 .entry(policy_url.clone())
                 .or_insert_with(|| RelayPolicy::new(self.sync_config.relay_min_interval_secs as u64));
 
-            match subscribe_and_collect(&client, vec![main_filter, articles_filter], 10, policy).await {
+            match subscribe_and_collect(&client, vec![main_filter, articles_filter], 10, policy, relay_urls.len().max(1)).await {
                 Ok(events) => {
                     let mut batch_new: u64 = 0;
                     let mut batch_dupe: u64 = 0;
@@ -1670,7 +1670,7 @@ impl SyncEngine {
                 .entry(hist_policy_url.clone())
                 .or_insert_with(|| RelayPolicy::new(self.sync_config.relay_min_interval_secs as u64));
 
-            match subscribe_and_collect(&hist_client, vec![notes_filter], 30, hist_policy).await {
+            match subscribe_and_collect(&hist_client, vec![notes_filter], 30, hist_policy, relay_urls.len().max(1)).await {
                 Ok(hist_events) if !hist_events.is_empty() => {
                     let mut oldest_ts = history_until;
                     let mut hist_new: u64 = 0;
@@ -1726,7 +1726,7 @@ impl SyncEngine {
                     .entry(hist_policy_url.clone())
                     .or_insert_with(|| RelayPolicy::new(self.sync_config.relay_min_interval_secs as u64));
 
-                match subscribe_and_collect(&hist_client, vec![articles_filter], 30, art_policy).await {
+                match subscribe_and_collect(&hist_client, vec![articles_filter], 30, art_policy, relay_urls.len().max(1)).await {
                     Ok(art_events) if !art_events.is_empty() => {
                         let mut oldest_ts = articles_until;
                         let mut art_new: u64 = 0;
@@ -1862,7 +1862,7 @@ impl SyncEngine {
                 .entry(policy_url.clone())
                 .or_insert_with(|| RelayPolicy::new(self.sync_config.relay_min_interval_secs as u64));
 
-            match subscribe_and_collect(&client, vec![filter], 10, policy).await {
+            match subscribe_and_collect(&client, vec![filter], 10, policy, relay_urls.len().max(1)).await {
                 Ok(events) => {
                     for event in events.iter() {
                         // Store every event in DB (metadata + contact lists)
