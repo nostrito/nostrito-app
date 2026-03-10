@@ -45,11 +45,43 @@ export interface WotStatus {
 export interface AppStatus {
   initialized: boolean;
   npub: string | null;
-  relayRunning: boolean;
-  relayPort: number;
-  eventsStored: number;
-  wotSize: number;
-  syncStatus: "idle" | "syncing" | "error";
+  relay_running: boolean;
+  relay_port: number;
+  events_stored: number;
+  wot_nodes: number;
+  wot_edges: number;
+  sync_status: string;
+  sync_tier: number;
+  sync_stats: SyncStats;
+  relayRunning?: boolean;
+  relayPort?: number;
+  eventsStored?: number;
+  wotSize?: number;
+  syncStatus?: "idle" | "syncing" | "error";
+}
+
+export interface SyncStats {
+  tier1_fetched: number;
+  tracked_fetched: number;
+  tier2_fetched: number;
+  tier3_fetched: number;
+  tier4_fetched: number;
+  current_tier: number;
+  current_layer: string;
+}
+
+export interface SyncProgress {
+  tier: number;
+  fetched: number;
+  total: number;
+  relay: string;
+}
+
+export interface RelayStatusInfo {
+  url: string;
+  name: string;
+  connected: boolean;
+  latency_ms: number | null;
 }
 
 export interface FeedFilter {
@@ -69,12 +101,45 @@ export interface StorageStats {
 
 export interface Settings {
   npub: string;
-  relayPort: number;
-  maxStorageMb: number;
-  wotMaxDepth: number;
-  syncIntervalSecs: number;
-  outboundRelays: string[];
-  autoStart: boolean;
+  relay_port: number;
+  max_storage_mb: number;
+  storage_others_gb: number;
+  storage_media_gb: number;
+  storage_own_media_gb: number;
+  storage_tracked_media_gb: number;
+  storage_wot_media_gb: number;
+  wot_event_retention_days: number;
+  wot_max_depth: number;
+  sync_interval_secs: number;
+  outbound_relays: string[];
+  auto_start: boolean;
+  sync_lookback_days: number;
+  sync_batch_size: number;
+  sync_events_per_batch: number;
+  sync_batch_pause_secs: number;
+  sync_relay_min_interval_secs: number;
+  sync_wot_batch_size: number;
+  sync_wot_events_per_batch: number;
+  max_event_age_days: number;
+  relayPort?: number;
+  maxStorageMb?: number;
+  syncIntervalSecs?: number;
+  autoStart?: boolean;
+}
+
+export interface MediaItem {
+  hash: string;
+  url: string;
+  local_path: string;
+  mime_type: string;
+  size_bytes: number;
+  downloaded_at: number;
+}
+
+export interface Conversation {
+  partnerPubkey: string;
+  messages: NostrEvent[];
+  lastTimestamp: number;
 }
 
 export type Screen = "wizard" | "dashboard" | "feed" | "dms" | "wot" | "storage" | "settings" | "my-media";

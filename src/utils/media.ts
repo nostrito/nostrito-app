@@ -58,7 +58,7 @@ export function renderMediaHtml(content: string): string {
     // Escape single quotes in URL for onclick
     const safeUrl = url.replace(/'/g, "\\'");
     parts.push(
-      `<img class="ev-media-img" src="${url}" loading="lazy" onerror="this.parentElement.style.display='none'" onclick="openMediaViewer('${safeUrl}')">`
+      `<img class="ev-media-img" src="${url}" loading="lazy" onerror="this.parentElement.style.display='none'" data-media-url="${safeUrl}" style="cursor:pointer">`
     );
   }
 
@@ -105,10 +105,14 @@ export function initMediaViewer(): void {
     }
   });
 
-  // Global function for onclick handlers
-  (window as any).openMediaViewer = (url: string) => {
+  // Event delegation for [data-media-url] clicks (replaces window global)
+  document.addEventListener("click", (e) => {
+    const target = (e.target as HTMLElement).closest("[data-media-url]") as HTMLElement | null;
+    if (!target) return;
+    const url = target.dataset.mediaUrl;
+    if (!url) return;
     const img = document.getElementById("media-viewer-img") as HTMLImageElement;
     if (img) img.src = url;
     viewer.style.display = "flex";
-  };
+  });
 }

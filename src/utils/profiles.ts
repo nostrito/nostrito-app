@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { shortPubkey } from "./format";
 
 export interface ProfileInfo {
   pubkey: string;
@@ -42,7 +43,3 @@ export function profileDisplayName(profile: ProfileInfo | undefined, pubkey: str
   return shortPubkey(pubkey);
 }
 
-function shortPubkey(pk: string): string {
-  if (pk.length > 12) return pk.slice(0, 6) + "..." + pk.slice(-4);
-  return pk;
-}
