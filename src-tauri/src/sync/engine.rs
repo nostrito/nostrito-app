@@ -188,8 +188,10 @@ async fn subscribe_and_collect(
     // Respect rate limits before sending
     policy.wait_for_slot().await;
 
-    let sub_id = client.subscribe(filter, None).await?.val;
+    // Create notification receiver BEFORE subscribing so we don't miss
+    // events or EOSE that the relay sends immediately after receiving REQ.
     let mut notifications = client.notifications();
+    let sub_id = client.subscribe(filter, None).await?.val;
     let mut events: Vec<Event> = Vec::new();
     let deadline = tokio::time::sleep(Duration::from_secs(timeout_secs));
     tokio::pin!(deadline);
@@ -1001,14 +1003,17 @@ impl SyncEngine {
         let lookback_floor = now_epoch.saturating_sub(self.sync_config.lookback_days as u64 * 86400);
 
         let cursor = self.db.get_sync_cursor().unwrap_or(None);
-        // Use the OLDER of (cursor - 60s) or (now - lookback_days)
-        // This ensures we always look back at least lookback_days for newly added follows
+        // Use the MORE RECENT of (cursor - 60s) or (now - lookback_days).
+        // The cursor tracks our last successful sync position: use it when it's
+        // recent so we only fetch new events (incremental sync). Fall back to
+        // lookback_floor when there's no cursor or when it's very old (e.g. after
+        // account change or first run).
         let since_ts = match cursor {
             Some(ts) => {
                 let cursor_ts = ts.saturating_sub(60);
-                let chosen = cursor_ts.min(lookback_floor); // use whichever is OLDER
+                let chosen = cursor_ts.max(lookback_floor); // use whichever is NEWER
                 info!(
-                    "Tier 2: cursor={}, lookback_floor={}, using since={} (older of both)",
+                    "Tier 2: cursor={}, lookback_floor={}, using since={} (newer of both)",
                     ts, lookback_floor, chosen
                 );
                 chosen
@@ -1186,20 +1191,20 @@ impl SyncEngine {
         client.disconnect().await.ok();
         info!("Tier 2: Disconnected persistent client");
 
-        // Only advance sync cursor if we actually processed batches and fetched events.
-        // This prevents the cursor from racing ahead when relays return 0 events,
-        // which would cause the next cycle to use a too-narrow since window.
-        if batches_processed > 0 && total_new > 0 {
+        // Advance sync cursor when we successfully communicated with relays.
+        // Advance even when total_new == 0 (all duplicates) — that means the
+        // window was fully covered and we can move forward. Only hold the cursor
+        // when NO batches ran at all (relay connectivity failure).
+        if batches_processed > 0 {
             let cursor_ts = chrono::Utc::now().timestamp() as u64;
             self.db.set_sync_cursor(cursor_ts.saturating_sub(60)).ok();
             info!(
-                "Tier 2: Updated sync cursor to {} ({} new events across {} batches)",
-                cursor_ts.saturating_sub(60), total_new, batches_processed
+                "Tier 2: Updated sync cursor to {} ({} new, {} dupe across {} batches)",
+                cursor_ts.saturating_sub(60), total_new, total_dupe, batches_processed
             );
         } else {
             info!(
-                "Tier 2: Cursor NOT advanced (batches={}, new={}, dupe={}) — will retry same window next cycle",
-                batches_processed, total_new, total_dupe
+                "Tier 2: Cursor NOT advanced — no batches processed (relay connectivity issue?)"
             );
         }
 

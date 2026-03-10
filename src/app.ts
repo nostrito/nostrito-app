@@ -1,7 +1,7 @@
 import type { Screen } from "./types/nostr";
 import { renderWizard } from "./screens/wizard";
 import { renderDashboard } from "./screens/dashboard";
-import { renderFeed } from "./screens/feed";
+import { renderFeed, cleanupFeed } from "./screens/feed";
 import { renderDms } from "./screens/dms";
 import { renderWot } from "./screens/wot";
 import { renderStorage } from "./screens/storage";
@@ -28,6 +28,8 @@ const screens: Record<Screen, (container: HTMLElement) => void | Promise<void>> 
 
 export function navigateTo(screen: Screen): void {
   console.log(`[app] navigateTo: ${screen}`);
+  // Cleanup previous screen resources
+  if (currentScreen === "feed") cleanupFeed();
   currentScreen = screen;
   const content = document.getElementById("main-content");
   if (content) {
