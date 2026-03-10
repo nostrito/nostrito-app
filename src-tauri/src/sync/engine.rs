@@ -1816,8 +1816,8 @@ impl SyncEngine {
                 }
             });
 
-        // Only cache images and videos
-        if !mime.starts_with("image/") && !mime.starts_with("video/") {
+        // Only cache images, videos, and audio
+        if !mime.starts_with("image/") && !mime.starts_with("video/") && !mime.starts_with("audio/") {
             debug!("Tier 4: skipping {} — mime={}", url, mime);
             return Ok(false);
         }

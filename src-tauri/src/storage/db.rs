@@ -1049,6 +1049,40 @@ impl Database {
         Ok(rows)
     }
 
+    /// Get all own media records for the media explorer.
+    /// Returns (hash, url, mime_type, size_bytes, downloaded_at) sorted by downloaded_at DESC.
+    pub fn get_own_media(&self, own_pubkey: &str) -> Result<Vec<(String, String, String, u64, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT hash, url, mime_type, size_bytes, downloaded_at FROM media_cache \
+             WHERE pubkey = ?1 ORDER BY downloaded_at DESC"
+        )?;
+        let rows = stmt
+            .query_map(params![own_pubkey], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? as u64,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Count own media files.
+    pub fn own_media_count(&self, own_pubkey: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM media_cache WHERE pubkey = ?1",
+            params![own_pubkey],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
     /// Count pending items in media queue.
     pub fn media_queue_count(&self) -> Result<u64> {
         let conn = self.conn.lock().unwrap();

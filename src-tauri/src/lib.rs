@@ -1300,6 +1300,48 @@ async fn get_media_stats(state: State<'_, AppState>) -> Result<MediaStats, Strin
     })
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OwnMediaItem {
+    pub hash: String,
+    pub url: String,
+    pub local_path: String,
+    pub mime_type: String,
+    pub size_bytes: u64,
+    pub downloaded_at: u64,
+}
+
+#[tauri::command]
+async fn get_own_media(state: State<'_, AppState>) -> Result<Vec<OwnMediaItem>, String> {
+    tracing::debug!("[cmd:get_own_media] called");
+    let config = state.config.read().await;
+    let own_pubkey = config.hex_pubkey.clone().unwrap_or_default();
+    drop(config);
+
+    if own_pubkey.is_empty() {
+        return Err("Not initialized — no pubkey set".into());
+    }
+
+    let records = state.db.get_own_media(&own_pubkey).map_err(|e| e.to_string())?;
+    tracing::info!("[cmd:get_own_media] returning {} own media items", records.len());
+
+    let home = dirs::home_dir().unwrap_or_default();
+    Ok(records.into_iter().map(|(hash, url, mime_type, size_bytes, downloaded_at)| {
+        let local_path = home.join(".nostrito/media")
+            .join(&hash[..2])
+            .join(&hash)
+            .to_string_lossy()
+            .to_string();
+        OwnMediaItem {
+            hash,
+            url,
+            local_path,
+            mime_type,
+            size_bytes,
+            downloaded_at: downloaded_at as u64,
+        }
+    }).collect())
+}
+
 #[tauri::command]
 async fn check_browser_integration() -> Result<bool, String> {
     let cert_path = dirs::home_dir()
@@ -1541,6 +1583,7 @@ pub fn run() {
             setup_browser_integration,
             check_browser_integration,
             get_media_stats,
+            get_own_media,
             restart_sync,
             resync_articles,
             track_profile,

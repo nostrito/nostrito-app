@@ -1,7 +1,6 @@
 /** Storage — ownership-based breakdown view. All data from backend commands. */
 
 import { invoke } from "@tauri-apps/api/core";
-import { iconBlossom } from "../utils/icons";
 
 interface OwnershipStorageStats {
   own_events_count: number;
@@ -49,7 +48,7 @@ export function renderStorage(container: HTMLElement): void {
               <span class="ownership-stat-label">media</span>
             </div>
           </div>
-          <div class="ownership-card-footer">Always kept — never pruned</div>
+          <div class="ownership-card-footer">Always kept — never pruned · ∞ unlimited</div>
         </div>
 
         <!-- Tracked Profiles -->
@@ -88,18 +87,6 @@ export function renderStorage(container: HTMLElement): void {
             </div>
           </div>
           <div class="ownership-card-footer">Subject to retention limits</div>
-        </div>
-      </div>
-
-      <div class="storage-media-section" id="storage-media-section" style="margin-top:20px">
-        <div class="storage-usage-title"><span class="icon">${iconBlossom()}</span> Blossom Media Cache (Total)</div>
-        <div class="storage-usage-visual" style="margin:8px 0">
-          <div class="storage-seg" id="media-seg-fill" style="width:0%;background:var(--purple)"></div>
-        </div>
-        <div style="display:flex;gap:24px;font-size:0.82rem;color:var(--text-dim);margin-top:6px;flex-wrap:wrap">
-          <span><span id="media-file-count">—</span> files</span>
-          <span><span id="media-size-used">—</span> used</span>
-          <span>limit: <span id="media-size-limit">—</span></span>
         </div>
       </div>
 
@@ -172,20 +159,6 @@ async function loadOwnershipStats(): Promise<void> {
     if (titleEl) titleEl.textContent = "Storage Usage — no data";
     console.error("[storage] get_ownership_storage_stats failed:", e);
   }
-
-  // Media cache stats (total)
-  try {
-    const media = await invoke<{ total_bytes: number; file_count: number; limit_bytes: number }>("get_media_stats");
-    const countEl = document.getElementById("media-file-count");
-    const usedEl = document.getElementById("media-size-used");
-    const limitEl = document.getElementById("media-size-limit");
-    const fillEl = document.getElementById("media-seg-fill");
-    if (countEl) countEl.textContent = media.file_count.toLocaleString();
-    if (usedEl) usedEl.textContent = formatBytes(media.total_bytes);
-    if (limitEl) limitEl.textContent = formatBytes(media.limit_bytes);
-    const pct = media.limit_bytes > 0 ? Math.min(100, (media.total_bytes / media.limit_bytes) * 100) : 0;
-    if (fillEl) fillEl.style.width = `${pct}%`;
-  } catch (_) {}
 
   // DB info (event time range)
   try {

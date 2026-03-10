@@ -6,11 +6,12 @@ import { renderDms } from "./screens/dms";
 import { renderWot } from "./screens/wot";
 import { renderStorage } from "./screens/storage";
 import { renderSettings } from "./screens/settings";
+import { renderMyMedia } from "./screens/my-media";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getProfiles, profileDisplayName, type ProfileInfo } from "./utils/profiles";
-import { iconDashboard, iconFeed, iconMessageCircle, iconNetwork, iconDatabase, iconSettings, iconCheckCircle, iconX } from "./utils/icons";
+import { iconDashboard, iconFeed, iconMessageCircle, iconNetwork, iconDatabase, iconSettings, iconCheckCircle, iconX, iconImage } from "./utils/icons";
 
 let currentScreen: Screen = "wizard";
 
@@ -22,6 +23,7 @@ const screens: Record<Screen, (container: HTMLElement) => void | Promise<void>> 
   wot: renderWot,
   storage: renderStorage,
   settings: renderSettings,
+  "my-media": renderMyMedia,
 };
 
 export function navigateTo(screen: Screen): void {
@@ -47,6 +49,7 @@ export function navigateTo(screen: Screen): void {
       feed: "Feed",
       dms: "DMs",
       wot: "WoT",
+      "my-media": "My Media",
       storage: "Storage",
       settings: "Settings",
     };
@@ -71,6 +74,7 @@ export async function initApp(root: HTMLElement): Promise<void> {
         <div class="app-nav-item" data-screen="feed"><span class="icon">${iconFeed()}</span> Feed</div>
         <div class="app-nav-item" data-screen="dms"><span class="icon">${iconMessageCircle()}</span> DMs</div>
         <div class="app-nav-item" data-screen="wot"><span class="icon">${iconNetwork()}</span> WoT</div>
+        <div class="app-nav-item" data-screen="my-media"><span class="icon">${iconImage()}</span> My Media</div>
         <div class="app-nav-item" data-screen="storage"><span class="icon">${iconDatabase()}</span> Storage</div>
         <div class="app-nav-item" data-screen="settings"><span class="icon">${iconSettings()}</span> Settings</div>
         <div class="sidebar-spacer"></div>

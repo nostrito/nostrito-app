@@ -107,11 +107,10 @@ export function renderSettings(container: HTMLElement): void {
               <div class="storage-row">
                 <div class="storage-row-info">
                   <span class="storage-row-label">Own media limit</span>
-                  <span class="storage-row-meta">Blossom media from your own events</span>
+                  <span class="storage-row-meta">Blossom media from your own events — always kept, never evicted</span>
                 </div>
                 <div class="storage-slider-wrap">
-                  <input type="range" class="storage-slider" min="1" max="50" value="5" id="settings-own-media-slider">
-                  <span class="storage-slider-value" id="settings-own-media-val">5 GB</span>
+                  <span class="storage-slider-value" id="settings-own-media-val" style="color:var(--green);font-weight:600">∞ Unlimited</span>
                 </div>
               </div>
             </div>
@@ -369,13 +368,7 @@ export function renderSettings(container: HTMLElement): void {
   });
 
   // Wire storage sliders (per-category)
-  const ownMediaSlider = document.getElementById("settings-own-media-slider") as HTMLInputElement | null;
-  const ownMediaVal = document.getElementById("settings-own-media-val");
-  if (ownMediaSlider && ownMediaVal) {
-    ownMediaSlider.addEventListener("input", () => {
-      ownMediaVal.textContent = `${ownMediaSlider.value} GB`;
-    });
-  }
+  // Own media slider removed — always unlimited
 
   const trackedMediaSlider = document.getElementById("settings-tracked-media-slider") as HTMLInputElement | null;
   const trackedMediaVal = document.getElementById("settings-tracked-media-val");
@@ -487,14 +480,13 @@ export function renderSettings(container: HTMLElement): void {
     const btn = document.getElementById("btn-save-storage") as HTMLButtonElement | null;
     if (!_currentSettings || !btn) return;
 
-    const ownMediaEl = document.getElementById("settings-own-media-slider") as HTMLInputElement;
     const trackedMediaEl = document.getElementById("settings-tracked-media-slider") as HTMLInputElement;
     const wotMediaEl = document.getElementById("settings-wot-media-slider") as HTMLInputElement;
     const wotRetentionEl = document.getElementById("storage-wot-retention") as HTMLInputElement;
 
     const updated = {
       ..._currentSettings,
-      storage_own_media_gb: parseFloat(ownMediaEl?.value || "5"),
+      storage_own_media_gb: 0,  // unlimited — own media is never limited
       storage_tracked_media_gb: parseFloat(trackedMediaEl?.value || "3"),
       storage_wot_media_gb: parseFloat(wotMediaEl?.value || "2"),
       wot_event_retention_days: parseInt(wotRetentionEl?.value || "30", 10),
@@ -782,12 +774,10 @@ async function loadSettings(): Promise<void> {
     // Storage sliders (per-category)
     _currentSettings = settings;
 
-    // Own media slider
-    const ownMediaSliderEl = document.getElementById("settings-own-media-slider") as HTMLInputElement | null;
+    // Own media — always unlimited, no slider needed
     const ownMediaValEl = document.getElementById("settings-own-media-val");
-    if (ownMediaSliderEl && ownMediaValEl) {
-      ownMediaSliderEl.value = String(Math.round(settings.storage_own_media_gb));
-      ownMediaValEl.textContent = `${Math.round(settings.storage_own_media_gb)} GB`;
+    if (ownMediaValEl) {
+      ownMediaValEl.textContent = "∞ Unlimited";
     }
 
     // Tracked media slider
