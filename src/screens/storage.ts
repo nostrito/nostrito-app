@@ -104,6 +104,15 @@ export function renderStorage(container: HTMLElement): void {
       </div>
 
       <div id="storage-db-info" style="font-size:0.8rem;color:var(--text-muted);margin-top:12px"></div>
+
+      <div class="kind-breakdown-separator"></div>
+
+      <div class="kind-breakdown-section" id="kind-breakdown-section">
+        <div class="kind-breakdown-title">Event Breakdown</div>
+        <div class="kind-breakdown-list" id="kind-breakdown-list">
+          <div style="font-size:0.8rem;color:var(--text-muted)">Loading...</div>
+        </div>
+      </div>
     </div>
   `;
 
@@ -192,4 +201,85 @@ async function loadOwnershipStats(): Promise<void> {
       dbInfo.textContent = `Event range: ${oldest} → ${newest}`;
     }
   } catch (_) {}
+
+  // Kind breakdown
+  try {
+    const kindData = await invoke<{ counts: Record<string, number> }>("get_kind_counts");
+    renderKindBreakdown(kindData.counts);
+  } catch (e) {
+    console.error("[storage] get_kind_counts failed:", e);
+    const listEl = document.getElementById("kind-breakdown-list");
+    if (listEl) listEl.innerHTML = `<div style="font-size:0.8rem;color:var(--text-muted)">Unable to load breakdown</div>`;
+  }
+}
+
+interface KindCategory {
+  label: string;
+  emoji: string;
+  kinds: number[];
+}
+
+const KIND_CATEGORIES: KindCategory[] = [
+  { label: "Notes",     emoji: "📝", kinds: [1] },
+  { label: "Reposts",   emoji: "🔁", kinds: [6] },
+  { label: "Reactions",  emoji: "❤️", kinds: [7] },
+  { label: "Profiles",  emoji: "👤", kinds: [0] },
+  { label: "Contacts",  emoji: "👥", kinds: [3] },
+  { label: "Articles",  emoji: "📄", kinds: [30023] },
+  { label: "Zaps",      emoji: "⚡", kinds: [9735] },
+  { label: "DMs",       emoji: "🔒", kinds: [4, 1059] },
+];
+
+function renderKindBreakdown(counts: Record<string, number>): void {
+  const listEl = document.getElementById("kind-breakdown-list");
+  if (!listEl) return;
+
+  // Aggregate counts into categories
+  const remaining = new Map<number, number>();
+  for (const [k, v] of Object.entries(counts)) {
+    remaining.set(Number(k), v);
+  }
+
+  const rows: { label: string; emoji: string; count: number }[] = [];
+
+  for (const cat of KIND_CATEGORIES) {
+    let total = 0;
+    for (const k of cat.kinds) {
+      total += remaining.get(k) || 0;
+      remaining.delete(k);
+    }
+    if (total > 0) {
+      rows.push({ label: cat.label, emoji: cat.emoji, count: total });
+    }
+  }
+
+  // Other — everything not categorized
+  let otherCount = 0;
+  for (const v of remaining.values()) otherCount += v;
+  if (otherCount > 0) {
+    rows.push({ label: "Other", emoji: "📦", count: otherCount });
+  }
+
+  if (rows.length === 0) {
+    listEl.innerHTML = `<div style="font-size:0.8rem;color:var(--text-muted)">No events stored</div>`;
+    return;
+  }
+
+  // Sort descending by count
+  rows.sort((a, b) => b.count - a.count);
+
+  const maxCount = rows[0].count;
+
+  listEl.innerHTML = rows.map(r => {
+    const pct = maxCount > 0 ? (r.count / maxCount) * 100 : 0;
+    return `
+      <div class="kind-breakdown-row">
+        <span class="kind-breakdown-emoji">${r.emoji}</span>
+        <span class="kind-breakdown-label">${r.label}</span>
+        <div class="kind-breakdown-bar-wrap">
+          <div class="kind-breakdown-bar" style="width:${pct}%"></div>
+        </div>
+        <span class="kind-breakdown-count">${r.count.toLocaleString()}</span>
+      </div>`;
+  }).join("");
 }

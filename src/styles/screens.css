@@ -92,6 +92,46 @@
 .kind-count { margin-left: auto; font-family: var(--mono); font-size: 0.75rem; color: var(--accent-light); }
 .kind-meta { font-size: 0.7rem; color: var(--text-dim); font-family: var(--mono); }
 
+/* Kind breakdown section */
+.kind-breakdown-separator {
+  height: 1px; background: var(--border); margin: 24px 0 20px;
+}
+.kind-breakdown-section {
+  background: var(--bg); border: 1px solid var(--border);
+  border-radius: 12px; padding: 20px;
+}
+.kind-breakdown-title {
+  font-size: 0.82rem; font-weight: 700; color: var(--text-dim);
+  text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 14px;
+}
+.kind-breakdown-list {
+  display: flex; flex-direction: column; gap: 6px;
+}
+.kind-breakdown-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 8px; border-radius: 6px;
+  transition: background 0.15s;
+}
+.kind-breakdown-row:hover { background: rgba(255,255,255,0.03); }
+.kind-breakdown-emoji { font-size: 1rem; width: 24px; text-align: center; flex-shrink: 0; }
+.kind-breakdown-label {
+  font-size: 0.82rem; font-weight: 600; color: var(--text);
+  width: 80px; flex-shrink: 0;
+}
+.kind-breakdown-bar-wrap {
+  flex: 1; height: 6px; background: var(--border); border-radius: 3px;
+  overflow: hidden; min-width: 60px;
+}
+.kind-breakdown-bar {
+  height: 100%; background: var(--accent); border-radius: 3px;
+  transition: width 0.3s ease;
+  opacity: 0.6;
+}
+.kind-breakdown-count {
+  font-family: var(--mono); font-size: 0.78rem; font-weight: 600;
+  color: var(--accent-light); min-width: 52px; text-align: right; flex-shrink: 0;
+}
+
 /* DMs page */
 .dms-page-inner { padding: 24px; }
 .dms-banner {
