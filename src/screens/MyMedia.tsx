@@ -71,9 +71,9 @@ export const MyMedia: React.FC = () => {
   }, [allMedia, currentFilter]);
 
   /* --- helpers ------------------------------------------------------ */
-  const openViewer = useCallback((url: string) => {
+  const openViewer = useCallback((url: string, type?: "image" | "video") => {
     if (typeof (window as any).openMediaViewer === "function") {
-      (window as any).openMediaViewer(url);
+      (window as any).openMediaViewer(url, type);
     }
   }, []);
 
@@ -169,7 +169,7 @@ export const MyMedia: React.FC = () => {
                 <div
                   key={item.hash}
                   className="my-media-card video"
-                  onClick={() => openViewer(localSrc)}
+                  onClick={() => openViewer(localSrc, "video")}
                   title={tooltip}
                 >
                   <video src={localSrc} preload="metadata" muted />
