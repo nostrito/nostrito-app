@@ -2,8 +2,13 @@
 
 .my-media-page {
   padding: 24px;
-  max-width: 1200px;
-  margin: 0 auto;
+}
+
+/* Inside profile tab, fill the available width */
+.profile-media-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 180px));
+  gap: 10px;
 }
 
 .my-media-header {
@@ -64,7 +69,7 @@
 
 .my-media-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(160px, 200px));
   gap: 12px;
 }
 

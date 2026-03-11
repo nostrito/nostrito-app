@@ -250,7 +250,7 @@ export const Dashboard: React.FC = () => {
 
   /* --- render -------------------------------------------------------- */
   return (
-    <div className="main-content">
+    <div className="screen-page dashboard-page">
       {/* Header */}
       <div className="dash-header">
         <div className="dash-header-left">

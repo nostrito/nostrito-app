@@ -128,6 +128,14 @@
   flex-direction: column;
 }
 
+/* Generic screen page — full-width, consistent padding */
+.screen-page {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
 /* Cards */
 .card {
   background: var(--bg-card);

@@ -1,6 +1,7 @@
-/** DMs -- Direct Messages screen. Shows encrypted NIP-04 DMs grouped by conversation. */
+/** DMs -- Direct Messages screen. Shows NIP-04 DMs grouped by conversation.
+ *  When nsec is available, messages are decrypted; otherwise shown as encrypted. */
 
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { IconMessageCircle, IconLock } from "../components/Icon";
@@ -28,6 +29,12 @@ export const Dms: React.FC = () => {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [ownPubkey, setOwnPubkey] = useState("");
   const [view, setView] = useState<DmsView>({ kind: "list" });
+  const [signingMode, setSigningMode] = useState<"nsec" | "read-only">("read-only");
+
+  // Cache for decrypted message content: eventId -> plaintext
+  const decryptedCache = useRef<Map<string, string>>(new Map());
+  // Incremented to force re-render after async decryption
+  const [, setDecryptTick] = useState(0);
 
   // Special empty-state variants
   const [emptyReason, setEmptyReason] = useState<
@@ -49,6 +56,14 @@ export const Dms: React.FC = () => {
         setEmptyReason("no-identity");
         setLoading(false);
         return;
+      }
+
+      // Check signing mode
+      try {
+        const mode = await invoke<string>("get_signing_mode");
+        setSigningMode(mode as "nsec" | "read-only");
+      } catch {
+        setSigningMode("read-only");
       }
 
       let pk: string;
@@ -122,6 +137,46 @@ export const Dms: React.FC = () => {
     loadDms();
   }, [loadDms]);
 
+  // Decrypt messages for the current thread view
+  const decryptThread = useCallback(async (messages: NostrEvent[], partnerPubkey: string) => {
+    const cache = decryptedCache.current;
+    let updated = false;
+
+    for (const msg of messages) {
+      if (cache.has(msg.id)) continue;
+
+      // The sender is the partner for received messages, or us for sent
+      const senderPk = msg.pubkey === ownPubkey ? partnerPubkey : msg.pubkey;
+
+      try {
+        const plaintext = await invoke<string>("decrypt_dm", {
+          content: msg.content,
+          senderPubkey: senderPk,
+        });
+        cache.set(msg.id, plaintext);
+        updated = true;
+      } catch (e) {
+        console.warn("[dms] Decrypt failed for", msg.id, e);
+        cache.set(msg.id, "[Decryption failed]");
+        updated = true;
+      }
+    }
+
+    if (updated) {
+      setDecryptTick((v) => v + 1);
+    }
+  }, [ownPubkey]);
+
+  // Trigger decryption when entering a thread with nsec
+  useEffect(() => {
+    if (view.kind !== "thread" || signingMode !== "nsec") return;
+
+    const conv = conversations.find((c) => c.partnerPubkey === view.partnerPubkey);
+    if (!conv) return;
+
+    decryptThread(conv.messages, view.partnerPubkey);
+  }, [view, signingMode, conversations, decryptThread]);
+
   // Loading state
   if (loading) {
     return (
@@ -162,7 +217,7 @@ export const Dms: React.FC = () => {
         <EmptyState
           message="You have DMs but your configuration is read-only."
           icon={<span className="icon"><IconLock /></span>}
-          hint="Connect your Nostr account to decrypt and read your messages."
+          hint="Add your nsec in Settings to decrypt and read your messages."
           cta={{ label: "Settings", onClick: () => navigate("/settings") }}
         />
       </div>
@@ -175,6 +230,7 @@ export const Dms: React.FC = () => {
         <EmptyState
           message="No DMs found yet."
           icon={<span className="icon"><IconMessageCircle /></span>}
+          hint="DMs will appear here after the next sync cycle."
         />
       </div>
     );
@@ -199,6 +255,7 @@ export const Dms: React.FC = () => {
     const profile = getCachedProfile(view.partnerPubkey);
     const name = profileDisplayName(profile, view.partnerPubkey);
     const sorted = [...conv.messages].sort((a, b) => a.created_at - b.created_at);
+    const cache = decryptedCache.current;
 
     return (
       <div className="dms-page-inner">
@@ -209,15 +266,25 @@ export const Dms: React.FC = () => {
           <span className="dms-thread-name">{name}</span>
           <span className="dms-thread-count">{conv.messages.length} messages</span>
         </div>
+        {signingMode !== "nsec" && (
+          <div className="dms-banner" style={{ marginBottom: 12 }}>
+            <span className="icon"><IconLock /></span> Messages are encrypted. Add your nsec in Settings to decrypt.
+          </div>
+        )}
         <div className="dms-thread-messages">
           {sorted.map((msg) => {
             const isSent = msg.pubkey === ownPubkey;
             const timeStr = formatTimestamp(msg.created_at);
+            const decrypted = cache.get(msg.id);
+
             return (
               <div key={msg.id} className={`dms-msg ${isSent ? "dms-msg-sent" : "dms-msg-received"}`}>
                 <div className="dms-msg-bubble">
                   <div className="dms-msg-content">
-                    <span className="icon"><IconLock /></span> Encrypted message — NIP-04
+                    {decrypted
+                      ? decrypted
+                      : <><span className="icon"><IconLock /></span> Encrypted message</>
+                    }
                   </div>
                   <div className="dms-msg-time">{timeStr}</div>
                 </div>
@@ -238,7 +305,8 @@ export const Dms: React.FC = () => {
       <div className="dms-banner">
         <span>
           <span className="icon"><IconMessageCircle /></span>{" "}
-          {count} encrypted conversation{count !== 1 ? "s" : ""} &middot; {totalMsgs} messages &middot; Connect a signer to read
+          {count} conversation{count !== 1 ? "s" : ""} &middot; {totalMsgs} messages
+          {signingMode !== "nsec" && " \u00B7 Add nsec in Settings to decrypt"}
         </span>
       </div>
       <div className="dms-conversation-list">
@@ -267,7 +335,10 @@ export const Dms: React.FC = () => {
               <div className="dms-conv-info">
                 <div className="dms-conv-name">{name}</div>
                 <div className="dms-conv-preview">
-                  <span className="icon"><IconLock /></span> Encrypted
+                  {signingMode === "nsec"
+                    ? <><span className="icon"><IconMessageCircle /></span> {msgCount} message{msgCount !== 1 ? "s" : ""}</>
+                    : <><span className="icon"><IconLock /></span> Encrypted</>
+                  }
                 </div>
               </div>
               <div className="dms-conv-meta">

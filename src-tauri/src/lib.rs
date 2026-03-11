@@ -2135,6 +2135,26 @@ async fn get_signing_mode(state: State<'_, AppState>) -> Result<String, String> 
     Ok(if config.nsec.is_some() { "nsec".to_string() } else { "read-only".to_string() })
 }
 
+#[tauri::command]
+async fn decrypt_dm(content: String, sender_pubkey: String, state: State<'_, AppState>) -> Result<String, String> {
+    use nostr_sdk::prelude::*;
+
+    let config = state.config.read().await;
+    let nsec_str = config.nsec.clone().ok_or("No nsec available — read-only mode")?;
+    drop(config);
+
+    let secret_key = SecretKey::from_bech32(&nsec_str)
+        .map_err(|e| format!("Invalid nsec: {}", e))?;
+
+    let sender_pk = PublicKey::from_hex(&sender_pubkey)
+        .map_err(|e| format!("Invalid sender pubkey: {}", e))?;
+
+    let decrypted = nip04::decrypt(&secret_key, &sender_pk, &content)
+        .map_err(|e| format!("Decryption failed: {}", e))?;
+
+    Ok(decrypted)
+}
+
 // ── App Entry ──────────────────────────────────────────────────────
 
 pub fn run() {
@@ -2465,6 +2485,7 @@ pub fn run() {
             set_nsec,
             clear_nsec,
             get_signing_mode,
+            decrypt_dm,
         ])
         .run(tauri::generate_context!())
         .expect("error while running nostrito");

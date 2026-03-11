@@ -241,7 +241,7 @@ export const ProfileView: React.FC = () => {
   /* --- early return if no pubkey ------------------------------------ */
   if (!pubkey) {
     return (
-      <div className="main-content">
+      <div className="screen-page">
         <EmptyState message="No profile pubkey specified." />
       </div>
     );
@@ -252,7 +252,7 @@ export const ProfileView: React.FC = () => {
   /* ================================================================== */
 
   return (
-    <div className="main-content">
+    <div className="screen-page profile-page">
       {/* Back button */}
       <div className="profile-back-row">
         <button className="btn btn-secondary profile-back-btn" onClick={() => navigate(-1)}>

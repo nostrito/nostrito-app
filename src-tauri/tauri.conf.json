@@ -29,7 +29,11 @@
       "title": "nostrito"
     },
     "security": {
-      "csp": null
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["$HOME/.nostrito/media/**"]
+      }
     }
   },
   "bundle": {

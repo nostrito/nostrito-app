@@ -210,12 +210,19 @@ impl SyncEngine {
                 Kind::Repost,
                 Kind::Reaction,
                 Kind::LongFormTextNote,
+                Kind::EncryptedDirectMessage,
             ])
             .limit(1000);
 
+        // Fetch DMs addressed to us (where we're a p-tag recipient)
+        let received_dms_filter = Filter::new()
+            .pubkey(pk)
+            .kind(Kind::EncryptedDirectMessage)
+            .limit(500);
+
         let events = self.pool.subscribe_and_collect(
             &self.relay_urls,
-            vec![meta_filter, events_filter],
+            vec![meta_filter, events_filter, received_dms_filter],
             30,
         ).await?;
 

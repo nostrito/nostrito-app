@@ -115,4 +115,11 @@ export function initMediaViewer(): void {
     if (img) img.src = url;
     viewer.style.display = "flex";
   });
+
+  // Expose global openMediaViewer for imperative calls (ProfileView, MyMedia grids)
+  (window as any).openMediaViewer = (url: string) => {
+    const img = document.getElementById("media-viewer-img") as HTMLImageElement;
+    if (img) img.src = url;
+    viewer.style.display = "flex";
+  };
 }
