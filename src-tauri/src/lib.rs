@@ -140,6 +140,7 @@ pub struct FeedFilter {
     pub kinds: Option<Vec<u32>>,
     pub limit: Option<u32>,
     pub since: Option<u64>,
+    pub until: Option<u64>,
     pub wot_only: Option<bool>,
     pub search: Option<String>,
     pub author: Option<String>,
@@ -666,7 +667,7 @@ async fn get_feed(filter: FeedFilter, state: State<'_, AppState>) -> Result<Vec<
     // Branch: WoT mode uses a SQL subquery (avoids SQLite parameter limit with large graphs)
     let events = if filter.wot_only.unwrap_or(false) {
         let own_pk = state.config.read().await.hex_pubkey.clone();
-        state.db.query_wot_feed(own_pk.as_deref(), kinds, filter.since, limit)
+        state.db.query_wot_feed(own_pk.as_deref(), kinds, filter.since, filter.until, limit)
             .map_err(|e| {
                 tracing::error!("[cmd:get_feed] wot query failed: {}", e);
                 format!("Failed to query WoT feed: {}", e)
@@ -674,7 +675,7 @@ async fn get_feed(filter: FeedFilter, state: State<'_, AppState>) -> Result<Vec<
     } else {
         let author_vec = filter.author.map(|a| vec![a]);
         let authors = author_vec.as_deref();
-        state.db.query_events(None, authors, kinds, filter.since, None, limit)
+        state.db.query_events(None, authors, kinds, filter.since, filter.until, limit)
             .map_err(|e| {
                 tracing::error!("[cmd:get_feed] query failed: {}", e);
                 format!("Failed to query events: {}", e)
@@ -1299,6 +1300,35 @@ pub struct KindCounts {
     pub counts: std::collections::HashMap<u32, u64>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TrackedProfileDetail {
+    pub pubkey: String,
+    pub tracked_at: i64,
+    pub note: Option<String>,
+    pub name: Option<String>,
+    pub display_name: Option<String>,
+    pub picture: Option<String>,
+    pub event_count: u64,
+    pub media_bytes: u64,
+    pub media_count: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MediaBreakdown {
+    pub image_count: u64,
+    pub image_bytes: u64,
+    pub video_count: u64,
+    pub video_bytes: u64,
+    pub audio_count: u64,
+    pub audio_bytes: u64,
+    pub other_count: u64,
+    pub other_bytes: u64,
+    pub total_count: u64,
+    pub total_bytes: u64,
+    pub oldest_media: i64,
+    pub newest_media: i64,
+}
+
 #[tauri::command]
 async fn get_activity_data(state: State<'_, AppState>) -> Result<Vec<u64>, String> {
     tracing::debug!("[cmd:get_activity_data] called");
@@ -1582,6 +1612,42 @@ async fn save_settings(settings: Settings, app_handle: tauri::AppHandle, state: 
 }
 
 #[tauri::command]
+async fn get_followers(pubkey: String, state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    tracing::debug!("[cmd:get_followers] pubkey={}...", &pubkey[..pubkey.len().min(8)]);
+    match state.wot_graph.get_followers(&pubkey) {
+        Some(followers) => Ok(followers),
+        None => Ok(vec![]),
+    }
+}
+
+#[tauri::command]
+async fn is_tracked_profile(pubkey: String, state: State<'_, AppState>) -> Result<bool, String> {
+    state.db.is_tracked(&pubkey).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn is_pubkey_muted_cmd(pubkey: String, state: State<'_, AppState>) -> Result<bool, String> {
+    state.db.is_pubkey_muted(&pubkey).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn mute_pubkey(pubkey: String, state: State<'_, AppState>) -> Result<(), String> {
+    state.db.mute_pubkey(&pubkey).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn unmute_pubkey(pubkey: String, state: State<'_, AppState>) -> Result<(), String> {
+    state.db.unmute_pubkey(&pubkey).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn hex_to_npub(pubkey: String) -> Result<String, String> {
+    use nostr_sdk::prelude::*;
+    let pk = PublicKey::from_hex(&pubkey).map_err(|e| format!("Invalid pubkey: {}", e))?;
+    Ok(pk.to_bech32().map_err(|e| format!("Bech32 error: {}", e))?)
+}
+
+#[tauri::command]
 async fn track_profile(pubkey: String, note: Option<String>, state: State<'_, AppState>) -> Result<(), String> {
     use nostr_sdk::prelude::*;
     let trimmed = pubkey.trim();
@@ -1617,6 +1683,82 @@ async fn get_tracked_profiles(state: State<'_, AppState>) -> Result<Vec<serde_js
             "note": note,
         })
     }).collect())
+}
+
+#[tauri::command]
+async fn get_tracked_profiles_detail(state: State<'_, AppState>) -> Result<Vec<TrackedProfileDetail>, String> {
+    tracing::debug!("[cmd:get_tracked_profiles_detail] called");
+    let profiles = state.db.get_tracked_profiles().map_err(|e| e.to_string())?;
+    let pubkeys: Vec<String> = profiles.iter().map(|(pk, _, _)| pk.clone()).collect();
+    let profile_infos = state.db.get_profiles(&pubkeys).unwrap_or_default();
+
+    let mut result = Vec::new();
+    for (pubkey, tracked_at, note) in profiles {
+        let event_count = state.db.count_events_for_pubkey(&pubkey).unwrap_or(0);
+        let media_bytes = state.db.media_bytes_for_pubkey(&pubkey).unwrap_or(0);
+        let media_count = state.db.media_count_for_pubkey(&pubkey).unwrap_or(0);
+        let info = profile_infos.iter().find(|p| p.pubkey == pubkey);
+        result.push(TrackedProfileDetail {
+            pubkey,
+            tracked_at,
+            note,
+            name: info.and_then(|p| p.name.clone()),
+            display_name: info.and_then(|p| p.display_name.clone()),
+            picture: info.and_then(|p| p.picture.clone()),
+            event_count,
+            media_bytes,
+            media_count,
+        });
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+async fn get_kind_counts_for_category(category: String, state: State<'_, AppState>) -> Result<KindCounts, String> {
+    let config = state.config.read().await;
+    let own_pubkey = config.hex_pubkey.clone().unwrap_or_default();
+    drop(config);
+
+    let counts = match category.as_str() {
+        "own" => state.db.kind_counts_for_pubkey(&own_pubkey),
+        "tracked" => state.db.kind_counts_for_tracked(&own_pubkey),
+        "wot" => state.db.kind_counts_for_wot(&own_pubkey),
+        _ => return Err("Invalid category. Use 'own', 'tracked', or 'wot'".into()),
+    }.map_err(|e| e.to_string())?;
+
+    Ok(KindCounts { counts })
+}
+
+#[tauri::command]
+async fn get_media_breakdown_for_category(category: String, state: State<'_, AppState>) -> Result<MediaBreakdown, String> {
+    let config = state.config.read().await;
+    let own_pubkey = config.hex_pubkey.clone().unwrap_or_default();
+    drop(config);
+
+    let (ic, ib, vc, vb, ac, ab, oc, ob, tc, tb, oldest, newest) = state.db
+        .media_breakdown_for_category(&own_pubkey, &category)
+        .map_err(|e| e.to_string())?;
+
+    Ok(MediaBreakdown {
+        image_count: ic,
+        image_bytes: ib,
+        video_count: vc,
+        video_bytes: vb,
+        audio_count: ac,
+        audio_bytes: ab,
+        other_count: oc,
+        other_bytes: ob,
+        total_count: tc,
+        total_bytes: tb,
+        oldest_media: oldest,
+        newest_media: newest,
+    })
+}
+
+#[tauri::command]
+async fn requeue_profile_media(pubkey: String, state: State<'_, AppState>) -> Result<u32, String> {
+    tracing::info!("[cmd:requeue_profile_media] pubkey={}...", &pubkey[..pubkey.len().min(12)]);
+    state.db.requeue_events_media(&pubkey).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2524,9 +2666,19 @@ pub fn run() {
             get_own_media,
             get_profile_media,
             restart_sync,
+            get_followers,
+            is_tracked_profile,
+            is_pubkey_muted_cmd,
+            mute_pubkey,
+            unmute_pubkey,
+            hex_to_npub,
             track_profile,
             untrack_profile,
             get_tracked_profiles,
+            get_tracked_profiles_detail,
+            get_kind_counts_for_category,
+            get_media_breakdown_for_category,
+            requeue_profile_media,
             fetch_profile,
             get_profile_with_refresh,
             nsec_to_npub,

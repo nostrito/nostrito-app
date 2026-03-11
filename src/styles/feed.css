@@ -145,21 +145,23 @@
   gap: 6px;
 }
 .ev-media-img {
-  max-width: 100%;
-  max-height: 280px;
-  width: auto;
-  height: auto;
+  width: 200px;
+  height: 200px;
   border-radius: 8px;
   object-fit: cover;
   cursor: zoom-in;
   display: block;
-  background: var(--bg); /* placeholder while loading */
+  background: var(--bg-card);
+  flex-shrink: 0;
 }
 .ev-media-video {
-  max-width: 100%;
-  max-height: 280px;
+  width: 200px;
+  height: 200px;
   border-radius: 8px;
+  object-fit: cover;
   display: block;
+  background: var(--bg-card);
+  flex-shrink: 0;
 }
 
 /* ── Article Cards Grid ─────────────────────────────────── */
@@ -511,7 +513,109 @@
   color: var(--text-muted);
 }
 
+/* ── Feed Page Layout ──────────────────────────────────── */
+
+.feed-page {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.feed-layout {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Right articles column — vertical carousel */
+.feed-articles-column {
+  width: 340px;
+  flex-shrink: 0;
+  overflow-y: auto;
+  border-left: 1px solid var(--border);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.feed-articles-column .article-card {
+  flex-shrink: 0;
+}
+
+.feed-articles-column .article-card-cover {
+  height: 140px;
+}
+
+/* Full-width articles view (long-form filter only) */
+.feed-articles-full {
+  flex: 1;
+  overflow-y: auto;
+}
+
+/* Right notes column */
+.feed-notes-column {
+  flex: 1;
+  overflow-y: auto;
+  min-width: 0;
+}
+
+/* Infinite scroll sentinel */
+.feed-sentinel {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px 20px;
+  min-height: 60px;
+}
+
+.feed-sentinel-text {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  animation: feed-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes feed-pulse {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
+}
+
+.feed-end {
+  padding: 20px;
+  text-align: center;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  border-top: 1px solid var(--border);
+}
+
 /* ── Responsive ─────────────────────────────────────────── */
+
+@media (max-width: 900px) {
+  .feed-layout {
+    flex-direction: column;
+  }
+  .feed-articles-column {
+    width: 100%;
+    max-height: 260px;
+    border-left: none;
+    border-top: 1px solid var(--border);
+    flex-direction: row;
+    overflow-x: auto;
+    overflow-y: hidden;
+    gap: 12px;
+    padding: 12px;
+  }
+  .feed-articles-column .article-card {
+    min-width: 260px;
+    max-width: 300px;
+  }
+  .feed-articles-column .article-card-cover {
+    height: 100px;
+  }
+}
 
 @media (max-width: 640px) {
   .feed-header-row {

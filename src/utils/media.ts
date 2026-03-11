@@ -73,53 +73,128 @@ export function renderMediaHtml(content: string): string {
 
 /**
  * Initialize the media viewer (lightbox) overlay.
- * Call once on app startup.
+ * Supports both images and videos. Call once on app startup.
  */
 export function initMediaViewer(): void {
   if (document.getElementById("media-viewer")) return;
 
+  /* --- inject styles -------------------------------------------------- */
+  const style = document.createElement("style");
+  style.textContent = `
+    #media-viewer {
+      position: fixed;
+      inset: 0;
+      z-index: 9999;
+      background: rgba(0, 0, 0, 0.92);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+    }
+    #media-viewer-img,
+    #media-viewer-video {
+      max-width: 90vw;
+      max-height: 90vh;
+      object-fit: contain;
+      border-radius: 8px;
+      cursor: default;
+    }
+    #media-viewer-close {
+      position: absolute;
+      top: 16px;
+      right: 16px;
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      border: none;
+      background: rgba(255, 255, 255, 0.15);
+      color: #fff;
+      font-size: 1.2rem;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: background 0.2s;
+      z-index: 1;
+    }
+    #media-viewer-close:hover {
+      background: rgba(255, 255, 255, 0.3);
+    }
+  `;
+  document.head.appendChild(style);
+
+  /* --- build DOM ------------------------------------------------------ */
   const viewer = document.createElement("div");
   viewer.id = "media-viewer";
   viewer.innerHTML = `
-    <img id="media-viewer-img">
+    <img id="media-viewer-img" style="display:none">
+    <video id="media-viewer-video" style="display:none" controls></video>
     <button id="media-viewer-close"><span class="icon">${iconX()}</span></button>
   `;
   document.body.appendChild(viewer);
 
+  const imgEl = viewer.querySelector("#media-viewer-img") as HTMLImageElement;
+  const videoEl = viewer.querySelector("#media-viewer-video") as HTMLVideoElement;
+
+  /* --- helpers -------------------------------------------------------- */
+  function isVideoUrl(url: string): boolean {
+    const lower = url.toLowerCase();
+    return /\.(mp4|webm|mov)(\?|$)/.test(lower);
+  }
+
+  function showMedia(url: string, type?: "image" | "video"): void {
+    const isVideo = type === "video" || (!type && isVideoUrl(url));
+    if (isVideo) {
+      imgEl.style.display = "none";
+      imgEl.removeAttribute("src");
+      videoEl.src = url;
+      videoEl.style.display = "block";
+    } else {
+      videoEl.style.display = "none";
+      videoEl.pause();
+      videoEl.removeAttribute("src");
+      videoEl.load();
+      imgEl.src = url;
+      imgEl.style.display = "block";
+    }
+    viewer.style.display = "flex";
+  }
+
+  function closeViewer(): void {
+    viewer.style.display = "none";
+    videoEl.pause();
+    videoEl.removeAttribute("src");
+    videoEl.load();
+    imgEl.removeAttribute("src");
+  }
+
+  /* --- event listeners ------------------------------------------------ */
+
   // Close on backdrop click
   viewer.addEventListener("click", (e) => {
-    if (e.target === viewer) {
-      viewer.style.display = "none";
-    }
+    if (e.target === viewer) closeViewer();
   });
 
   // Close button
-  viewer.querySelector("#media-viewer-close")?.addEventListener("click", () => {
-    viewer.style.display = "none";
-  });
+  viewer.querySelector("#media-viewer-close")?.addEventListener("click", closeViewer);
 
   // ESC key
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape" && viewer.style.display === "flex") {
-      viewer.style.display = "none";
+      closeViewer();
     }
   });
 
-  // Event delegation for [data-media-url] clicks (replaces window global)
+  // Event delegation for [data-media-url] clicks
   document.addEventListener("click", (e) => {
     const target = (e.target as HTMLElement).closest("[data-media-url]") as HTMLElement | null;
     if (!target) return;
     const url = target.dataset.mediaUrl;
     if (!url) return;
-    const img = document.getElementById("media-viewer-img") as HTMLImageElement;
-    if (img) img.src = url;
-    viewer.style.display = "flex";
+    const type = target.dataset.mediaType as "image" | "video" | undefined;
+    showMedia(url, type);
   });
 
   // Expose global openMediaViewer for imperative calls (ProfileView, MyMedia grids)
-  (window as any).openMediaViewer = (url: string) => {
-    const img = document.getElementById("media-viewer-img") as HTMLImageElement;
-    if (img) img.src = url;
-    viewer.style.display = "flex";
-  };
+  (window as any).openMediaViewer = showMedia;
 }

@@ -533,6 +533,7 @@ impl Database {
         own_pubkey: Option<&str>,
         kinds: Option<&[u32]>,
         since: Option<u64>,
+        until: Option<u64>,
         limit: u32,
     ) -> Result<Vec<(String, String, i64, i64, String, String, String)>> {
         let conn = self.conn.lock().unwrap();
@@ -572,6 +573,12 @@ impl Database {
             param_values.push(Box::new(since as i64));
         }
 
+        if let Some(until) = until {
+            let idx = param_values.len() + 1;
+            sql.push_str(&format!(" AND created_at <= ?{}", idx));
+            param_values.push(Box::new(until as i64));
+        }
+
         sql.push_str(" ORDER BY created_at DESC");
 
         {
@@ -581,8 +588,8 @@ impl Database {
         }
 
         debug!(
-            "[db] query_wot_feed: kinds={:?}, since={:?}, limit={}",
-            kinds, since, limit
+            "[db] query_wot_feed: kinds={:?}, since={:?}, until={:?}, limit={}",
+            kinds, since, until, limit
         );
 
         let params_refs: Vec<&dyn rusqlite::ToSql> =
@@ -1367,6 +1374,166 @@ impl Database {
         Ok(total as u64)
     }
 
+    /// Media bytes for a specific pubkey.
+    pub fn media_bytes_for_pubkey(&self, pubkey: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let total: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(size_bytes), 0) FROM media_cache WHERE pubkey = ?1",
+            params![pubkey],
+            |row| row.get(0),
+        )?;
+        Ok(total as u64)
+    }
+
+    /// Media file count for a specific pubkey.
+    pub fn media_count_for_pubkey(&self, pubkey: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM media_cache WHERE pubkey = ?1",
+            params![pubkey],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Kind counts for a specific pubkey.
+    pub fn kind_counts_for_pubkey(&self, pubkey: &str) -> Result<HashMap<u32, u64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT kind, COUNT(*) FROM nostr_events WHERE pubkey = ?1 GROUP BY kind ORDER BY COUNT(*) DESC"
+        )?;
+        let mut map = HashMap::new();
+        let rows = stmt.query_map(params![pubkey], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            if let Ok((kind, count)) = row {
+                map.insert(kind as u32, count as u64);
+            }
+        }
+        Ok(map)
+    }
+
+    /// Kind counts for all tracked profiles (excluding own pubkey).
+    pub fn kind_counts_for_tracked(&self, own_pubkey: &str) -> Result<HashMap<u32, u64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT kind, COUNT(*) FROM nostr_events WHERE pubkey != ?1 AND pubkey IN (SELECT pubkey FROM tracked_profiles) GROUP BY kind ORDER BY COUNT(*) DESC"
+        )?;
+        let mut map = HashMap::new();
+        let rows = stmt.query_map(params![own_pubkey], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            if let Ok((kind, count)) = row {
+                map.insert(kind as u32, count as u64);
+            }
+        }
+        Ok(map)
+    }
+
+    /// Kind counts for WoT profiles (excluding own pubkey and tracked profiles).
+    pub fn kind_counts_for_wot(&self, own_pubkey: &str) -> Result<HashMap<u32, u64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT kind, COUNT(*) FROM nostr_events WHERE pubkey != ?1 AND pubkey NOT IN (SELECT pubkey FROM tracked_profiles) GROUP BY kind ORDER BY COUNT(*) DESC"
+        )?;
+        let mut map = HashMap::new();
+        let rows = stmt.query_map(params![own_pubkey], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            if let Ok((kind, count)) = row {
+                map.insert(kind as u32, count as u64);
+            }
+        }
+        Ok(map)
+    }
+
+    /// Media type breakdown for a category (own/tracked/wot).
+    pub fn media_breakdown_for_category(&self, own_pubkey: &str, category: &str) -> Result<(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, i64, i64)> {
+        let conn = self.conn.lock().unwrap();
+        let filter = match category {
+            "own" => "WHERE pubkey = ?1",
+            "tracked" => "WHERE pubkey != ?1 AND pubkey IN (SELECT pubkey FROM tracked_profiles)",
+            "wot" => "WHERE pubkey != ?1 AND pubkey NOT IN (SELECT pubkey FROM tracked_profiles)",
+            _ => return Err(anyhow::anyhow!("Invalid category")),
+        };
+        let sql = format!(
+            "SELECT \
+               COALESCE(SUM(CASE WHEN mime_type LIKE 'image/%' THEN 1 ELSE 0 END), 0), \
+               COALESCE(SUM(CASE WHEN mime_type LIKE 'image/%' THEN size_bytes ELSE 0 END), 0), \
+               COALESCE(SUM(CASE WHEN mime_type LIKE 'video/%' THEN 1 ELSE 0 END), 0), \
+               COALESCE(SUM(CASE WHEN mime_type LIKE 'video/%' THEN size_bytes ELSE 0 END), 0), \
+               COALESCE(SUM(CASE WHEN mime_type LIKE 'audio/%' THEN 1 ELSE 0 END), 0), \
+               COALESCE(SUM(CASE WHEN mime_type LIKE 'audio/%' THEN size_bytes ELSE 0 END), 0), \
+               COALESCE(SUM(CASE WHEN mime_type NOT LIKE 'image/%' AND mime_type NOT LIKE 'video/%' AND mime_type NOT LIKE 'audio/%' THEN 1 ELSE 0 END), 0), \
+               COALESCE(SUM(CASE WHEN mime_type NOT LIKE 'image/%' AND mime_type NOT LIKE 'video/%' AND mime_type NOT LIKE 'audio/%' THEN size_bytes ELSE 0 END), 0), \
+               COUNT(*), \
+               COALESCE(SUM(size_bytes), 0), \
+               COALESCE(MIN(downloaded_at), 0), \
+               COALESCE(MAX(downloaded_at), 0) \
+             FROM media_cache {}", filter
+        );
+        let row = conn.query_row(&sql, params![own_pubkey], |row| {
+            Ok((
+                row.get::<_, i64>(0)? as u64,
+                row.get::<_, i64>(1)? as u64,
+                row.get::<_, i64>(2)? as u64,
+                row.get::<_, i64>(3)? as u64,
+                row.get::<_, i64>(4)? as u64,
+                row.get::<_, i64>(5)? as u64,
+                row.get::<_, i64>(6)? as u64,
+                row.get::<_, i64>(7)? as u64,
+                row.get::<_, i64>(8)? as u64,
+                row.get::<_, i64>(9)? as u64,
+                row.get::<_, i64>(10)?,
+                row.get::<_, i64>(11)?,
+            ))
+        })?;
+        Ok(row)
+    }
+
+    /// Re-queue media URLs from existing events for a pubkey (for re-downloading).
+    pub fn requeue_events_media(&self, pubkey: &str) -> Result<u32> {
+        let events: Vec<(String, String)> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT content, tags FROM nostr_events WHERE pubkey = ?1 AND kind IN (1, 6, 30023)"
+            )?;
+            let result: Vec<(String, String)> = stmt.query_map(params![pubkey], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+            result
+        };
+
+        let mut count = 0u32;
+        for (content, tags_json) in &events {
+            // Queue from tags
+            let tag_urls = crate::sync::media::extract_urls_from_tags(tags_json);
+            for url in &tag_urls {
+                if self.queue_media_url(url, pubkey, 5).is_ok() {
+                    count += 1;
+                }
+            }
+            // Queue from content
+            let text_urls = crate::sync::media::extract_urls_from_text(content);
+            for url in &text_urls {
+                if crate::sync::media::is_nostr_media_cdn(url)
+                    || crate::sync::media::mime_type_from_url(url).is_some()
+                {
+                    if self.queue_media_url(url, pubkey, 5).is_ok() {
+                        count += 1;
+                    }
+                }
+            }
+        }
+
+        Ok(count)
+    }
+
     // ── V2: User Relays ──────────────────────────────────────────
 
     /// Upsert a user relay, respecting source priority (higher source wins).
@@ -1724,6 +1891,26 @@ impl Database {
             }
         }
 
+        Ok(())
+    }
+
+    /// Mute a single pubkey.
+    pub fn mute_pubkey(&self, pubkey: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT OR IGNORE INTO muted_users (pubkey, muted_at) VALUES (?1, ?2)",
+            params![pubkey, now],
+        )?;
+        info!("[db] mute_pubkey: {}", &pubkey[..std::cmp::min(12, pubkey.len())]);
+        Ok(())
+    }
+
+    /// Unmute a single pubkey.
+    pub fn unmute_pubkey(&self, pubkey: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM muted_users WHERE pubkey = ?1", params![pubkey])?;
+        info!("[db] unmute_pubkey: {}", &pubkey[..std::cmp::min(12, pubkey.len())]);
         Ok(())
     }
 

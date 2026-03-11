@@ -115,12 +115,19 @@ export const Feed: React.FC = () => {
   const [isSearchMode, setIsSearchMode] = useState(false);
   const [globalConsent, setGlobalConsent] = useState(false);
   const [savedEventIds, setSavedEventIds] = useState<Set<string>>(new Set());
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [hasMore, setHasMore] = useState(true);
+  const [loadingMoreArticles, setLoadingMoreArticles] = useState(false);
+  const [hasMoreArticles, setHasMoreArticles] = useState(true);
 
   const { getProfile, ensureProfiles } = useProfileContext();
 
   const renderedEventIdsRef = useRef(new Set<string>());
   const feedLoadingRef = useRef(false);
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const oldestNoteTimestamp = useRef<number | null>(null);
+  const oldestArticleTimestamp = useRef<number | null>(null);
+  const articleLoadingRef = useRef(false);
 
   // Listen for sync tier completion to trigger refresh
   const tierEvent = useTauriEvent<{ tier: number }>("sync:tier_complete");
@@ -177,7 +184,7 @@ export const Feed: React.FC = () => {
         const toAdd = newEvents.filter((e) => !existingIds.has(e.id));
         const merged = [...toAdd, ...prev];
         const articles = merged.filter((e) => e.kind === 30023);
-        const notes = merged.filter((e) => e.kind !== 30023).slice(0, 100);
+        const notes = merged.filter((e) => e.kind !== 30023);
         return [...articles, ...notes];
       });
 
@@ -190,11 +197,122 @@ export const Feed: React.FC = () => {
     }
   }, [feedMode, ensureProfiles]);
 
+  // Track oldest timestamps for pagination
+  useEffect(() => {
+    const notes = feedEvents.filter((e) => e.kind !== 30023);
+    if (notes.length > 0) {
+      oldestNoteTimestamp.current = Math.min(...notes.map((e) => e.created_at));
+    } else {
+      oldestNoteTimestamp.current = null;
+    }
+    const arts = feedEvents.filter((e) => e.kind === 30023);
+    if (arts.length > 0) {
+      oldestArticleTimestamp.current = Math.min(...arts.map((e) => e.created_at));
+    } else {
+      oldestArticleTimestamp.current = null;
+    }
+  }, [feedEvents]);
+
+  const loadMoreEvents = useCallback(async () => {
+    if (feedLoadingRef.current || isSearchMode || !hasMore) return;
+    const oldest = oldestNoteTimestamp.current;
+    if (oldest === null) return;
+    const until = oldest - 1;
+
+    feedLoadingRef.current = true;
+    setLoadingMore(true);
+
+    try {
+      let rawEvents: NostrEvent[];
+
+      if (feedMode === "global") {
+        rawEvents = await invoke<NostrEvent[]>("fetch_global_feed", { limit: 50, until });
+      } else {
+        rawEvents = await invoke<NostrEvent[]>("get_feed", {
+          filter: { kinds: [1, 6], limit: 50, wot_only: true, until },
+        });
+      }
+
+      // Only mark end when backend returned fewer than requested
+      if (rawEvents.length === 0) {
+        setHasMore(false);
+        return;
+      }
+
+      const kindFiltered = rawEvents.filter((e) => FEED_KINDS.includes(e.kind));
+      const newEvents = kindFiltered.filter((e) => !renderedEventIdsRef.current.has(e.id));
+
+      if (newEvents.length === 0) return;
+
+      const pubkeys = [...new Set(newEvents.map((e) => e.pubkey))];
+      ensureProfiles(pubkeys);
+
+      for (const e of newEvents) {
+        renderedEventIdsRef.current.add(e.id);
+      }
+
+      setFeedEvents((prev) => {
+        const existingIds = new Set(prev.map((e) => e.id));
+        const toAdd = newEvents.filter((e) => !existingIds.has(e.id));
+        return [...prev, ...toAdd];
+      });
+    } catch (err) {
+      console.warn("[feed] Failed to load more events:", err);
+    } finally {
+      feedLoadingRef.current = false;
+      setLoadingMore(false);
+    }
+  }, [feedMode, isSearchMode, hasMore, ensureProfiles]);
+
+  const loadMoreArticles = useCallback(async () => {
+    if (articleLoadingRef.current || isSearchMode || !hasMoreArticles || feedMode === "global") return;
+    const oldest = oldestArticleTimestamp.current;
+    if (oldest === null) return;
+    const until = oldest - 1;
+
+    articleLoadingRef.current = true;
+    setLoadingMoreArticles(true);
+
+    try {
+      const rawEvents = await invoke<NostrEvent[]>("get_feed", {
+        filter: { kinds: [30023], limit: 20, wot_only: true, until },
+      });
+
+      if (rawEvents.length === 0) {
+        setHasMoreArticles(false);
+        return;
+      }
+
+      const newEvents = rawEvents.filter((e) => !renderedEventIdsRef.current.has(e.id));
+      if (newEvents.length === 0) return;
+
+      const pubkeys = [...new Set(newEvents.map((e) => e.pubkey))];
+      ensureProfiles(pubkeys);
+
+      for (const e of newEvents) {
+        renderedEventIdsRef.current.add(e.id);
+      }
+
+      setFeedEvents((prev) => {
+        const existingIds = new Set(prev.map((e) => e.id));
+        const toAdd = newEvents.filter((e) => !existingIds.has(e.id));
+        return [...prev, ...toAdd];
+      });
+    } catch (err) {
+      console.warn("[feed] Failed to load more articles:", err);
+    } finally {
+      articleLoadingRef.current = false;
+      setLoadingMoreArticles(false);
+    }
+  }, [isSearchMode, hasMoreArticles, feedMode, ensureProfiles]);
+
   // Reset feed when mode changes
   useEffect(() => {
     renderedEventIdsRef.current.clear();
     setFeedEvents([]);
     setSavedEventIds(new Set());
+    setHasMore(true);
+    setHasMoreArticles(true);
     if (feedMode === "global") {
       setGlobalConsent(false);
       setLoading(false);
@@ -302,6 +420,8 @@ export const Feed: React.FC = () => {
         renderedEventIdsRef.current.clear();
         setFeedEvents([]);
         setLoading(true);
+        setHasMore(true);
+        setHasMoreArticles(true);
         return;
       }
 
@@ -319,6 +439,8 @@ export const Feed: React.FC = () => {
     renderedEventIdsRef.current.clear();
     setFeedEvents([]);
     setLoading(true);
+    setHasMore(true);
+    setHasMoreArticles(true);
   }, []);
 
   // Cleanup debounce timer
@@ -327,6 +449,27 @@ export const Feed: React.FC = () => {
       if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
     };
   }, []);
+
+  // Scroll handlers for infinite scroll (must be before any conditional returns — Rules of Hooks)
+  const handleNotesScroll = useCallback(
+    (e: React.UIEvent<HTMLDivElement>) => {
+      const el = e.currentTarget;
+      if (el.scrollHeight - el.scrollTop - el.clientHeight < 400) {
+        loadMoreEvents();
+      }
+    },
+    [loadMoreEvents],
+  );
+
+  const handleArticlesScroll = useCallback(
+    (e: React.UIEvent<HTMLDivElement>) => {
+      const el = e.currentTarget;
+      if (el.scrollHeight - el.scrollTop - el.clientHeight < 400) {
+        loadMoreArticles();
+      }
+    },
+    [loadMoreArticles],
+  );
 
   // Article reader view
   if (view.kind === "article") {
@@ -343,10 +486,13 @@ export const Feed: React.FC = () => {
   const notes = feedEvents.filter((e) => e.kind !== 30023);
 
   // Apply filter visibility
-  const showArticleGrid = activeFilter === "all" || activeFilter === "long-form";
   const filteredNotes = activeFilter === "all"
     ? notes
     : notes.filter((e) => kindTag(e.kind) === activeFilter);
+
+  // Layout: articles on left carousel, notes on right
+  const showArticleColumn = (activeFilter === "all" || activeFilter === "long-form") && articles.length > 0;
+  const showNotesColumn = activeFilter !== "long-form";
 
   const filterTabs: { key: FilterTab; label: string }[] = [
     { key: "all", label: "All" },
@@ -356,7 +502,7 @@ export const Feed: React.FC = () => {
   ];
 
   return (
-    <>
+    <div className="feed-page">
       <div className="feed-header-row">
         <div className="feed-mode-toggle">
           <button
@@ -404,44 +550,70 @@ export const Feed: React.FC = () => {
         <div className="feed-search-status">{searchStatus}</div>
       )}
 
-      <div id="feedList">
-        {feedMode === "global" && !globalConsent && !isSearchMode && (
-          <div className="global-consent">
-            <div className="global-consent-icon">
-              <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                <circle cx="12" cy="12" r="10" /><path d="M2 12h20" /><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" />
-              </svg>
-            </div>
-            <h3 className="global-consent-title">Global Feed</h3>
-            <p className="global-consent-text">
-              This will fetch recent notes from public relays. These events are temporary and won't be saved to your local database unless you explicitly save them.
-            </p>
-            <button className="global-consent-btn" onClick={handleGlobalConsent}>
-              Fetch Global Feed
-            </button>
+      <div className="feed-layout">
+        {/* Notes column (left) with infinite scroll */}
+        {showNotesColumn && (
+          <div className="feed-notes-column" onScroll={handleNotesScroll}>
+            {feedMode === "global" && !globalConsent && !isSearchMode && (
+              <div className="global-consent">
+                <div className="global-consent-icon">
+                  <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                    <circle cx="12" cy="12" r="10" /><path d="M2 12h20" /><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" />
+                  </svg>
+                </div>
+                <h3 className="global-consent-title">Global Feed</h3>
+                <p className="global-consent-text">
+                  This will fetch recent notes from public relays. These events are temporary and won't be saved to your local database unless you explicitly save them.
+                </p>
+                <button className="global-consent-btn" onClick={handleGlobalConsent}>
+                  Fetch Global Feed
+                </button>
+              </div>
+            )}
+
+            {loading && !isSearchMode && (feedMode === "wot" || globalConsent) && (
+              <div className="event-card" style={{ justifyContent: "center", color: "var(--text-muted)", padding: 32 }}>
+                Loading events...
+              </div>
+            )}
+
+            {!loading && feedEvents.length === 0 && !isSearchMode && (feedMode === "wot" || globalConsent) && (
+              <div className="event-card" style={{ justifyContent: "center", color: "var(--text-muted)", padding: 32 }}>
+                No events yet
+              </div>
+            )}
+
+            {isSearchMode && feedEvents.length === 0 && searchStatus && !searchStatus.includes("Searching") && !searchStatus.includes("Resolving") && (
+              <div className="event-card" style={{ justifyContent: "center", color: "var(--text-muted)", padding: 32 }}>
+                No events found
+              </div>
+            )}
+
+            {filteredNotes.map((event) => (
+              <NoteCard
+                key={event.id}
+                event={event}
+                profile={getProfile(event.pubkey)}
+                onSave={feedMode === "global" ? saveEvent : undefined}
+                saved={savedEventIds.has(event.id)}
+              />
+            ))}
+
+            {!loading && !isSearchMode && hasMore && filteredNotes.length > 0 && (feedMode === "wot" || globalConsent) && (
+              <div className="feed-sentinel">
+                {loadingMore && <span className="feed-sentinel-text">Loading more...</span>}
+              </div>
+            )}
+
+            {!isSearchMode && !hasMore && filteredNotes.length > 0 && (
+              <div className="feed-end">No more events to load</div>
+            )}
           </div>
         )}
 
-        {loading && !isSearchMode && (feedMode === "wot" || globalConsent) && (
-          <div className="event-card" style={{ justifyContent: "center", color: "var(--text-muted)", padding: 32 }}>
-            Loading events...
-          </div>
-        )}
-
-        {!loading && feedEvents.length === 0 && !isSearchMode && (feedMode === "wot" || globalConsent) && (
-          <div className="event-card" style={{ justifyContent: "center", color: "var(--text-muted)", padding: 32 }}>
-            No events yet
-          </div>
-        )}
-
-        {isSearchMode && feedEvents.length === 0 && searchStatus && !searchStatus.includes("Searching") && !searchStatus.includes("Resolving") && (
-          <div className="event-card" style={{ justifyContent: "center", color: "var(--text-muted)", padding: 32 }}>
-            No events found
-          </div>
-        )}
-
-        {showArticleGrid && articles.length > 0 && (
-          <div className="article-cards-grid">
+        {/* Articles column (right vertical carousel) — split view */}
+        {showArticleColumn && showNotesColumn && (
+          <div className="feed-articles-column" onScroll={handleArticlesScroll}>
             {articles.map((event) => (
               <ArticleCard
                 key={event.id}
@@ -450,19 +622,44 @@ export const Feed: React.FC = () => {
                 onClick={() => setView({ kind: "article", event })}
               />
             ))}
+            {hasMoreArticles && articles.length > 0 && (
+              <div className="feed-sentinel">
+                {loadingMoreArticles && <span className="feed-sentinel-text">Loading more...</span>}
+              </div>
+            )}
           </div>
         )}
 
-        {filteredNotes.map((event) => (
-          <NoteCard
-            key={event.id}
-            event={event}
-            profile={getProfile(event.pubkey)}
-            onSave={feedMode === "global" ? saveEvent : undefined}
-            saved={savedEventIds.has(event.id)}
-          />
-        ))}
+        {/* Articles grid — full width when long-form filter only */}
+        {showArticleColumn && !showNotesColumn && (
+          <div className="feed-articles-full" onScroll={handleArticlesScroll}>
+            <div className="article-cards-grid">
+              {articles.map((event) => (
+                <ArticleCard
+                  key={event.id}
+                  event={event}
+                  profile={getProfile(event.pubkey)}
+                  onClick={() => setView({ kind: "article", event })}
+                />
+              ))}
+            </div>
+            {hasMoreArticles && articles.length > 0 && (
+              <div className="feed-sentinel">
+                {loadingMoreArticles && <span className="feed-sentinel-text">Loading more...</span>}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Empty state for long-form filter with no articles */}
+        {!showArticleColumn && !showNotesColumn && !loading && (
+          <div className="feed-notes-column">
+            <div className="event-card" style={{ justifyContent: "center", color: "var(--text-muted)", padding: 32 }}>
+              No long-form events yet
+            </div>
+          </div>
+        )}
       </div>
-    </>
+    </div>
   );
 };
