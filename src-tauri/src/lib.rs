@@ -56,6 +56,8 @@ pub struct AppConfig {
     pub sync_wot_batch_size: u32,
     pub sync_wot_events_per_batch: u32,
     pub max_event_age_days: u32,
+    /// Fetch content (kind:1/6/30023) from follows-of-follows
+    pub sync_fof_content: bool,
     /// Cached nsec (loaded from system keychain on startup)
     pub nsec: Option<String>,
 }
@@ -89,6 +91,7 @@ impl Default for AppConfig {
             sync_wot_batch_size: 5,
             sync_wot_events_per_batch: 15,
             max_event_age_days: 30,
+            sync_fof_content: false,
             nsec: None,
         }
     }
@@ -182,6 +185,7 @@ pub struct Settings {
     pub sync_wot_batch_size: u32,
     pub sync_wot_events_per_batch: u32,
     pub max_event_age_days: u32,
+    pub sync_fof_content: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -340,6 +344,7 @@ async fn init_nostrito(
         wot_batch_size: config.sync_wot_batch_size,
         wot_events_per_batch: config.sync_wot_events_per_batch,
         cycle_interval_secs: config.sync_interval_secs,
+        fof_content: config.sync_fof_content,
     };
     let cancel = start_sync_engine(
         state.wot_graph.clone(),
@@ -516,6 +521,7 @@ async fn start_sync(
         wot_batch_size: config.sync_wot_batch_size,
         wot_events_per_batch: config.sync_wot_events_per_batch,
         cycle_interval_secs: config.sync_interval_secs,
+        fof_content: config.sync_fof_content,
     };
     let cancel = start_sync_engine(
         state.wot_graph.clone(),
@@ -572,6 +578,7 @@ async fn restart_sync(state: State<'_, AppState>, app_handle: tauri::AppHandle) 
         wot_batch_size: config.sync_wot_batch_size,
         wot_events_per_batch: config.sync_wot_events_per_batch,
         cycle_interval_secs: config.sync_interval_secs,
+        fof_content: config.sync_fof_content,
     };
 
     let cancel = start_sync_engine(
@@ -1139,6 +1146,7 @@ async fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
         sync_wot_batch_size: config.sync_wot_batch_size,
         sync_wot_events_per_batch: config.sync_wot_events_per_batch,
         max_event_age_days: config.max_event_age_days,
+        sync_fof_content: config.sync_fof_content,
     })
 }
 
@@ -1173,6 +1181,7 @@ async fn save_settings(settings: Settings, app_handle: tauri::AppHandle, state: 
     config.sync_wot_batch_size = settings.sync_wot_batch_size;
     config.sync_wot_events_per_batch = settings.sync_wot_events_per_batch;
     config.max_event_age_days = settings.max_event_age_days;
+    config.sync_fof_content = settings.sync_fof_content;
 
     // Persist ALL settings to DB so they survive restart
     drop(config);
@@ -1204,6 +1213,7 @@ async fn save_settings(settings: Settings, app_handle: tauri::AppHandle, state: 
     db.set_config("sync_wot_batch_size", &settings.sync_wot_batch_size.to_string()).ok();
     db.set_config("sync_wot_events_per_batch", &settings.sync_wot_events_per_batch.to_string()).ok();
     db.set_config("max_event_age_days", &settings.max_event_age_days.to_string()).ok();
+    db.set_config("sync_fof_content", if settings.sync_fof_content { "true" } else { "false" }).ok();
     db.set_config("storage_own_media_gb", &settings.storage_own_media_gb.to_string()).ok();
     db.set_config("storage_tracked_media_gb", &settings.storage_tracked_media_gb.to_string()).ok();
     db.set_config("storage_wot_media_gb", &settings.storage_wot_media_gb.to_string()).ok();
@@ -1229,6 +1239,7 @@ async fn save_settings(settings: Settings, app_handle: tauri::AppHandle, state: 
             wot_batch_size: config.sync_wot_batch_size,
             wot_events_per_batch: config.sync_wot_events_per_batch,
             cycle_interval_secs: config.sync_interval_secs,
+            fof_content: config.sync_fof_content,
         };
         let cancel = start_sync_engine(
             state.wot_graph.clone(),
@@ -1495,18 +1506,6 @@ pub struct ProfileFetchResult {
     pub has_profile: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ProfileCacheStatus {
-    pub event_count: u64,
-    pub has_metadata: bool,
-}
-
-#[tauri::command]
-async fn get_profile_cache_status(pubkey: String, state: State<'_, AppState>) -> Result<ProfileCacheStatus, String> {
-    let event_count = state.db.count_events_for_pubkey(&pubkey).map_err(|e| e.to_string())?;
-    let has_metadata = state.db.has_profile_metadata(&pubkey).map_err(|e| e.to_string())?;
-    Ok(ProfileCacheStatus { event_count, has_metadata })
-}
 
 /// Core profile fetch logic — reusable from both the command and background refresh.
 async fn do_fetch_profile(
@@ -1941,6 +1940,7 @@ pub fn run() {
     if let Ok(Some(v)) = db.get_config("sync_wot_batch_size") { if let Ok(n) = v.parse::<u32>() { config.sync_wot_batch_size = n; } }
     if let Ok(Some(v)) = db.get_config("sync_wot_events_per_batch") { if let Ok(n) = v.parse::<u32>() { config.sync_wot_events_per_batch = n; } }
     if let Ok(Some(v)) = db.get_config("max_event_age_days") { if let Ok(n) = v.parse::<u32>() { config.max_event_age_days = n; } }
+    if let Ok(Some(v)) = db.get_config("sync_fof_content") { config.sync_fof_content = v == "true"; }
     if let Ok(Some(v)) = db.get_config("storage_own_media_gb") { if let Ok(n) = v.parse::<f64>() { config.storage_own_media_gb = n; } }
     if let Ok(Some(v)) = db.get_config("storage_tracked_media_gb") { if let Ok(n) = v.parse::<f64>() { config.storage_tracked_media_gb = n; } }
     if let Ok(Some(v)) = db.get_config("storage_wot_media_gb") { if let Ok(n) = v.parse::<f64>() { config.storage_wot_media_gb = n; } }
@@ -2042,6 +2042,7 @@ pub fn run() {
                         wot_batch_size: cfg2.sync_wot_batch_size,
                         wot_events_per_batch: cfg2.sync_wot_events_per_batch,
                         cycle_interval_secs: cfg2.sync_interval_secs,
+                        fof_content: cfg2.sync_fof_content,
                     };
                     drop(cfg2);
                     let cancel = start_sync_engine(
@@ -2151,7 +2152,6 @@ pub fn run() {
             get_tracked_profiles,
             fetch_profile,
             get_profile_with_refresh,
-            get_profile_cache_status,
             set_nsec,
             clear_nsec,
             get_signing_mode,
