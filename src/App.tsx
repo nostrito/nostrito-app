@@ -17,6 +17,9 @@ import { Settings } from "./screens/Settings";
 import { MyMedia } from "./screens/MyMedia";
 import { Wizard } from "./screens/Wizard";
 import { ProfileView } from "./screens/ProfileView";
+import { StorageOwnEvents } from "./screens/StorageOwnEvents";
+import { StorageTrackedProfiles } from "./screens/StorageTrackedProfiles";
+import { StorageWotProfiles } from "./screens/StorageWotProfiles";
 
 const SCREEN_LABELS: Record<string, string> = {
   "/": "Dashboard",
@@ -24,6 +27,9 @@ const SCREEN_LABELS: Record<string, string> = {
   "/dms": "DMs",
   "/wot": "WoT",
   "/storage": "Storage",
+  "/storage/own-events": "Storage / Own Events",
+  "/storage/tracked-profiles": "Storage / Tracked Profiles",
+  "/storage/wot-profiles": "Storage / WoT Profiles",
   "/settings": "Settings",
   "/my-media": "My Media",
 };
@@ -91,6 +97,9 @@ const AppRoutes: React.FC = () => {
         <Route path="/dms" element={<Dms />} />
         <Route path="/wot" element={<Wot />} />
         <Route path="/storage" element={<Storage />} />
+        <Route path="/storage/own-events" element={<StorageOwnEvents />} />
+        <Route path="/storage/tracked-profiles" element={<StorageTrackedProfiles />} />
+        <Route path="/storage/wot-profiles" element={<StorageWotProfiles />} />
         <Route path="/settings" element={<Settings />} />
         <Route path="/my-media" element={<MyMedia />} />
         <Route path="/profile/:pubkey" element={<ProfileView />} />

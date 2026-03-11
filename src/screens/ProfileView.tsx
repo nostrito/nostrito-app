@@ -1,7 +1,11 @@
-import React, { useState, useEffect, useCallback, useMemo } from "react";
+import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
-import { IconCheck, IconImage, IconBookOpen, IconFeed, IconZap } from "../components/Icon";
+import {
+  IconCheck, IconImage, IconBookOpen, IconFeed, IconZap,
+  IconMoreVertical, IconCopy, IconShare, IconVolumeX, IconVolume,
+  IconExternalLink, IconDatabase,
+} from "../components/Icon";
 import { Avatar } from "../components/Avatar";
 import { NoteCard } from "../components/NoteCard";
 import { ArticleCard } from "../components/ArticleCard";
@@ -64,6 +68,17 @@ export const ProfileView: React.FC = () => {
   const [follows, setFollows] = useState<string[]>([]);
   const [followSearch, setFollowSearch] = useState("");
   const [followingCount, setFollowingCount] = useState<number>(0);
+  const [followerCount, setFollowerCount] = useState<number>(0);
+
+  // Relationship badges
+  const [followsMe, setFollowsMe] = useState(false);
+  const [isTracked, setIsTracked] = useState(false);
+  const [isMuted, setIsMuted] = useState(false);
+
+  // Three-dots menu
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
 
   // Tab data
   const [notes, setNotes] = useState<NostrEvent[]>([]);
@@ -86,9 +101,24 @@ export const ProfileView: React.FC = () => {
     }
   }, [activeTab]);
 
+  /* --- close menu on outside click ---------------------------------- */
+  useEffect(() => {
+    const handleClick = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setMenuOpen(false);
+      }
+    };
+    if (menuOpen) {
+      document.addEventListener("mousedown", handleClick);
+      return () => document.removeEventListener("mousedown", handleClick);
+    }
+  }, [menuOpen]);
+
   /* --- profile loading ---------------------------------------------- */
   useEffect(() => {
     if (!pubkey) return;
+
+    let ownPubkey: string | null = null;
 
     const load = async () => {
       setProfileLoading(true);
@@ -103,8 +133,11 @@ export const ProfileView: React.FC = () => {
       // Check if this is the own profile
       try {
         const ownProfile = await invoke<ProfileInfo | null>("get_own_profile");
-        if (ownProfile && ownProfile.pubkey === pubkey) {
-          setIsOwn(true);
+        if (ownProfile) {
+          ownPubkey = ownProfile.pubkey;
+          if (ownProfile.pubkey === pubkey) {
+            setIsOwn(true);
+          }
         }
       } catch (_) {
         // Not critical
@@ -116,10 +149,39 @@ export const ProfileView: React.FC = () => {
         setFollows(followList);
         setFollowingCount(followList.length);
 
+        // Check if this profile follows us
+        if (ownPubkey && ownPubkey !== pubkey) {
+          setFollowsMe(followList.includes(ownPubkey));
+        }
+
         // Batch-load follow profiles via context
         if (followList.length > 0) {
           ensureProfiles(followList.slice(0, 200));
         }
+      } catch (_) {
+        // Not critical
+      }
+
+      // Load followers count
+      try {
+        const followerList = await invoke<string[]>("get_followers", { pubkey });
+        setFollowerCount(followerList.length);
+      } catch (_) {
+        // Not critical
+      }
+
+      // Check tracked status
+      try {
+        const tracked = await invoke<boolean>("is_tracked_profile", { pubkey });
+        setIsTracked(tracked);
+      } catch (_) {
+        // Not critical
+      }
+
+      // Check muted status
+      try {
+        const muted = await invoke<boolean>("is_pubkey_muted_cmd", { pubkey });
+        setIsMuted(muted);
       } catch (_) {
         // Not critical
       }
@@ -220,6 +282,65 @@ export const ProfileView: React.FC = () => {
     [],
   );
 
+  /* --- menu actions ------------------------------------------------- */
+  const handleCopyNpub = useCallback(async () => {
+    if (!pubkey) return;
+    try {
+      const npub = await invoke<string>("hex_to_npub", { pubkey });
+      await navigator.clipboard.writeText(npub);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (e) {
+      console.error("[profile] Failed to copy npub:", e);
+    }
+  }, [pubkey]);
+
+  const handleShareNjump = useCallback(async () => {
+    if (!pubkey) return;
+    try {
+      const npub = await invoke<string>("hex_to_npub", { pubkey });
+      const url = `https://njump.me/${npub}`;
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (e) {
+      console.error("[profile] Failed to share:", e);
+    }
+    setMenuOpen(false);
+  }, [pubkey]);
+
+  const handleToggleMute = useCallback(async () => {
+    if (!pubkey) return;
+    try {
+      if (isMuted) {
+        await invoke("unmute_pubkey", { pubkey });
+        setIsMuted(false);
+      } else {
+        await invoke("mute_pubkey", { pubkey });
+        setIsMuted(true);
+      }
+    } catch (e) {
+      console.error("[profile] Failed to toggle mute:", e);
+    }
+    setMenuOpen(false);
+  }, [pubkey, isMuted]);
+
+  const handleToggleTrack = useCallback(async () => {
+    if (!pubkey) return;
+    try {
+      if (isTracked) {
+        await invoke("untrack_profile", { pubkey });
+        setIsTracked(false);
+      } else {
+        await invoke("track_profile", { pubkey, note: null });
+        setIsTracked(true);
+      }
+    } catch (e) {
+      console.error("[profile] Failed to toggle track:", e);
+    }
+    setMenuOpen(false);
+  }, [pubkey, isTracked]);
+
   /* --- follows filtering -------------------------------------------- */
   const filteredFollows = useMemo(() => {
     if (!followSearch.trim()) return follows;
@@ -237,6 +358,14 @@ export const ProfileView: React.FC = () => {
   }, [profile, pubkey]);
 
   const truncatedPubkey = useMemo(() => shortPubkey(pubkey || ""), [pubkey]);
+
+  /* --- helper: make website URL clickable --------------------------- */
+  const websiteHref = useMemo(() => {
+    if (!profile?.website) return null;
+    const w = profile.website.trim();
+    if (w.startsWith("http://") || w.startsWith("https://")) return w;
+    return `https://${w}`;
+  }, [profile?.website]);
 
   /* --- early return if no pubkey ------------------------------------ */
   if (!pubkey) {
@@ -256,7 +385,8 @@ export const ProfileView: React.FC = () => {
       {/* Back button */}
       <div className="profile-back-row">
         <button className="btn btn-secondary profile-back-btn" onClick={() => navigate(-1)}>
-          ← Back
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" width="16" height="16"><path d="M19 12H5"/><path d="m12 19-7-7 7-7"/></svg>
+          Back
         </button>
       </div>
 
@@ -281,7 +411,70 @@ export const ProfileView: React.FC = () => {
               fallbackClassName="profile-hero-avatar-fallback"
             />
             <div className="profile-hero-details">
-              <div className="profile-hero-name">{displayName}</div>
+              <div className="profile-hero-name-row">
+                <div className="profile-hero-name">{displayName}</div>
+
+                {/* Badges */}
+                <div className="profile-badges">
+                  {followsMe && (
+                    <span className="profile-badge profile-badge-follows">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" width="12" height="12"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>
+                      Follows you
+                    </span>
+                  )}
+                  {isTracked && (
+                    <span className="profile-badge profile-badge-tracked">
+                      <span className="icon" style={{ width: 12, height: 12 }}><IconDatabase /></span>
+                      Tracked
+                    </span>
+                  )}
+                  {isMuted && (
+                    <span className="profile-badge profile-badge-muted">
+                      <span className="icon" style={{ width: 12, height: 12 }}><IconVolumeX /></span>
+                      Muted
+                    </span>
+                  )}
+                </div>
+
+                {/* Three-dots menu */}
+                {!isOwn && (
+                  <div className="profile-menu-container" ref={menuRef}>
+                    <button
+                      className="profile-menu-btn"
+                      onClick={() => setMenuOpen(!menuOpen)}
+                      title="Profile actions"
+                    >
+                      <IconMoreVertical />
+                    </button>
+
+                    {menuOpen && (
+                      <div className="profile-menu-dropdown">
+                        <button className="profile-menu-item" onClick={handleCopyNpub}>
+                          <span className="icon"><IconCopy /></span>
+                          {copied ? "Copied!" : "Copy npub"}
+                        </button>
+                        <button className="profile-menu-item" onClick={handleShareNjump}>
+                          <span className="icon"><IconShare /></span>
+                          Share via njump.me
+                        </button>
+                        <div className="profile-menu-divider" />
+                        <button className="profile-menu-item" onClick={handleToggleTrack}>
+                          <span className="icon"><IconDatabase /></span>
+                          {isTracked ? "Untrack profile" : "Track profile"}
+                        </button>
+                        <button
+                          className={`profile-menu-item${isMuted ? " profile-menu-item-danger" : ""}`}
+                          onClick={handleToggleMute}
+                        >
+                          <span className="icon">{isMuted ? <IconVolume /> : <IconVolumeX />}</span>
+                          {isMuted ? "Unmute user" : "Mute user"}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+
               <div className="profile-hero-npub">{truncatedPubkey}</div>
               {profile?.nip05 && (
                 <div className="profile-hero-nip05">
@@ -290,6 +483,7 @@ export const ProfileView: React.FC = () => {
               )}
               <div className="profile-hero-stats">
                 <span className="profile-stat"><strong>{followingCount}</strong> Following</span>
+                <span className="profile-stat"><strong>{followerCount}</strong> Followers</span>
               </div>
             </div>
           </div>
@@ -305,11 +499,16 @@ export const ProfileView: React.FC = () => {
                   </span>
                 )}
                 {profile?.website && (
-                  <span className="profile-meta-item">
-                    <span className="icon">
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
-                    </span> {profile.website}
-                  </span>
+                  <a
+                    className="profile-meta-item profile-meta-link"
+                    href={websiteHref ?? "#"}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <span className="icon"><IconExternalLink /></span>
+                    {profile.website}
+                  </a>
                 )}
               </div>
             </div>

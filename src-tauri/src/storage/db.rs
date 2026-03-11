@@ -1496,13 +1496,13 @@ impl Database {
 
     /// Re-queue media URLs from existing events for a pubkey (for re-downloading).
     pub fn requeue_events_media(&self, pubkey: &str) -> Result<u32> {
-        let events: Vec<(String, String)> = {
+        let events: Vec<(u32, String, String)> = {
             let conn = self.conn.lock().unwrap();
             let mut stmt = conn.prepare(
-                "SELECT content, tags FROM nostr_events WHERE pubkey = ?1 AND kind IN (1, 6, 30023)"
+                "SELECT kind, content, tags FROM nostr_events WHERE pubkey = ?1 AND kind IN (0, 1, 6, 30023)"
             )?;
-            let result: Vec<(String, String)> = stmt.query_map(params![pubkey], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            let result: Vec<(u32, String, String)> = stmt.query_map(params![pubkey], |row| {
+                Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
             })?
             .filter_map(|r| r.ok())
             .collect();
@@ -1510,22 +1510,38 @@ impl Database {
         };
 
         let mut count = 0u32;
-        for (content, tags_json) in &events {
-            // Queue from tags
-            let tag_urls = crate::sync::media::extract_urls_from_tags(tags_json);
-            for url in &tag_urls {
-                if self.queue_media_url(url, pubkey, 5).is_ok() {
-                    count += 1;
+        for (kind, content, tags_json) in &events {
+            if *kind == 0 {
+                // Kind 0: extract picture and banner from JSON content
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) {
+                    for field in &["picture", "banner"] {
+                        if let Some(url) = parsed.get(field).and_then(|v| v.as_str()) {
+                            if (url.starts_with("https://") || url.starts_with("http://"))
+                                && url.len() > 10
+                            {
+                                if self.queue_media_url(url, pubkey, 5).is_ok() {
+                                    count += 1;
+                                }
+                            }
+                        }
+                    }
                 }
-            }
-            // Queue from content
-            let text_urls = crate::sync::media::extract_urls_from_text(content);
-            for url in &text_urls {
-                if crate::sync::media::is_nostr_media_cdn(url)
-                    || crate::sync::media::mime_type_from_url(url).is_some()
-                {
+            } else {
+                // Kinds 1, 6, 30023: extract from tags and content
+                let tag_urls = crate::sync::media::extract_urls_from_tags(tags_json);
+                for url in &tag_urls {
                     if self.queue_media_url(url, pubkey, 5).is_ok() {
                         count += 1;
+                    }
+                }
+                let text_urls = crate::sync::media::extract_urls_from_text(content);
+                for url in &text_urls {
+                    if crate::sync::media::is_nostr_media_cdn(url)
+                        || crate::sync::media::mime_type_from_url(url).is_some()
+                    {
+                        if self.queue_media_url(url, pubkey, 5).is_ok() {
+                            count += 1;
+                        }
                     }
                 }
             }

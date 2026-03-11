@@ -138,8 +138,8 @@ const TABS: { id: TabId; label: string; Icon: React.FC }[] = [
   { id: "identity", label: "Identity", Icon: IconKey },
   { id: "relays", label: "Relays", Icon: IconRadio },
   { id: "storage", label: "Storage", Icon: IconDatabase },
-  { id: "advanced", label: "Advanced", Icon: IconSettingsIcon },
   { id: "tracked", label: "Tracked Profiles", Icon: IconUsers },
+  { id: "advanced", label: "Advanced", Icon: IconSettingsIcon },
 ];
 
 const WOT_PRESETS = [
@@ -529,6 +529,7 @@ export const Settings: React.FC = () => {
       await invoke("track_profile", { pubkey: trackInput.trim(), note: null });
       setTrackInput("");
       loadTrackedProfiles();
+      try { await invoke("restart_sync"); } catch (e) { console.warn("[settings] restart_sync after track failed:", e); }
     } catch (e) {
       console.error("[settings] track_profile failed:", e);
     }
@@ -539,6 +540,7 @@ export const Settings: React.FC = () => {
       try {
         await invoke("untrack_profile", { pubkey });
         loadTrackedProfiles();
+        try { await invoke("restart_sync"); } catch (e) { console.warn("[settings] restart_sync after untrack failed:", e); }
       } catch (e) {
         console.error("[settings] untrack_profile failed:", e);
       }
@@ -858,7 +860,7 @@ export const Settings: React.FC = () => {
                 <div className="storage-row-info">
                   <span className="storage-row-label">Own media limit</span>
                   <span className="storage-row-meta">
-                    Blossom media from your own events &mdash; always kept, never evicted
+                    Media from your own events &mdash; always kept, never evicted
                   </span>
                 </div>
                 <div className="storage-slider-wrap">
@@ -887,7 +889,7 @@ export const Settings: React.FC = () => {
                     <span className="icon">
                       <IconLock />
                     </span>{" "}
-                    Tracked profiles are always kept
+                    Tracked profiles events are always kept
                   </span>
                 </div>
               </div>
@@ -896,7 +898,7 @@ export const Settings: React.FC = () => {
               <div className="storage-row">
                 <div className="storage-row-info">
                   <span className="storage-row-label">Tracked media limit</span>
-                  <span className="storage-row-meta">Blossom media from tracked profiles</span>
+                  <span className="storage-row-meta">Media from tracked profiles</span>
                 </div>
                 <Slider
                   variant="storage"
@@ -952,7 +954,7 @@ export const Settings: React.FC = () => {
               <div className="storage-row">
                 <div className="storage-row-info">
                   <span className="storage-row-label">WoT media limit</span>
-                  <span className="storage-row-meta">Blossom media from WoT profiles</span>
+                  <span className="storage-row-meta">Media from WoT profiles</span>
                 </div>
                 <Slider
                   variant="storage"
@@ -1413,6 +1415,7 @@ export const Settings: React.FC = () => {
             ) : (
               trackedProfiles.map((p) => {
                 const profile = trackedProfileMap.get(p.pubkey);
+                const hasName = !!(profile?.name || profile?.display_name);
                 const displayName = profileDisplayName(profile, p.pubkey);
                 const short = shortPubkey(p.pubkey);
 
@@ -1445,19 +1448,21 @@ export const Settings: React.FC = () => {
                       >
                         {displayName}
                       </div>
-                      <div
-                        style={{
-                          fontFamily: "var(--mono)",
-                          fontSize: "0.72rem",
-                          color: "var(--text-muted)",
-                          whiteSpace: "nowrap",
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                        }}
-                        title={p.pubkey}
-                      >
-                        {short}
-                      </div>
+                      {!hasName && (
+                        <div
+                          style={{
+                            fontFamily: "var(--mono)",
+                            fontSize: "0.72rem",
+                            color: "var(--text-muted)",
+                            whiteSpace: "nowrap",
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                          }}
+                          title={p.pubkey}
+                        >
+                          {short}
+                        </div>
+                      )}
                     </div>
                     <button
                       className="btn-untrack"

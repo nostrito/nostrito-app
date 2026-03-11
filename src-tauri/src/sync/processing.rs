@@ -138,6 +138,11 @@ pub fn process_event(
         }
     }
 
+    // Queue profile picture/banner from kind:0 metadata events
+    if result.stored && kind == 0 {
+        result.media_urls_queued = queue_profile_media(db, &pubkey, &event.content.to_string(), media_priority);
+    }
+
     // Advance cursor for stored events
     if result.stored {
         db.advance_user_cursor(&pubkey, created_at).ok();
@@ -430,31 +435,58 @@ fn queue_media_urls(
 ) -> u32 {
     let mut count = 0u32;
 
-    // Extract URLs from content (simple pattern)
-    for word in content.split_whitespace() {
-        if (word.starts_with("https://") || word.starts_with("http://"))
-            && is_media_url(word)
+    // Extract URLs from content using byte-scan (handles markdown syntax, inline URLs, etc.)
+    let text_urls = super::media::extract_urls_from_text(content);
+    for url in &text_urls {
+        if is_media_url(url)
+            || super::media::is_nostr_media_cdn(url)
+            || super::media::mime_type_from_url(url).is_some()
         {
-            if db.queue_media_url(word, pubkey, priority).is_ok() {
+            if db.queue_media_url(url, pubkey, priority).is_ok() {
                 count += 1;
             }
         }
     }
 
-    // Extract from image/video tags
-    for tag in tags {
-        if tag.len() >= 2 && (tag[0] == "image" || tag[0] == "thumb" || tag[0] == "url") {
-            let url = &tag[1];
-            if (url.starts_with("https://") || url.starts_with("http://"))
-                && is_media_url(url)
-            {
-                if db.queue_media_url(url, pubkey, priority).is_ok() {
-                    count += 1;
-                }
+    // Extract from image/video/imeta tags
+    let tag_urls = super::media::extract_urls_from_tags(
+        &serde_json::to_string(tags).unwrap_or_default(),
+    );
+    for url in &tag_urls {
+        if is_media_url(url)
+            || super::media::is_nostr_media_cdn(url)
+            || super::media::mime_type_from_url(url).is_some()
+        {
+            if db.queue_media_url(url, pubkey, priority).is_ok() {
+                count += 1;
             }
         }
     }
 
+    count
+}
+
+/// Queue profile picture and banner from kind:0 metadata JSON content.
+fn queue_profile_media(
+    db: &Database,
+    pubkey: &str,
+    content: &str,
+    priority: i32,
+) -> u32 {
+    let mut count = 0u32;
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) {
+        for field in &["picture", "banner"] {
+            if let Some(url) = parsed.get(field).and_then(|v| v.as_str()) {
+                if (url.starts_with("https://") || url.starts_with("http://"))
+                    && url.len() > 10
+                {
+                    if db.queue_media_url(url, pubkey, priority).is_ok() {
+                        count += 1;
+                    }
+                }
+            }
+        }
+    }
     count
 }
 

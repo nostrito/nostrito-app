@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { Link } from "react-router-dom";
 import { Badge } from "../components/Badge";
 import { formatBytes } from "../utils/format";
 
@@ -202,7 +203,7 @@ export const Storage: React.FC = () => {
       {/* ---- Ownership grid ---- */}
       <div className="ownership-grid">
         {/* Own Events */}
-        <div className="ownership-card own">
+        <Link to="/storage/own-events" className="ownership-card own" style={{ textDecoration: "none", color: "inherit" }}>
           <div className="ownership-card-header">
             <span className="ownership-card-label">Own Events</span>
             <Badge text="YOU" className="ownership-card-badge" variant="own" />
@@ -224,10 +225,10 @@ export const Storage: React.FC = () => {
           <div className="ownership-card-footer">
             Always kept &mdash; never pruned &middot; &infin; unlimited
           </div>
-        </div>
+        </Link>
 
         {/* Tracked Profiles */}
-        <div className="ownership-card tracked">
+        <Link to="/storage/tracked-profiles" className="ownership-card tracked" style={{ textDecoration: "none", color: "inherit" }}>
           <div className="ownership-card-header">
             <span className="ownership-card-label">Tracked Profiles</span>
             <Badge text="TRACKED" className="ownership-card-badge" variant="tracked" />
@@ -249,10 +250,10 @@ export const Storage: React.FC = () => {
           <div className="ownership-card-footer">
             Always kept &mdash; never pruned
           </div>
-        </div>
+        </Link>
 
         {/* WoT Profiles */}
-        <div className="ownership-card wot">
+        <Link to="/storage/wot-profiles" className="ownership-card wot" style={{ textDecoration: "none", color: "inherit" }}>
           <div className="ownership-card-header">
             <span className="ownership-card-label">WoT Profiles</span>
             <Badge text="WOT" className="ownership-card-badge" variant="wot" />
@@ -274,7 +275,7 @@ export const Storage: React.FC = () => {
           <div className="ownership-card-footer">
             Subject to retention limits
           </div>
-        </div>
+        </Link>
       </div>
 
       {/* ---- DB info ---- */}
