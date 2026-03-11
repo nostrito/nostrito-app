@@ -273,6 +273,7 @@ impl SyncEngine {
             Arc::clone(&self.pool),
             self.hex_pubkey.clone(),
             self.sync_config.lookback_days,
+            self.sync_config.fof_content,
         );
 
         let stats = content.run(&needing_refresh).await?;

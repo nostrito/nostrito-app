@@ -49,6 +49,7 @@ interface Settings {
   sync_wot_batch_size: number;
   sync_wot_events_per_batch: number;
   max_event_age_days: number;
+  sync_fof_content: boolean;
 }
 
 interface TrackedProfile {
@@ -183,6 +184,7 @@ export const Settings: React.FC = () => {
   const [syncWotEvents, setSyncWotEvents] = useState(15);
   const [syncInterval, setSyncInterval] = useState(5);
   const [syncWotDepth, setSyncWotDepth] = useState(2);
+  const [syncFofContent, setSyncFofContent] = useState(false);
   const [autoStart, setAutoStart] = useState(false);
   const [advancedSaving, setAdvancedSaving] = useState(false);
   const [advancedFeedback, setAdvancedFeedback] = useState<SaveFeedback | null>(null);
@@ -246,6 +248,7 @@ export const Settings: React.FC = () => {
       setSyncWotEvents(s.sync_wot_events_per_batch);
       setSyncInterval(Math.round(s.sync_interval_secs / 60));
       setSyncWotDepth(s.wot_max_depth);
+      setSyncFofContent(s.sync_fof_content);
       setAutoStart(s.auto_start);
 
       // Browser integration
@@ -372,6 +375,7 @@ export const Settings: React.FC = () => {
       sync_wot_events_per_batch: syncWotEvents,
       sync_interval_secs: syncInterval * 60,
       wot_max_depth: syncWotDepth,
+      sync_fof_content: syncFofContent,
     };
 
     try {
@@ -407,6 +411,7 @@ export const Settings: React.FC = () => {
     setSyncWotEvents(DEFAULTS.sync_wot_events_per_batch);
     setSyncInterval(Math.round(DEFAULTS.sync_interval_secs / 60));
     setSyncWotDepth(DEFAULTS.wot_max_depth);
+    setSyncFofContent(false);
     setResetDefaultsFeedback({
       type: "success",
       message: 'Defaults restored \u2014 click "Save & Restart Sync" to apply',
@@ -1033,6 +1038,27 @@ export const Settings: React.FC = () => {
               </span>
             </div>
           )}
+
+          {/* FoF Content Toggle */}
+          <div className="settings-field" style={{ marginBottom: 20 }}>
+            <div className="settings-field-info">
+              <span className="settings-field-label">Follows-of-follows content</span>
+              <span className="settings-field-desc">
+                Fetch posts from people your follows follow, prioritized by how many of your follows also follow them
+              </span>
+            </div>
+            <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+              <input
+                type="checkbox"
+                checked={syncFofContent}
+                onChange={(e) => setSyncFofContent(e.target.checked)}
+                style={{ width: 18, height: 18, accentColor: "var(--accent)" }}
+              />
+              <span style={{ fontSize: "0.82rem", color: "var(--text-secondary)" }}>
+                {syncFofContent ? "Enabled" : "Disabled"}
+              </span>
+            </label>
+          </div>
 
           {/* Sync Presets */}
           <div style={{ marginBottom: 20 }}>

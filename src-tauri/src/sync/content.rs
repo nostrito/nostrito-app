@@ -19,6 +19,7 @@ pub struct ContentFetch {
     pool: Arc<RelayPool>,
     own_pubkey: String,
     lookback_days: u32,
+    fof_content: bool,
 }
 
 impl ContentFetch {
@@ -28,8 +29,9 @@ impl ContentFetch {
         pool: Arc<RelayPool>,
         own_pubkey: String,
         lookback_days: u32,
+        fof_content: bool,
     ) -> Self {
-        Self { db, graph, pool, own_pubkey, lookback_days }
+        Self { db, graph, pool, own_pubkey, lookback_days, fof_content }
     }
 
     /// Run the full content fetch phase.
@@ -42,11 +44,23 @@ impl ContentFetch {
         // Step 3.0: Build routing plan
         let follows = self.graph.get_follows(&self.own_pubkey).unwrap_or_default();
         let tracked = self.db.get_tracked_pubkeys()?;
-        let all_pubkeys: Vec<String> = follows
+        let mut all_pubkeys: Vec<String> = follows
             .iter()
             .chain(tracked.iter())
             .cloned()
             .collect();
+
+        // Include follows-of-follows if enabled, prioritized by overlap count
+        if self.fof_content {
+            let fof = self.get_fof_by_overlap(&follows);
+            let fof_count = fof.len();
+            all_pubkeys.extend(fof);
+            all_pubkeys.sort();
+            all_pubkeys.dedup();
+            if fof_count > 0 {
+                info!("Content: including {} FoF pubkeys (by overlap priority)", fof_count);
+            }
+        }
 
         if all_pubkeys.is_empty() {
             return Ok(stats);
@@ -261,6 +275,38 @@ impl ContentFetch {
                 (0, 0)
             }
         }
+    }
+
+    /// Get follows-of-follows sorted by how many of our follows also follow them.
+    /// Returns up to 200 FoF pubkeys, excluding direct follows and self.
+    fn get_fof_by_overlap(&self, follows: &[String]) -> Vec<String> {
+        let follow_set: std::collections::HashSet<&str> =
+            follows.iter().map(|s| s.as_str()).collect();
+
+        // Count how many of our follows also follow each FoF
+        let mut overlap_counts: HashMap<String, u32> = HashMap::new();
+        for follow in follows {
+            if let Some(fof_list) = self.graph.get_follows(follow) {
+                for fof in fof_list {
+                    if fof != self.own_pubkey && !follow_set.contains(fof.as_str()) {
+                        *overlap_counts.entry(fof).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+
+        // Sort by overlap count descending, take top 200
+        let mut fof_ranked: Vec<(String, u32)> = overlap_counts.into_iter().collect();
+        fof_ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        fof_ranked.truncate(200);
+
+        debug!(
+            "FoF overlap: top={}, min_overlap={}",
+            fof_ranked.len(),
+            fof_ranked.last().map(|f| f.1).unwrap_or(0)
+        );
+
+        fof_ranked.into_iter().map(|(pk, _)| pk).collect()
     }
 
     /// Compute the `since` timestamp for a cursor band.

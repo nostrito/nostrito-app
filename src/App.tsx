@@ -2,6 +2,7 @@ import React, { useEffect } from "react";
 import { BrowserRouter, Routes, Route, Outlet, Navigate, useNavigate, useLocation } from "react-router-dom";
 import { listen } from "@tauri-apps/api/event";
 import { AppProvider, useAppContext } from "./context/AppContext";
+import { ProfileProvider } from "./context/ProfileContext";
 import { Titlebar } from "./components/Titlebar";
 import { Sidebar } from "./components/Sidebar";
 import { initMediaViewer } from "./utils/media";
@@ -100,8 +101,10 @@ const AppRoutes: React.FC = () => {
 
 export const App: React.FC = () => (
   <AppProvider>
-    <BrowserRouter>
-      <AppRoutes />
-    </BrowserRouter>
+    <ProfileProvider>
+      <BrowserRouter>
+        <AppRoutes />
+      </BrowserRouter>
+    </ProfileProvider>
   </AppProvider>
 );

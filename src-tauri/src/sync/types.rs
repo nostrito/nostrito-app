@@ -40,6 +40,8 @@ pub struct SyncConfig {
     pub wot_batch_size: u32,
     pub wot_events_per_batch: u32,
     pub cycle_interval_secs: u32,
+    /// Fetch content from follows-of-follows, prioritized by overlap count
+    pub fof_content: bool,
 }
 
 impl Default for SyncConfig {
@@ -53,6 +55,7 @@ impl Default for SyncConfig {
             wot_batch_size: 5,
             wot_events_per_batch: 15,
             cycle_interval_secs: 300,
+            fof_content: false,
         }
     }
 }

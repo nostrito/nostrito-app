@@ -208,11 +208,29 @@ pub struct WotDistanceResponse {
 
 // ── Sync Engine Factory ───────────────────────────────────────────
 
+/// Resolve relays for the sync engine: prefer NIP-65 read relays, fall back to config defaults.
+fn resolve_sync_relays(db: &Database, hex_pubkey: &str, fallback_relays: &[String]) -> Vec<String> {
+    let nip65_relays: Vec<String> = db
+        .get_read_relays(hex_pubkey)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(url, _source)| url)
+        .collect();
+
+    if nip65_relays.is_empty() {
+        tracing::info!("No NIP-65 read relays found, using config defaults");
+        fallback_relays.to_vec()
+    } else {
+        tracing::info!("Using {} NIP-65 read relays for sync", nip65_relays.len());
+        nip65_relays
+    }
+}
+
 /// Start the sync engine. Returns a CancellationToken for stopping.
 fn start_sync_engine(
     wot_graph: Arc<WotGraph>,
     db: Arc<Database>,
-    relays: Vec<String>,
+    fallback_relays: Vec<String>,
     hex_pubkey: String,
     sync_tier: Arc<AtomicU8>,
     sync_stats: Arc<RwLock<SyncStats>>,
@@ -221,6 +239,7 @@ fn start_sync_engine(
     sync_config: SyncConfig,
     max_event_age_days: u32,
 ) -> CancellationToken {
+    let relays = resolve_sync_relays(&db, &hex_pubkey, &fallback_relays);
     let engine = Arc::new(SyncEngine::new(
         wot_graph, db, relays, hex_pubkey, sync_tier, sync_stats,
         app_handle, media_gb, sync_config, max_event_age_days,
@@ -637,7 +656,25 @@ async fn get_feed(filter: FeedFilter, state: State<'_, AppState>) -> Result<Vec<
     let kinds = feed_kinds.as_deref();
     let limit = filter.limit.unwrap_or(50);
 
-    let author_vec = filter.author.map(|a| vec![a]);
+    // WoT filtering: when wot_only=true, restrict to WoT-connected pubkeys
+    let wot_authors: Option<Vec<String>> = if filter.wot_only.unwrap_or(false) {
+        let mut pubkeys = state.wot_graph.get_all_pubkeys();
+        // Always include own pubkey
+        if let Some(ref hex) = state.config.read().await.hex_pubkey {
+            if !pubkeys.contains(hex) {
+                pubkeys.push(hex.clone());
+            }
+        }
+        Some(pubkeys)
+    } else {
+        None
+    };
+
+    let author_vec = if wot_authors.is_some() {
+        wot_authors
+    } else {
+        filter.author.map(|a| vec![a])
+    };
     let authors = author_vec.as_deref();
 
     let events = state
@@ -662,6 +699,129 @@ async fn get_feed(filter: FeedFilter, state: State<'_, AppState>) -> Result<Vec<
                 tags,
                 content,
                 sig,
+            }
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn fetch_global_feed(limit: Option<u32>, state: State<'_, AppState>) -> Result<Vec<NostrEvent>, String> {
+    use nostr_sdk::prelude::*;
+
+    let lim = limit.unwrap_or(50);
+    tracing::info!("[cmd:fetch_global_feed] limit={}", lim);
+
+    let cfg = state.config.read().await;
+    let hex_pubkey = cfg.hex_pubkey.clone().unwrap_or_default();
+    let fallback_relays = cfg.outbound_relays.clone();
+    drop(cfg);
+
+    let relay_urls = resolve_sync_relays(&state.db, &hex_pubkey, &fallback_relays);
+    if relay_urls.is_empty() {
+        return Err("No relays available".into());
+    }
+
+    tracing::info!("[fetch_global_feed] querying {} relays", relay_urls.len());
+
+    let since_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .saturating_sub(86400); // last 24h
+
+    let filter = Filter::new()
+        .kinds(vec![Kind::TextNote, Kind::Repost, Kind::LongFormTextNote])
+        .since(Timestamp::from(since_ts))
+        .limit(lim as usize);
+
+    let client = Client::default();
+    for url in &relay_urls {
+        if let Err(e) = client.add_relay(url.as_str()).await {
+            tracing::warn!("[fetch_global_feed] Failed to add relay {}: {}", url, e);
+        }
+    }
+    client.connect().await;
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    let mut notifications = client.notifications();
+    let sub_id = match client.subscribe(vec![filter], None).await {
+        Ok(output) => output.val,
+        Err(e) => {
+            client.disconnect().await.ok();
+            return Err(format!("Subscribe failed: {}", e));
+        }
+    };
+
+    let mut all_events: Vec<Event> = Vec::new();
+    let deadline = tokio::time::sleep(std::time::Duration::from_secs(10));
+    tokio::pin!(deadline);
+
+    loop {
+        tokio::select! {
+            result = notifications.recv() => {
+                match result {
+                    Ok(RelayPoolNotification::Event { event, .. }) => {
+                        if !all_events.iter().any(|e| e.id == event.id) {
+                            all_events.push(*event);
+                        }
+                    }
+                    Ok(RelayPoolNotification::Message { message, .. }) => {
+                        if matches!(&message, RelayMessage::EndOfStoredEvents(_)) {
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            _ = &mut deadline => {
+                tracing::info!("[fetch_global_feed] timeout, got {} events", all_events.len());
+                break;
+            }
+        }
+    }
+
+    client.unsubscribe(sub_id).await;
+    client.disconnect().await.ok();
+
+    // Store events in DB
+    let mut stored_count: u64 = 0;
+    for event in &all_events {
+        let tags_json = serde_json::to_string(
+            &event.tags.iter().map(|t| t.as_slice().iter().map(|s| s.to_string()).collect::<Vec<String>>()).collect::<Vec<Vec<String>>>()
+        ).unwrap_or_else(|_| "[]".to_string());
+
+        match state.db.store_event(
+            &event.id.to_hex(),
+            &event.pubkey.to_hex(),
+            event.created_at.as_u64() as i64,
+            event.kind.as_u16() as u32,
+            &tags_json,
+            &event.content.to_string(),
+            &event.sig.to_string(),
+        ) {
+            Ok(true) => stored_count += 1,
+            Ok(false) => {}
+            Err(e) => tracing::warn!("[fetch_global_feed] Failed to store event: {}", e),
+        }
+    }
+
+    tracing::info!("[fetch_global_feed] {} events fetched, {} stored", all_events.len(), stored_count);
+
+    Ok(all_events
+        .into_iter()
+        .map(|event| {
+            let tags: Vec<Vec<String>> = event.tags.iter()
+                .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
+                .collect();
+            NostrEvent {
+                id: event.id.to_hex(),
+                pubkey: event.pubkey.to_hex(),
+                created_at: event.created_at.as_u64(),
+                kind: event.kind.as_u16() as u32,
+                tags,
+                content: event.content.to_string(),
+                sig: event.sig.to_string(),
             }
         })
         .collect())
@@ -715,6 +875,154 @@ async fn search_events(query: String, limit: Option<u32>, state: State<'_, AppSt
                 tags,
                 content,
                 sig,
+            }
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn search_global(query: String, limit: Option<u32>, state: State<'_, AppState>) -> Result<Vec<NostrEvent>, String> {
+    use nostr_sdk::prelude::*;
+
+    let lim = limit.unwrap_or(50) as usize;
+    let trimmed = query.trim().to_string();
+    tracing::info!("[cmd:search_global] query={:?}, limit={}", trimmed, lim);
+
+    let cfg = state.config.read().await;
+    let hex_pubkey = cfg.hex_pubkey.clone().unwrap_or_default();
+    let fallback_relays = cfg.outbound_relays.clone();
+    drop(cfg);
+
+    let relay_urls = resolve_sync_relays(&state.db, &hex_pubkey, &fallback_relays);
+    if relay_urls.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Build filter: if query looks like a pubkey, filter by author; otherwise fetch recent and filter client-side
+    let mut author_hex: Option<String> = None;
+
+    if trimmed.starts_with("npub1") {
+        if let Ok(pk) = PublicKey::from_bech32(&trimmed) {
+            author_hex = Some(pk.to_hex());
+        }
+    } else if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        author_hex = Some(trimmed.clone());
+    }
+
+    let filter = if let Some(ref author) = author_hex {
+        Filter::new()
+            .kinds(vec![Kind::TextNote, Kind::Repost, Kind::LongFormTextNote])
+            .authors(vec![PublicKey::from_hex(author).map_err(|e| format!("Invalid pubkey: {}", e))?])
+            .limit(lim)
+    } else {
+        // Keyword search: fetch recent events, filter client-side
+        let since_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_sub(7 * 86400); // last 7 days
+        Filter::new()
+            .kinds(vec![Kind::TextNote, Kind::LongFormTextNote])
+            .since(Timestamp::from(since_ts))
+            .limit(200) // fetch more to filter client-side
+    };
+
+    let client = Client::default();
+    for url in &relay_urls {
+        if let Err(e) = client.add_relay(url.as_str()).await {
+            tracing::warn!("[search_global] Failed to add relay {}: {}", url, e);
+        }
+    }
+    client.connect().await;
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    let mut notifications = client.notifications();
+    let sub_id = match client.subscribe(vec![filter], None).await {
+        Ok(output) => output.val,
+        Err(e) => {
+            client.disconnect().await.ok();
+            return Err(format!("Subscribe failed: {}", e));
+        }
+    };
+
+    let mut all_events: Vec<Event> = Vec::new();
+    let deadline = tokio::time::sleep(std::time::Duration::from_secs(10));
+    tokio::pin!(deadline);
+
+    loop {
+        tokio::select! {
+            result = notifications.recv() => {
+                match result {
+                    Ok(RelayPoolNotification::Event { event, .. }) => {
+                        if !all_events.iter().any(|e| e.id == event.id) {
+                            all_events.push(*event);
+                        }
+                    }
+                    Ok(RelayPoolNotification::Message { message, .. }) => {
+                        if matches!(&message, RelayMessage::EndOfStoredEvents(_)) {
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            _ = &mut deadline => {
+                tracing::info!("[search_global] timeout, got {} events", all_events.len());
+                break;
+            }
+        }
+    }
+
+    client.unsubscribe(sub_id).await;
+    client.disconnect().await.ok();
+
+    // Client-side keyword filter if not an author search
+    let keyword_lower = if author_hex.is_none() { Some(trimmed.to_lowercase()) } else { None };
+    let filtered: Vec<&Event> = all_events.iter()
+        .filter(|e| {
+            if let Some(ref kw) = keyword_lower {
+                e.content.to_string().to_lowercase().contains(kw)
+            } else {
+                true
+            }
+        })
+        .take(lim)
+        .collect();
+
+    // Store matching events in DB
+    for event in &filtered {
+        let tags_json = serde_json::to_string(
+            &event.tags.iter().map(|t| t.as_slice().iter().map(|s| s.to_string()).collect::<Vec<String>>()).collect::<Vec<Vec<String>>>()
+        ).unwrap_or_else(|_| "[]".to_string());
+
+        state.db.store_event(
+            &event.id.to_hex(),
+            &event.pubkey.to_hex(),
+            event.created_at.as_u64() as i64,
+            event.kind.as_u16() as u32,
+            &tags_json,
+            &event.content.to_string(),
+            &event.sig.to_string(),
+        ).ok();
+    }
+
+    tracing::info!("[search_global] {} matched out of {} fetched", filtered.len(), all_events.len());
+
+    Ok(filtered
+        .into_iter()
+        .map(|event| {
+            let tags: Vec<Vec<String>> = event.tags.iter()
+                .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
+                .collect();
+            NostrEvent {
+                id: event.id.to_hex(),
+                pubkey: event.pubkey.to_hex(),
+                created_at: event.created_at.as_u64(),
+                kind: event.kind.as_u16() as u32,
+                tags,
+                content: event.content.to_string(),
+                sig: event.sig.to_string(),
             }
         })
         .collect())
@@ -2123,7 +2431,9 @@ pub fn run() {
             get_profiles_batch,
             get_wot_distance,
             get_feed,
+            fetch_global_feed,
             search_events,
+            search_global,
             get_storage_stats,
             get_ownership_storage_stats,
             get_settings,

@@ -1,8 +1,6 @@
-# Sync Engine v2 — Relay-Aware Outbox Model
+# Sync Engine — Relay-Aware Outbox Model
 
-> Design document — 2026-03-10
-
-This document describes the new sync engine from scratch. It replaces the current tier-based spray-to-all-relays approach with a relay-centric outbox model that routes queries to the right relays for each user, batches intelligently, and respects Nostr protocol semantics for replaceable events, deletions, and mute lists.
+The sync engine uses a relay-centric outbox model that routes queries to the right relays for each user, batches intelligently, and respects Nostr protocol semantics for replaceable events, deletions, and mute lists.
 
 ## Documents
 
@@ -17,7 +15,6 @@ This document describes the new sync engine from scratch. It replaces the curren
 | [Pruning](./pruning.md) | Tiered retention, pruning algorithm, storage settings UI |
 | [Search](./search.md) | Hybrid search: local DB + NIP-50 global relays, WoT-aware ranking |
 | [Config](./config.md) | User-configurable + hardcoded settings, event kind reference, decided questions |
-| [Migration](./migration.md) | v1 to v2 migration steps |
 | [Modules](./modules.md) | Implementation module map and file layout |
 
 ---

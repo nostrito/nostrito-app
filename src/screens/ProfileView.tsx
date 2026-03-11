@@ -1,13 +1,16 @@
 import React, { useState, useEffect, useCallback, useMemo } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { IconCheck, IconImage, IconBookOpen, IconFeed, IconZap } from "../components/Icon";
 import { Avatar } from "../components/Avatar";
+import { NoteCard } from "../components/NoteCard";
+import { ArticleCard } from "../components/ArticleCard";
 import { EmptyState } from "../components/EmptyState";
-import { formatBytes, shortPubkey, formatDate } from "../utils/format";
-import { getProfiles, profileDisplayName, invalidateProfileCache, type ProfileInfo } from "../utils/profiles";
+import { formatBytes, shortPubkey } from "../utils/format";
+import { profileDisplayName } from "../utils/profiles";
 import { initMediaViewer } from "../utils/media";
+import { useProfileContext, useProfile } from "../context/ProfileContext";
+import type { ProfileInfo } from "../utils/profiles";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -52,12 +55,13 @@ export const ProfileView: React.FC = () => {
   const { pubkey } = useParams<{ pubkey: string }>();
   const navigate = useNavigate();
 
+  /* --- profile from context ----------------------------------------- */
+  const profile = useProfile(pubkey);
+
   /* --- state -------------------------------------------------------- */
-  const [profile, setProfile] = useState<ProfileInfo | null>(null);
   const [isOwn, setIsOwn] = useState(false);
   const [activeTab, setActiveTab] = useState<ProfileTab>("notes");
   const [follows, setFollows] = useState<string[]>([]);
-  const [followProfiles, setFollowProfiles] = useState<Map<string, ProfileInfo>>(new Map());
   const [followSearch, setFollowSearch] = useState("");
   const [followingCount, setFollowingCount] = useState<number>(0);
 
@@ -72,9 +76,12 @@ export const ProfileView: React.FC = () => {
   const [articlesLoading, setArticlesLoading] = useState(false);
   const [mediaLoading, setMediaLoading] = useState(false);
 
+  /* --- profile context for batch operations ------------------------- */
+  const { ensureProfiles, getProfile } = useProfileContext();
+
   /* --- init media viewer -------------------------------------------- */
   useEffect(() => {
-    if (activeTab === "media") {
+    if (activeTab === "media" || activeTab === "notes") {
       initMediaViewer();
     }
   }, [activeTab]);
@@ -83,13 +90,12 @@ export const ProfileView: React.FC = () => {
   useEffect(() => {
     if (!pubkey) return;
 
-    const loadProfile = async () => {
+    const load = async () => {
       setProfileLoading(true);
 
-      // Use get_profile_with_refresh for automatic caching
+      // Trigger refresh if stale
       try {
-        const p = await invoke<ProfileInfo | null>("get_profile_with_refresh", { pubkey });
-        setProfile(p);
+        await invoke<ProfileInfo | null>("get_profile_with_refresh", { pubkey });
       } catch (_) {
         // Profile not available
       }
@@ -110,11 +116,9 @@ export const ProfileView: React.FC = () => {
         setFollows(followList);
         setFollowingCount(followList.length);
 
-        // Resolve follow profiles (batch up to 200 for search)
+        // Batch-load follow profiles via context
         if (followList.length > 0) {
-          const batch = followList.slice(0, 200);
-          const profiles = await getProfiles(batch);
-          setFollowProfiles(new Map(profiles));
+          ensureProfiles(followList.slice(0, 200));
         }
       } catch (_) {
         // Not critical
@@ -123,24 +127,8 @@ export const ProfileView: React.FC = () => {
       setProfileLoading(false);
     };
 
-    loadProfile();
-  }, [pubkey]);
-
-  /* --- listen for profile-updated Tauri event ----------------------- */
-  useEffect(() => {
-    const unlisten = listen<string>("profile-updated", (event) => {
-      if (event.payload === pubkey) {
-        invalidateProfileCache(pubkey!);
-        getProfiles([pubkey!]).then((profiles) => {
-          const updated = profiles.get(pubkey!) ?? null;
-          if (updated) setProfile(updated);
-        });
-      }
-    });
-    return () => {
-      unlisten.then((fn) => fn());
-    };
-  }, [pubkey]);
+    load();
+  }, [pubkey, ensureProfiles]);
 
   /* --- load notes --------------------------------------------------- */
   const loadNotes = useCallback(async () => {
@@ -151,12 +139,14 @@ export const ProfileView: React.FC = () => {
         filter: { kinds: [1], limit: 50, author: pubkey },
       });
       setNotes(events.sort((a, b) => b.created_at - a.created_at));
+      // Ensure profiles for note authors (mostly same pubkey but reposts may differ)
+      ensureProfiles(events.map((e) => e.pubkey));
     } catch (e) {
       console.error("[profile] Failed to load notes:", e);
     } finally {
       setNotesLoading(false);
     }
-  }, [pubkey]);
+  }, [pubkey, ensureProfiles]);
 
   /* --- load articles ------------------------------------------------ */
   const loadArticles = useCallback(async () => {
@@ -235,11 +225,11 @@ export const ProfileView: React.FC = () => {
     if (!followSearch.trim()) return follows;
     const q = followSearch.toLowerCase();
     return follows.filter((pk) => {
-      const fp = followProfiles.get(pk);
+      const fp = getProfile(pk);
       const name = fp ? (fp.name || fp.display_name || "") : "";
       return name.toLowerCase().includes(q) || pk.toLowerCase().includes(q);
     });
-  }, [follows, followProfiles, followSearch]);
+  }, [follows, getProfile, followSearch]);
 
   /* --- derived values ----------------------------------------------- */
   const displayName = useMemo(() => {
@@ -356,19 +346,14 @@ export const ProfileView: React.FC = () => {
                         message="No notes found for this profile."
                       />
                     )}
-                    {notes.map((note) => {
-                      const preview = note.content.length > 300
-                        ? note.content.slice(0, 300) + "..."
-                        : note.content;
-                      const date = formatDate(note.created_at);
-
-                      return (
-                        <div key={note.id} className="profile-note-card">
-                          <div className="profile-note-date">{date}</div>
-                          <div className="profile-note-content">{preview}</div>
-                        </div>
-                      );
-                    })}
+                    {notes.map((note) => (
+                      <NoteCard
+                        key={note.id}
+                        event={note}
+                        profile={getProfile(note.pubkey) ?? profile ?? undefined}
+                        compact
+                      />
+                    ))}
                   </div>
                 )}
 
@@ -384,23 +369,17 @@ export const ProfileView: React.FC = () => {
                         message="No articles found for this profile."
                       />
                     )}
-                    {articles.map((article) => {
-                      const titleTag = article.tags.find((t) => t[0] === "title");
-                      const summaryTag = article.tags.find((t) => t[0] === "summary");
-                      const title = titleTag ? titleTag[1] : "Untitled";
-                      const summary = summaryTag
-                        ? summaryTag[1]
-                        : article.content.slice(0, 200) + (article.content.length > 200 ? "..." : "");
-                      const date = formatDate(article.created_at);
-
-                      return (
-                        <div key={article.id} className="profile-article-card">
-                          <div className="profile-article-title">{title}</div>
-                          <div className="profile-article-date">{date}</div>
-                          <div className="profile-article-summary">{summary}</div>
-                        </div>
-                      );
-                    })}
+                    {articles.length > 0 && (
+                      <div className="article-cards-grid">
+                        {articles.map((article) => (
+                          <ArticleCard
+                            key={article.id}
+                            event={article}
+                            profile={getProfile(article.pubkey) ?? profile ?? undefined}
+                          />
+                        ))}
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -494,7 +473,7 @@ export const ProfileView: React.FC = () => {
               </div>
               <div className="profile-follows-list">
                 {filteredFollows.slice(0, 50).map((pk) => {
-                  const fp = followProfiles.get(pk);
+                  const fp = getProfile(pk);
                   return (
                     <div
                       key={pk}

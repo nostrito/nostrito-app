@@ -1,7 +1,5 @@
 # Storage Architecture — nostrito-app
 
-> Last updated: 2026-03-09
-
 ---
 
 ## What Gets Stored
@@ -36,11 +34,7 @@ The core table. Every Nostr event that nostrito has seen and chosen to store.
 | `content` | TEXT | Event content |
 | `sig` | TEXT | Schnorr signature |
 | `stored_at` | INTEGER | When nostrito stored this event (wall-clock, our timestamp) |
-
-**Storage priority:**
-1. **Own events** — always kept, never pruned
-2. **Tracked profiles** — always kept, no age limit
-3. **Others' events** — pruned after `max_event_age_days` days (default 30)
+| `source` | TEXT | How the event arrived: `sync`, `thread_context`, or `search` |
 
 ### `nodes`
 WoT graph: one row per known pubkey.
@@ -65,6 +59,18 @@ WoT graph: follow relationships.
 
 Trust is computed at query time from graph distance (BFS from own pubkey).
 
+### `user_relays`
+NIP-65 relay lists discovered for each user.
+
+### `user_cursors`
+Per-user sync cursors tracking the newest event fetched.
+
+### `relay_stats`
+Per-relay success/failure rates and latency.
+
+### `thread_refs`
+Tracks e-tag references between events to protect thread roots from pruning.
+
 ### `media_cache`
 Records of downloaded media files.
 
@@ -78,21 +84,11 @@ Records of downloaded media files.
 | `downloaded_at` | INTEGER | When it was downloaded |
 | `last_accessed` | INTEGER | For LRU eviction of others' media |
 
-**Media storage priority:**
-- **Own media** — never evicted, no size limit
-- **Others' media** — evicted LRU when storage exceeds configured media GB limit
-
 ### `media_queue`
-URLs pending download. Populated at event store time, drained by Tier 4.
-
-| Column | Type | Description |
-|---|---|---|
-| `url` | TEXT PK | URL to download (deduped) |
-| `pubkey` | TEXT | Author pubkey |
-| `queued_at` | INTEGER | When queued |
+URLs pending download. Populated at event store time, drained by the media download phase.
 
 ### `tracked_profiles`
-Profiles the user has explicitly marked for unlimited retention. Foundation for the Gozzip protocol.
+Profiles the user has explicitly marked for unlimited retention.
 
 | Column | Type | Description |
 |---|---|---|
@@ -100,85 +96,10 @@ Profiles the user has explicitly marked for unlimited retention. Foundation for 
 | `tracked_at` | INTEGER | When tracking started |
 | `note` | TEXT | Optional user note |
 
-Tracked profiles are **excluded from all pruning operations** — their events are kept regardless of age or storage limits.
+Tracked profiles are **excluded from all pruning operations**.
 
 ### `app_config`
-Key-value store for persistent configuration and sync cursors.
-
-| Key | Value | Description |
-|---|---|---|
-| `outbound_relays` | CSV of wss:// URLs | Active relay list |
-| `tier2_since` | Unix timestamp | Forward sync cursor (wall-clock) |
-| `tier2_history_until` | Unix timestamp | Historical backfill cursor (backward) |
-| `wot_max_depth` | integer | WoT expansion depth |
-| `max_event_age_days` | integer | Event retention period |
-| + other settings | | |
-
----
-
-## Storage Limits & Pruning
-
-### Events (others)
-Configured via **Settings → Storage → Event retention** slider.
-
-| Option | Retention |
-|---|---|
-| 7 days | Aggressive — keeps last week only |
-| 14 days | Standard |
-| **30 days** | **Default** — good balance |
-| 90 days | Extended history |
-| 1 year | Long-term archive |
-
-**Never pruned:**
-- Own events (own pubkey)
-- Events from tracked profiles
-
-Pruning runs at the start of each sync cycle. The SQL:
-```sql
-DELETE FROM nostr_events
-WHERE created_at < (now - max_age_secs)
-  AND pubkey != own_pubkey
-  AND pubkey NOT IN (SELECT pubkey FROM tracked_profiles)
-```
-
-### Media (others)
-Configured via **Settings → Storage → Media storage** (GB slider).
-
-- Others' media is evicted LRU (least recently accessed first) when total others' media exceeds the limit
-- Own media is never evicted regardless of size
-
----
-
-## Tracked Profiles — Gozzip Foundation
-
-Tracked profiles are the first building block of the **Gozzip protocol** — a decentralized gossip and data preservation layer for Nostr.
-
-### What tracking means
-When you track a profile:
-- All their events are **kept indefinitely** — no age limit
-- Their events are **excluded from all pruning**, even when storage is tight
-- Their metadata (kind:0 profile, kind:3 contacts) is **always refreshed** in Tier 1.5
-- Their media is treated with higher priority in Tier 4
-
-### Use cases
-- Important contacts you want full history for
-- Historical figures in the Nostr ecosystem
-- Accounts you're archiving for research
-- Preparatory step for future Gozzip relay operations
-
-### Managing tracked profiles
-**Settings → Storage → Tracked Profiles:**
-- Add by npub or hex pubkey
-- Optional note to remember why you're tracking them
-- Untrack at any time (does not delete their events — just removes the protection)
-
-### Gozzip protocol context
-Gozzip (gossip + zip) envisions nostrito nodes acting as voluntary data custodians for specific profiles. By tracking a profile, your nostrito instance:
-1. Becomes a full archive of that profile's history
-2. Can serve that profile's events to other relays
-3. Participates in a distributed preservation network
-
-The `tracked_profiles` table is the registry for this custodianship. Future versions will add Gozzip relay federation, data serving capabilities, and custodian discovery.
+Key-value store for persistent configuration.
 
 ---
 
@@ -186,22 +107,19 @@ The `tracked_profiles` table is the registry for this custodianship. Future vers
 
 ```
 Priority 1 (highest): Own events + own media
-  → Always stored, never pruned, never evicted
+  -> Always stored, never pruned, never evicted
 
 Priority 2: Tracked profiles
-  → Always stored, never pruned
-  → Media treated with elevated priority
+  -> Always stored, never pruned
 
-Priority 3: WoT follows (direct)
-  → Stored within retention window
-  → Media downloaded up to media GB limit
+Priority 3: Direct follows (hop 1)
+  -> Stored within retention window (default 30 days, min 50 events)
 
-Priority 4: WoT peers (2nd+ hop)
-  → Stored within retention window
-  → Media downloaded if space available
+Priority 4: Follows-of-follows (hop 2)
+  -> Stored within retention window (default 7 days, min 10 events)
 
-Priority 5 (lowest): Unknown pubkeys
-  → May appear in relayed events but not actively fetched
+Priority 5 (lowest): Others (hop 3+)
+  -> Stored within retention window (default 3 days, min 5 events)
 ```
 
 ---
@@ -221,21 +139,8 @@ Priority 5 (lowest): Unknown pubkeys
 
 ---
 
-## Disk Usage Estimates
-
-| Scenario | Events | Avg size | DB size |
-|---|---|---|---|
-| 100 follows, 7 days | ~5,000 | 500 bytes | ~2.5 MB |
-| 100 follows, 30 days | ~20,000 | 500 bytes | ~10 MB |
-| 500 follows, 30 days | ~100,000 | 500 bytes | ~50 MB |
-| WoT crawl (10K peers) | ~500,000 | 500 bytes | ~250 MB |
-
-Media is separate and depends entirely on how media-heavy your follows are.
-Blossom servers typically serve images at 100KB–2MB each.
-
----
-
 ## See Also
-- `docs/SYNC_ARCHITECTURE.md` — how events are fetched and stored
+- `docs/SYNC.md` — sync engine overview
+- `docs/data-model.md` — full v2 table schemas
 - `src-tauri/src/storage/db.rs` — database implementation
-- `src-tauri/src/sync/engine.rs` — sync engine with pruning logic
+- `src-tauri/src/sync/engine.rs` — sync engine

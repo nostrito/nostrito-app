@@ -2,76 +2,21 @@
 
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { IconMessageCircle, IconRepeat, IconZap, IconX } from "../components/Icon";
+import { IconX } from "../components/Icon";
+import { NoteCard } from "../components/NoteCard";
+import { ArticleCard, getArticleTitle, getArticleImage, getArticleTimestamp } from "../components/ArticleCard";
 import { Avatar } from "../components/Avatar";
-import { timeAgo, formatDate } from "../utils/format";
-import { kindLabel } from "../utils/ui";
-import { renderMediaHtml, stripMediaUrls, initMediaViewer } from "../utils/media";
+import { formatDate } from "../utils/format";
 import { renderMarkdown } from "../utils/markdown";
-import { getProfiles, profileDisplayName, type ProfileInfo } from "../utils/profiles";
+import { initMediaViewer } from "../utils/media";
+import { useProfileContext } from "../context/ProfileContext";
+import { profileDisplayName } from "../utils/profiles";
 import { useTauriEvent } from "../hooks/useTauriEvent";
 import { useInterval } from "../hooks/useInterval";
 import type { NostrEvent } from "../types/nostr";
 
 /** Kinds that belong in the feed */
 const FEED_KINDS = [1, 6, 30023];
-
-// -- NIP-23 tag helpers --
-
-function getTagValue(tags: string[][], name: string): string | null {
-  const tag = tags.find((t) => t[0] === name);
-  return tag && tag.length > 1 ? tag[1] : null;
-}
-
-function getArticleTitle(event: NostrEvent): string {
-  return getTagValue(event.tags, "title") || "Untitled";
-}
-
-function getArticleSummary(event: NostrEvent): string {
-  const summary = getTagValue(event.tags, "summary");
-  if (summary) return summary.length > 200 ? summary.slice(0, 200) + "\u2026" : summary;
-  const plain = event.content
-    .replace(/^#+\s+/gm, "")
-    .replace(/[*_~`]/g, "")
-    .replace(/!\[.*?\]\(.*?\)/g, "")
-    .replace(/\[.*?\]\(.*?\)/g, "")
-    .trim();
-  return plain.length > 150 ? plain.slice(0, 150) + "\u2026" : plain;
-}
-
-function getArticleImage(event: NostrEvent): string | null {
-  return getTagValue(event.tags, "image");
-}
-
-function getArticleTimestamp(event: NostrEvent): number {
-  const published = getTagValue(event.tags, "published_at");
-  if (published) {
-    const ts = parseInt(published, 10);
-    if (!isNaN(ts)) return ts;
-  }
-  return event.created_at;
-}
-
-// -- Repost helpers --
-
-function parseRepostContent(event: NostrEvent): { content: string; pubkey: string } | null {
-  if (event.kind !== 6 || !event.content.trim()) return null;
-  try {
-    const original = JSON.parse(event.content);
-    if (original && typeof original.content === "string" && original.content.trim()) {
-      return { content: original.content, pubkey: original.pubkey || event.pubkey };
-    }
-  } catch {
-    // Not valid JSON
-  }
-  return null;
-}
-
-function renderEventContent(content: string): { cleaned: string; mediaHtml: string } {
-  const mediaHtml = renderMediaHtml(content);
-  const cleaned = stripMediaUrls(content).slice(0, 280);
-  return { cleaned, mediaHtml };
-}
 
 /** Resolve NIP-05 identifier (name@domain) to hex pubkey */
 async function resolveNip05(nip05: string): Promise<string | null> {
@@ -93,132 +38,18 @@ function isNip05(input: string): boolean {
   return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(input);
 }
 
-// -- Sub-components --
-
-interface FeedCardProps {
-  event: NostrEvent;
-  profile?: ProfileInfo;
-}
-
-const FeedCard: React.FC<FeedCardProps> = ({ event, profile }) => {
-  const k = kindLabel(event.kind);
-  const displayName = profileDisplayName(profile, event.pubkey);
-
-  if (event.kind === 6) {
-    const original = parseRepostContent(event);
-    if (!original) return null;
-
-    const repostContent = renderEventContent(original.content);
-
-    return (
-      <div className="event-card" data-kind={k.tag}>
-        <Avatar picture={profile?.picture} pubkey={event.pubkey} className="ev-avatar" clickable />
-        <div className="ev-content">
-          <div className="ev-meta">
-            <span className="ev-npub" data-pubkey={event.pubkey} style={{ cursor: "pointer" }}>
-              {displayName}
-            </span>
-            <span className={`ev-kind-tag ${k.cls}`}>
-              <span className="icon"><IconRepeat /></span> repost
-            </span>
-            <span className="ev-time">{timeAgo(event.created_at, false)}</span>
-          </div>
-          <div className="ev-text">{repostContent.cleaned}</div>
-          {repostContent.mediaHtml && (
-            <div dangerouslySetInnerHTML={{ __html: repostContent.mediaHtml }} />
-          )}
-          <div className="ev-actions">
-            <button className="ev-action"><span className="icon"><IconMessageCircle /></span> 0</button>
-            <button className="ev-action"><span className="icon"><IconRepeat /></span> 0</button>
-            <button className="ev-action"><span className="icon"><IconZap /></span> 0</button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  const eventContent = renderEventContent(event.content);
-
-  return (
-    <div className="event-card" data-kind={k.tag}>
-      <Avatar picture={profile?.picture} pubkey={event.pubkey} className="ev-avatar" clickable />
-      <div className="ev-content">
-        <div className="ev-meta">
-          <span className="ev-npub" data-pubkey={event.pubkey} style={{ cursor: "pointer" }}>
-            {displayName}
-          </span>
-          <span className={`ev-kind-tag ${k.cls}`}>{k.tag}</span>
-          <span className="ev-time">{timeAgo(event.created_at, false)}</span>
-        </div>
-        <div className="ev-text">{eventContent.cleaned}</div>
-        {eventContent.mediaHtml && (
-          <div dangerouslySetInnerHTML={{ __html: eventContent.mediaHtml }} />
-        )}
-        <div className="ev-actions">
-          <button className="ev-action"><span className="icon"><IconMessageCircle /></span> 0</button>
-          <button className="ev-action"><span className="icon"><IconRepeat /></span> 0</button>
-          <button className="ev-action"><span className="icon"><IconZap /></span> 0</button>
-        </div>
-      </div>
-    </div>
-  );
-};
-
-interface ArticleCardProps {
-  event: NostrEvent;
-  profile?: ProfileInfo;
-  onClick: () => void;
-}
-
-const ArticleCard: React.FC<ArticleCardProps> = ({ event, profile, onClick }) => {
-  const title = getArticleTitle(event);
-  const summary = getArticleSummary(event);
-  const image = getArticleImage(event);
-  const ts = getArticleTimestamp(event);
-  const displayName = profileDisplayName(profile, event.pubkey);
-
-  return (
-    <div className="article-card" data-kind="long-form" data-event-id={event.id} onClick={onClick}>
-      {image && (
-        <div className="article-card-cover">
-          <img
-            src={image}
-            alt=""
-            loading="lazy"
-            onError={(e) => {
-              const parent = (e.target as HTMLImageElement).parentElement;
-              if (parent) parent.style.display = "none";
-            }}
-          />
-        </div>
-      )}
-      <div className="article-card-body">
-        <div className="article-card-title">{title}</div>
-        <div className="article-card-summary">{summary}</div>
-        <div className="article-card-footer">
-          <div className="article-card-author">
-            <Avatar
-              picture={profile?.picture}
-              pubkey={event.pubkey}
-              className="article-card-avatar"
-              fallbackClassName="article-card-avatar article-card-avatar-fallback"
-            />
-            <span className="article-card-author-name">{displayName}</span>
-          </div>
-          <span className="article-card-date">{formatDate(ts)}</span>
-        </div>
-      </div>
-    </div>
-  );
-};
+// -- Article reader (inline, uses shared helpers) --
 
 interface ArticleReaderProps {
   event: NostrEvent;
-  profile?: ProfileInfo;
   onBack: () => void;
 }
 
-const ArticleReader: React.FC<ArticleReaderProps> = ({ event, profile, onBack }) => {
+const ArticleReader: React.FC<ArticleReaderProps> = ({ event, onBack }) => {
+  const { getProfile, ensureProfiles } = useProfileContext();
+  useEffect(() => { ensureProfiles([event.pubkey]); }, [event.pubkey, ensureProfiles]);
+  const profile = getProfile(event.pubkey);
+
   const title = getArticleTitle(event);
   const ts = getArticleTimestamp(event);
   const displayName = profileDisplayName(profile, event.pubkey);
@@ -264,16 +95,26 @@ type FeedView =
   | { kind: "article"; event: NostrEvent };
 
 type FilterTab = "all" | "note" | "long-form" | "repost";
+type FeedMode = "wot" | "global";
+
+function kindTag(kind: number): FilterTab {
+  if (kind === 1) return "note";
+  if (kind === 6) return "repost";
+  if (kind === 30023) return "long-form";
+  return "note";
+}
 
 export const Feed: React.FC = () => {
   const [view, setView] = useState<FeedView>({ kind: "feed" });
+  const [feedMode, setFeedMode] = useState<FeedMode>("wot");
   const [activeFilter, setActiveFilter] = useState<FilterTab>("all");
   const [searchQuery, setSearchQuery] = useState("");
   const [searchStatus, setSearchStatus] = useState<string | null>(null);
   const [feedEvents, setFeedEvents] = useState<NostrEvent[]>([]);
-  const [profileMap, setProfileMap] = useState<Map<string, ProfileInfo>>(new Map());
   const [loading, setLoading] = useState(true);
   const [isSearchMode, setIsSearchMode] = useState(false);
+
+  const { getProfile, ensureProfiles } = useProfileContext();
 
   const renderedEventIdsRef = useRef(new Set<string>());
   const feedLoadingRef = useRef(false);
@@ -292,11 +133,20 @@ export const Feed: React.FC = () => {
     feedLoadingRef.current = true;
 
     try {
-      const [rawNotes, rawArticles] = await Promise.all([
-        invoke<NostrEvent[]>("get_feed", { filter: { kinds: [1, 6], limit: 50 } }),
-        invoke<NostrEvent[]>("get_feed", { filter: { kinds: [30023], limit: 20 } }),
-      ]);
-      const rawEvents = [...rawArticles, ...rawNotes];
+      let rawEvents: NostrEvent[];
+
+      if (feedMode === "global") {
+        // Fetch from relays for global mode
+        rawEvents = await invoke<NostrEvent[]>("fetch_global_feed", { limit: 50 });
+      } else {
+        // WoT mode: query local DB
+        const [rawNotes, rawArticles] = await Promise.all([
+          invoke<NostrEvent[]>("get_feed", { filter: { kinds: [1, 6], limit: 50, wot_only: true } }),
+          invoke<NostrEvent[]>("get_feed", { filter: { kinds: [30023], limit: 20, wot_only: true } }),
+        ]);
+        rawEvents = [...rawArticles, ...rawNotes];
+      }
+
       const kindFiltered = rawEvents.filter((e) => FEED_KINDS.includes(e.kind));
       const newEvents = kindFiltered.filter((e) => !renderedEventIdsRef.current.has(e.id));
       if (newEvents.length === 0) {
@@ -305,25 +155,16 @@ export const Feed: React.FC = () => {
       }
 
       const pubkeys = [...new Set(newEvents.map((e) => e.pubkey))];
-      const profiles = await getProfiles(pubkeys);
+      ensureProfiles(pubkeys);
 
-      // Mark as rendered
       for (const e of newEvents) {
         renderedEventIdsRef.current.add(e.id);
       }
 
-      setProfileMap((prev) => {
-        const merged = new Map(prev);
-        profiles.forEach((v, k) => merged.set(k, v));
-        return merged;
-      });
-
       setFeedEvents((prev) => {
-        // Merge new events, avoiding duplicates
         const existingIds = new Set(prev.map((e) => e.id));
         const toAdd = newEvents.filter((e) => !existingIds.has(e.id));
         const merged = [...toAdd, ...prev];
-        // Cap at 100 note/repost items + unlimited articles
         const articles = merged.filter((e) => e.kind === 30023);
         const notes = merged.filter((e) => e.kind !== 30023).slice(0, 100);
         return [...articles, ...notes];
@@ -336,7 +177,14 @@ export const Feed: React.FC = () => {
     } finally {
       feedLoadingRef.current = false;
     }
-  }, []);
+  }, [feedMode, ensureProfiles]);
+
+  // Reset feed when mode changes
+  useEffect(() => {
+    renderedEventIdsRef.current.clear();
+    setFeedEvents([]);
+    setLoading(true);
+  }, [feedMode]);
 
   // Initial load
   useEffect(() => {
@@ -363,13 +211,13 @@ export const Feed: React.FC = () => {
     setSearchStatus("Searching\u2026");
     setIsSearchMode(true);
 
-    let searchQuery = query;
+    let sq = query;
 
     if (isNip05(query)) {
       setSearchStatus(`Resolving ${query}\u2026`);
       const resolved = await resolveNip05(query);
       if (resolved) {
-        searchQuery = resolved;
+        sq = resolved;
       } else {
         setSearchStatus(`Could not resolve ${query}`);
         setFeedEvents([]);
@@ -377,31 +225,46 @@ export const Feed: React.FC = () => {
       }
     }
 
+    // Local search first
     try {
-      const results = await invoke<NostrEvent[]>("search_events", { query: searchQuery, limit: 50 });
+      const localResults = await invoke<NostrEvent[]>("search_events", { query: sq, limit: 50 });
 
-      setSearchStatus(`${results.length} result${results.length !== 1 ? "s" : ""} for "${query}"`);
+      const localCount = localResults.length;
+      setSearchStatus(`${localCount} local result${localCount !== 1 ? "s" : ""} for "${query}" \u2014 searching relays\u2026`);
 
-      if (results.length === 0) {
-        setFeedEvents([]);
-        return;
+      if (localResults.length > 0) {
+        const pubkeys = [...new Set(localResults.map((e) => e.pubkey))];
+        ensureProfiles(pubkeys);
       }
+      setFeedEvents([...localResults]);
 
-      const pubkeys = [...new Set(results.map((e) => e.pubkey))];
-      const profiles = await getProfiles(pubkeys);
+      // Global search from relays (async, appends results)
+      try {
+        const globalResults = await invoke<NostrEvent[]>("search_global", { query: sq, limit: 50 });
+        const localIds = new Set(localResults.map((e) => e.id));
+        const newResults = globalResults.filter((e) => !localIds.has(e.id));
 
-      setProfileMap((prev) => {
-        const merged = new Map(prev);
-        profiles.forEach((v, k) => merged.set(k, v));
-        return merged;
-      });
+        if (newResults.length > 0) {
+          const pubkeys = [...new Set(newResults.map((e) => e.pubkey))];
+          ensureProfiles(pubkeys);
+          setFeedEvents((prev) => {
+            const existingIds = new Set(prev.map((e) => e.id));
+            const toAdd = newResults.filter((e) => !existingIds.has(e.id));
+            return [...prev, ...toAdd];
+          });
+        }
 
-      setFeedEvents([...results]);
+        const totalCount = localCount + newResults.length;
+        setSearchStatus(`${totalCount} result${totalCount !== 1 ? "s" : ""} for "${query}" (${localCount} local, ${newResults.length} relay)`);
+      } catch {
+        // Relay search failed, keep local results
+        setSearchStatus(`${localCount} result${localCount !== 1 ? "s" : ""} for "${query}" (local only)`);
+      }
     } catch {
       setSearchStatus("Search failed");
       setFeedEvents([]);
     }
-  }, []);
+  }, [ensureProfiles]);
 
   const handleSearchInput = useCallback(
     (val: string) => {
@@ -415,7 +278,6 @@ export const Feed: React.FC = () => {
         renderedEventIdsRef.current.clear();
         setFeedEvents([]);
         setLoading(true);
-        // loadEvents will fire via the useEffect watching isSearchMode
         return;
       }
 
@@ -447,7 +309,6 @@ export const Feed: React.FC = () => {
     return (
       <ArticleReader
         event={view.event}
-        profile={profileMap.get(view.event.pubkey)}
         onBack={() => setView({ kind: "feed" })}
       />
     );
@@ -461,10 +322,7 @@ export const Feed: React.FC = () => {
   const showArticleGrid = activeFilter === "all" || activeFilter === "long-form";
   const filteredNotes = activeFilter === "all"
     ? notes
-    : notes.filter((e) => {
-        const k = kindLabel(e.kind);
-        return k.tag === activeFilter;
-      });
+    : notes.filter((e) => kindTag(e.kind) === activeFilter);
 
   const filterTabs: { key: FilterTab; label: string }[] = [
     { key: "all", label: "All" },
@@ -476,6 +334,20 @@ export const Feed: React.FC = () => {
   return (
     <>
       <div className="feed-header-row">
+        <div className="feed-mode-toggle">
+          <button
+            className={`feed-mode-btn${feedMode === "wot" ? " active" : ""}`}
+            onClick={() => setFeedMode("wot")}
+          >
+            WoT
+          </button>
+          <button
+            className={`feed-mode-btn${feedMode === "global" ? " active" : ""}`}
+            onClick={() => setFeedMode("global")}
+          >
+            Global
+          </button>
+        </div>
         <div className="feed-filters">
           {filterTabs.map((tab) => (
             <div
@@ -533,7 +405,7 @@ export const Feed: React.FC = () => {
               <ArticleCard
                 key={event.id}
                 event={event}
-                profile={profileMap.get(event.pubkey)}
+                profile={getProfile(event.pubkey)}
                 onClick={() => setView({ kind: "article", event })}
               />
             ))}
@@ -541,10 +413,10 @@ export const Feed: React.FC = () => {
         )}
 
         {filteredNotes.map((event) => (
-          <FeedCard
+          <NoteCard
             key={event.id}
             event={event}
-            profile={profileMap.get(event.pubkey)}
+            profile={getProfile(event.pubkey)}
           />
         ))}
       </div>

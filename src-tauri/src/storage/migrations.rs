@@ -435,7 +435,7 @@ mod tests {
 
         run_migrations(&conn).unwrap();
 
-        assert_eq!(get_schema_version(&conn), 2);
+        assert_eq!(get_schema_version(&conn), SCHEMA_VERSION);
 
         // nostr_events should still be a table (not renamed yet — deferred to cutover)
         let table_count: i64 = conn
@@ -503,6 +503,6 @@ mod tests {
 
         // Running again should be a no-op
         run_migrations(&conn).unwrap();
-        assert_eq!(get_schema_version(&conn), 2);
+        assert_eq!(get_schema_version(&conn), SCHEMA_VERSION);
     }
 }

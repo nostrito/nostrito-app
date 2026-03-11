@@ -1,3 +1,29 @@
+/* Feed mode toggle — WoT / Global */
+.feed-mode-toggle {
+  display: flex;
+  gap: 2px;
+  padding: 4px 12px;
+  align-items: center;
+}
+.feed-mode-btn {
+  padding: 5px 14px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.feed-mode-btn:first-child { border-radius: 6px 0 0 6px; }
+.feed-mode-btn:last-child { border-radius: 0 6px 6px 0; }
+.feed-mode-btn:hover { color: var(--text); background: var(--bg-hover); }
+.feed-mode-btn.active {
+  background: var(--accent);
+  color: var(--bg);
+  border-color: var(--accent);
+}
+
 /* Feed filters — tab bar */
 .feed-filters {
   display: flex;

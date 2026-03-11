@@ -121,6 +121,7 @@ export interface Settings {
   sync_wot_batch_size: number;
   sync_wot_events_per_batch: number;
   max_event_age_days: number;
+  sync_fof_content: boolean;
   relayPort?: number;
   maxStorageMb?: number;
   syncIntervalSecs?: number;

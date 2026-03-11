@@ -201,6 +201,12 @@ impl WotGraph {
         })
     }
 
+    /// Return all pubkeys in the WoT graph.
+    pub fn get_all_pubkeys(&self) -> Vec<String> {
+        let id_to_pubkey = self.id_to_pubkey.read();
+        id_to_pubkey.iter().map(|arc| arc.to_string()).collect()
+    }
+
     pub fn with_adjacency<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&[Vec<u32>], &[Vec<u32>]) -> R,

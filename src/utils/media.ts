@@ -21,8 +21,8 @@ export function extractMediaUrls(content: string): MediaUrls {
     if (/\.(mp4|webm|mov)(\?|$)/.test(lower)) {
       videos.push(url);
     } else if (
-      /\.(jpg|jpeg|png|gif|webp|avif)(\?|$)/.test(lower) ||
-      /nostr\.build|void\.cat|blossom\.|media\.nostr\.band/.test(lower)
+      /\.(jpg|jpeg|png|gif|webp|avif|svg)(\?|$)/.test(lower) ||
+      /nostr\.build|void\.cat|blossom\.|media\.nostr\.band|imgproxy|primal\.net|nip\.media|sovbit\.host|satellite\.earth|snort\.social|nostpic\.com|stacker\.news\/uploads/.test(lower)
     ) {
       images.push(url);
     }
@@ -58,7 +58,7 @@ export function renderMediaHtml(content: string): string {
     // Escape single quotes in URL for onclick
     const safeUrl = url.replace(/'/g, "\\'");
     parts.push(
-      `<img class="ev-media-img" src="${url}" loading="lazy" onerror="this.parentElement.style.display='none'" data-media-url="${safeUrl}" style="cursor:pointer">`
+      `<img class="ev-media-img" src="${url}" loading="lazy" onerror="this.style.display='none'" data-media-url="${safeUrl}" style="cursor:pointer">`
     );
   }
 
