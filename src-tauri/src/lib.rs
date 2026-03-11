@@ -60,6 +60,8 @@ pub struct AppConfig {
     pub sync_fof_content: bool,
     /// Fetch content from hop-3 pubkeys (lowest priority)
     pub sync_hop3_content: bool,
+    /// Offline mode — stop all outbound sync, work only with local data
+    pub offline_mode: bool,
     /// Cached nsec (loaded from system keychain on startup)
     pub nsec: Option<String>,
 }
@@ -95,6 +97,7 @@ impl Default for AppConfig {
             max_event_age_days: 30,
             sync_fof_content: false,
             sync_hop3_content: false,
+            offline_mode: false,
             nsec: None,
         }
     }
@@ -191,6 +194,7 @@ pub struct Settings {
     pub max_event_age_days: u32,
     pub sync_fof_content: bool,
     pub sync_hop3_content: bool,
+    pub offline_mode: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -357,33 +361,37 @@ async fn init_nostrito(
         .load_graph(&state.wot_graph)
         .map_err(|e| format!("Failed to load graph: {}", e))?;
 
-    // Start tiered sync engine
+    // Start tiered sync engine (unless offline mode is active)
     let config = state.config.read().await;
-    let sync_config = SyncConfig {
-        lookback_days: config.sync_lookback_days,
-        batch_size: config.sync_batch_size,
-        events_per_batch: config.sync_events_per_batch,
-        batch_pause_secs: config.sync_batch_pause_secs,
-        relay_min_interval_secs: config.sync_relay_min_interval_secs,
-        wot_batch_size: config.sync_wot_batch_size,
-        wot_events_per_batch: config.sync_wot_events_per_batch,
-        cycle_interval_secs: config.sync_interval_secs,
-        fof_content: config.sync_fof_content,
-        hop3_content: config.sync_hop3_content,
-    };
-    let cancel = start_sync_engine(
-        state.wot_graph.clone(),
-        state.db.clone(),
-        config.outbound_relays.clone(),
-        hex_pubkey.clone(),
-        state.sync_tier.clone(),
-        state.sync_stats.clone(),
-        app_handle.clone(),
-        config.storage_media_gb,
-        sync_config,
-        config.max_event_age_days,
-    );
-    *state.sync_cancel.write().await = Some(cancel);
+    if config.offline_mode {
+        tracing::info!("[init] Offline mode active — skipping sync engine start");
+    } else {
+        let sync_config = SyncConfig {
+            lookback_days: config.sync_lookback_days,
+            batch_size: config.sync_batch_size,
+            events_per_batch: config.sync_events_per_batch,
+            batch_pause_secs: config.sync_batch_pause_secs,
+            relay_min_interval_secs: config.sync_relay_min_interval_secs,
+            wot_batch_size: config.sync_wot_batch_size,
+            wot_events_per_batch: config.sync_wot_events_per_batch,
+            cycle_interval_secs: config.sync_interval_secs,
+            fof_content: config.sync_fof_content,
+            hop3_content: config.sync_hop3_content,
+        };
+        let cancel = start_sync_engine(
+            state.wot_graph.clone(),
+            state.db.clone(),
+            config.outbound_relays.clone(),
+            hex_pubkey.clone(),
+            state.sync_tier.clone(),
+            state.sync_stats.clone(),
+            app_handle.clone(),
+            config.storage_media_gb,
+            sync_config,
+            config.max_event_age_days,
+        );
+        *state.sync_cancel.write().await = Some(cancel);
+    }
 
     // Auto-setup mkcert if certs don't exist (first launch)
     {
@@ -579,6 +587,76 @@ async fn stop_sync(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn set_offline_mode(
+    enabled: bool,
+    app_handle: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    tracing::info!("[cmd:set_offline_mode] enabled={}", enabled);
+
+    // Update in-memory config
+    {
+        let mut config = state.config.write().await;
+        config.offline_mode = enabled;
+    }
+
+    // Persist to DB
+    state.db.set_config("offline_mode", if enabled { "true" } else { "false" })
+        .map_err(|e| format!("Failed to save offline_mode: {}", e))?;
+
+    if enabled {
+        // Stop sync engine
+        if let Some(cancel) = state.sync_cancel.write().await.take() {
+            cancel.cancel();
+            state.sync_tier.store(0u8, Ordering::Relaxed);
+            tracing::info!("[cmd:set_offline_mode] Sync engine stopped");
+        }
+    } else {
+        // Restart sync engine
+        let config = state.config.read().await;
+        if let Some(ref hex_pubkey) = config.hex_pubkey {
+            // Cancel any existing sync first
+            if let Some(cancel) = state.sync_cancel.write().await.take() {
+                cancel.cancel();
+                state.sync_tier.store(0u8, Ordering::Relaxed);
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+
+            let sync_config = SyncConfig {
+                lookback_days: config.sync_lookback_days,
+                batch_size: config.sync_batch_size,
+                events_per_batch: config.sync_events_per_batch,
+                batch_pause_secs: config.sync_batch_pause_secs,
+                relay_min_interval_secs: config.sync_relay_min_interval_secs,
+                wot_batch_size: config.sync_wot_batch_size,
+                wot_events_per_batch: config.sync_wot_events_per_batch,
+                cycle_interval_secs: config.sync_interval_secs,
+                fof_content: config.sync_fof_content,
+                hop3_content: config.sync_hop3_content,
+            };
+            let cancel = start_sync_engine(
+                state.wot_graph.clone(),
+                state.db.clone(),
+                config.outbound_relays.clone(),
+                hex_pubkey.clone(),
+                state.sync_tier.clone(),
+                state.sync_stats.clone(),
+                app_handle,
+                config.storage_media_gb,
+                sync_config,
+                config.max_event_age_days,
+            );
+            drop(config);
+
+            *state.sync_cancel.write().await = Some(cancel);
+            tracing::info!("[cmd:set_offline_mode] Sync engine restarted");
+        }
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
 async fn restart_sync(state: State<'_, AppState>, app_handle: tauri::AppHandle) -> Result<(), String> {
     tracing::info!("[cmd:restart_sync] called");
     // Cancel existing sync
@@ -590,6 +668,13 @@ async fn restart_sync(state: State<'_, AppState>, app_handle: tauri::AppHandle) 
 
     // Read current config and restart
     let config = state.config.read().await;
+
+    // Don't restart sync in offline mode
+    if config.offline_mode {
+        tracing::info!("[cmd:restart_sync] Offline mode active — not restarting");
+        return Ok(());
+    }
+
     let hex_pubkey = match &config.hex_pubkey {
         Some(pk) => pk.clone(),
         None => return Ok(()), // not initialized yet
@@ -1493,6 +1578,7 @@ async fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
         max_event_age_days: config.max_event_age_days,
         sync_fof_content: config.sync_fof_content,
         sync_hop3_content: config.sync_hop3_content,
+        offline_mode: config.offline_mode,
     })
 }
 
@@ -1529,6 +1615,7 @@ async fn save_settings(settings: Settings, app_handle: tauri::AppHandle, state: 
     config.max_event_age_days = settings.max_event_age_days;
     config.sync_fof_content = settings.sync_fof_content;
     config.sync_hop3_content = settings.sync_hop3_content;
+    config.offline_mode = settings.offline_mode;
 
     // Persist ALL settings to DB so they survive restart
     drop(config);
@@ -1562,6 +1649,7 @@ async fn save_settings(settings: Settings, app_handle: tauri::AppHandle, state: 
     db.set_config("max_event_age_days", &settings.max_event_age_days.to_string()).ok();
     db.set_config("sync_fof_content", if settings.sync_fof_content { "true" } else { "false" }).ok();
     db.set_config("sync_hop3_content", if settings.sync_hop3_content { "true" } else { "false" }).ok();
+    db.set_config("offline_mode", if settings.offline_mode { "true" } else { "false" }).ok();
     db.set_config("storage_own_media_gb", &settings.storage_own_media_gb.to_string()).ok();
     db.set_config("storage_tracked_media_gb", &settings.storage_tracked_media_gb.to_string()).ok();
     db.set_config("storage_wot_media_gb", &settings.storage_wot_media_gb.to_string()).ok();
@@ -1574,6 +1662,12 @@ async fn save_settings(settings: Settings, app_handle: tauri::AppHandle, state: 
         cancel.cancel();
         state.sync_tier.store(0u8, Ordering::Relaxed);
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    // In offline mode, don't restart the sync engine — just leave it stopped
+    if settings.offline_mode {
+        tracing::info!("[cmd:save_settings] Offline mode enabled — sync engine not restarted");
+        return Ok(());
     }
 
     let config = state.config.read().await;
@@ -2445,6 +2539,7 @@ pub fn run() {
     if let Ok(Some(v)) = db.get_config("max_event_age_days") { if let Ok(n) = v.parse::<u32>() { config.max_event_age_days = n; } }
     if let Ok(Some(v)) = db.get_config("sync_fof_content") { config.sync_fof_content = v == "true"; }
     if let Ok(Some(v)) = db.get_config("sync_hop3_content") { config.sync_hop3_content = v == "true"; }
+    if let Ok(Some(v)) = db.get_config("offline_mode") { config.offline_mode = v == "true"; }
     if let Ok(Some(v)) = db.get_config("storage_own_media_gb") { if let Ok(n) = v.parse::<f64>() { config.storage_own_media_gb = n; } }
     if let Ok(Some(v)) = db.get_config("storage_tracked_media_gb") { if let Ok(n) = v.parse::<f64>() { config.storage_tracked_media_gb = n; } }
     if let Ok(Some(v)) = db.get_config("storage_wot_media_gb") { if let Ok(n) = v.parse::<f64>() { config.storage_wot_media_gb = n; } }
@@ -2649,6 +2744,7 @@ pub fn run() {
             save_settings,
             start_sync,
             stop_sync,
+            set_offline_mode,
             start_relay,
             stop_relay,
             get_uptime,

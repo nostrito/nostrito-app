@@ -21,6 +21,7 @@ import {
   IconAlertTriangle,
   IconCheckCircle,
   IconUsers,
+  IconWifiOff,
 } from "../components/Icon";
 
 /* ------------------------------------------------------------------ */
@@ -50,6 +51,7 @@ interface Settings {
   sync_wot_events_per_batch: number;
   max_event_age_days: number;
   sync_fof_content: boolean;
+  offline_mode: boolean;
 }
 
 interface TrackedProfile {
@@ -201,6 +203,10 @@ export const Settings: React.FC = () => {
   const [trackedLoading, setTrackedLoading] = useState(true);
   const [trackInput, setTrackInput] = useState("");
 
+  /* --- offline mode -------------------------------------------------- */
+  const [offlineMode, setOfflineMode] = useState(false);
+  const [offlineToggling, setOfflineToggling] = useState(false);
+
   /* --- nsec identity ------------------------------------------------ */
   const [nsecExpanded, setNsecExpanded] = useState(false);
   const [nsecInput, setNsecInput] = useState("");
@@ -250,6 +256,7 @@ export const Settings: React.FC = () => {
       setSyncWotDepth(s.wot_max_depth);
       setSyncFofContent(s.sync_fof_content);
       setAutoStart(s.auto_start);
+      setOfflineMode(s.offline_mode);
 
       // Browser integration
       try {
@@ -522,6 +529,23 @@ export const Settings: React.FC = () => {
     }
   }, [settings]);
 
+  /* --- offline mode toggle ------------------------------------------ */
+  const handleToggleOffline = useCallback(async () => {
+    const next = !offlineMode;
+    setOfflineToggling(true);
+    try {
+      await invoke("set_offline_mode", { enabled: next });
+      setOfflineMode(next);
+      if (settings) {
+        setSettings({ ...settings, offline_mode: next });
+      }
+    } catch (e) {
+      console.error("[settings] set_offline_mode failed:", e);
+    } finally {
+      setOfflineToggling(false);
+    }
+  }, [offlineMode, settings]);
+
   /* --- tracked profiles --------------------------------------------- */
   const handleTrackProfile = useCallback(async () => {
     if (!trackInput.trim()) return;
@@ -573,6 +597,59 @@ export const Settings: React.FC = () => {
       </div>
 
       <div className="settings-panel">
+        {/* ================================================================ */}
+        {/*  Offline Mode Banner                                             */}
+        {/* ================================================================ */}
+        <div
+          style={{
+            background: offlineMode ? "rgba(251, 191, 36, 0.08)" : "var(--bg)",
+            border: offlineMode ? "1px solid rgba(251, 191, 36, 0.3)" : "1px solid var(--border)",
+            borderRadius: 12,
+            padding: "16px 20px",
+            marginBottom: 20,
+            transition: "all 0.3s ease",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+              <span
+                className="icon"
+                style={{
+                  color: offlineMode ? "#fbbf24" : "var(--text-muted)",
+                  transition: "color 0.3s ease",
+                }}
+              >
+                <IconWifiOff />
+              </span>
+              <div>
+                <div
+                  style={{
+                    fontSize: "0.88rem",
+                    fontWeight: 600,
+                    color: offlineMode ? "#fbbf24" : "var(--text)",
+                  }}
+                >
+                  Offline Mode
+                </div>
+                <div style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginTop: 2 }}>
+                  {offlineMode
+                    ? "All relay sync is paused. Working with local data only."
+                    : "Disable all outbound connections and work with downloaded data"}
+                </div>
+              </div>
+            </div>
+            <label className="toggle">
+              <input
+                type="checkbox"
+                checked={offlineMode}
+                disabled={offlineToggling}
+                onChange={handleToggleOffline}
+              />
+              <span className="toggle-slider" />
+            </label>
+          </div>
+        </div>
+
         {/* ================================================================ */}
         {/*  Tab 1: Identity                                                 */}
         {/* ================================================================ */}
