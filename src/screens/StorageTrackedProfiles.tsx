@@ -264,53 +264,120 @@ export const StorageTrackedProfiles: React.FC = () => {
           />
         )}
 
-        {!loading && sortedProfiles.map(p => (
-          <div key={p.pubkey} className="tracked-profile-row">
-            <div className="tracked-profile-info">
-              <Avatar
-                picture={p.picture}
-                pubkey={p.pubkey}
-                className="tracked-profile-avatar"
-                clickable
-              />
-              <div className="tracked-profile-meta">
-                <span className="tracked-profile-name" data-pubkey={p.pubkey} style={{ cursor: "pointer" }}>
-                  {p.display_name || p.name || shortPubkey(p.pubkey)}
-                </span>
-                <span className="tracked-profile-pubkey" title={p.pubkey}>{shortPubkey(p.pubkey)}</span>
+        {!loading && sortedProfiles.map(p => {
+          const isExpanded = expandedPubkey === p.pubkey;
+          return (
+            <div key={p.pubkey}>
+              <div
+                className={`tracked-profile-row${isExpanded ? " expanded" : ""}`}
+                onClick={() => p.media_count > 0 && toggleProfileMedia(p.pubkey)}
+                style={{ cursor: p.media_count > 0 ? "pointer" : undefined }}
+              >
+                <div className="tracked-profile-info">
+                  <Avatar
+                    picture={p.picture}
+                    pubkey={p.pubkey}
+                    className="tracked-profile-avatar"
+                  />
+                  <div className="tracked-profile-meta">
+                    <span className="tracked-profile-name">
+                      {p.display_name || p.name || shortPubkey(p.pubkey)}
+                    </span>
+                    <span className="tracked-profile-pubkey" title={p.pubkey}>{shortPubkey(p.pubkey)}</span>
+                  </div>
+                </div>
+                <div className="tracked-profile-stats">
+                  <div className="tracked-profile-stat">
+                    <span className="tracked-profile-stat-value">{p.event_count.toLocaleString()}</span>
+                    <span className="tracked-profile-stat-label">events</span>
+                  </div>
+                  <div className="tracked-profile-stat">
+                    <span className="tracked-profile-stat-value">{formatBytes(p.media_bytes)}</span>
+                    <span className="tracked-profile-stat-label">media</span>
+                  </div>
+                  <div className="tracked-profile-stat">
+                    <span className="tracked-profile-stat-value">{p.media_count}</span>
+                    <span className="tracked-profile-stat-label">files</span>
+                  </div>
+                </div>
+                <button
+                  className="storage-requeue-btn-sm"
+                  onClick={(e) => { e.stopPropagation(); handleRequeueMedia(p.pubkey); }}
+                  disabled={requeueing !== null}
+                  title="Retry media download for this profile"
+                >
+                  {requeueing === p.pubkey ? (
+                    <svg className="icon-sm spinning" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
+                  ) : (
+                    <svg className="icon-sm" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>
+                  )}
+                </button>
+                {requeueResult && requeueResult.pubkey === p.pubkey && (
+                  <span className="storage-requeue-result-inline">+{requeueResult.count}</span>
+                )}
               </div>
-            </div>
-            <div className="tracked-profile-stats">
-              <div className="tracked-profile-stat">
-                <span className="tracked-profile-stat-value">{p.event_count.toLocaleString()}</span>
-                <span className="tracked-profile-stat-label">events</span>
-              </div>
-              <div className="tracked-profile-stat">
-                <span className="tracked-profile-stat-value">{formatBytes(p.media_bytes)}</span>
-                <span className="tracked-profile-stat-label">media</span>
-              </div>
-              <div className="tracked-profile-stat">
-                <span className="tracked-profile-stat-value">{p.media_count}</span>
-                <span className="tracked-profile-stat-label">files</span>
-              </div>
-            </div>
-            <button
-              className="storage-requeue-btn-sm"
-              onClick={() => handleRequeueMedia(p.pubkey)}
-              disabled={requeueing !== null}
-              title="Retry media download for this profile"
-            >
-              {requeueing === p.pubkey ? (
-                <svg className="icon-sm spinning" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
-              ) : (
-                <svg className="icon-sm" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>
+              {isExpanded && (
+                <div className="tracked-profile-media-panel">
+                  {mediaLoading && (
+                    <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", padding: 12 }}>Loading media...</div>
+                  )}
+                  {!mediaLoading && profileMedia.length === 0 && (
+                    <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", padding: 12 }}>No media files stored.</div>
+                  )}
+                  {!mediaLoading && profileMedia.length > 0 && (
+                    <div className="profile-media-grid">
+                      {profileMedia.map((item) => {
+                        const localSrc = convertFileSrc(item.local_path);
+                        const date = new Date(item.downloaded_at * 1000).toLocaleDateString();
+                        const tooltip = `${date} \u00B7 ${formatBytes(item.size_bytes)}`;
+
+                        if (item.mime_type.startsWith("image/")) {
+                          return (
+                            <div
+                              key={item.hash}
+                              className="my-media-card"
+                              onClick={() => openViewer(localSrc)}
+                              title={tooltip}
+                            >
+                              <img src={localSrc} loading="lazy" onError={handleImageError} />
+                              <div className="my-media-card-overlay">{formatBytes(item.size_bytes)}</div>
+                            </div>
+                          );
+                        }
+
+                        if (item.mime_type.startsWith("video/")) {
+                          return (
+                            <div
+                              key={item.hash}
+                              className="my-media-card video"
+                              onClick={() => openViewer(localSrc, "video")}
+                              title={tooltip}
+                            >
+                              <video src={localSrc} preload="metadata" muted />
+                              <div className="my-media-card-play">{"\u25B6"}</div>
+                              <div className="my-media-card-overlay">{formatBytes(item.size_bytes)}</div>
+                            </div>
+                          );
+                        }
+
+                        if (item.mime_type.startsWith("audio/")) {
+                          return (
+                            <div key={item.hash} className="my-media-card audio" title={tooltip}>
+                              <audio src={localSrc} controls preload="metadata" onClick={(e) => e.stopPropagation()} />
+                              <div className="my-media-card-overlay">{formatBytes(item.size_bytes)}</div>
+                            </div>
+                          );
+                        }
+
+                        return null;
+                      })}
+                    </div>
+                  )}
+                </div>
               )}
-            </button>
-            {requeueResult && requeueResult.pubkey === p.pubkey && (
-              <span className="storage-requeue-result-inline">+{requeueResult.count}</span>
-            )}
-          </div>
-        ))}
+            </div>
+          );
+        })}
       </div>
 
       {/* Media breakdown */}

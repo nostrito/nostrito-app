@@ -157,8 +157,23 @@
 .tracked-profile-row:hover {
   background: rgba(255,255,255,0.03);
 }
-.tracked-profile-row + .tracked-profile-row {
+.tracked-profile-row.expanded {
+  background: rgba(255,255,255,0.04);
+  border-color: var(--accent);
+}
+.tracked-profile-row + .tracked-profile-row,
+.tracked-profile-media-panel + div > .tracked-profile-row {
   border-top: 1px solid var(--border);
+}
+.tracked-profile-media-panel {
+  padding: 8px 12px 12px;
+  border-top: 1px solid var(--border);
+  background: rgba(0,0,0,0.15);
+}
+.tracked-profile-media-panel .profile-media-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: 8px;
 }
 .tracked-profile-info {
   display: flex;
