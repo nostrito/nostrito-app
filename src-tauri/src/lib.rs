@@ -1508,16 +1508,20 @@ async fn get_profile_cache_status(pubkey: String, state: State<'_, AppState>) ->
     Ok(ProfileCacheStatus { event_count, has_metadata })
 }
 
-/// One-shot targeted fetch for a specific pubkey from all connected relays.
-#[tauri::command]
-async fn fetch_profile(pubkey: String, state: State<'_, AppState>) -> Result<ProfileFetchResult, String> {
+/// Core profile fetch logic — reusable from both the command and background refresh.
+async fn do_fetch_profile(
+    pubkey: &str,
+    db: &std::sync::Arc<Database>,
+    wot: &std::sync::Arc<crate::wot::WotGraph>,
+    config: &std::sync::Arc<tokio::sync::RwLock<AppConfig>>,
+) -> Result<ProfileFetchResult, String> {
     use nostr_sdk::prelude::*;
 
     tracing::info!("[cmd:fetch_profile] pubkey={}…", &pubkey[..pubkey.len().min(12)]);
 
-    let config = state.config.read().await;
-    let relay_urls = config.outbound_relays.clone();
-    drop(config);
+    let cfg = config.read().await;
+    let relay_urls = cfg.outbound_relays.clone();
+    drop(cfg);
 
     if relay_urls.is_empty() {
         return Err("No relays configured".into());
@@ -1528,12 +1532,12 @@ async fn fetch_profile(pubkey: String, state: State<'_, AppState>) -> Result<Pro
     // Metadata + contacts filter
     let meta_filter = Filter::new()
         .kinds(vec![Kind::Metadata, Kind::ContactList])
-        .authors(vec![PublicKey::from_hex(&pubkey).map_err(|e| format!("Invalid pubkey: {}", e))?]);
+        .authors(vec![PublicKey::from_hex(pubkey).map_err(|e| format!("Invalid pubkey: {}", e))?]);
 
     // Recent events filter
     let events_filter = Filter::new()
         .kinds(vec![Kind::TextNote, Kind::Repost, Kind::LongFormTextNote])
-        .authors(vec![PublicKey::from_hex(&pubkey).map_err(|e| format!("Invalid pubkey: {}", e))?])
+        .authors(vec![PublicKey::from_hex(pubkey).map_err(|e| format!("Invalid pubkey: {}", e))?])
         .limit(100);
 
     for url in &relay_urls {
@@ -1612,7 +1616,7 @@ async fn fetch_profile(pubkey: String, state: State<'_, AppState>) -> Result<Pro
             &event.tags.iter().map(|t| t.as_slice().iter().map(|s| s.to_string()).collect::<Vec<String>>()).collect::<Vec<Vec<String>>>()
         ).unwrap_or_else(|_| "[]".to_string());
 
-        match state.db.store_event(
+        match db.store_event(
             &event.id.to_hex(),
             &event.pubkey.to_hex(),
             event.created_at.as_u64() as i64,
@@ -1638,7 +1642,7 @@ async fn fetch_profile(pubkey: String, state: State<'_, AppState>) -> Result<Pro
 
             let pk_hex = event.pubkey.to_hex();
             let ev_id = event.id.to_hex();
-            let updated = state.wot_graph.update_follows(
+            let updated = wot.update_follows(
                 &pk_hex,
                 &follows,
                 Some(ev_id.clone()),
@@ -1651,7 +1655,7 @@ async fn fetch_profile(pubkey: String, state: State<'_, AppState>) -> Result<Pro
                     event_id: Some(&ev_id),
                     created_at: Some(event.created_at.as_u64() as i64),
                 }];
-                state.db.update_follows_batch(&batch).ok();
+                db.update_follows_batch(&batch).ok();
             }
         }
 
@@ -1669,6 +1673,73 @@ async fn fetch_profile(pubkey: String, state: State<'_, AppState>) -> Result<Pro
         events_fetched: all_events.len() as u64,
         has_profile,
     })
+}
+
+/// One-shot targeted fetch for a specific pubkey from all connected relays.
+#[tauri::command]
+async fn fetch_profile(pubkey: String, state: State<'_, AppState>) -> Result<ProfileFetchResult, String> {
+    do_fetch_profile(&pubkey, &state.db, &state.wot_graph, &state.config).await
+}
+
+#[tauri::command]
+async fn get_profile_with_refresh(
+    pubkey: String,
+    app_handle: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Option<ProfileInfo>, String> {
+    // 1. Return cached profile immediately
+    let profiles = state.db.get_profiles(&[pubkey.clone()]).map_err(|e| e.to_string())?;
+    let cached = profiles.into_iter().find(|p| p.pubkey == pubkey);
+
+    // 2. Check if we need a background refresh
+    let fetched_at = state.db.get_profile_fetched_at(&pubkey).map_err(|e| e.to_string())?;
+    let now = chrono::Utc::now().timestamp();
+    let twelve_hours = 12 * 60 * 60;
+    let needs_refresh = match fetched_at {
+        Some(ts) => (now - ts) > twelve_hours,
+        None => true,
+    };
+
+    if needs_refresh {
+        // 3. Spawn background fetch — don't block the response
+        let pk = pubkey.clone();
+        let db = state.db.clone();
+        let wot = state.wot_graph.clone();
+        let config = state.config.clone();
+        let handle = app_handle.clone();
+
+        tokio::spawn(async move {
+            tracing::info!("[profile_refresh] Background fetch for {}...", &pk[..pk.len().min(12)]);
+
+            // Get old profile for comparison
+            let old_profile_json = db.get_profiles(&[pk.clone()])
+                .ok()
+                .and_then(|ps| ps.into_iter().find(|p| p.pubkey == pk))
+                .and_then(|p| serde_json::to_string(&p).ok());
+
+            match do_fetch_profile(&pk, &db, &wot, &config).await {
+                Ok(_) => {
+                    let now = chrono::Utc::now().timestamp();
+                    db.set_profile_fetched_at(&pk, now).ok();
+
+                    // Check if any profile field changed
+                    let new_profile_json = db.get_profiles(&[pk.clone()])
+                        .ok()
+                        .and_then(|ps| ps.into_iter().find(|p| p.pubkey == pk))
+                        .and_then(|p| serde_json::to_string(&p).ok());
+
+                    if old_profile_json != new_profile_json {
+                        handle.emit("profile-updated", &pk).ok();
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("[profile_refresh] Failed for {}: {}", &pk[..pk.len().min(12)], e);
+                }
+            }
+        });
+    }
+
+    Ok(cached)
 }
 
 #[tauri::command]
@@ -2079,6 +2150,7 @@ pub fn run() {
             untrack_profile,
             get_tracked_profiles,
             fetch_profile,
+            get_profile_with_refresh,
             get_profile_cache_status,
             set_nsec,
             clear_nsec,
