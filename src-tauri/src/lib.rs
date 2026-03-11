@@ -13,7 +13,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use storage::{Database, ProfileInfo};
-use sync::{resolve_relay_alias, SyncConfig, SyncEngine, SyncEngineV2, SyncStats, SyncTier};
+use sync::{resolve_relay_url as resolve_relay_alias, SyncConfig, SyncEngine, SyncStats};
 use wot::WotGraph;
 
 // ── App State ──────────────────────────────────────────────────────
@@ -56,8 +56,6 @@ pub struct AppConfig {
     pub sync_wot_batch_size: u32,
     pub sync_wot_events_per_batch: u32,
     pub max_event_age_days: u32,
-    /// "v1" for legacy SyncEngine, "v2" for relay-centric SyncEngineV2
-    pub sync_engine_version: String,
     /// Cached nsec (loaded from system keychain on startup)
     pub nsec: Option<String>,
 }
@@ -91,7 +89,6 @@ impl Default for AppConfig {
             sync_wot_batch_size: 5,
             sync_wot_events_per_batch: 15,
             max_event_age_days: 30,
-            sync_engine_version: "v2".to_string(),
             nsec: None,
         }
     }
@@ -207,10 +204,8 @@ pub struct WotDistanceResponse {
 
 // ── Sync Engine Factory ───────────────────────────────────────────
 
-/// Start the appropriate sync engine based on config version.
-/// Returns a CancellationToken for stopping the engine.
+/// Start the sync engine. Returns a CancellationToken for stopping.
 fn start_sync_engine(
-    version: &str,
     wot_graph: Arc<WotGraph>,
     db: Arc<Database>,
     relays: Vec<String>,
@@ -222,19 +217,11 @@ fn start_sync_engine(
     sync_config: SyncConfig,
     max_event_age_days: u32,
 ) -> CancellationToken {
-    if version == "v1" {
-        let engine = Arc::new(SyncEngine::new(
-            wot_graph, db, relays, hex_pubkey, sync_tier, sync_stats,
-            app_handle, media_gb, sync_config, max_event_age_days,
-        ));
-        engine.start()
-    } else {
-        let engine = Arc::new(SyncEngineV2::new(
-            wot_graph, db, relays, hex_pubkey, sync_tier, sync_stats,
-            app_handle, media_gb, sync_config, max_event_age_days,
-        ));
-        engine.start()
-    }
+    let engine = Arc::new(SyncEngine::new(
+        wot_graph, db, relays, hex_pubkey, sync_tier, sync_stats,
+        app_handle, media_gb, sync_config, max_event_age_days,
+    ));
+    engine.start()
 }
 
 // ── Tauri Commands ─────────────────────────────────────────────────
@@ -261,12 +248,12 @@ async fn get_status(state: State<'_, AppState>) -> Result<AppStatus, String> {
         wot_nodes: stats.node_count,
         wot_edges: stats.edge_count,
         sync_status: if sync_running {
-            match SyncTier::from(current_tier) {
-                SyncTier::Critical => "syncing (tier 1: critical)".into(),
-                SyncTier::Important => "syncing (tier 2: recent events)".into(),
-                SyncTier::Background => "syncing (tier 3: WoT crawl)".into(),
-                SyncTier::Archive => "syncing (tier 4: archive)".into(),
-                SyncTier::Idle => "idle".into(),
+            match current_tier {
+                1 => "syncing (phase 1: own data)".into(),
+                2 => "syncing (phase 2: discovery)".into(),
+                3 => "syncing (phase 3: content)".into(),
+                4 => "syncing (phase 4: media)".into(),
+                _ => "idle".into(),
             }
         } else {
             "idle".into()
@@ -355,7 +342,6 @@ async fn init_nostrito(
         cycle_interval_secs: config.sync_interval_secs,
     };
     let cancel = start_sync_engine(
-        &config.sync_engine_version,
         state.wot_graph.clone(),
         state.db.clone(),
         config.outbound_relays.clone(),
@@ -532,7 +518,6 @@ async fn start_sync(
         cycle_interval_secs: config.sync_interval_secs,
     };
     let cancel = start_sync_engine(
-        &config.sync_engine_version,
         state.wot_graph.clone(),
         state.db.clone(),
         config.outbound_relays.clone(),
@@ -555,7 +540,7 @@ async fn stop_sync(state: State<'_, AppState>) -> Result<(), String> {
     let cancel = state.sync_cancel.write().await.take();
     if let Some(cancel) = cancel {
         cancel.cancel();
-        state.sync_tier.store(SyncTier::Idle as u8, Ordering::Relaxed);
+        state.sync_tier.store(0u8, Ordering::Relaxed);
         tracing::info!("Sync engine stopped");
     }
     Ok(())
@@ -567,7 +552,7 @@ async fn restart_sync(state: State<'_, AppState>, app_handle: tauri::AppHandle) 
     // Cancel existing sync
     if let Some(cancel) = state.sync_cancel.write().await.take() {
         cancel.cancel();
-        state.sync_tier.store(SyncTier::Idle as u8, Ordering::Relaxed);
+        state.sync_tier.store(0u8, Ordering::Relaxed);
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
@@ -590,7 +575,6 @@ async fn restart_sync(state: State<'_, AppState>, app_handle: tauri::AppHandle) 
     };
 
     let cancel = start_sync_engine(
-        &config.sync_engine_version,
         state.wot_graph.clone(),
         state.db.clone(),
         config.outbound_relays.clone(),
@@ -866,7 +850,7 @@ async fn reset_app_data(
         cancel.cancel();
         state
             .sync_tier
-            .store(SyncTier::Idle as u8, Ordering::Relaxed);
+            .store(0u8, Ordering::Relaxed);
     }
 
     // Stop relay if running
@@ -918,7 +902,7 @@ async fn change_account(
         cancel.cancel();
         state
             .sync_tier
-            .store(SyncTier::Idle as u8, Ordering::Relaxed);
+            .store(0u8, Ordering::Relaxed);
     }
 
     // Stop relay if running
@@ -939,10 +923,6 @@ async fn change_account(
     let identity_keys = [
         "npub",
         "hex_pubkey",
-        "tier2_since",
-        "tier2_history_until",
-        "tier2_history_until_articles",
-        "sync_tier3_checkpoint",
     ];
     for key in &identity_keys {
         state
@@ -1178,7 +1158,7 @@ async fn save_settings(settings: Settings, app_handle: tauri::AppHandle, state: 
     config.sync_interval_secs = settings.sync_interval_secs;
     // Only update relays if the new list has valid entries — never clear to empty
     let valid_relays: Vec<String> = settings.outbound_relays.iter()
-        .map(|r| sync::resolve_relay_alias(r).to_string())
+        .map(|r| sync::resolve_relay_url(r).to_string())
         .filter(|r| !r.trim().is_empty())
         .collect();
     if !valid_relays.is_empty() {
@@ -1234,7 +1214,7 @@ async fn save_settings(settings: Settings, app_handle: tauri::AppHandle, state: 
     // Cancel existing sync, then start a new engine with the fresh config.
     if let Some(cancel) = state.sync_cancel.write().await.take() {
         cancel.cancel();
-        state.sync_tier.store(SyncTier::Idle as u8, Ordering::Relaxed);
+        state.sync_tier.store(0u8, Ordering::Relaxed);
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
@@ -1251,7 +1231,6 @@ async fn save_settings(settings: Settings, app_handle: tauri::AppHandle, state: 
             cycle_interval_secs: config.sync_interval_secs,
         };
         let cancel = start_sync_engine(
-            &config.sync_engine_version,
             state.wot_graph.clone(),
             state.db.clone(),
             config.outbound_relays.clone(),
@@ -1903,8 +1882,6 @@ pub fn run() {
     if let Ok(Some(v)) = db.get_config("storage_media_gb") { if let Ok(n) = v.parse::<f64>() { config.storage_media_gb = n; } }
     if let Ok(Some(v)) = db.get_config("wot_max_depth") { if let Ok(n) = v.parse::<u32>() { config.wot_max_depth = n; } }
     if let Ok(Some(v)) = db.get_config("sync_interval_secs") { if let Ok(n) = v.parse::<u32>() { config.sync_interval_secs = n; } }
-    if let Ok(Some(v)) = db.get_config("sync_engine_version") { config.sync_engine_version = v; }
-
     // Load nsec from system keychain
     if let Some(ref npub) = config.npub {
         if let Some(nsec) = load_nsec_from_keychain(npub) {
@@ -1913,7 +1890,7 @@ pub fn run() {
         }
     }
 
-    tracing::info!("[init] Config: npub={:?}, relays={:?}, port={}, engine={}, signing={}", config.npub, config.outbound_relays, config.relay_port, config.sync_engine_version, if config.nsec.is_some() { "nsec" } else { "read-only" });
+    tracing::info!("[init] Config: npub={:?}, relays={:?}, port={}, signing={}", config.npub, config.outbound_relays, config.relay_port, if config.nsec.is_some() { "nsec" } else { "read-only" });
 
     // ── STARTUP LOG ──
     {
@@ -1927,25 +1904,14 @@ pub fn run() {
         let npub_display = config.npub.as_deref().unwrap_or("(not set)");
         let relay_list: Vec<&str> = config.outbound_relays.iter().map(|s| s.as_str()).collect();
 
-        let tier2_since_display = db.get_sync_cursor().ok().flatten()
-            .and_then(|ts| chrono::DateTime::from_timestamp(ts as i64, 0))
-            .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
-            .unwrap_or_else(|| "(none)".into());
-        let articles_cursor_display = db.get_articles_history_cursor().ok().flatten()
-            .and_then(|ts| chrono::DateTime::from_timestamp(ts as i64, 0))
-            .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
-            .unwrap_or_else(|| "(none)".into());
-
         tracing::info!(
-            "\n[NOSTRITO STARTUP]\n  npub: {}\n  relays configured: {} → {:?}\n  own events in DB: {}\n  follows: {}\n  tracked profiles: {}\n  wot peers: {}\n  tier2_since cursor: {}\n  articles cursor: {}\n  cycle interval: {}s",
+            "\n[NOSTRITO STARTUP]\n  npub: {}\n  relays configured: {} → {:?}\n  own events in DB: {}\n  follows: {}\n  tracked profiles: {}\n  wot peers: {}\n  cycle interval: {}s",
             npub_display,
             relay_list.len(), relay_list,
             event_count,
             follows_count,
             tracked_count,
             wot_stats.node_count,
-            tier2_since_display,
-            articles_cursor_display,
             config.sync_interval_secs,
         );
     }
@@ -2006,10 +1972,8 @@ pub fn run() {
                         wot_events_per_batch: cfg2.sync_wot_events_per_batch,
                         cycle_interval_secs: cfg2.sync_interval_secs,
                     };
-                    let engine_version = cfg2.sync_engine_version.clone();
                     drop(cfg2);
                     let cancel = start_sync_engine(
-                        &engine_version,
                         wot_graph,
                         db,
                         relays,

@@ -1,6 +1,80 @@
 #![allow(dead_code)]
 use serde::{Deserialize, Serialize};
 
+// ── Sync Progress Events ───────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncProgress {
+    pub tier: u8,
+    pub fetched: u64,
+    pub total: u64,
+    pub relay: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TierComplete {
+    pub tier: u8,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SyncStats {
+    pub tier1_fetched: u64,
+    pub tracked_fetched: u64,
+    pub tier2_fetched: u64,
+    pub tier3_fetched: u64,
+    pub tier4_fetched: u64,
+    pub current_tier: u8,
+    /// Conceptual layer currently executing: "0", "0.5", "1", "2", "3", or "" (idle)
+    pub current_layer: String,
+}
+
+// ── Sync Config ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct SyncConfig {
+    pub lookback_days: u32,
+    pub batch_size: u32,
+    pub events_per_batch: u32,
+    pub batch_pause_secs: u32,
+    pub relay_min_interval_secs: u32,
+    pub wot_batch_size: u32,
+    pub wot_events_per_batch: u32,
+    pub cycle_interval_secs: u32,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            lookback_days: 7,
+            batch_size: 10,
+            events_per_batch: 50,
+            batch_pause_secs: 7,
+            relay_min_interval_secs: 3,
+            wot_batch_size: 5,
+            wot_events_per_batch: 15,
+            cycle_interval_secs: 300,
+        }
+    }
+}
+
+// ── Relay URL Resolution ───────────────────────────────────────────
+
+/// Resolve a relay alias (e.g. "primal") to its canonical wss:// URL.
+/// Returns the input unchanged if it's already a URL or unknown alias.
+pub fn resolve_relay_url(alias: &str) -> &str {
+    match alias {
+        "primal" => "wss://relay.primal.net",
+        "damus" => "wss://relay.damus.io",
+        "nos" => "wss://relay.nos.social",
+        "snort" => "wss://relay.snort.social",
+        "coracle" => "wss://relay.coracle.social",
+        "nostr.wine" => "wss://nostr.wine",
+        "amethyst" => "wss://nostr.band",
+        "yakihonne" => "wss://relay.yakihonne.com",
+        _ => alias,
+    }
+}
+
 // ── Sync Phases ──────────────────────────────────────────────────
 
 /// The five phases of a v2 sync cycle, executed in order.

@@ -1767,3 +1767,76 @@ impl Database {
         Ok(ids_to_delete.len() as u64)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_prune_skips_referenced_events() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+
+        let pk_a = "a".repeat(64);
+        let pk_b = "b".repeat(64);
+
+        // Event B (old, from pk_b) — a root note
+        db.store_event("ev_b", &pk_b, 1000, 1, "[]", "root note", "sig_b").unwrap();
+
+        // Event A (newer, from pk_a) — replies to B via e-tag
+        let tags_a = r#"[["e","ev_b"]]"#;
+        db.store_event("ev_a", &pk_a, 2000, 1, tags_a, "reply to B", "sig_a").unwrap();
+
+        // Insert thread ref: ev_a references ev_b
+        db.insert_thread_refs("ev_a", &["ev_b".to_string()]).unwrap();
+
+        // Try to prune pk_b's events with a cutoff that would normally delete ev_b
+        let deleted = db.prune_pubkey_events(&pk_b, 1500, 0).unwrap();
+
+        // ev_b should NOT be deleted because it's referenced by ev_a
+        assert_eq!(deleted, 0);
+
+        // Verify ev_b still exists
+        let events = db.query_events(Some(&["ev_b".to_string()]), None, None, None, None, 1).unwrap();
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn test_prune_deletes_unreferenced_events() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+
+        let pk = "c".repeat(64);
+
+        // Store two old events, no thread refs
+        db.store_event("ev1", &pk, 1000, 1, "[]", "old note 1", "sig1").unwrap();
+        db.store_event("ev2", &pk, 1100, 1, "[]", "old note 2", "sig2").unwrap();
+        // One newer event
+        db.store_event("ev3", &pk, 3000, 1, "[]", "new note", "sig3").unwrap();
+
+        // Prune with cutoff at 2000, keep min 1
+        let deleted = db.prune_pubkey_events(&pk, 2000, 1).unwrap();
+
+        // Should delete ev1 (oldest, below cutoff, not in top 1)
+        // ev2 is also below cutoff but the min-events=1 keeps the newest non-metadata event
+        assert!(deleted >= 1);
+    }
+
+    #[test]
+    fn test_thread_refs_insert_and_cleanup() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+
+        // Insert refs
+        db.insert_thread_refs("reply1", &["root1".to_string(), "root2".to_string()]).unwrap();
+        db.insert_thread_refs("reply2", &["root1".to_string()]).unwrap();
+
+        // Delete refs for reply1
+        db.delete_thread_refs_by_referencing("reply1").unwrap();
+
+        // root1 should still be referenced by reply2
+        // root2 should no longer be referenced
+        // We can verify this works without error
+        db.delete_thread_refs_by_referencing("reply2").unwrap();
+    }
+}
