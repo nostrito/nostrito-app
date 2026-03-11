@@ -65,8 +65,19 @@ function formatUptime(seconds: number): string {
   return `${seconds}s`;
 }
 
-function contentPreview(content: string): string {
-  return content.replace(/https?:\/\/\S+/g, "").trim().slice(0, 60) || "\u2014";
+function contentPreview(event: NostrEvent): string {
+  // For reposts, try to parse the embedded event and show its content
+  if (event.kind === 6 && event.content.trim()) {
+    try {
+      const original = JSON.parse(event.content);
+      if (original && typeof original.content === "string" && original.content.trim()) {
+        return original.content.replace(/https?:\/\/\S+/g, "").trim().slice(0, 60) || "\u2014";
+      }
+    } catch {
+      // Not valid JSON, fall through
+    }
+  }
+  return event.content.replace(/https?:\/\/\S+/g, "").trim().slice(0, 60) || "\u2014";
 }
 
 /* ------------------------------------------------------------------ */
@@ -136,6 +147,7 @@ export const Dashboard: React.FC = () => {
   const [uptime, setUptime] = useState<number>(0);
   const [activityData, setActivityData] = useState<number[]>(new Array(24).fill(0));
   const [relays, setRelays] = useState<RelayStatusInfo[]>([]);
+  const [relaysLoaded, setRelaysLoaded] = useState(false);
   const [events, setEvents] = useState<NostrEvent[]>([]);
   const [profileMap, setProfileMap] = useState<Map<string, ProfileInfo>>(new Map());
   const feedLoadingRef = useRef(false);
@@ -173,8 +185,9 @@ export const Dashboard: React.FC = () => {
     try {
       const r = await invoke<RelayStatusInfo[]>("get_relay_status");
       setRelays(r);
+      setRelaysLoaded(true);
     } catch (_) {
-      /* ignore */
+      setRelaysLoaded(true);
     }
   }, []);
 
@@ -229,15 +242,18 @@ export const Dashboard: React.FC = () => {
   useEffect(() => {
     if (syncProgress) {
       loadStats();
+      loadFeed();
+      loadActivityChart();
     }
-  }, [syncProgress, loadStats]);
+  }, [syncProgress, loadStats, loadFeed, loadActivityChart]);
 
   useEffect(() => {
     if (tierComplete) {
       loadStats();
       loadFeed();
+      loadRelayStatus();
     }
-  }, [tierComplete, loadStats, loadFeed]);
+  }, [tierComplete, loadStats, loadFeed, loadRelayStatus]);
 
   /* --- derived values ------------------------------------------------ */
   const relayUrl = status ? `wss://localhost:${status.relay_port}` : "";
@@ -349,17 +365,19 @@ export const Dashboard: React.FC = () => {
                 const name = profileDisplayName(profile, e.pubkey);
                 const kind = kindLabel(e.kind);
                 const kindCls = kindCssClass(e.kind);
-                const preview = contentPreview(e.content);
+                const preview = contentPreview(e);
 
                 return (
                   <div className="dash-live-row" key={e.id}>
-                    <Avatar
-                      picture={profile?.picture}
-                      pubkey={e.pubkey}
-                      className="live-avatar"
-                      fallbackClassName="live-avatar-fallback"
-                    />
-                    <span className="live-name">{name}</span>
+                    <span data-pubkey={e.pubkey} style={{ cursor: "pointer", display: "flex", alignItems: "center", gap: 8 }}>
+                      <Avatar
+                        picture={profile?.picture}
+                        pubkey={e.pubkey}
+                        className="live-avatar"
+                        fallbackClassName="live-avatar-fallback"
+                      />
+                      <span className="live-name">{name}</span>
+                    </span>
                     <span className={`live-kind ${kindCls}`}>{kind}</span>
                     <span className="live-preview">{preview}</span>
                     <span className="live-time">{timeAgo(e.created_at)}</span>
@@ -407,7 +425,7 @@ export const Dashboard: React.FC = () => {
                     padding: "4px 0",
                   }}
                 >
-                  No relays configured
+                  {relaysLoaded ? "No relays configured" : "Connecting..."}
                 </div>
               ) : (
                 relays.map((r) => (
