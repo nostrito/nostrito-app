@@ -16,6 +16,10 @@ pub struct ProfileInfo {
     pub display_name: Option<String>,
     pub picture: Option<String>,
     pub nip05: Option<String>,
+    pub about: Option<String>,
+    pub banner: Option<String>,
+    pub website: Option<String>,
+    pub lud16: Option<String>,
 }
 
 pub struct Database {
@@ -740,6 +744,10 @@ impl Database {
                             display_name: parsed.get("display_name").and_then(|v| v.as_str()).map(String::from),
                             picture: parsed.get("picture").and_then(|v| v.as_str()).map(String::from),
                             nip05: parsed.get("nip05").and_then(|v| v.as_str()).map(String::from),
+                            about: parsed.get("about").and_then(|v| v.as_str()).map(String::from),
+                            banner: parsed.get("banner").and_then(|v| v.as_str()).map(String::from),
+                            website: parsed.get("website").and_then(|v| v.as_str()).map(String::from),
+                            lud16: parsed.get("lud16").and_then(|v| v.as_str()).map(String::from),
                         });
                     }
                 }
