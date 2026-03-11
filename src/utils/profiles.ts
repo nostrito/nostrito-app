@@ -8,6 +8,9 @@ export interface ProfileInfo {
   picture: string | null;
   nip05: string | null;
   about: string | null;
+  banner: string | null;
+  website: string | null;
+  lud16: string | null;
 }
 
 const profileCache = new Map<string, ProfileInfo>();
