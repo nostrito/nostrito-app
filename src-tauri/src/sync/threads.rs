@@ -196,6 +196,7 @@ impl ThreadContext {
                     &self.graph,
                     &self.own_pubkey,
                     EventSource::ThreadContext,
+                    super::types::MEDIA_PRIORITY_OTHERS,
                 );
                 if stored > 0 {
                     debug!("Thread: fetched {} events from {}", stored, relay_url);

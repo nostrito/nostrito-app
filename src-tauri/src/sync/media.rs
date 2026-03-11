@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use anyhow::Result;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -11,14 +12,20 @@ pub struct MediaDownloader {
     db: Arc<Database>,
     own_pubkey: String,
     limit_bytes: u64,
+    tracked_pubkeys: HashSet<String>,
 }
 
 impl MediaDownloader {
     pub fn new(db: Arc<Database>, own_pubkey: String, storage_gb: f64) -> Self {
+        let tracked = db.get_tracked_pubkeys()
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<HashSet<String>>();
         Self {
             db,
             own_pubkey,
             limit_bytes: (storage_gb * 1_073_741_824.0) as u64,
+            tracked_pubkeys: tracked,
         }
     }
 
@@ -45,8 +52,8 @@ impl MediaDownloader {
                 continue;
             }
 
-            let is_own = pubkey == &self.own_pubkey;
-            match self.download_media(&http_client, url, &hash, pubkey, is_own).await {
+            let bypass_limit = pubkey == &self.own_pubkey || self.tracked_pubkeys.contains(pubkey);
+            match self.download_media(&http_client, url, &hash, pubkey, bypass_limit).await {
                 Ok(true) => stats.downloaded += 1,
                 Ok(false) => stats.skipped += 1,
                 Err(e) => {
@@ -76,7 +83,7 @@ impl MediaDownloader {
         url: &str,
         hash: &str,
         pubkey: &str,
-        is_own: bool,
+        bypass_limit: bool,
     ) -> Result<bool> {
         const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024; // 50 MB
 
@@ -99,7 +106,7 @@ impl MediaDownloader {
             if cl > MAX_FILE_SIZE {
                 return Ok(false);
             }
-            if !is_own {
+            if !bypass_limit {
                 let used = self.db.media_total_bytes().unwrap_or(0);
                 if used + cl > self.limit_bytes {
                     return Ok(false);
@@ -136,7 +143,7 @@ impl MediaDownloader {
             return Ok(false);
         }
 
-        if !is_own {
+        if !bypass_limit {
             let used = self.db.media_total_bytes().unwrap_or(0);
             if used + size_bytes > self.limit_bytes {
                 return Ok(false);

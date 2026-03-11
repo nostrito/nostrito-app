@@ -230,10 +230,14 @@ impl SyncEngine {
             &events,
             &self.db,
             &self.graph,
-            &self.hex_pubkey,
-            EventSource::Sync,
+            &self.hex_pubkey,            EventSource::OwnBackup,
+            super::types::MEDIA_PRIORITY_OWNER,
         );
 
+        {
+            let mut ss = self.sync_stats.write().await;
+            ss.tier1_fetched += stored as u64;
+        }
         self.emit_progress(1, stored as u64, events.len() as u64, "own");
         info!("Phase 1: {} events stored, {} WoT updates", stored, wot);
 
@@ -281,14 +285,11 @@ impl SyncEngine {
             self.hex_pubkey.clone(),
             self.sync_config.lookback_days,
             self.sync_config.fof_content,
+            self.sync_config.hop3_content,
+            Arc::clone(&self.sync_stats),
         );
 
         let stats = content.run(&needing_refresh).await?;
-
-        {
-            let mut ss = self.sync_stats.write().await;
-            ss.tier2_fetched += stats.events_stored as u64;
-        }
 
         self.emit_progress(3, stats.events_stored as u64, 0, "content");
         info!(
@@ -397,6 +398,7 @@ impl SyncEngine {
                         &self.graph,
                         &self.hex_pubkey,
                         EventSource::Sync,
+                        super::types::MEDIA_PRIORITY_FOF,
                     );
 
                     let mut ss = self.sync_stats.write().await;
@@ -421,6 +423,18 @@ impl SyncEngine {
     // ── Event Emission ───────────────────────────────────────────
 
     fn emit_phase(&self, phase: SyncPhase) {
+        let layer = match phase {
+            SyncPhase::OwnData => "0",
+            SyncPhase::Discovery => "0",
+            SyncPhase::ContentFetch => "1",
+            SyncPhase::ThreadContext => "1",
+            SyncPhase::MediaDownload => "3",
+        };
+        // Update sync_stats with current phase info
+        if let Ok(mut ss) = self.sync_stats.try_write() {
+            ss.current_tier = phase as u8;
+            ss.current_layer = layer.to_string();
+        }
         let progress = SyncProgress {
             tier: phase as u8,
             fetched: 0,
@@ -441,6 +455,13 @@ impl SyncEngine {
     }
 
     fn emit_tier_complete(&self, tier: u8) {
+        if tier == 0 {
+            // Cycle complete — mark as idle
+            if let Ok(mut ss) = self.sync_stats.try_write() {
+                ss.current_tier = 0;
+                ss.current_layer = String::new();
+            }
+        }
         self.app_handle.emit("sync:tier_complete", &TierComplete { tier }).ok();
     }
 }

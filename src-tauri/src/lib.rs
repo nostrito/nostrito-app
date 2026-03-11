@@ -58,6 +58,8 @@ pub struct AppConfig {
     pub max_event_age_days: u32,
     /// Fetch content (kind:1/6/30023) from follows-of-follows
     pub sync_fof_content: bool,
+    /// Fetch content from hop-3 pubkeys (lowest priority)
+    pub sync_hop3_content: bool,
     /// Cached nsec (loaded from system keychain on startup)
     pub nsec: Option<String>,
 }
@@ -92,6 +94,7 @@ impl Default for AppConfig {
             sync_wot_events_per_batch: 15,
             max_event_age_days: 30,
             sync_fof_content: false,
+            sync_hop3_content: false,
             nsec: None,
         }
     }
@@ -186,6 +189,7 @@ pub struct Settings {
     pub sync_wot_events_per_batch: u32,
     pub max_event_age_days: u32,
     pub sync_fof_content: bool,
+    pub sync_hop3_content: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -364,6 +368,7 @@ async fn init_nostrito(
         wot_events_per_batch: config.sync_wot_events_per_batch,
         cycle_interval_secs: config.sync_interval_secs,
         fof_content: config.sync_fof_content,
+        hop3_content: config.sync_hop3_content,
     };
     let cancel = start_sync_engine(
         state.wot_graph.clone(),
@@ -541,6 +546,7 @@ async fn start_sync(
         wot_events_per_batch: config.sync_wot_events_per_batch,
         cycle_interval_secs: config.sync_interval_secs,
         fof_content: config.sync_fof_content,
+        hop3_content: config.sync_hop3_content,
     };
     let cancel = start_sync_engine(
         state.wot_graph.clone(),
@@ -598,6 +604,7 @@ async fn restart_sync(state: State<'_, AppState>, app_handle: tauri::AppHandle) 
         wot_events_per_batch: config.sync_wot_events_per_batch,
         cycle_interval_secs: config.sync_interval_secs,
         fof_content: config.sync_fof_content,
+        hop3_content: config.sync_hop3_content,
     };
 
     let cancel = start_sync_engine(
@@ -1066,6 +1073,22 @@ async fn get_ownership_storage_stats(state: State<'_, AppState>) -> Result<Owner
     let total_events = db.event_count().map_err(|e| e.to_string())?;
     let db_size_bytes = db.db_size_bytes().map_err(|e| e.to_string())?;
 
+    // Debug: show tracked pubkeys and whether they match any events
+    let tracked_pks = db.get_tracked_pubkeys().unwrap_or_default();
+    if !tracked_pks.is_empty() {
+        for tpk in &tracked_pks {
+            let is_own = tpk == &own_pubkey;
+            let event_sample = db.query_events(None, Some(&[tpk.clone()]), None, None, None, 1).unwrap_or_default();
+            tracing::info!(
+                "[cmd:get_ownership_storage_stats] tracked_pk={}... is_own={} has_events={} format={}",
+                &tpk[..tpk.len().min(16)], is_own, !event_sample.is_empty(),
+                if tpk.starts_with("npub") { "npub" } else { "hex" }
+            );
+        }
+    } else {
+        tracing::warn!("[cmd:get_ownership_storage_stats] tracked_profiles table is EMPTY");
+    }
+
     tracing::info!(
         "[cmd:get_ownership_storage_stats] own={}/{}, tracked={}/{}, wot={}/{}",
         own_events_count, own_media_bytes,
@@ -1455,6 +1478,7 @@ async fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
         sync_wot_events_per_batch: config.sync_wot_events_per_batch,
         max_event_age_days: config.max_event_age_days,
         sync_fof_content: config.sync_fof_content,
+        sync_hop3_content: config.sync_hop3_content,
     })
 }
 
@@ -1490,6 +1514,7 @@ async fn save_settings(settings: Settings, app_handle: tauri::AppHandle, state: 
     config.sync_wot_events_per_batch = settings.sync_wot_events_per_batch;
     config.max_event_age_days = settings.max_event_age_days;
     config.sync_fof_content = settings.sync_fof_content;
+    config.sync_hop3_content = settings.sync_hop3_content;
 
     // Persist ALL settings to DB so they survive restart
     drop(config);
@@ -1522,6 +1547,7 @@ async fn save_settings(settings: Settings, app_handle: tauri::AppHandle, state: 
     db.set_config("sync_wot_events_per_batch", &settings.sync_wot_events_per_batch.to_string()).ok();
     db.set_config("max_event_age_days", &settings.max_event_age_days.to_string()).ok();
     db.set_config("sync_fof_content", if settings.sync_fof_content { "true" } else { "false" }).ok();
+    db.set_config("sync_hop3_content", if settings.sync_hop3_content { "true" } else { "false" }).ok();
     db.set_config("storage_own_media_gb", &settings.storage_own_media_gb.to_string()).ok();
     db.set_config("storage_tracked_media_gb", &settings.storage_tracked_media_gb.to_string()).ok();
     db.set_config("storage_wot_media_gb", &settings.storage_wot_media_gb.to_string()).ok();
@@ -1548,6 +1574,7 @@ async fn save_settings(settings: Settings, app_handle: tauri::AppHandle, state: 
             wot_events_per_batch: config.sync_wot_events_per_batch,
             cycle_interval_secs: config.sync_interval_secs,
             fof_content: config.sync_fof_content,
+            hop3_content: config.sync_hop3_content,
         };
         let cancel = start_sync_engine(
             state.wot_graph.clone(),
@@ -1572,8 +1599,21 @@ async fn save_settings(settings: Settings, app_handle: tauri::AppHandle, state: 
 
 #[tauri::command]
 async fn track_profile(pubkey: String, note: Option<String>, state: State<'_, AppState>) -> Result<(), String> {
-    tracing::info!("[cmd:track_profile] pubkey={}...", &pubkey[..pubkey.len().min(12)]);
-    state.db.track_profile(&pubkey, note.as_deref()).map_err(|e| e.to_string())
+    use nostr_sdk::prelude::*;
+    let trimmed = pubkey.trim();
+    // Normalize npub/hex to hex pubkey
+    let hex_pk = if trimmed.starts_with("npub") {
+        PublicKey::from_bech32(trimmed)
+            .map(|pk| pk.to_hex())
+            .map_err(|e| format!("Invalid npub: {}", e))?
+    } else {
+        // Validate hex pubkey
+        PublicKey::from_hex(trimmed)
+            .map(|pk| pk.to_hex())
+            .map_err(|e| format!("Invalid pubkey: {}", e))?
+    };
+    tracing::info!("[cmd:track_profile] pubkey={}...", &hex_pk[..hex_pk.len().min(12)]);
+    state.db.track_profile(&hex_pk, note.as_deref()).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2278,6 +2318,7 @@ pub fn run() {
     if let Ok(Some(v)) = db.get_config("sync_wot_events_per_batch") { if let Ok(n) = v.parse::<u32>() { config.sync_wot_events_per_batch = n; } }
     if let Ok(Some(v)) = db.get_config("max_event_age_days") { if let Ok(n) = v.parse::<u32>() { config.max_event_age_days = n; } }
     if let Ok(Some(v)) = db.get_config("sync_fof_content") { config.sync_fof_content = v == "true"; }
+    if let Ok(Some(v)) = db.get_config("sync_hop3_content") { config.sync_hop3_content = v == "true"; }
     if let Ok(Some(v)) = db.get_config("storage_own_media_gb") { if let Ok(n) = v.parse::<f64>() { config.storage_own_media_gb = n; } }
     if let Ok(Some(v)) = db.get_config("storage_tracked_media_gb") { if let Ok(n) = v.parse::<f64>() { config.storage_tracked_media_gb = n; } }
     if let Ok(Some(v)) = db.get_config("storage_wot_media_gb") { if let Ok(n) = v.parse::<f64>() { config.storage_wot_media_gb = n; } }
@@ -2308,7 +2349,18 @@ pub fn run() {
             .and_then(|pk| wot_graph.get_follows(pk))
             .map(|f| f.len())
             .unwrap_or(0);
-        let tracked_count = db.get_tracked_pubkeys().map(|t| t.len()).unwrap_or(0);
+        // Normalize any npub entries in tracked_profiles to hex
+        match db.normalize_tracked_profiles() {
+            Ok(n) if n > 0 => tracing::info!("[init] normalized {} tracked profile(s) from npub to hex", n),
+            Err(e) => tracing::warn!("[init] tracked profile normalization failed: {}", e),
+            _ => {}
+        }
+        let tracked_pubkeys = db.get_tracked_pubkeys().unwrap_or_default();
+        let tracked_count = tracked_pubkeys.len();
+        if !tracked_pubkeys.is_empty() {
+            let previews: Vec<String> = tracked_pubkeys.iter().map(|pk| format!("{}...", &pk[..pk.len().min(16)])).collect();
+            tracing::info!("[init] tracked pubkeys ({}): {:?}", tracked_count, previews);
+        }
         let npub_display = config.npub.as_deref().unwrap_or("(not set)");
         let relay_list: Vec<&str> = config.outbound_relays.iter().map(|s| s.as_str()).collect();
 
@@ -2380,6 +2432,7 @@ pub fn run() {
                         wot_events_per_batch: cfg2.sync_wot_events_per_batch,
                         cycle_interval_secs: cfg2.sync_interval_secs,
                         fof_content: cfg2.sync_fof_content,
+                        hop3_content: cfg2.sync_hop3_content,
                     };
                     drop(cfg2);
                     let cancel = start_sync_engine(

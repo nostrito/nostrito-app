@@ -42,6 +42,8 @@ pub struct SyncConfig {
     pub cycle_interval_secs: u32,
     /// Fetch content from follows-of-follows, prioritized by overlap count
     pub fof_content: bool,
+    /// Fetch content from hop-3 pubkeys (lowest priority)
+    pub hop3_content: bool,
 }
 
 impl Default for SyncConfig {
@@ -56,6 +58,7 @@ impl Default for SyncConfig {
             wot_events_per_batch: 15,
             cycle_interval_secs: 300,
             fof_content: false,
+            hop3_content: false,
         }
     }
 }
@@ -116,7 +119,9 @@ pub enum RetentionTier {
     Follows,
     /// Hop 2 — follows of follows.
     FollowsOfFollows,
-    /// Hop 3+ or not in WoT.
+    /// Hop 3 — three hops out.
+    Hop3,
+    /// Hop 4+ or not in WoT.
     Others,
 }
 
@@ -126,6 +131,7 @@ impl RetentionTier {
         match self {
             Self::Follows => Some("follows"),
             Self::FollowsOfFollows => Some("fof"),
+            Self::Hop3 => Some("hop3"),
             Self::Others => Some("others"),
             _ => None, // Own and Tracked have no configurable limits
         }
@@ -136,6 +142,7 @@ impl RetentionTier {
         match self {
             Self::Follows => Some(50),
             Self::FollowsOfFollows => Some(10),
+            Self::Hop3 => Some(3),
             Self::Others => Some(5),
             _ => None,
         }
@@ -146,6 +153,7 @@ impl RetentionTier {
         match self {
             Self::Follows => Some(2_592_000),         // 30 days
             Self::FollowsOfFollows => Some(604_800),  // 7 days
+            Self::Hop3 => Some(172_800),              // 2 days
             Self::Others => Some(259_200),             // 3 days
             _ => None,
         }
@@ -215,6 +223,8 @@ impl RelaySource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventSource {
     Sync,
+    /// Phase 1 own-data backup. Kind:5 deletions are stored but not executed.
+    OwnBackup,
     ThreadContext,
     Search,
 }
@@ -223,6 +233,7 @@ impl EventSource {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Sync => "sync",
+            Self::OwnBackup => "own_backup",
             Self::ThreadContext => "thread_context",
             Self::Search => "search",
         }
@@ -230,6 +241,7 @@ impl EventSource {
 
     pub fn from_str(s: &str) -> Self {
         match s {
+            "own_backup" => Self::OwnBackup,
             "thread_context" => Self::ThreadContext,
             "search" => Self::Search,
             _ => Self::Sync,
@@ -280,6 +292,16 @@ pub struct RoutingPlan {
 
 // ── Constants ────────────────────────────────────────────────────
 
+// ── Media Priority ──────────────────────────────────────────────
+
+/// Media download priority: owner (highest) → tracked → follows → FoF → hop3 → others (lowest).
+pub const MEDIA_PRIORITY_OWNER: i32 = 100;
+pub const MEDIA_PRIORITY_TRACKED: i32 = 80;
+pub const MEDIA_PRIORITY_FOLLOWS: i32 = 60;
+pub const MEDIA_PRIORITY_FOF: i32 = 40;
+pub const MEDIA_PRIORITY_HOP3: i32 = 20;
+pub const MEDIA_PRIORITY_OTHERS: i32 = 0;
+
 /// Relay polite interval between requests (seconds).
 pub const RELAY_MIN_INTERVAL_SECS: u64 = 3;
 /// Pause between relay subscription batches (seconds).
@@ -327,6 +349,9 @@ mod tests {
     fn test_retention_tier_defaults() {
         assert_eq!(RetentionTier::Follows.default_min_events(), Some(50));
         assert_eq!(RetentionTier::FollowsOfFollows.default_time_window_secs(), Some(604_800));
+        assert_eq!(RetentionTier::Hop3.default_min_events(), Some(3));
+        assert_eq!(RetentionTier::Hop3.default_time_window_secs(), Some(172_800));
+        assert_eq!(RetentionTier::Hop3.config_key(), Some("hop3"));
         assert_eq!(RetentionTier::Own.config_key(), None);
         assert_eq!(RetentionTier::Others.config_key(), Some("others"));
     }
@@ -346,7 +371,7 @@ mod tests {
 
     #[test]
     fn test_event_source_roundtrip() {
-        for src in [EventSource::Sync, EventSource::ThreadContext, EventSource::Search] {
+        for src in [EventSource::Sync, EventSource::OwnBackup, EventSource::ThreadContext, EventSource::Search] {
             assert_eq!(EventSource::from_str(src.as_str()), src);
         }
     }

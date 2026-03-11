@@ -40,6 +40,7 @@ pub fn process_event(
     graph: &Arc<WotGraph>,
     own_pubkey: &str,
     source: EventSource,
+    media_priority: i32,
 ) -> ProcessResult {
     let mut result = ProcessResult::default();
 
@@ -66,7 +67,10 @@ pub fn process_event(
     match kind {
         5 => {
             // Deletion event — verify and create tombstones
-            process_deletion(event, &event_id, &pubkey, created_at, &tags, db);
+            // Skip deletion execution during Phase 1 own-data backup to prevent self-tombstoning
+            if source != EventSource::OwnBackup {
+                process_deletion(event, &event_id, &pubkey, created_at, &tags, db);
+            }
             // Store the deletion event itself
             result.stored = store_event(db, &event_id, &pubkey, created_at, kind, &tags_json, event, source);
         }
@@ -121,7 +125,7 @@ pub fn process_event(
 
     // Queue media for newly stored content events
     if result.stored && matches!(kind, 1 | 6 | 30023) {
-        result.media_urls_queued = queue_media_urls(db, &pubkey, &event.content.to_string(), &tags);
+        result.media_urls_queued = queue_media_urls(db, &pubkey, &event.content.to_string(), &tags, media_priority);
 
         // Populate thread_refs for pruning protection
         let e_tag_refs: Vec<String> = tags
@@ -422,6 +426,7 @@ fn queue_media_urls(
     pubkey: &str,
     content: &str,
     tags: &[Vec<String>],
+    priority: i32,
 ) -> u32 {
     let mut count = 0u32;
 
@@ -430,7 +435,7 @@ fn queue_media_urls(
         if (word.starts_with("https://") || word.starts_with("http://"))
             && is_media_url(word)
         {
-            if db.queue_media_url(word, pubkey).is_ok() {
+            if db.queue_media_url(word, pubkey, priority).is_ok() {
                 count += 1;
             }
         }
@@ -443,7 +448,7 @@ fn queue_media_urls(
             if (url.starts_with("https://") || url.starts_with("http://"))
                 && is_media_url(url)
             {
-                if db.queue_media_url(url, pubkey).is_ok() {
+                if db.queue_media_url(url, pubkey, priority).is_ok() {
                     count += 1;
                 }
             }
@@ -475,6 +480,7 @@ pub fn process_events(
     graph: &Arc<WotGraph>,
     own_pubkey: &str,
     source: EventSource,
+    media_priority: i32,
 ) -> (u32, u32) {
     let mut stored = 0u32;
     let mut wot_updates = 0u32;
@@ -484,7 +490,7 @@ pub fn process_events(
     sorted.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
     for event in sorted {
-        let result = process_event(event, db, graph, own_pubkey, source);
+        let result = process_event(event, db, graph, own_pubkey, source, media_priority);
         if result.stored {
             stored += 1;
         }

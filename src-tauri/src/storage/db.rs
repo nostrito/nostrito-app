@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::storage::migrations;
 use crate::wot::WotGraph;
@@ -120,8 +120,10 @@ impl Database {
             CREATE TABLE IF NOT EXISTS media_queue (
                 url TEXT PRIMARY KEY,
                 pubkey TEXT NOT NULL,
-                queued_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+                queued_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                priority INTEGER NOT NULL DEFAULT 0
             );
+            CREATE INDEX IF NOT EXISTS idx_media_queue_priority ON media_queue(priority DESC, queued_at ASC);
 
             CREATE TABLE IF NOT EXISTS tracked_profiles (
                 pubkey TEXT PRIMARY KEY,
@@ -897,6 +899,32 @@ impl Database {
         Ok(rows)
     }
 
+    /// Normalize any npub entries in tracked_profiles to hex format.
+    /// Should be called once at startup.
+    pub fn normalize_tracked_profiles(&self) -> Result<u32> {
+        use nostr_sdk::prelude::*;
+        let profiles = self.get_tracked_profiles()?;
+        let mut fixed = 0u32;
+        let conn = self.conn.lock().unwrap();
+        for (pubkey, _tracked_at, note) in &profiles {
+            if pubkey.starts_with("npub") {
+                if let Ok(pk) = PublicKey::from_bech32(pubkey) {
+                    let hex = pk.to_hex();
+                    conn.execute("DELETE FROM tracked_profiles WHERE pubkey = ?1", params![pubkey])?;
+                    conn.execute(
+                        "INSERT OR REPLACE INTO tracked_profiles (pubkey, tracked_at, note) VALUES (?1, strftime('%s','now'), ?2)",
+                        params![hex, note],
+                    )?;
+                    info!("[db] normalized tracked profile npub→hex: {}...", &hex[..hex.len().min(12)]);
+                    fixed += 1;
+                } else {
+                    warn!("[db] invalid npub in tracked_profiles: {}...", &pubkey[..pubkey.len().min(16)]);
+                }
+            }
+        }
+        Ok(fixed)
+    }
+
     /// Prune events older than max_age_secs, excluding own events and tracked profiles.
     pub fn prune_old_events(&self, own_pubkey: &str, max_age_secs: u64) -> Result<u64> {
         let conn = self.conn.lock().unwrap();
@@ -993,11 +1021,11 @@ impl Database {
         Ok(rows)
     }
 
-    /// Total bytes used by others' media (excluding own pubkey)
+    /// Total bytes used by evictable media (excluding own pubkey and tracked profiles)
     pub fn media_others_bytes(&self, exclude_pubkey: &str) -> Result<u64> {
         let conn = self.conn.lock().unwrap();
         let total: i64 = conn.query_row(
-            "SELECT COALESCE(SUM(size_bytes), 0) FROM media_cache WHERE pubkey != ?1",
+            "SELECT COALESCE(SUM(size_bytes), 0) FROM media_cache WHERE pubkey != ?1 AND pubkey NOT IN (SELECT pubkey FROM tracked_profiles)",
             params![exclude_pubkey],
             |row| row.get(0),
         )?;
@@ -1092,12 +1120,13 @@ impl Database {
 
     // ── Media queue ─────────────────────────────────────────────
 
-    /// Queue a media URL for later download (INSERT OR IGNORE to dedup).
-    pub fn queue_media_url(&self, url: &str, pubkey: &str) -> Result<()> {
+    /// Queue a media URL for later download. Higher priority upgrades existing entries.
+    pub fn queue_media_url(&self, url: &str, pubkey: &str, priority: i32) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR IGNORE INTO media_queue (url, pubkey) VALUES (?1, ?2)",
-            params![url, pubkey],
+            "INSERT INTO media_queue (url, pubkey, priority) VALUES (?1, ?2, ?3)
+             ON CONFLICT(url) DO UPDATE SET priority = MAX(priority, excluded.priority)",
+            params![url, pubkey, priority],
         )?;
         Ok(())
     }
@@ -1106,7 +1135,7 @@ impl Database {
     pub fn dequeue_media_urls(&self, limit: usize) -> Result<Vec<(String, String)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT url, pubkey FROM media_queue ORDER BY queued_at ASC LIMIT ?1",
+            "SELECT url, pubkey FROM media_queue ORDER BY priority DESC, queued_at ASC LIMIT ?1",
         )?;
         let rows: Vec<(String, String)> = stmt
             .query_map(params![limit as i64], |row| {

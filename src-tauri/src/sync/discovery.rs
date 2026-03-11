@@ -118,6 +118,7 @@ impl Discovery {
                         &self.graph,
                         &self.own_pubkey,
                         EventSource::Sync,
+                        super::types::MEDIA_PRIORITY_OTHERS,
                     );
                     total_processed += stored;
                 }
