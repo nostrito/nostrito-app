@@ -3,7 +3,7 @@ use rusqlite::Connection;
 use tracing::info;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Get the current schema version from the database.
 pub fn get_schema_version(conn: &Connection) -> u32 {
@@ -38,6 +38,10 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
 
     if current < 2 {
         migrate_v1_to_v2(conn)?;
+    }
+
+    if current < 3 {
+        migrate_v2_to_v3(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -286,6 +290,18 @@ fn bootstrap_retention_defaults(conn: &Connection) -> Result<()> {
         "#,
     )?;
     info!("Bootstrapped default retention config");
+    Ok(())
+}
+
+fn migrate_v2_to_v3(conn: &Connection) -> Result<()> {
+    info!("Running migration v2 → v3...");
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS profile_cache (
+            pubkey TEXT PRIMARY KEY,
+            fetched_at INTEGER NOT NULL
+        );",
+    )?;
+    info!("Migration v2 → v3 complete");
     Ok(())
 }
 
