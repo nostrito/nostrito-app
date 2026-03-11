@@ -1,0 +1,125 @@
+<h2>Profile Layout — A+C Hybrid</h2>
+<p class="subtitle">Full-width banner hero at top, then content + follows sidebar below. Does this capture what you're after?</p>
+
+<div class="mockup">
+  <div class="mockup-header">Profile: Alice</div>
+  <div class="mockup-body" style="padding:0;">
+    <div style="background:#0a0a0a;border-radius:0 0 8px 8px;overflow:hidden;">
+
+      <!-- === HERO BANNER === -->
+      <div style="height:120px;background:linear-gradient(135deg,#7c3aed 0%,#3b82f6 50%,#06b6d4 100%);position:relative;">
+        <!-- Avatar overlapping banner -->
+        <div style="position:absolute;bottom:-32px;left:24px;width:72px;height:72px;border-radius:50%;background:#1a1a2e;border:4px solid #0a0a0a;display:flex;align-items:center;justify-content:center;color:#a78bfa;font-weight:700;font-size:24px;">A</div>
+      </div>
+
+      <!-- === PROFILE INFO ROW === -->
+      <div style="padding:40px 24px 16px;">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+          <div>
+            <div style="font-weight:800;font-size:18px;color:#e8e8f0;letter-spacing:-0.02em;">Alice</div>
+            <div style="font-size:11px;color:#55556a;font-family:monospace;margin-top:2px;">npub1abc...def789xyz</div>
+            <div style="display:flex;align-items:center;gap:4px;margin-top:4px;">
+              <span style="color:#34d399;font-size:11px;">&#10003;</span>
+              <span style="font-size:11px;color:#34d399;">alice@nostr.com</span>
+            </div>
+          </div>
+          <div style="display:flex;gap:20px;text-align:center;">
+            <div>
+              <div style="font-weight:700;font-size:16px;color:#e8e8f0;">142</div>
+              <div style="font-size:10px;color:#55556a;text-transform:uppercase;">Following</div>
+            </div>
+            <div>
+              <div style="font-weight:700;font-size:16px;color:#e8e8f0;">1,247</div>
+              <div style="font-size:10px;color:#55556a;text-transform:uppercase;">Followers</div>
+            </div>
+          </div>
+        </div>
+        <div style="font-size:13px;color:#7a7a90;margin-top:10px;line-height:1.5;">Nostr developer & protocol enthusiast. Building open social infrastructure. Working on NIP implementations and relay software.</div>
+        <!-- Extra metadata row -->
+        <div style="display:flex;gap:16px;margin-top:8px;font-size:11px;color:#55556a;">
+          <span>&#9889; alice@getalby.com</span>
+          <span>&#127760; alice.dev</span>
+        </div>
+      </div>
+
+      <!-- === SPLIT: CONTENT + SIDEBAR === -->
+      <div style="display:flex;border-top:1px solid #1e1e24;min-height:280px;">
+
+        <!-- LEFT: Tabbed content -->
+        <div style="flex:1;min-width:0;">
+          <!-- Tab bar -->
+          <div style="display:flex;border-bottom:1px solid #1e1e24;">
+            <div style="padding:10px 20px;font-size:12px;font-weight:600;color:#7c3aed;border-bottom:2px solid #7c3aed;">Notes</div>
+            <div style="padding:10px 20px;font-size:12px;font-weight:500;color:#55556a;">Articles</div>
+            <div style="padding:10px 20px;font-size:12px;font-weight:500;color:#55556a;">Media</div>
+          </div>
+          <!-- Sample notes -->
+          <div style="padding:14px 20px;border-bottom:1px solid #1e1e24;">
+            <div style="font-size:10px;color:#55556a;margin-bottom:4px;">Mar 10, 2026</div>
+            <div style="font-size:13px;color:#7a7a90;line-height:1.5;">Just released v0.4 of the relay toolkit. Major performance improvements on event filtering — 3x faster on large subscription sets.</div>
+          </div>
+          <div style="padding:14px 20px;border-bottom:1px solid #1e1e24;">
+            <div style="font-size:10px;color:#55556a;margin-bottom:4px;">Mar 8, 2026</div>
+            <div style="font-size:13px;color:#7a7a90;line-height:1.5;">Working on NIP-65 relay list metadata. The outbox model is going to change how we think about message routing.</div>
+          </div>
+          <div style="padding:14px 20px;">
+            <div style="font-size:10px;color:#55556a;margin-bottom:4px;">Mar 5, 2026</div>
+            <div style="font-size:13px;color:#7a7a90;line-height:1.5;">Anyone else excited about the NIP-44 encryption changes? Finally a solid upgrade path from NIP-04.</div>
+          </div>
+        </div>
+
+        <!-- RIGHT: Follows sidebar -->
+        <div style="width:220px;border-left:1px solid #1e1e24;flex-shrink:0;">
+          <!-- Search -->
+          <div style="padding:10px 12px;border-bottom:1px solid #1e1e24;">
+            <div style="background:#111113;border:1px solid #2a2a34;border-radius:6px;padding:6px 10px;font-size:11px;color:#55556a;">Search follows...</div>
+          </div>
+          <!-- Follow items -->
+          <div style="padding:4px 0;">
+            <div style="display:flex;align-items:center;gap:8px;padding:6px 12px;cursor:pointer;">
+              <div style="width:28px;height:28px;border-radius:50%;background:linear-gradient(135deg,#2563eb,#60a5fa);flex-shrink:0;display:flex;align-items:center;justify-content:center;color:#fff;font-size:10px;font-weight:700;">B</div>
+              <div>
+                <div style="font-size:12px;font-weight:600;color:#e8e8f0;">Bob</div>
+                <div style="font-size:9px;color:#55556a;font-family:monospace;">npub1bbb...xyz</div>
+              </div>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;padding:6px 12px;cursor:pointer;">
+              <div style="width:28px;height:28px;border-radius:50%;background:linear-gradient(135deg,#059669,#34d399);flex-shrink:0;display:flex;align-items:center;justify-content:center;color:#fff;font-size:10px;font-weight:700;">C</div>
+              <div>
+                <div style="font-size:12px;font-weight:600;color:#e8e8f0;">Carol</div>
+                <div style="font-size:9px;color:#55556a;font-family:monospace;">npub1ccc...xyz</div>
+              </div>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;padding:6px 12px;cursor:pointer;">
+              <div style="width:28px;height:28px;border-radius:50%;background:linear-gradient(135deg,#d97706,#fbbf24);flex-shrink:0;display:flex;align-items:center;justify-content:center;color:#fff;font-size:10px;font-weight:700;">D</div>
+              <div>
+                <div style="font-size:12px;font-weight:600;color:#e8e8f0;">Dave</div>
+                <div style="font-size:9px;color:#55556a;font-family:monospace;">npub1ddd...xyz</div>
+              </div>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;padding:6px 12px;cursor:pointer;">
+              <div style="width:28px;height:28px;border-radius:50%;background:linear-gradient(135deg,#dc2626,#f87171);flex-shrink:0;display:flex;align-items:center;justify-content:center;color:#fff;font-size:10px;font-weight:700;">E</div>
+              <div>
+                <div style="font-size:12px;font-weight:600;color:#e8e8f0;">Eve</div>
+                <div style="font-size:9px;color:#55556a;font-family:monospace;">npub1eee...xyz</div>
+              </div>
+            </div>
+          </div>
+          <!-- More indicator -->
+          <div style="text-align:center;padding:8px;font-size:10px;color:#55556a;">+ 138 more</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div style="margin-top:24px;">
+  <h3>Key elements in this layout:</h3>
+  <ul style="color:#aaa;font-size:14px;line-height:1.8;margin-top:8px;">
+    <li><strong>Banner image</strong> — from kind 0 <code>banner</code> field (gradient fallback when none)</li>
+    <li><strong>Large avatar</strong> overlapping banner edge</li>
+    <li><strong>Profile info row</strong> — name, npub, NIP-05, following/followers counts</li>
+    <li><strong>Bio + metadata</strong> — about text, lightning address, website</li>
+    <li><strong>Below the fold</strong> — splits into tabbed content (left) + follows sidebar with search (right)</li>
+  </ul>
+</div>
