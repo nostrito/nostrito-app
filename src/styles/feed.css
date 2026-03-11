@@ -545,3 +545,52 @@
     gap: 8px;
   }
 }
+
+/* Global consent screen */
+.global-consent {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 64px 32px;
+  text-align: center;
+  color: var(--text-muted);
+}
+.global-consent-icon {
+  color: var(--text-dim);
+  margin-bottom: 16px;
+  opacity: 0.6;
+}
+.global-consent-title {
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--text);
+  margin: 0 0 8px;
+}
+.global-consent-text {
+  font-size: 0.85rem;
+  max-width: 360px;
+  line-height: 1.5;
+  margin: 0 0 24px;
+}
+.global-consent-btn {
+  padding: 10px 28px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: var(--bg);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+.global-consent-btn:hover {
+  opacity: 0.85;
+}
+
+/* Save button state */
+.ev-action-saved {
+  color: var(--accent) !important;
+  opacity: 0.8;
+  cursor: default !important;
+}

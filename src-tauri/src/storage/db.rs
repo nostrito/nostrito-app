@@ -526,6 +526,87 @@ impl Database {
         Ok(rows)
     }
 
+    /// Query feed events restricted to WoT pubkeys (using nodes table subquery).
+    /// Avoids SQLite parameter limit by not passing pubkeys as bind params.
+    pub fn query_wot_feed(
+        &self,
+        own_pubkey: Option<&str>,
+        kinds: Option<&[u32]>,
+        since: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<(String, String, i64, i64, String, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+
+        let mut sql = String::from(
+            "SELECT id, pubkey, created_at, kind, tags, content, sig FROM nostr_events WHERE ",
+        );
+        let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        // WoT filter: restrict to direct follows (hop 1) via edges table
+        if let Some(own_pk) = own_pubkey {
+            let idx = param_values.len() + 1;
+            sql.push_str(&format!(
+                "(pubkey IN (SELECT n2.pubkey FROM nodes n1 JOIN edges e ON e.follower_id = n1.id JOIN nodes n2 ON n2.id = e.followed_id WHERE n1.pubkey = ?{}) OR pubkey = ?{})",
+                idx, idx
+            ));
+            param_values.push(Box::new(own_pk.to_string()));
+        } else {
+            sql.push_str("1=1");
+        }
+
+        if let Some(kinds) = kinds {
+            if !kinds.is_empty() {
+                let placeholders: Vec<String> = (0..kinds.len())
+                    .map(|i| format!("?{}", param_values.len() + i + 1))
+                    .collect();
+                sql.push_str(&format!(" AND kind IN ({})", placeholders.join(",")));
+                for k in kinds {
+                    param_values.push(Box::new(*k as i64));
+                }
+            }
+        }
+
+        if let Some(since) = since {
+            let idx = param_values.len() + 1;
+            sql.push_str(&format!(" AND created_at >= ?{}", idx));
+            param_values.push(Box::new(since as i64));
+        }
+
+        sql.push_str(" ORDER BY created_at DESC");
+
+        {
+            let idx = param_values.len() + 1;
+            sql.push_str(&format!(" LIMIT ?{}", idx));
+            param_values.push(Box::new(limit as i64));
+        }
+
+        debug!(
+            "[db] query_wot_feed: kinds={:?}, since={:?}, limit={}",
+            kinds, since, limit
+        );
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(rows)
+    }
+
     /// Search events by keyword in content and/or by author pubkey.
     /// Returns feed-worthy kinds (1, 6, 30023) ordered by created_at DESC.
     pub fn search_events(

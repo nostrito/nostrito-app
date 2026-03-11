@@ -1,6 +1,6 @@
 /** Shared note/repost card used in Feed and ProfileView */
 import React from "react";
-import { IconMessageCircle, IconRepeat, IconZap } from "./Icon";
+import { IconMessageCircle, IconRepeat, IconZap, IconBookmark } from "./Icon";
 import { Avatar } from "./Avatar";
 import { timeAgo } from "../utils/format";
 import { kindLabel } from "../utils/ui";
@@ -31,9 +31,11 @@ interface NoteCardProps {
   event: NostrEvent;
   profile?: ProfileInfo;
   compact?: boolean;
+  onSave?: (event: NostrEvent) => void;
+  saved?: boolean;
 }
 
-export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact }) => {
+export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, onSave, saved }) => {
   const k = kindLabel(event.kind);
   const displayName = profileDisplayName(profile, event.pubkey);
 
@@ -64,6 +66,15 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact }) =
               <button className="ev-action"><span className="icon"><IconMessageCircle /></span> 0</button>
               <button className="ev-action"><span className="icon"><IconRepeat /></span> 0</button>
               <button className="ev-action"><span className="icon"><IconZap /></span> 0</button>
+              {onSave && (
+                <button
+                  className={`ev-action${saved ? " ev-action-saved" : ""}`}
+                  onClick={() => !saved && onSave(event)}
+                  title={saved ? "Saved" : "Save to local DB"}
+                >
+                  <span className="icon"><IconBookmark /></span>{saved ? " Saved" : " Save"}
+                </button>
+              )}
             </div>
           )}
         </div>
@@ -93,6 +104,15 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact }) =
             <button className="ev-action"><span className="icon"><IconMessageCircle /></span> 0</button>
             <button className="ev-action"><span className="icon"><IconRepeat /></span> 0</button>
             <button className="ev-action"><span className="icon"><IconZap /></span> 0</button>
+            {onSave && (
+              <button
+                className={`ev-action${saved ? " ev-action-saved" : ""}`}
+                onClick={() => !saved && onSave(event)}
+                title={saved ? "Saved" : "Save to local DB"}
+              >
+                <span className="icon"><IconBookmark /></span>{saved ? " Saved" : " Save"}
+              </button>
+            )}
           </div>
         )}
       </div>

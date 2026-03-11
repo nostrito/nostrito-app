@@ -113,6 +113,8 @@ export const Feed: React.FC = () => {
   const [feedEvents, setFeedEvents] = useState<NostrEvent[]>([]);
   const [loading, setLoading] = useState(true);
   const [isSearchMode, setIsSearchMode] = useState(false);
+  const [globalConsent, setGlobalConsent] = useState(false);
+  const [savedEventIds, setSavedEventIds] = useState<Set<string>>(new Set());
 
   const { getProfile, ensureProfiles } = useProfileContext();
 
@@ -128,6 +130,15 @@ export const Feed: React.FC = () => {
     initMediaViewer();
   }, []);
 
+  const saveEvent = useCallback(async (event: NostrEvent) => {
+    try {
+      await invoke("save_event", { event });
+      setSavedEventIds((prev) => new Set(prev).add(event.id));
+    } catch (err) {
+      console.warn("[feed] Failed to save event:", err);
+    }
+  }, []);
+
   const loadEvents = useCallback(async () => {
     if (feedLoadingRef.current) return;
     feedLoadingRef.current = true;
@@ -136,10 +147,10 @@ export const Feed: React.FC = () => {
       let rawEvents: NostrEvent[];
 
       if (feedMode === "global") {
-        // Fetch from relays for global mode
+        // Fetch from relays for global mode (events are NOT persisted)
         rawEvents = await invoke<NostrEvent[]>("fetch_global_feed", { limit: 50 });
       } else {
-        // WoT mode: query local DB
+        // WoT mode: query local DB (follows only)
         const [rawNotes, rawArticles] = await Promise.all([
           invoke<NostrEvent[]>("get_feed", { filter: { kinds: [1, 6], limit: 50, wot_only: true } }),
           invoke<NostrEvent[]>("get_feed", { filter: { kinds: [30023], limit: 20, wot_only: true } }),
@@ -171,8 +182,8 @@ export const Feed: React.FC = () => {
       });
 
       setLoading(false);
-    } catch {
-      console.warn("[feed] Failed to load events");
+    } catch (err) {
+      console.warn("[feed] Failed to load events:", err);
       setLoading(false);
     } finally {
       feedLoadingRef.current = false;
@@ -183,29 +194,42 @@ export const Feed: React.FC = () => {
   useEffect(() => {
     renderedEventIdsRef.current.clear();
     setFeedEvents([]);
-    setLoading(true);
+    setSavedEventIds(new Set());
+    if (feedMode === "global") {
+      setGlobalConsent(false);
+      setLoading(false);
+    } else {
+      setLoading(true);
+    }
   }, [feedMode]);
 
-  // Initial load
+  // Initial load (WoT mode auto-loads; global waits for consent)
   useEffect(() => {
-    if (!isSearchMode) {
+    if (!isSearchMode && feedMode === "wot") {
       loadEvents();
     }
-  }, [loadEvents, isSearchMode]);
+  }, [loadEvents, isSearchMode, feedMode]);
 
-  // Refresh on sync tier complete
+  // Refresh on sync tier complete (WoT only)
   useEffect(() => {
-    if (tierEvent && !isSearchMode) {
+    if (tierEvent && !isSearchMode && feedMode === "wot") {
       loadEvents();
     }
-  }, [tierEvent, loadEvents, isSearchMode]);
+  }, [tierEvent, loadEvents, isSearchMode, feedMode]);
 
-  // 30s refresh interval
+  // 30s refresh interval (WoT only)
   useInterval(() => {
-    if (!isSearchMode) {
+    if (!isSearchMode && feedMode === "wot") {
       loadEvents();
     }
   }, 30000);
+
+  // Handle global consent — fetch once user clicks
+  const handleGlobalConsent = useCallback(() => {
+    setGlobalConsent(true);
+    setLoading(true);
+    loadEvents();
+  }, [loadEvents]);
 
   const performSearch = useCallback(async (query: string) => {
     setSearchStatus("Searching\u2026");
@@ -381,13 +405,30 @@ export const Feed: React.FC = () => {
       )}
 
       <div id="feedList">
-        {loading && !isSearchMode && (
+        {feedMode === "global" && !globalConsent && !isSearchMode && (
+          <div className="global-consent">
+            <div className="global-consent-icon">
+              <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="10" /><path d="M2 12h20" /><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" />
+              </svg>
+            </div>
+            <h3 className="global-consent-title">Global Feed</h3>
+            <p className="global-consent-text">
+              This will fetch recent notes from public relays. These events are temporary and won't be saved to your local database unless you explicitly save them.
+            </p>
+            <button className="global-consent-btn" onClick={handleGlobalConsent}>
+              Fetch Global Feed
+            </button>
+          </div>
+        )}
+
+        {loading && !isSearchMode && (feedMode === "wot" || globalConsent) && (
           <div className="event-card" style={{ justifyContent: "center", color: "var(--text-muted)", padding: 32 }}>
             Loading events...
           </div>
         )}
 
-        {!loading && feedEvents.length === 0 && !isSearchMode && (
+        {!loading && feedEvents.length === 0 && !isSearchMode && (feedMode === "wot" || globalConsent) && (
           <div className="event-card" style={{ justifyContent: "center", color: "var(--text-muted)", padding: 32 }}>
             No events yet
           </div>
@@ -417,6 +458,8 @@ export const Feed: React.FC = () => {
             key={event.id}
             event={event}
             profile={getProfile(event.pubkey)}
+            onSave={feedMode === "global" ? saveEvent : undefined}
+            saved={savedEventIds.has(event.id)}
           />
         ))}
       </div>

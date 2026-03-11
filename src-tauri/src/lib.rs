@@ -663,34 +663,23 @@ async fn get_feed(filter: FeedFilter, state: State<'_, AppState>) -> Result<Vec<
     let kinds = feed_kinds.as_deref();
     let limit = filter.limit.unwrap_or(50);
 
-    // WoT filtering: when wot_only=true, restrict to WoT-connected pubkeys
-    let wot_authors: Option<Vec<String>> = if filter.wot_only.unwrap_or(false) {
-        let mut pubkeys = state.wot_graph.get_all_pubkeys();
-        // Always include own pubkey
-        if let Some(ref hex) = state.config.read().await.hex_pubkey {
-            if !pubkeys.contains(hex) {
-                pubkeys.push(hex.clone());
-            }
-        }
-        Some(pubkeys)
+    // Branch: WoT mode uses a SQL subquery (avoids SQLite parameter limit with large graphs)
+    let events = if filter.wot_only.unwrap_or(false) {
+        let own_pk = state.config.read().await.hex_pubkey.clone();
+        state.db.query_wot_feed(own_pk.as_deref(), kinds, filter.since, limit)
+            .map_err(|e| {
+                tracing::error!("[cmd:get_feed] wot query failed: {}", e);
+                format!("Failed to query WoT feed: {}", e)
+            })?
     } else {
-        None
+        let author_vec = filter.author.map(|a| vec![a]);
+        let authors = author_vec.as_deref();
+        state.db.query_events(None, authors, kinds, filter.since, None, limit)
+            .map_err(|e| {
+                tracing::error!("[cmd:get_feed] query failed: {}", e);
+                format!("Failed to query events: {}", e)
+            })?
     };
-
-    let author_vec = if wot_authors.is_some() {
-        wot_authors
-    } else {
-        filter.author.map(|a| vec![a])
-    };
-    let authors = author_vec.as_deref();
-
-    let events = state
-        .db
-        .query_events(None, authors, kinds, filter.since, None, limit)
-        .map_err(|e| {
-            tracing::error!("[cmd:get_feed] query failed: {}", e);
-            format!("Failed to query events: {}", e)
-        })?;
 
     tracing::info!("[cmd:get_feed] returning {} events", events.len());
 
@@ -791,29 +780,9 @@ async fn fetch_global_feed(limit: Option<u32>, state: State<'_, AppState>) -> Re
     client.unsubscribe(sub_id).await;
     client.disconnect().await.ok();
 
-    // Store events in DB
-    let mut stored_count: u64 = 0;
-    for event in &all_events {
-        let tags_json = serde_json::to_string(
-            &event.tags.iter().map(|t| t.as_slice().iter().map(|s| s.to_string()).collect::<Vec<String>>()).collect::<Vec<Vec<String>>>()
-        ).unwrap_or_else(|_| "[]".to_string());
-
-        match state.db.store_event(
-            &event.id.to_hex(),
-            &event.pubkey.to_hex(),
-            event.created_at.as_u64() as i64,
-            event.kind.as_u16() as u32,
-            &tags_json,
-            &event.content.to_string(),
-            &event.sig.to_string(),
-        ) {
-            Ok(true) => stored_count += 1,
-            Ok(false) => {}
-            Err(e) => tracing::warn!("[fetch_global_feed] Failed to store event: {}", e),
-        }
-    }
-
-    tracing::info!("[fetch_global_feed] {} events fetched, {} stored", all_events.len(), stored_count);
+    // Global events are NOT persisted — they are returned as temporary data.
+    // Users can explicitly save individual events via the save_event command.
+    tracing::info!("[fetch_global_feed] {} events fetched (not persisted)", all_events.len());
 
     Ok(all_events
         .into_iter()
@@ -832,6 +801,21 @@ async fn fetch_global_feed(limit: Option<u32>, state: State<'_, AppState>) -> Re
             }
         })
         .collect())
+}
+
+#[tauri::command]
+async fn save_event(event: NostrEvent, state: State<'_, AppState>) -> Result<bool, String> {
+    tracing::info!("[cmd:save_event] id={}...", &event.id[..event.id.len().min(12)]);
+    let tags_json = serde_json::to_string(&event.tags).unwrap_or_else(|_| "[]".to_string());
+    state.db.store_event(
+        &event.id,
+        &event.pubkey,
+        event.created_at as i64,
+        event.kind,
+        &tags_json,
+        &event.content,
+        &event.sig,
+    ).map_err(|e| format!("Failed to save event: {}", e))
 }
 
 #[tauri::command]
@@ -2514,6 +2498,7 @@ pub fn run() {
             get_wot_distance,
             get_feed,
             fetch_global_feed,
+            save_event,
             search_events,
             search_global,
             get_storage_stats,
