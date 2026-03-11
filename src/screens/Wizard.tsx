@@ -78,6 +78,8 @@ export const Wizard: React.FC = () => {
   const [identityMode, setIdentityMode] = useState<IdentityMode>("readonly");
   const [npub, setNpub] = useState("");
   const [npubError, setNpubError] = useState("");
+  const [nsecInput, setNsecInput] = useState("");
+  const [nsecError, setNsecError] = useState("");
   const [signerType, setSignerType] = useState<SignerType | null>(null);
   const [selectedRelays, setSelectedRelays] = useState<Set<string>>(
     () => new Set(RELAYS.filter((r) => r.defaultOn).map((r) => r.id))
@@ -125,7 +127,10 @@ export const Wizard: React.FC = () => {
   const canGoNext = (): boolean => {
     if (step === 1) {
       if (identityMode === "readonly") return isNpubValid(npub);
-      if (identityMode === "full") return signerType !== null;
+      if (identityMode === "full") {
+        if (signerType === "nsec") return nsecInput.trim().startsWith("nsec1");
+        return signerType !== null;
+      }
     }
     if (step === 2) return selectedRelays.size > 0;
     return true;
@@ -136,9 +141,25 @@ export const Wizard: React.FC = () => {
   }, [step]);
 
   const handleNext = useCallback(async () => {
-    if (step === 1 && identityMode === "readonly" && !isNpubValid(npub)) {
-      setNpubError("Enter a valid npub (starts with npub1, 63 characters)");
-      return;
+    if (step === 1) {
+      if (identityMode === "readonly" && !isNpubValid(npub)) {
+        setNpubError("Enter a valid npub (starts with npub1, 63 characters)");
+        return;
+      }
+      if (identityMode === "full" && signerType === "nsec") {
+        if (!nsecInput.trim().startsWith("nsec1")) {
+          setNsecError("Enter a valid nsec (starts with nsec1)");
+          return;
+        }
+        try {
+          const derived = await invoke<string>("nsec_to_npub", { nsec: nsecInput.trim() });
+          setNpub(derived);
+          setNsecError("");
+        } catch (e: any) {
+          setNsecError(String(e));
+          return;
+        }
+      }
     }
     if (step === 2 && selectedRelays.size === 0) return;
 
@@ -147,7 +168,7 @@ export const Wizard: React.FC = () => {
     } else {
       await handleFinish();
     }
-  }, [step, identityMode, npub, selectedRelays]);
+  }, [step, identityMode, npub, nsecInput, signerType, selectedRelays]);
 
   /* --- finish handler ----------------------------------------------- */
   const handleFinish = async () => {
@@ -166,6 +187,13 @@ export const Wizard: React.FC = () => {
       });
 
       console.log("[wizard] init_nostrito succeeded");
+
+      // If nsec was provided, store it in keychain
+      if (identityMode === "full" && signerType === "nsec" && nsecInput.trim()) {
+        await invoke("set_nsec", { nsec: nsecInput.trim() });
+        console.log("[wizard] nsec saved to keychain");
+      }
+
       localStorage.setItem("nostrito_initialized", "true");
       localStorage.setItem(
         "nostrito_config",
@@ -328,6 +356,9 @@ export const Wizard: React.FC = () => {
                 npub={npub}
                 npubError={npubError}
                 onNpubChange={handleNpubChange}
+                nsecInput={nsecInput}
+                nsecError={nsecError}
+                onNsecChange={(e) => { setNsecInput(e.target.value); setNsecError(""); }}
                 signerType={signerType}
                 onSignerTypeChange={setSignerType}
                 npubInputRef={npubInputRef}
@@ -387,6 +418,9 @@ interface StepIdentityProps {
   npub: string;
   npubError: string;
   onNpubChange: (e: React.ChangeEvent<HTMLInputElement>) => void;
+  nsecInput: string;
+  nsecError: string;
+  onNsecChange: (e: React.ChangeEvent<HTMLInputElement>) => void;
   signerType: SignerType | null;
   onSignerTypeChange: (type: SignerType) => void;
   npubInputRef: React.RefObject<HTMLInputElement | null>;
@@ -398,6 +432,9 @@ const StepIdentity: React.FC<StepIdentityProps> = ({
   npub,
   npubError,
   onNpubChange,
+  nsecInput,
+  nsecError,
+  onNsecChange,
   signerType,
   onSignerTypeChange,
   npubInputRef,
@@ -462,6 +499,21 @@ const StepIdentity: React.FC<StepIdentityProps> = ({
             {opt.icon} {opt.label}
           </div>
         ))}
+        {signerType === "nsec" && (
+          <div style={{ marginTop: 8 }}>
+            <input
+              type="password"
+              className="wiz-input"
+              placeholder="nsec1..."
+              value={nsecInput}
+              onChange={onNsecChange}
+              spellCheck={false}
+              autoComplete="off"
+              autoFocus
+            />
+            {nsecError && <p className="wiz-error">{nsecError}</p>}
+          </div>
+        )}
       </div>
     )}
   </>

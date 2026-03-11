@@ -2076,6 +2076,15 @@ fn delete_nsec_from_keychain(npub: &str) {
 }
 
 #[tauri::command]
+fn nsec_to_npub(nsec: String) -> Result<String, String> {
+    use nostr_sdk::prelude::*;
+    let secret_key = SecretKey::from_bech32(nsec.trim())
+        .map_err(|e| format!("Invalid nsec: {}", e))?;
+    let keys = Keys::new(secret_key);
+    keys.public_key().to_bech32().map_err(|e| format!("Failed to encode npub: {}", e))
+}
+
+#[tauri::command]
 async fn set_nsec(nsec: String, state: State<'_, AppState>) -> Result<(), String> {
     use nostr_sdk::prelude::*;
 
@@ -2482,6 +2491,7 @@ pub fn run() {
             get_tracked_profiles,
             fetch_profile,
             get_profile_with_refresh,
+            nsec_to_npub,
             set_nsec,
             clear_nsec,
             get_signing_mode,
