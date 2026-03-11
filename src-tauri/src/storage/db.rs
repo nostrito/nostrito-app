@@ -758,6 +758,32 @@ impl Database {
         Ok(profiles)
     }
 
+    /// Get the last time a profile was fetched from relays.
+    pub fn get_profile_fetched_at(&self, pubkey: &str) -> Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT fetched_at FROM profile_cache WHERE pubkey = ?1",
+            [pubkey],
+            |row| row.get(0),
+        );
+        match result {
+            Ok(ts) => Ok(Some(ts)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Record that a profile was fetched from relays now.
+    pub fn set_profile_fetched_at(&self, pubkey: &str, fetched_at: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO profile_cache (pubkey, fetched_at) VALUES (?1, ?2)
+             ON CONFLICT(pubkey) DO UPDATE SET fetched_at = ?2",
+            rusqlite::params![pubkey, fetched_at],
+        )?;
+        Ok(())
+    }
+
     /// Get DM events (kind:4) involving a specific pubkey (as sender or recipient).
     /// Returns (id, pubkey, created_at, kind, tags_json, content, sig).
     pub fn get_dm_events(
