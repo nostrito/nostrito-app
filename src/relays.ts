@@ -1,3 +1,4 @@
+
 /** Shared relay definitions used by wizard and settings. */
 
 export interface RelayOption {
