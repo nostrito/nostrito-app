@@ -39,9 +39,7 @@ function renderEventContent(
   const cleaned = stripMediaUrls(content).slice(0, 280);
   // Escape HTML first, then inject mention spans
   const escaped = escapeHtml(cleaned);
-  const cleanedHtml = mentionProfiles && mentionProfiles.size > 0
-    ? replaceMentions(escaped, mentionProfiles)
-    : escaped;
+  const cleanedHtml = replaceMentions(escaped, mentionProfiles || new Map());
   return { cleanedHtml, mediaHtml };
 }
 
@@ -83,6 +81,8 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, onS
 
     const handleRepostClick = (e: React.MouseEvent) => {
       if ((e.target as HTMLElement).closest("[data-pubkey]")) return;
+      if ((e.target as HTMLElement).closest("[data-note-id]")) return;
+      if ((e.target as HTMLElement).closest("[data-naddr]")) return;
       onClick?.();
     };
 
@@ -128,6 +128,8 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, onS
 
   const handleClick = (e: React.MouseEvent) => {
     if ((e.target as HTMLElement).closest("[data-pubkey]")) return;
+    if ((e.target as HTMLElement).closest("[data-note-id]")) return;
+    if ((e.target as HTMLElement).closest("[data-naddr]")) return;
     if ((e.target as HTMLElement).closest(".ev-actions")) return;
     onClick?.();
   };

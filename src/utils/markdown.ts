@@ -3,6 +3,8 @@
  * No external dependencies — handles the subset of markdown commonly used in Nostr articles.
  */
 
+import { decodeEntity } from "./mentions";
+
 function escapeHtml(str: string): string {
   return str
     .replace(/&/g, "&amp;")
@@ -50,6 +52,28 @@ function renderInline(text: string): string {
     /(?<!href="|src=")(https?:\/\/[^\s<>"]+)/g,
     '<a class="md-link" href="$1" target="_blank" rel="noopener">$1</a>'
   );
+
+  // Nostr entity links (npub, note, nevent, naddr, nprofile)
+  result = result.replace(/nostr:((npub|nprofile|note|nevent|naddr)1[a-z0-9]+)/g, (_match, bech32str) => {
+    const entity = decodeEntity(bech32str);
+    if (!entity) return bech32str;
+    const linkIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="12" height="12" style="vertical-align:middle;margin-right:2px"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>`;
+    switch (entity.type) {
+      case "npub":
+      case "nprofile":
+        return `<span class="mention" data-pubkey="${entity.pubkey}" style="cursor:pointer;color:var(--accent)">@${bech32str.slice(0, 12)}...</span>`;
+      case "note":
+      case "nevent":
+        return `<span class="mention note-link" data-note-id="${entity.eventId}" style="cursor:pointer;color:var(--accent)">${linkIcon}${bech32str.slice(0, 16)}...</span>`;
+      case "naddr": {
+        const data = JSON.stringify({ kind: entity.kind, pubkey: entity.pubkey, dTag: entity.dTag, relays: entity.relays });
+        const label = entity.dTag || bech32str.slice(0, 16) + "...";
+        return `<span class="mention note-link" data-naddr='${data.replace(/&/g, "&amp;").replace(/'/g, "&#39;")}' style="cursor:pointer;color:var(--accent)">${linkIcon}${label.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</span>`;
+      }
+      default:
+        return bech32str;
+    }
+  });
 
   return result;
 }

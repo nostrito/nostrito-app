@@ -77,13 +77,46 @@ const AppRoutes: React.FC = () => {
     };
   }, [navigate, setInitialized]);
 
-  // Pubkey click delegation for [data-pubkey] elements
+  // Click delegation for [data-pubkey], [data-note-id], [data-naddr] elements
   useEffect(() => {
-    const handler = (e: MouseEvent) => {
-      const target = (e.target as HTMLElement).closest("[data-pubkey]") as HTMLElement | null;
-      if (!target) return;
-      const pubkey = target.dataset.pubkey;
-      if (pubkey) navigate(`/profile/${pubkey}`);
+    const handler = async (e: MouseEvent) => {
+      const el = e.target as HTMLElement;
+
+      // Profile links
+      const pubkeyEl = el.closest("[data-pubkey]") as HTMLElement | null;
+      if (pubkeyEl) {
+        const pubkey = pubkeyEl.dataset.pubkey;
+        if (pubkey) navigate(`/profile/${pubkey}`);
+        return;
+      }
+
+      // Note/nevent links
+      const noteEl = el.closest("[data-note-id]") as HTMLElement | null;
+      if (noteEl) {
+        const noteId = noteEl.dataset.noteId;
+        if (noteId) navigate(`/note/${noteId}`);
+        return;
+      }
+
+      // naddr links (addressable events)
+      const naddrEl = el.closest("[data-naddr]") as HTMLElement | null;
+      if (naddrEl) {
+        try {
+          const data = JSON.parse(naddrEl.dataset.naddr || "{}");
+          const { invoke } = await import("@tauri-apps/api/core");
+          const ev = await invoke<{ id: string } | null>("get_addressable_event", {
+            kind: data.kind,
+            pubkey: data.pubkey,
+            dTag: data.dTag,
+          });
+          if (ev) {
+            navigate(`/note/${ev.id}`);
+          }
+        } catch (err) {
+          console.error("[naddr] Failed to resolve addressable event:", err);
+        }
+        return;
+      }
     };
     document.addEventListener("click", handler);
     return () => document.removeEventListener("click", handler);

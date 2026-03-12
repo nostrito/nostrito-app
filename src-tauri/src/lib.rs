@@ -881,6 +881,22 @@ async fn get_event(id: String, state: State<'_, AppState>) -> Result<Option<Nost
 }
 
 #[tauri::command]
+async fn get_addressable_event(
+    kind: u32,
+    pubkey: String,
+    d_tag: String,
+    state: State<'_, AppState>,
+) -> Result<Option<NostrEvent>, String> {
+    let rows = state.db().query_events(None, Some(&[pubkey]), Some(&[kind]), None, None, 50)
+        .map_err(|e| format!("Failed to query events: {}", e))?;
+    let events = rows_to_events(rows);
+    // Find the one with matching d-tag
+    Ok(events.into_iter().find(|ev| {
+        ev.tags.iter().any(|t| t.len() >= 2 && t[0] == "d" && t[1] == d_tag)
+    }))
+}
+
+#[tauri::command]
 async fn get_note_replies(
     note_id: String,
     until: Option<u64>,
@@ -2932,6 +2948,7 @@ pub fn run() {
             clear_nsec,
             get_signing_mode,
             decrypt_dm,
+            get_addressable_event,
         ])
         .run(tauri::generate_context!())
         .expect("error while running nostrito");
