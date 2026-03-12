@@ -22,6 +22,8 @@ pub struct StoredEventNotification {
     pub kind: u32,
     pub pubkey: String,
     pub content: String,
+    /// Which sync layer produced this event ("0", "0.5", "1", "2", "3", or "")
+    pub layer: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -38,6 +40,12 @@ pub struct SyncStats {
     pub pass_pubkeys_done: u64,
     /// Total pubkeys in the current content pass.
     pub pass_pubkeys_total: u64,
+    /// Relays completed in the current content pass.
+    pub pass_relays_done: u64,
+    /// Total relays to query in the current content pass.
+    pub pass_relays_total: u64,
+    /// Number of direct follows (for Layer 1 display).
+    pub follows_count: u64,
 }
 
 // ── Sync Config ────────────────────────────────────────────────────
@@ -52,12 +60,8 @@ pub struct SyncConfig {
     pub wot_batch_size: u32,
     pub wot_events_per_batch: u32,
     pub cycle_interval_secs: u32,
-    /// Fetch content from follows-of-follows, prioritized by overlap count
-    pub fof_content: bool,
-    /// Fetch content from hop-3 pubkeys (lowest priority)
-    pub hop3_content: bool,
-    /// Max number of FoF pubkeys to fetch content for (0 = unlimited)
-    pub fof_max_pubkeys: u32,
+    /// How many notes to fetch from WoT peers each cycle (0 = disabled).
+    pub wot_notes_per_cycle: u32,
 }
 
 impl Default for SyncConfig {
@@ -71,9 +75,7 @@ impl Default for SyncConfig {
             wot_batch_size: 5,
             wot_events_per_batch: 15,
             cycle_interval_secs: 300,
-            fof_content: true,
-            hop3_content: false,
-            fof_max_pubkeys: 200,
+            wot_notes_per_cycle: 50,
         }
     }
 }

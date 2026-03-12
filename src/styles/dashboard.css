@@ -228,6 +228,23 @@
 .live-kind-note { background: rgba(124,58,237,.15); color: #a78bfa; }
 .live-kind-repost { background: rgba(16,185,129,.1); color: #34d399; }
 .live-kind-other { background: rgba(100,100,120,.15); color: var(--text-dim); }
+/* Layer badges on live events */
+.live-layer {
+  font-size: 0.58rem;
+  padding: 1px 4px;
+  border-radius: 4px;
+  font-weight: 700;
+  font-family: var(--mono);
+  flex-shrink: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+.live-layer-own { background: rgba(124,58,237,.12); color: #a78bfa; }
+.live-layer-tracked { background: rgba(167,139,250,.12); color: #c4b5fd; }
+.live-layer-follows { background: rgba(59,130,246,.12); color: #60a5fa; }
+.live-layer-fof { background: rgba(16,185,129,.1); color: #34d399; }
+.live-layer-hop3 { background: rgba(245,158,11,.1); color: #fbbf24; }
+.live-layer-other { background: rgba(100,100,120,.1); color: var(--text-muted); }
 .live-preview {
   font-size: 0.76rem;
   color: var(--text-dim);
@@ -301,6 +318,11 @@
 .sync-tier-badge.idle {
   background: rgba(255,255,255,0.04);
   color: var(--text-muted);
+}
+.sync-tier-badge.disabled {
+  background: rgba(239,68,68,0.1);
+  color: #ef4444;
+  opacity: 0.7;
 }
 .sync-tier-detail {
   font-size: 0.7rem;

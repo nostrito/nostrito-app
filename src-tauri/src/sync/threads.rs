@@ -200,6 +200,7 @@ impl ThreadContext {
                     EventSource::ThreadContext,
                     super::types::MEDIA_PRIORITY_OTHERS,
                     Some(&self.app_handle),
+                    "thread",
                 );
                 if stored > 0 {
                     debug!("Thread: fetched {} events from {}", stored, relay_url);

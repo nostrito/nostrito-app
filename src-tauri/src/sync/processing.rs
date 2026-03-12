@@ -516,6 +516,7 @@ pub fn process_events(
     source: EventSource,
     media_priority: i32,
     app_handle: Option<&tauri::AppHandle>,
+    layer: &str,
 ) -> (u32, u32) {
     let mut stored = 0u32;
     let mut wot_updates = 0u32;
@@ -576,6 +577,7 @@ pub fn process_events(
                     kind: event.kind.as_u16() as u32,
                     pubkey: event.pubkey.to_hex(),
                     content,
+                    layer: layer.to_string(),
                 }).ok();
             }
         }

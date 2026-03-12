@@ -12,18 +12,17 @@ use crate::wot::WotGraph;
 use super::pool::RelayPool;
 use super::processing;
 use super::scheduler;
-use super::types::{CursorBand, EventSource, SyncProgress, SyncStats, BATCH_PAUSE_SECS, CURSOR_OVERLAP_SECS};
+use super::types::{CursorBand, EventSource, SyncProgress, SyncStats, CURSOR_OVERLAP_SECS};
 
-/// Phase 3: Content Fetch — relay-centric batched event retrieval.
+/// Phase 3: Content Fetch — per-pubkey sequential event retrieval.
 pub struct ContentFetch {
     db: Arc<Database>,
     graph: Arc<WotGraph>,
     pool: Arc<RelayPool>,
     own_pubkey: String,
     lookback_days: u32,
-    fof_content: bool,
-    hop3_content: bool,
-    fof_max_pubkeys: u32,
+    /// How many notes to fetch from WoT peers each cycle (0 = disabled).
+    wot_notes_per_cycle: u32,
     sync_stats: Arc<RwLock<SyncStats>>,
     app_handle: tauri::AppHandle,
 }
@@ -35,13 +34,11 @@ impl ContentFetch {
         pool: Arc<RelayPool>,
         own_pubkey: String,
         lookback_days: u32,
-        fof_content: bool,
-        hop3_content: bool,
-        fof_max_pubkeys: u32,
+        wot_notes_per_cycle: u32,
         sync_stats: Arc<RwLock<SyncStats>>,
         app_handle: tauri::AppHandle,
     ) -> Self {
-        Self { db, graph, pool, own_pubkey, lookback_days, fof_content, hop3_content, fof_max_pubkeys, sync_stats, app_handle }
+        Self { db, graph, pool, own_pubkey, lookback_days, wot_notes_per_cycle, sync_stats, app_handle }
     }
 
     /// Run the full content fetch phase.
@@ -63,10 +60,9 @@ impl ContentFetch {
 
         // Pass 1: Tracked profiles (highest priority after own)
         if !tracked.is_empty() {
-            self.set_layer("0.5").await;
             info!("Content: fetching {} tracked profiles first", tracked.len());
             let pass_stats = self.fetch_pubkey_set(
-                &tracked, &refresh_set, &bands, now, super::types::MEDIA_PRIORITY_TRACKED, "tracked",
+                &tracked, &refresh_set, &bands, now, super::types::MEDIA_PRIORITY_TRACKED, "tracked", "0.5",
             ).await;
             stats.events_stored += pass_stats.0;
             stats.wot_updates += pass_stats.1;
@@ -82,50 +78,33 @@ impl ContentFetch {
             .cloned()
             .collect();
 
+        // Record follows count for dashboard display
+        {
+            let mut ss = self.sync_stats.write().await;
+            ss.follows_count = follows.len() as u64;
+        }
+
         if !follows_only.is_empty() {
-            self.set_layer("1").await;
             let pass_stats = self.fetch_pubkey_set(
-                &follows_only, &refresh_set, &bands, now, super::types::MEDIA_PRIORITY_FOLLOWS, "tier2",
+                &follows_only, &refresh_set, &bands, now, super::types::MEDIA_PRIORITY_FOLLOWS, "tier2", "1",
             ).await;
             stats.events_stored += pass_stats.0;
             stats.wot_updates += pass_stats.1;
             stats.relays_queried += pass_stats.2;
         }
 
-        // Pass 3: Follows-of-follows
+        // Pass 3: WoT content — random sample from the broader network
         let follow_set: std::collections::HashSet<&str> =
             follows.iter().map(|s| s.as_str()).collect();
-        let mut fof_set: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        if self.fof_content {
-            self.set_layer("2").await;
-            let fof = self.get_fof_by_overlap(&follows);
-            if !fof.is_empty() {
-                let fof_only: Vec<String> = fof
-                    .into_iter()
-                    .filter(|pk| !tracked_set.contains(pk.as_str()) && !follow_set.contains(pk.as_str()))
-                    .collect();
-                fof_set = fof_only.iter().cloned().collect();
-                if !fof_only.is_empty() {
-                    info!("Content: fetching {} FoF pubkeys (by overlap priority)", fof_only.len());
-                    let pass_stats = self.fetch_pubkey_set(
-                        &fof_only, &refresh_set, &bands, now, super::types::MEDIA_PRIORITY_FOF, "tier3",
-                    ).await;
-                    stats.events_stored += pass_stats.0;
-                    stats.wot_updates += pass_stats.1;
-                    stats.relays_queried += pass_stats.2;
-                }
-            }
-        }
-
-        // Pass 4: Hop 3 (lowest priority content fetch)
-        if self.hop3_content {
-            self.set_layer("3").await;
-            let hop3 = self.get_hop3_pubkeys(&follows, &follow_set, &tracked_set, &fof_set);
-            if !hop3.is_empty() {
-                info!("Content: fetching {} hop-3 pubkeys", hop3.len());
-                let pass_stats = self.fetch_pubkey_set(
-                    &hop3, &refresh_set, &bands, now, super::types::MEDIA_PRIORITY_HOP3, "tier3",
+        if self.wot_notes_per_cycle > 0 {
+            let wot_peers = self.get_random_wot_peers(&follows, &tracked_set, &follow_set);
+            if !wot_peers.is_empty() {
+                info!("Content: fetching WoT content from {} random peers (target: {} notes)", wot_peers.len(), self.wot_notes_per_cycle);
+                let pass_stats = self.fetch_pubkey_set_with_limit(
+                    &wot_peers, &refresh_set, &bands, now,
+                    super::types::MEDIA_PRIORITY_FOF, "tier3", "2",
+                    self.wot_notes_per_cycle,
                 ).await;
                 stats.events_stored += pass_stats.0;
                 stats.wot_updates += pass_stats.1;
@@ -141,14 +120,9 @@ impl ContentFetch {
         Ok(stats)
     }
 
-    /// Update the current_layer in sync_stats for frontend display.
-    async fn set_layer(&self, layer: &str) {
-        let mut ss = self.sync_stats.write().await;
-        ss.current_layer = layer.to_string();
-    }
-
-    /// Fetch events for a set of pubkeys with routing, banding, and media priority.
-    /// Updates sync_stats incrementally after each relay and emits progress.
+    /// Fetch events for a set of pubkeys **one at a time**, sequentially.
+    /// Each pubkey is fetched from its best known relay.
+    /// Updates sync_stats after every pubkey so the dashboard shows 1/N, 2/N, ...
     /// `stat_key` identifies which counter to update: "tracked", "tier2", "tier3".
     /// Returns (events_stored, wot_updates, relays_queried).
     async fn fetch_pubkey_set(
@@ -159,149 +133,119 @@ impl ContentFetch {
         now: i64,
         media_priority: i32,
         stat_key: &str,
+        layer: &str,
     ) -> (u32, u32, u32) {
         let mut events_stored = 0u32;
         let mut wot_updates = 0u32;
+        let mut relays_used: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        // Build relay routing
-        let mut pubkey_relays: HashMap<String, Vec<(String, f64)>> = HashMap::new();
-        let mut fallback_pubkeys: Vec<String> = Vec::new();
+        let total = pubkeys.len() as u64;
 
-        for pubkey in pubkeys {
-            let write_relays = match self.db.get_write_relays(pubkey) {
-                Ok(r) => r,
-                Err(_) => {
-                    fallback_pubkeys.push(pubkey.clone());
-                    continue;
-                }
-            };
-            if write_relays.is_empty() {
-                fallback_pubkeys.push(pubkey.clone());
-                continue;
-            }
-            let mut relay_scores = Vec::new();
-            for (relay_url, _source) in &write_relays {
-                let score = self.db.get_relay_reliability(relay_url).unwrap_or(0.5);
-                relay_scores.push((relay_url.clone(), score));
-            }
-            pubkey_relays.insert(pubkey.clone(), relay_scores);
+        // Atomically update layer + progress so the frontend never sees
+        // a new layer with stale progress from the previous pass.
+        {
+            let mut ss = self.sync_stats.write().await;
+            ss.current_layer = layer.to_string();
+            ss.pass_pubkeys_done = 0;
+            ss.pass_pubkeys_total = total;
+            ss.pass_relays_done = 0;
+            ss.pass_relays_total = 0;
         }
 
-        if !fallback_pubkeys.is_empty() {
-            info!(
-                "Content: {} of {} pubkeys have no relay info, using default relays as fallback",
-                fallback_pubkeys.len(), pubkeys.len()
-            );
-            // Assign default relays for pubkeys with no NIP-65 data
-            for pk in &fallback_pubkeys {
-                let defaults: Vec<(String, f64)> = super::types::DEFAULT_RELAYS
-                    .iter()
-                    .map(|r| (r.to_string(), 0.3))
-                    .collect();
-                pubkey_relays.insert(pk.clone(), defaults);
-            }
-        }
-
-        let muted: Vec<String> = pubkeys
+        // Filter out muted pubkeys
+        let muted_set: std::collections::HashSet<String> = pubkeys
             .iter()
             .filter(|pk| self.db.is_pubkey_muted(pk).unwrap_or(false))
             .cloned()
             .collect();
 
-        let plan = scheduler::build_routing_plan(&pubkey_relays, &muted);
-        let relays_queried = plan.routes.len() as u32;
-
-        if plan.routes.is_empty() && !pubkeys.is_empty() {
-            warn!("Content: routing plan is empty for {} pubkeys — no relays to query", pubkeys.len());
-        }
-
-        // Set pass totals so the dashboard can show progress
-        let total_pubkeys = pubkeys.len() as u64;
-        {
-            let mut ss = self.sync_stats.write().await;
-            ss.pass_pubkeys_done = 0;
-            ss.pass_pubkeys_total = total_pubkeys;
-        }
-
-        let mut covered_pubkeys: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        for (i, route) in plan.routes.iter().enumerate() {
-            // Mark these pubkeys as in-progress BEFORE the fetch so the
-            // dashboard shows progress immediately
-            for pk in &route.pubkeys {
-                covered_pubkeys.insert(pk.clone());
-            }
-            {
+        for (i, pubkey) in pubkeys.iter().enumerate() {
+            if muted_set.contains(pubkey) {
                 let mut ss = self.sync_stats.write().await;
-                ss.pass_pubkeys_done = covered_pubkeys.len() as u64;
+                ss.pass_pubkeys_done = (i + 1) as u64;
+                continue;
             }
 
-            // Emit progress BEFORE fetch so dashboard shows which relay we're querying
-            let short_url = route.relay_url.replace("wss://", "").replace("ws://", "");
-            info!(
-                "Content[{}]: relay {}/{} {} ({} pubkeys, {}/{} covered)",
-                stat_key, i + 1, relays_queried, short_url, route.pubkeys.len(),
-                covered_pubkeys.len(), total_pubkeys
-            );
+            // Find best relay for this pubkey
+            let relay_urls: Vec<String> = match self.db.get_write_relays(pubkey) {
+                Ok(relays) if !relays.is_empty() => {
+                    let mut scored: Vec<(String, f64)> = relays
+                        .into_iter()
+                        .map(|(url, _)| {
+                            let score = self.db.get_relay_reliability(&url).unwrap_or(0.5);
+                            (url, score)
+                        })
+                        .collect();
+                    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    scored.into_iter().map(|(url, _)| url).take(2).collect()
+                }
+                _ => {
+                    super::types::DEFAULT_RELAYS.iter().map(|r| r.to_string()).take(2).collect()
+                }
+            };
+
+            let short_url = relay_urls[0].replace("wss://", "").replace("ws://", "");
+
+            // Emit progress
             self.app_handle.emit("sync:progress", &SyncProgress {
                 tier: 3,
                 fetched: events_stored as u64,
-                total: relays_queried as u64,
-                relay: format!("{} ({}/{})", short_url, i + 1, relays_queried),
+                total,
+                relay: format!("{} ({}/{})", short_url, i + 1, total),
             }).ok();
 
-            let relay_start = std::time::Instant::now();
-            let route_result = tokio::time::timeout(
-                std::time::Duration::from_secs(20),
+            // Fetch this single pubkey
+            let fetch_result = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
                 self.fetch_from_relay(
-                    &route.relay_url,
-                    &route.pubkeys,
+                    &relay_urls[0],
+                    &[pubkey.clone()],
                     bands,
                     refresh_set,
                     now,
                     media_priority,
+                    layer,
                 ),
             ).await;
 
-            let route_stats = match route_result {
-                Ok(stats) => {
-                    info!(
-                        "Content[{}]: relay {} done in {:.1}s → {} stored, {} wot",
-                        stat_key, short_url, relay_start.elapsed().as_secs_f32(), stats.0, stats.1
-                    );
-                    stats
-                },
+            let (stored, wot) = match fetch_result {
+                Ok(stats) => stats,
                 Err(_) => {
-                    warn!("Content[{}]: relay {} TIMED OUT after 20s, skipping", stat_key, route.relay_url);
+                    debug!("Content[{}]: timeout for {} via {}", stat_key, &pubkey[..8.min(pubkey.len())], short_url);
                     (0, 0)
                 }
             };
 
-            events_stored += route_stats.0;
-            wot_updates += route_stats.1;
+            events_stored += stored;
+            wot_updates += wot;
+            relays_used.insert(relay_urls[0].clone());
 
-            // Update event counters incrementally
-            if route_stats.0 > 0 {
+            // Touch cursor so next cycle knows we fetched this pubkey,
+            // even if no new events were found
+            self.db.touch_user_cursor(pubkey).ok();
+
+            // Update counters after each pubkey
+            {
                 let mut ss = self.sync_stats.write().await;
+                ss.pass_pubkeys_done = (i + 1) as u64;
                 match stat_key {
-                    "tracked" => ss.tracked_fetched += route_stats.0 as u64,
-                    "tier2" => ss.tier2_fetched += route_stats.0 as u64,
-                    "tier3" => ss.tier3_fetched += route_stats.0 as u64,
+                    "tracked" => ss.tracked_fetched += stored as u64,
+                    "tier2" => ss.tier2_fetched += stored as u64,
+                    "tier3" => ss.tier3_fetched += stored as u64,
                     _ => {}
                 }
             }
 
-            tokio::time::sleep(std::time::Duration::from_secs(BATCH_PAUSE_SECS)).await;
+            if stored > 0 {
+                self.db.record_relay_success(&relay_urls[0], stored, 0).ok();
+            }
         }
 
-        // Clear pass progress
-        {
-            let mut ss = self.sync_stats.write().await;
-            ss.pass_pubkeys_done = 0;
-            ss.pass_pubkeys_total = 0;
-        }
+        // Don't clear pass progress here — the next pass or layer transition
+        // will overwrite these values. Clearing them causes the dashboard
+        // counter to briefly jump to 0 between cycles.
 
-        (events_stored, wot_updates, relays_queried)
+        (events_stored, wot_updates, relays_used.len() as u32)
     }
 
     /// Fetch events from a single relay for a set of pubkeys.
@@ -313,6 +257,7 @@ impl ContentFetch {
         refresh_set: &std::collections::HashSet<&str>,
         now: i64,
         media_priority: i32,
+        layer: &str,
     ) -> (u32, u32) {
         let mut filters = Vec::new();
 
@@ -342,6 +287,12 @@ impl ContentFetch {
             }
 
             let since = self.compute_since(band, &band_pubkeys, now);
+            let age_mins = (now - since) / 60;
+
+            debug!(
+                "Content filter: {:?} band, {} authors, since={}min ago",
+                band, band_pubkeys.len(), age_mins
+            );
 
             let content_filter = Filter::new()
                 .authors(authors)
@@ -389,6 +340,7 @@ impl ContentFetch {
                     EventSource::Sync,
                     media_priority,
                     Some(&self.app_handle),
+                    layer,
                 );
 
                 // Update relay stats
@@ -430,7 +382,7 @@ impl ContentFetch {
                             &[relay_url.to_string()], vec![thread_filter], 10,
                         ).await {
                             let (ts, _) = processing::process_events(
-                                &thread_events, &self.db, &self.graph, &self.own_pubkey, EventSource::ThreadContext, super::types::MEDIA_PRIORITY_OTHERS, Some(&self.app_handle),
+                                &thread_events, &self.db, &self.graph, &self.own_pubkey, EventSource::ThreadContext, super::types::MEDIA_PRIORITY_OTHERS, Some(&self.app_handle), "thread",
                             );
                             thread_stored = ts;
                             if ts > 0 {
@@ -457,110 +409,180 @@ impl ContentFetch {
 
     /// Get follows-of-follows sorted by how many of our follows also follow them.
     /// Returns up to 200 FoF pubkeys, excluding direct follows and self.
-    fn get_fof_by_overlap(&self, follows: &[String]) -> Vec<String> {
-        let follow_set: std::collections::HashSet<&str> =
-            follows.iter().map(|s| s.as_str()).collect();
+    /// Get a random sample of WoT peers (FoF and beyond), weighted by overlap.
+    /// Excludes own pubkey, tracked profiles, and direct follows.
+    fn get_random_wot_peers(
+        &self,
+        follows: &[String],
+        tracked_set: &std::collections::HashSet<&str>,
+        follow_set: &std::collections::HashSet<&str>,
+    ) -> Vec<String> {
+        use rand::seq::SliceRandom;
 
-        // Count how many of our follows also follow each FoF
+        // Gather all FoF with overlap counts
         let mut overlap_counts: HashMap<String, u32> = HashMap::new();
         for follow in follows {
             if let Some(fof_list) = self.graph.get_follows(follow) {
                 for fof in fof_list {
-                    if fof != self.own_pubkey && !follow_set.contains(fof.as_str()) {
+                    if fof != self.own_pubkey
+                        && !follow_set.contains(fof.as_str())
+                        && !tracked_set.contains(fof.as_str())
+                    {
                         *overlap_counts.entry(fof).or_insert(0) += 1;
                     }
                 }
             }
         }
 
-        // Sort by overlap count descending
-        let mut fof_ranked: Vec<(String, u32)> = overlap_counts.into_iter().collect();
-        fof_ranked.sort_by(|a, b| b.1.cmp(&a.1));
-
-        let limit = if self.fof_max_pubkeys == 0 { fof_ranked.len() } else { self.fof_max_pubkeys as usize };
-
-        // Take top half by overlap, fill the rest randomly from remaining pool
-        // This ensures high-overlap accounts are always fetched while rotating through the network
-        use rand::seq::SliceRandom;
-        let top_half = limit / 2;
-        let mut selected: Vec<String> = fof_ranked.iter().take(top_half).map(|(pk, _)| pk.clone()).collect();
-        let remaining: Vec<&(String, u32)> = fof_ranked.iter().skip(top_half).collect();
-        if !remaining.is_empty() {
-            let mut rng = rand::thread_rng();
-            let mut pool: Vec<String> = remaining.iter().map(|(pk, _)| pk.clone()).collect();
-            pool.shuffle(&mut rng);
-            pool.truncate(limit.saturating_sub(selected.len()));
-            selected.extend(pool);
+        if overlap_counts.is_empty() {
+            return Vec::new();
         }
 
-        debug!(
-            "FoF overlap: total={}, selected={} (limit={}), min_overlap={}",
-            fof_ranked.len(),
-            selected.len(),
-            limit,
-            fof_ranked.last().map(|f| f.1).unwrap_or(0)
+        // Shuffle the full pool — weighted towards higher overlap
+        // by repeating high-overlap entries in the pool
+        let mut pool: Vec<String> = Vec::new();
+        for (pk, count) in &overlap_counts {
+            // Weight: sqrt(count) repetitions so high-overlap peers are more likely
+            let weight = (*count as f64).sqrt().ceil() as u32;
+            for _ in 0..weight {
+                pool.push(pk.clone());
+            }
+        }
+
+        let mut rng = rand::thread_rng();
+        pool.shuffle(&mut rng);
+
+        // Deduplicate while preserving shuffled order
+        let mut seen = std::collections::HashSet::new();
+        let selected: Vec<String> = pool
+            .into_iter()
+            .filter(|pk| seen.insert(pk.clone()))
+            .collect();
+
+        info!(
+            "WoT peers: {} unique from {} total FoF",
+            selected.len(), overlap_counts.len()
         );
 
         selected
     }
 
-    /// Get hop-3 pubkeys: follows of FoF, excluding all closer hops.
-    /// Returns up to 100 pubkeys, sorted by overlap with FoF set.
-    fn get_hop3_pubkeys(
+    /// Like fetch_pubkey_set but stops after collecting `max_notes` new events.
+    async fn fetch_pubkey_set_with_limit(
         &self,
-        follows: &[String],
-        follow_set: &std::collections::HashSet<&str>,
-        tracked_set: &std::collections::HashSet<&str>,
-        fof_set: &std::collections::HashSet<String>,
-    ) -> Vec<String> {
-        let mut overlap_counts: HashMap<String, u32> = HashMap::new();
+        pubkeys: &[String],
+        refresh_set: &std::collections::HashSet<&str>,
+        bands: &HashMap<CursorBand, Vec<String>>,
+        now: i64,
+        media_priority: i32,
+        _stat_key: &str,
+        layer: &str,
+        max_notes: u32,
+    ) -> (u32, u32, u32) {
+        let mut events_stored = 0u32;
+        let mut wot_updates = 0u32;
+        let mut relays_used: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        // For each FoF, get their follows (which are hop 3 from us)
-        for fof_pk in fof_set {
-            if let Some(hop3_list) = self.graph.get_follows(fof_pk) {
-                for pk in hop3_list {
-                    if pk != self.own_pubkey
-                        && !follow_set.contains(pk.as_str())
-                        && !tracked_set.contains(pk.as_str())
-                        && !fof_set.contains(&pk)
-                    {
-                        *overlap_counts.entry(pk).or_insert(0) += 1;
-                    }
+        let total = pubkeys.len() as u64;
+
+        {
+            let mut ss = self.sync_stats.write().await;
+            ss.current_layer = layer.to_string();
+            ss.pass_pubkeys_done = 0;
+            ss.pass_pubkeys_total = total;
+            ss.pass_relays_done = 0;
+            ss.pass_relays_total = 0;
+        }
+
+        let muted_set: std::collections::HashSet<String> = pubkeys
+            .iter()
+            .filter(|pk| self.db.is_pubkey_muted(pk).unwrap_or(false))
+            .cloned()
+            .collect();
+
+        for (i, pubkey) in pubkeys.iter().enumerate() {
+            // Stop if we've collected enough notes
+            if events_stored >= max_notes {
+                info!("WoT content: reached {} notes limit at peer {}/{}", max_notes, i, total);
+                break;
+            }
+
+            if muted_set.contains(pubkey) {
+                let mut ss = self.sync_stats.write().await;
+                ss.pass_pubkeys_done = (i + 1) as u64;
+                continue;
+            }
+
+            let relay_urls: Vec<String> = match self.db.get_write_relays(pubkey) {
+                Ok(relays) if !relays.is_empty() => {
+                    let mut scored: Vec<(String, f64)> = relays
+                        .into_iter()
+                        .map(|(url, _)| {
+                            let score = self.db.get_relay_reliability(&url).unwrap_or(0.5);
+                            (url, score)
+                        })
+                        .collect();
+                    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    scored.into_iter().map(|(url, _)| url).take(2).collect()
                 }
+                _ => {
+                    super::types::DEFAULT_RELAYS.iter().map(|r| r.to_string()).take(2).collect()
+                }
+            };
+
+            let short_url = relay_urls[0].replace("wss://", "").replace("ws://", "");
+
+            self.app_handle.emit("sync:progress", &SyncProgress {
+                tier: 3,
+                fetched: events_stored as u64,
+                total: max_notes as u64,
+                relay: format!("{} ({}/{}notes)", short_url, events_stored, max_notes),
+            }).ok();
+
+            let fetch_result = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                self.fetch_from_relay(
+                    &relay_urls[0],
+                    &[pubkey.clone()],
+                    bands,
+                    refresh_set,
+                    now,
+                    media_priority,
+                    layer,
+                ),
+            ).await;
+
+            let (stored, wot) = match fetch_result {
+                Ok(stats) => stats,
+                Err(_) => {
+                    debug!("WoT content: timeout for {} via {}", &pubkey[..8.min(pubkey.len())], short_url);
+                    (0, 0)
+                }
+            };
+
+            events_stored += stored;
+            wot_updates += wot;
+            relays_used.insert(relay_urls[0].clone());
+
+            // Touch cursor so next cycle knows we fetched this pubkey
+            self.db.touch_user_cursor(pubkey).ok();
+
+            {
+                let mut ss = self.sync_stats.write().await;
+                ss.pass_pubkeys_done = (i + 1) as u64;
+                ss.tier3_fetched += stored as u64;
+            }
+
+            if stored > 0 {
+                self.db.record_relay_success(&relay_urls[0], stored, 0).ok();
             }
         }
 
-        // If FoF set is empty, derive hop3 from follows' follows' follows
-        if fof_set.is_empty() {
-            for follow in follows {
-                if let Some(fof_list) = self.graph.get_follows(follow) {
-                    for fof in &fof_list {
-                        if let Some(hop3_list) = self.graph.get_follows(fof) {
-                            for pk in hop3_list {
-                                if pk != self.own_pubkey
-                                    && !follow_set.contains(pk.as_str())
-                                    && !tracked_set.contains(pk.as_str())
-                                {
-                                    *overlap_counts.entry(pk).or_insert(0) += 1;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // Don't clear pass progress here — the next pass or layer transition
+        // will overwrite these values. Clearing them causes the dashboard
+        // counter to briefly jump to 0 between cycles.
 
-        let mut ranked: Vec<(String, u32)> = overlap_counts.into_iter().collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1));
-        ranked.truncate(100);
-
-        debug!(
-            "Hop3: top={}, min_overlap={}",
-            ranked.len(),
-            ranked.last().map(|f| f.1).unwrap_or(0)
-        );
-
-        ranked.into_iter().map(|(pk, _)| pk).collect()
+        (events_stored, wot_updates, relays_used.len() as u32)
     }
 
     /// Compute the `since` timestamp for a cursor band.
@@ -581,7 +603,19 @@ impl ContentFetch {
                 oldest_cursor.unwrap_or(fallback)
             }
             CursorBand::Cold => {
-                fallback
+                // If we've fetched this user before, use last_fetched_at with overlap
+                // instead of the full lookback window. This makes subsequent syncs
+                // much faster when there are no new events.
+                let mut best_fetched_at: Option<i64> = None;
+                for pk in pubkeys {
+                    if let Ok(Some((_last_ts, last_fetched_at))) = self.db.get_user_cursor(pk) {
+                        if last_fetched_at > 0 {
+                            let since = last_fetched_at - CURSOR_OVERLAP_SECS as i64;
+                            best_fetched_at = Some(best_fetched_at.map_or(since, |c: i64| c.min(since)));
+                        }
+                    }
+                }
+                best_fetched_at.unwrap_or(fallback)
             }
         }
     }

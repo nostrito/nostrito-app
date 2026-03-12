@@ -117,6 +117,7 @@ impl Discovery {
                         EventSource::Sync,
                         super::types::MEDIA_PRIORITY_OTHERS,
                         Some(&self.app_handle),
+                        "",
                     );
                     total_processed += stored;
                 }
