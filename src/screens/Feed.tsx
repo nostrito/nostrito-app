@@ -18,6 +18,22 @@ import type { NostrEvent } from "../types/nostr";
 /** Kinds that belong in the feed */
 const FEED_KINDS = [1, 6, 30023];
 
+/** Deduplicate kind:30023 articles by pubkey:d-tag, keeping the newest version. */
+function deduplicateArticles(events: NostrEvent[]): NostrEvent[] {
+  const articles = events.filter((e) => e.kind === 30023);
+  const rest = events.filter((e) => e.kind !== 30023);
+  const best = new Map<string, NostrEvent>();
+  for (const e of articles) {
+    const dTag = e.tags.find((t) => t[0] === "d")?.[1] ?? "";
+    const key = `${e.pubkey}:${dTag}`;
+    const existing = best.get(key);
+    if (!existing || e.created_at > existing.created_at) {
+      best.set(key, e);
+    }
+  }
+  return [...Array.from(best.values()), ...rest];
+}
+
 /** Resolve NIP-05 identifier (name@domain) to hex pubkey */
 async function resolveNip05(nip05: string): Promise<string | null> {
   const parts = nip05.split("@");
@@ -119,6 +135,8 @@ export const Feed: React.FC = () => {
   const [hasMore, setHasMore] = useState(true);
   const [loadingMoreArticles, setLoadingMoreArticles] = useState(false);
   const [hasMoreArticles, setHasMoreArticles] = useState(true);
+  const [fetchingRelay, setFetchingRelay] = useState(false);
+  const [relayFetched, setRelayFetched] = useState(false);
 
   const { getProfile, ensureProfiles } = useProfileContext();
 
@@ -182,10 +200,7 @@ export const Feed: React.FC = () => {
       setFeedEvents((prev) => {
         const existingIds = new Set(prev.map((e) => e.id));
         const toAdd = newEvents.filter((e) => !existingIds.has(e.id));
-        const merged = [...toAdd, ...prev];
-        const articles = merged.filter((e) => e.kind === 30023);
-        const notes = merged.filter((e) => e.kind !== 30023);
-        return [...articles, ...notes];
+        return deduplicateArticles([...toAdd, ...prev]);
       });
 
       setLoading(false);
@@ -296,7 +311,7 @@ export const Feed: React.FC = () => {
       setFeedEvents((prev) => {
         const existingIds = new Set(prev.map((e) => e.id));
         const toAdd = newEvents.filter((e) => !existingIds.has(e.id));
-        return [...prev, ...toAdd];
+        return deduplicateArticles([...prev, ...toAdd]);
       });
     } catch (err) {
       console.warn("[feed] Failed to load more articles:", err);
@@ -306,6 +321,38 @@ export const Feed: React.FC = () => {
     }
   }, [isSearchMode, hasMoreArticles, feedMode, ensureProfiles]);
 
+  const fetchFromRelays = useCallback(async () => {
+    if (fetchingRelay) return;
+    setFetchingRelay(true);
+    try {
+      const rawEvents = await invoke<NostrEvent[]>("fetch_global_feed", { limit: 50 });
+      const newEvents = rawEvents.filter((e) => FEED_KINDS.includes(e.kind) && !renderedEventIdsRef.current.has(e.id));
+
+      if (newEvents.length > 0) {
+        const pubkeys = [...new Set(newEvents.map((e) => e.pubkey))];
+        ensureProfiles(pubkeys);
+
+        for (const e of newEvents) {
+          renderedEventIdsRef.current.add(e.id);
+        }
+
+        setFeedEvents((prev) => {
+          const existingIds = new Set(prev.map((e) => e.id));
+          const toAdd = newEvents.filter((e) => !existingIds.has(e.id));
+          return deduplicateArticles([...prev, ...toAdd]);
+        });
+
+        // Mark relay events for save buttons
+        setSavedEventIds((prev) => new Set(prev));
+      }
+      setRelayFetched(true);
+    } catch (err) {
+      console.warn("[feed] Failed to fetch from relays:", err);
+    } finally {
+      setFetchingRelay(false);
+    }
+  }, [fetchingRelay, ensureProfiles]);
+
   // Reset feed when mode changes
   useEffect(() => {
     renderedEventIdsRef.current.clear();
@@ -313,6 +360,7 @@ export const Feed: React.FC = () => {
     setSavedEventIds(new Set());
     setHasMore(true);
     setHasMoreArticles(true);
+    setRelayFetched(false);
     if (feedMode === "global") {
       setGlobalConsent(false);
       setLoading(false);
@@ -605,7 +653,15 @@ export const Feed: React.FC = () => {
               </div>
             )}
 
-            {!isSearchMode && !hasMore && filteredNotes.length > 0 && (
+            {!isSearchMode && !hasMore && filteredNotes.length > 0 && feedMode === "wot" && !relayFetched && (
+              <div className="feed-end feed-relay-prompt">
+                <span>No more local events.</span>
+                <button className="feed-relay-fetch-btn" onClick={fetchFromRelays} disabled={fetchingRelay}>
+                  {fetchingRelay ? "Fetching from relays..." : "Fetch from relays?"}
+                </button>
+              </div>
+            )}
+            {!isSearchMode && !hasMore && filteredNotes.length > 0 && (feedMode !== "wot" || relayFetched) && (
               <div className="feed-end">No more events to load</div>
             )}
           </div>
@@ -627,6 +683,13 @@ export const Feed: React.FC = () => {
                 {loadingMoreArticles && <span className="feed-sentinel-text">Loading more...</span>}
               </div>
             )}
+            {!hasMoreArticles && articles.length > 0 && feedMode === "wot" && !relayFetched && (
+              <div className="feed-end feed-relay-prompt">
+                <button className="feed-relay-fetch-btn" onClick={fetchFromRelays} disabled={fetchingRelay}>
+                  {fetchingRelay ? "Fetching..." : "Fetch from relays?"}
+                </button>
+              </div>
+            )}
           </div>
         )}
 
@@ -646,6 +709,13 @@ export const Feed: React.FC = () => {
             {hasMoreArticles && articles.length > 0 && (
               <div className="feed-sentinel">
                 {loadingMoreArticles && <span className="feed-sentinel-text">Loading more...</span>}
+              </div>
+            )}
+            {!hasMoreArticles && articles.length > 0 && feedMode === "wot" && !relayFetched && (
+              <div className="feed-end feed-relay-prompt">
+                <button className="feed-relay-fetch-btn" onClick={fetchFromRelays} disabled={fetchingRelay}>
+                  {fetchingRelay ? "Fetching..." : "Fetch from relays?"}
+                </button>
               </div>
             )}
           </div>
