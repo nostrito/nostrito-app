@@ -84,6 +84,9 @@ export const ProfileView: React.FC = () => {
   const [notes, setNotes] = useState<NostrEvent[]>([]);
   const [articles, setArticles] = useState<NostrEvent[]>([]);
   const [media, setMedia] = useState<MediaItem[]>([]);
+  const [hasMoreNotes, setHasMoreNotes] = useState(true);
+  const [loadingMoreNotes, setLoadingMoreNotes] = useState(false);
+  const notesSentinelRef = useRef<HTMLDivElement>(null);
 
   // Loading states
   const [profileLoading, setProfileLoading] = useState(true);
@@ -196,19 +199,45 @@ export const ProfileView: React.FC = () => {
   const loadNotes = useCallback(async () => {
     if (!pubkey || notesLoading) return;
     setNotesLoading(true);
+    setHasMoreNotes(true);
     try {
       const events = await invoke<NostrEvent[]>("get_feed", {
         filter: { kinds: [1], limit: 50, author: pubkey },
       });
-      setNotes(events.sort((a, b) => b.created_at - a.created_at));
-      // Ensure profiles for note authors (mostly same pubkey but reposts may differ)
+      const sorted = events.sort((a, b) => b.created_at - a.created_at);
+      setNotes(sorted);
       ensureProfiles(events.map((e) => e.pubkey));
+      if (events.length < 50) setHasMoreNotes(false);
     } catch (e) {
       console.error("[profile] Failed to load notes:", e);
     } finally {
       setNotesLoading(false);
     }
   }, [pubkey, ensureProfiles]);
+
+  /* --- load more notes (pagination) -------------------------------- */
+  const loadMoreNotes = useCallback(async () => {
+    if (!pubkey || loadingMoreNotes || !hasMoreNotes || notes.length === 0) return;
+    setLoadingMoreNotes(true);
+    try {
+      const oldest = notes[notes.length - 1].created_at;
+      const events = await invoke<NostrEvent[]>("get_feed", {
+        filter: { kinds: [1], limit: 50, author: pubkey, until: oldest - 1 },
+      });
+      if (events.length === 0) {
+        setHasMoreNotes(false);
+      } else {
+        const sorted = events.sort((a, b) => b.created_at - a.created_at);
+        setNotes((prev) => [...prev, ...sorted]);
+        ensureProfiles(events.map((e) => e.pubkey));
+        if (events.length < 50) setHasMoreNotes(false);
+      }
+    } catch (e) {
+      console.error("[profile] Failed to load more notes:", e);
+    } finally {
+      setLoadingMoreNotes(false);
+    }
+  }, [pubkey, notes, loadingMoreNotes, hasMoreNotes, ensureProfiles]);
 
   /* --- load articles ------------------------------------------------ */
   const loadArticles = useCallback(async () => {
@@ -266,6 +295,19 @@ export const ProfileView: React.FC = () => {
       loadNotes();
     }
   }, [pubkey, profileLoading]);
+
+  /* --- IntersectionObserver for notes pagination -------------------- */
+  useEffect(() => {
+    if (!notesSentinelRef.current || !hasMoreNotes || activeTab !== "notes") return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0].isIntersecting) loadMoreNotes();
+      },
+      { threshold: 0.1 },
+    );
+    observer.observe(notesSentinelRef.current);
+    return () => observer.disconnect();
+  }, [loadMoreNotes, hasMoreNotes, activeTab]);
 
   /* --- media viewer opener ------------------------------------------ */
   const openViewer = useCallback((url: string) => {
@@ -551,8 +593,14 @@ export const ProfileView: React.FC = () => {
                         event={note}
                         profile={getProfile(note.pubkey) ?? profile ?? undefined}
                         compact
+                        onClick={() => navigate(`/note/${note.id}`)}
                       />
                     ))}
+                    {hasMoreNotes && notes.length > 0 && (
+                      <div ref={notesSentinelRef} style={{ padding: 16, color: "var(--text-muted)" }}>
+                        {loadingMoreNotes ? "Loading more notes..." : ""}
+                      </div>
+                    )}
                   </div>
                 )}
 

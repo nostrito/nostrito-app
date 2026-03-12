@@ -1,17 +1,10 @@
-import React, { useEffect, useState } from "react";
+import React from "react";
 import { NavLink } from "react-router-dom";
-import { invoke } from "@tauri-apps/api/core";
 import { IconDashboard, IconFeed, IconMessageCircle, IconNetwork, IconDatabase, IconSettings, IconImage } from "./Icon";
-import type { ProfileInfo } from "../utils/profiles";
+import { useAppContext } from "../context/AppContext";
 
 export const Sidebar: React.FC = () => {
-  const [ownProfile, setOwnProfile] = useState<ProfileInfo | null>(null);
-
-  useEffect(() => {
-    invoke<ProfileInfo | null>("get_own_profile")
-      .then((p) => setOwnProfile(p))
-      .catch(() => {});
-  }, []);
+  const { ownProfile } = useAppContext();
 
   const navItems = [
     { to: "/", icon: <IconDashboard />, label: "Dashboard" },

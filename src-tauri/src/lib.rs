@@ -16,18 +16,44 @@ use storage::{Database, ProfileInfo};
 use sync::{resolve_relay_url as resolve_relay_alias, SyncConfig, SyncEngine, SyncStats};
 use wot::WotGraph;
 
+// ── Helpers ────────────────────────────────────────────────────────
+
+/// Per-npub database path: `{data_dir}/{npub_prefix}.db`
+fn db_path_for_npub(data_dir: &std::path::Path, npub: &str) -> PathBuf {
+    let short = if npub.len() > 16 { &npub[..16] } else { npub };
+    data_dir.join(format!("{}.db", short))
+}
+
+/// Lobby database used before any npub is known.
+fn lobby_db_path(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("nostrito.db")
+}
+
 // ── App State ──────────────────────────────────────────────────────
 
 pub struct AppState {
     pub wot_graph: Arc<WotGraph>,
-    pub db: Arc<Database>,
+    db: parking_lot::RwLock<Arc<Database>>,
     pub config: Arc<RwLock<AppConfig>>,
-    pub db_path: PathBuf,
+    pub data_dir: PathBuf,
     pub sync_cancel: Arc<RwLock<Option<CancellationToken>>>,
     pub sync_tier: Arc<AtomicU8>,
     pub sync_stats: Arc<RwLock<SyncStats>>,
     pub relay_cancel: Arc<RwLock<Option<CancellationToken>>>,
     pub start_time: std::time::Instant,
+}
+
+impl AppState {
+    /// Get a clone of the current database Arc.
+    pub fn db(&self) -> Arc<Database> {
+        self.db.read().clone()
+    }
+
+    /// Swap the database to a new one.
+    pub fn swap_db(&self, new_db: Arc<Database>) {
+        let mut guard = self.db.write();
+        *guard = new_db;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -56,12 +82,8 @@ pub struct AppConfig {
     pub sync_wot_batch_size: u32,
     pub sync_wot_events_per_batch: u32,
     pub max_event_age_days: u32,
-    /// Fetch content (kind:1/6/30023) from follows-of-follows
-    pub sync_fof_content: bool,
-    /// Fetch content from hop-3 pubkeys (lowest priority)
-    pub sync_hop3_content: bool,
-    /// Max FoF pubkeys to fetch content for (limits Layer 2 scope)
-    pub sync_fof_max_pubkeys: u32,
+    /// How many notes to fetch from WoT peers each sync cycle (0 = disabled)
+    pub sync_wot_notes_per_cycle: u32,
     /// Offline mode — stop all outbound sync, work only with local data
     pub offline_mode: bool,
     /// Cached nsec (loaded from system keychain on startup)
@@ -97,9 +119,7 @@ impl Default for AppConfig {
             sync_wot_batch_size: 5,
             sync_wot_events_per_batch: 15,
             max_event_age_days: 30,
-            sync_fof_content: true,
-            sync_hop3_content: false,
-            sync_fof_max_pubkeys: 200,
+            sync_wot_notes_per_cycle: 50,
             offline_mode: false,
             nsec: None,
         }
@@ -122,6 +142,7 @@ pub struct AppStatus {
     pub sync_stats: SyncStats,
     pub media_stored: u64,
     pub offline_mode: bool,
+    pub sync_wot_notes_per_cycle: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -197,9 +218,7 @@ pub struct Settings {
     pub sync_wot_batch_size: u32,
     pub sync_wot_events_per_batch: u32,
     pub max_event_age_days: u32,
-    pub sync_fof_content: bool,
-    pub sync_hop3_content: bool,
-    pub sync_fof_max_pubkeys: u32,
+    pub sync_wot_notes_per_cycle: u32,
     pub offline_mode: bool,
 }
 
@@ -274,8 +293,8 @@ async fn get_status(state: State<'_, AppState>) -> Result<AppStatus, String> {
     let relay_running = state.relay_cancel.read().await.is_some();
     let current_tier = state.sync_tier.load(Ordering::Relaxed);
     let sync_stats = state.sync_stats.read().await.clone();
-    let events_stored = state.db.event_count().unwrap_or(0);
-    let media_stored = state.db.media_file_count().unwrap_or(0);
+    let events_stored = state.db().event_count().unwrap_or(0);
+    let media_stored = state.db().media_total_bytes().unwrap_or(0);
     let offline_mode = config.offline_mode;
 
     tracing::debug!("[cmd:get_status] relay_running={}, events={}, wot_nodes={}, sync_tier={}", relay_running, events_stored, stats.node_count, current_tier);
@@ -303,6 +322,7 @@ async fn get_status(state: State<'_, AppState>) -> Result<AppStatus, String> {
         sync_stats,
         media_stored,
         offline_mode,
+        sync_wot_notes_per_cycle: config.sync_wot_notes_per_cycle,
     })
 }
 
@@ -328,6 +348,24 @@ async fn init_nostrito(
     } else {
         return Err("Invalid pubkey format. Use npub1... or 64-char hex".into());
     };
+
+    // Open per-npub database and swap it in
+    let user_db_path = db_path_for_npub(&state.data_dir, &npub);
+    tracing::info!("[init_nostrito] Opening per-user DB: {}", user_db_path.display());
+    let new_db = Arc::new(
+        Database::open(&user_db_path).map_err(|e| format!("Failed to open per-user DB: {}", e))?,
+    );
+    state.swap_db(new_db);
+
+    // Save npub to lobby DB so we know which user to auto-load on next startup
+    let lobby_path = lobby_db_path(&state.data_dir);
+    if let Ok(lobby) = Database::open(&lobby_path) {
+        lobby.set_config("npub", &npub).ok();
+        lobby.set_config("hex_pubkey", &hex_pubkey).ok();
+    }
+
+    // Clear WoT graph and reload from new DB
+    state.wot_graph.clear();
 
     // Resolve relay aliases to canonical wss:// URLs (wizard may send short aliases)
     let resolved_relays: Vec<String> = relays
@@ -355,17 +393,14 @@ async fn init_nostrito(
     }
 
     // Persist to DB
-    state
-        .db
+    state.db()
         .set_config("npub", &npub)
         .map_err(|e| format!("Failed to save config: {}", e))?;
-    state
-        .db
+    state.db()
         .set_config("hex_pubkey", &hex_pubkey)
         .map_err(|e| format!("Failed to save config: {}", e))?;
     if !resolved_relays.is_empty() {
-        state
-            .db
+        state.db()
             .set_config("outbound_relays", &resolved_relays.join(","))
             .map_err(|e| format!("Failed to save relays: {}", e))?;
     }
@@ -373,13 +408,12 @@ async fn init_nostrito(
     // Persist per-category media limits
     {
         let config = state.config.read().await;
-        state.db.set_config("storage_tracked_media_gb", &config.storage_tracked_media_gb.to_string()).ok();
-        state.db.set_config("storage_wot_media_gb", &config.storage_wot_media_gb.to_string()).ok();
+        state.db().set_config("storage_tracked_media_gb", &config.storage_tracked_media_gb.to_string()).ok();
+        state.db().set_config("storage_wot_media_gb", &config.storage_wot_media_gb.to_string()).ok();
     }
 
     // Load existing graph from DB
-    state
-        .db
+    state.db()
         .load_graph(&state.wot_graph)
         .map_err(|e| format!("Failed to load graph: {}", e))?;
 
@@ -397,13 +431,11 @@ async fn init_nostrito(
             wot_batch_size: config.sync_wot_batch_size,
             wot_events_per_batch: config.sync_wot_events_per_batch,
             cycle_interval_secs: config.sync_interval_secs,
-            fof_content: config.sync_fof_content,
-            hop3_content: config.sync_hop3_content,
-            fof_max_pubkeys: config.sync_fof_max_pubkeys,
+            wot_notes_per_cycle: config.sync_wot_notes_per_cycle,
         };
         let cancel = start_sync_engine(
             state.wot_graph.clone(),
-            state.db.clone(),
+            state.db(),
             config.outbound_relays.clone(),
             hex_pubkey.clone(),
             state.sync_tier.clone(),
@@ -440,7 +472,7 @@ async fn init_nostrito(
         let allowed = config.hex_pubkey.clone();
         drop(config);
 
-        let db_relay = state.db.clone();
+        let db_relay = state.db();
         let relay_cancel = CancellationToken::new();
         let relay_cancel_clone = relay_cancel.clone();
 
@@ -490,7 +522,7 @@ async fn get_follows(pubkey: String, state: State<'_, AppState>) -> Result<Vec<S
 #[tauri::command]
 async fn get_profiles_batch(pubkeys: Vec<String>, state: State<'_, AppState>) -> Result<Vec<serde_json::Value>, String> {
     tracing::debug!("[cmd:get_profiles_batch] called for {} pubkeys", pubkeys.len());
-    let profiles = state.db.get_profiles(&pubkeys).map_err(|e| e.to_string())?;
+    let profiles = state.db().get_profiles(&pubkeys).map_err(|e| e.to_string())?;
     let map: std::collections::HashMap<String, _> = profiles.into_iter().map(|p| (p.pubkey.clone(), p)).collect();
     let result = pubkeys.iter().map(|pk| {
         if let Some(p) = map.get(pk) {
@@ -578,13 +610,11 @@ async fn start_sync(
         wot_batch_size: config.sync_wot_batch_size,
         wot_events_per_batch: config.sync_wot_events_per_batch,
         cycle_interval_secs: config.sync_interval_secs,
-        fof_content: config.sync_fof_content,
-        hop3_content: config.sync_hop3_content,
-        fof_max_pubkeys: config.sync_fof_max_pubkeys,
+        wot_notes_per_cycle: config.sync_wot_notes_per_cycle,
     };
     let cancel = start_sync_engine(
         state.wot_graph.clone(),
-        state.db.clone(),
+        state.db(),
         config.outbound_relays.clone(),
         hex_pubkey,
         state.sync_tier.clone(),
@@ -627,7 +657,7 @@ async fn set_offline_mode(
     }
 
     // Persist to DB
-    state.db.set_config("offline_mode", if enabled { "true" } else { "false" })
+    state.db().set_config("offline_mode", if enabled { "true" } else { "false" })
         .map_err(|e| format!("Failed to save offline_mode: {}", e))?;
 
     if enabled {
@@ -657,13 +687,11 @@ async fn set_offline_mode(
                 wot_batch_size: config.sync_wot_batch_size,
                 wot_events_per_batch: config.sync_wot_events_per_batch,
                 cycle_interval_secs: config.sync_interval_secs,
-                fof_content: config.sync_fof_content,
-                hop3_content: config.sync_hop3_content,
-                fof_max_pubkeys: config.sync_fof_max_pubkeys,
+                wot_notes_per_cycle: config.sync_wot_notes_per_cycle,
             };
             let cancel = start_sync_engine(
                 state.wot_graph.clone(),
-                state.db.clone(),
+                state.db(),
                 config.outbound_relays.clone(),
                 hex_pubkey.clone(),
                 state.sync_tier.clone(),
@@ -717,14 +745,12 @@ async fn restart_sync(state: State<'_, AppState>, app_handle: tauri::AppHandle) 
         wot_batch_size: config.sync_wot_batch_size,
         wot_events_per_batch: config.sync_wot_events_per_batch,
         cycle_interval_secs: config.sync_interval_secs,
-        fof_content: config.sync_fof_content,
-        hop3_content: config.sync_hop3_content,
-        fof_max_pubkeys: config.sync_fof_max_pubkeys,
+        wot_notes_per_cycle: config.sync_wot_notes_per_cycle,
     };
 
     let cancel = start_sync_engine(
         state.wot_graph.clone(),
-        state.db.clone(),
+        state.db(),
         config.outbound_relays.clone(),
         hex_pubkey,
         state.sync_tier.clone(),
@@ -743,6 +769,20 @@ async fn restart_sync(state: State<'_, AppState>, app_handle: tauri::AppHandle) 
     Ok(())
 }
 
+/// Reset all user sync cursors so the next cycle does a full lookback fetch.
+/// Used when the user wants to restart sync from scratch.
+#[tauri::command]
+async fn reset_sync_cursors(state: State<'_, AppState>, app_handle: tauri::AppHandle) -> Result<(), String> {
+    tracing::info!("[cmd:reset_sync_cursors] Clearing all user cursors");
+    state.db().clear_user_cursors()
+        .map_err(|e| format!("Failed to clear cursors: {}", e))?;
+
+    // Also restart sync so it picks up the cleared state immediately
+    restart_sync(state, app_handle).await?;
+    tracing::info!("[cmd:reset_sync_cursors] Cursors cleared — sync restarted from scratch");
+    Ok(())
+}
+
 /// Reset the articles (kind 30023) backfill cursor so historical articles are re-fetched.
 /// Also resets the main history cursor to trigger a full re-crawl of notes too.
 /// The next sync cycle will start backfilling from now, walking backward through all history.
@@ -756,11 +796,11 @@ async fn resync_articles(state: State<'_, AppState>) -> Result<String, String> {
     tracing::info!("[cmd:resync_articles] Resetting article sync cursors");
 
     // Reset articles-specific cursor (kind 30023 backfill)
-    state.db.delete_config("tier2_history_until_articles")
+    state.db().delete_config("tier2_history_until_articles")
         .map_err(|e| format!("Failed to reset articles cursor: {}", e))?;
 
     // Also reset the main history cursor so notes/reposts re-backfill too
-    state.db.delete_config("tier2_history_until")
+    state.db().delete_config("tier2_history_until")
         .map_err(|e| format!("Failed to reset history cursor: {}", e))?;
 
     tracing::info!("[cmd:resync_articles] Cursors reset — next sync cycle will re-backfill all history");
@@ -782,7 +822,7 @@ async fn get_feed(filter: FeedFilter, state: State<'_, AppState>) -> Result<Vec<
     // Branch: WoT mode uses a SQL subquery (avoids SQLite parameter limit with large graphs)
     let events = if filter.wot_only.unwrap_or(false) {
         let own_pk = state.config.read().await.hex_pubkey.clone();
-        state.db.query_wot_feed(own_pk.as_deref(), kinds, filter.since, filter.until, limit)
+        state.db().query_wot_feed(own_pk.as_deref(), kinds, filter.since, filter.until, limit)
             .map_err(|e| {
                 tracing::error!("[cmd:get_feed] wot query failed: {}", e);
                 format!("Failed to query WoT feed: {}", e)
@@ -790,7 +830,7 @@ async fn get_feed(filter: FeedFilter, state: State<'_, AppState>) -> Result<Vec<
     } else {
         let author_vec = filter.author.map(|a| vec![a]);
         let authors = author_vec.as_deref();
-        state.db.query_events(None, authors, kinds, filter.since, filter.until, limit)
+        state.db().query_events(None, authors, kinds, filter.since, filter.until, limit)
             .map_err(|e| {
                 tracing::error!("[cmd:get_feed] query failed: {}", e);
                 format!("Failed to query events: {}", e)
@@ -816,6 +856,64 @@ async fn get_feed(filter: FeedFilter, state: State<'_, AppState>) -> Result<Vec<
         .collect())
 }
 
+fn rows_to_events(rows: Vec<(String, String, i64, i64, String, String, String)>) -> Vec<NostrEvent> {
+    rows.into_iter()
+        .map(|(id, pubkey, created_at, kind, tags_json, content, sig)| {
+            let tags: Vec<Vec<String>> = serde_json::from_str(&tags_json).unwrap_or_default();
+            NostrEvent {
+                id,
+                pubkey,
+                created_at: created_at as u64,
+                kind: kind as u32,
+                tags,
+                content,
+                sig,
+            }
+        })
+        .collect()
+}
+
+#[tauri::command]
+async fn get_event(id: String, state: State<'_, AppState>) -> Result<Option<NostrEvent>, String> {
+    let events = state.db().query_events(Some(&[id]), None, None, None, None, 1)
+        .map_err(|e| format!("Failed to get event: {}", e))?;
+    Ok(rows_to_events(events).into_iter().next())
+}
+
+#[tauri::command]
+async fn get_note_replies(
+    note_id: String,
+    until: Option<u64>,
+    limit: Option<u32>,
+    state: State<'_, AppState>,
+) -> Result<Vec<NostrEvent>, String> {
+    let own_pk = state.config.read().await.hex_pubkey.clone();
+    let rows = state.db().query_events_by_tag(
+        "e", &note_id,
+        Some(&[1]),
+        own_pk.as_deref(),
+        until,
+        limit.unwrap_or(50),
+    ).map_err(|e| format!("Failed to get replies: {}", e))?;
+    Ok(rows_to_events(rows))
+}
+
+#[tauri::command]
+async fn get_note_reactions(
+    note_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<NostrEvent>, String> {
+    let own_pk = state.config.read().await.hex_pubkey.clone();
+    let rows = state.db().query_events_by_tag(
+        "e", &note_id,
+        Some(&[7]),
+        own_pk.as_deref(),
+        None,
+        500,
+    ).map_err(|e| format!("Failed to get reactions: {}", e))?;
+    Ok(rows_to_events(rows))
+}
+
 #[tauri::command]
 async fn fetch_global_feed(limit: Option<u32>, state: State<'_, AppState>) -> Result<Vec<NostrEvent>, String> {
     use nostr_sdk::prelude::*;
@@ -828,7 +926,7 @@ async fn fetch_global_feed(limit: Option<u32>, state: State<'_, AppState>) -> Re
     let fallback_relays = cfg.outbound_relays.clone();
     drop(cfg);
 
-    let relay_urls = resolve_sync_relays(&state.db, &hex_pubkey, &fallback_relays);
+    let relay_urls = resolve_sync_relays(&state.db(), &hex_pubkey, &fallback_relays);
     if relay_urls.is_empty() {
         return Err("No relays available".into());
     }
@@ -923,7 +1021,7 @@ async fn fetch_global_feed(limit: Option<u32>, state: State<'_, AppState>) -> Re
 async fn save_event(event: NostrEvent, state: State<'_, AppState>) -> Result<bool, String> {
     tracing::info!("[cmd:save_event] id={}...", &event.id[..event.id.len().min(12)]);
     let tags_json = serde_json::to_string(&event.tags).unwrap_or_else(|_| "[]".to_string());
-    state.db.store_event(
+    state.db().store_event(
         &event.id,
         &event.pubkey,
         event.created_at as i64,
@@ -960,8 +1058,7 @@ async fn search_events(query: String, limit: Option<u32>, state: State<'_, AppSt
         keyword = Some(trimmed.to_string());
     }
 
-    let events = state
-        .db
+    let events = state.db()
         .search_events(keyword.as_deref(), author_filter.as_deref(), lim)
         .map_err(|e| {
             tracing::error!("[cmd:search_events] query failed: {}", e);
@@ -1000,7 +1097,7 @@ async fn search_global(query: String, limit: Option<u32>, state: State<'_, AppSt
     let fallback_relays = cfg.outbound_relays.clone();
     drop(cfg);
 
-    let relay_urls = resolve_sync_relays(&state.db, &hex_pubkey, &fallback_relays);
+    let relay_urls = resolve_sync_relays(&state.db(), &hex_pubkey, &fallback_relays);
     if relay_urls.is_empty() {
         return Ok(Vec::new());
     }
@@ -1103,7 +1200,7 @@ async fn search_global(query: String, limit: Option<u32>, state: State<'_, AppSt
             &event.tags.iter().map(|t| t.as_slice().iter().map(|s| s.to_string()).collect::<Vec<String>>()).collect::<Vec<Vec<String>>>()
         ).unwrap_or_else(|_| "[]".to_string());
 
-        state.db.store_event(
+        state.db().store_event(
             &event.id.to_hex(),
             &event.pubkey.to_hex(),
             event.created_at.as_u64() as i64,
@@ -1138,9 +1235,9 @@ async fn search_global(query: String, limit: Option<u32>, state: State<'_, AppSt
 #[tauri::command]
 async fn get_storage_stats(state: State<'_, AppState>) -> Result<StorageStats, String> {
     tracing::debug!("[cmd:get_storage_stats] called");
-    let total_events = state.db.event_count().map_err(|e| e.to_string())?;
-    let db_size_bytes = state.db.db_size_bytes().map_err(|e| e.to_string())?;
-    let (oldest_event, newest_event) = state.db.event_time_range().map_err(|e| e.to_string())?;
+    let total_events = state.db().event_count().map_err(|e| e.to_string())?;
+    let db_size_bytes = state.db().db_size_bytes().map_err(|e| e.to_string())?;
+    let (oldest_event, newest_event) = state.db().event_time_range().map_err(|e| e.to_string())?;
 
     tracing::info!("[cmd:get_storage_stats] events={}, db_size={} bytes, range={}..{}", total_events, db_size_bytes, oldest_event, newest_event);
 
@@ -1163,7 +1260,7 @@ async fn get_ownership_storage_stats(state: State<'_, AppState>) -> Result<Owner
         return Err("Not initialized — no pubkey set".into());
     }
 
-    let db = &state.db;
+    let db = state.db();
     let own_events_count = db.own_event_count(&own_pubkey).map_err(|e| e.to_string())?;
     let own_media_bytes = db.own_media_bytes(&own_pubkey).map_err(|e| e.to_string())?;
     let tracked_events_count = db.tracked_event_count(&own_pubkey).map_err(|e| e.to_string())?;
@@ -1223,7 +1320,7 @@ async fn start_relay(state: State<'_, AppState>) -> Result<(), String> {
     let allowed_pubkey = config.hex_pubkey.clone();
     drop(config);
 
-    let db = state.db.clone();
+    let db = state.db();
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
 
@@ -1297,8 +1394,7 @@ async fn reset_app_data(
     }
 
     // Clear database
-    state
-        .db
+    state.db()
         .clear_all()
         .map_err(|e| format!("Failed to clear database: {}", e))?;
 
@@ -1333,14 +1429,12 @@ async fn change_account(
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    tracing::info!("Changing account — clearing identity, keeping event data");
+    tracing::info!("Changing account — switching to lobby DB");
 
     // Stop sync if running
     if let Some(cancel) = state.sync_cancel.write().await.take() {
         cancel.cancel();
-        state
-            .sync_tier
-            .store(0u8, Ordering::Relaxed);
+        state.sync_tier.store(0u8, Ordering::Relaxed);
     }
 
     // Stop relay if running
@@ -1356,30 +1450,19 @@ async fn change_account(
         }
     }
 
-    // Clear only identity keys and sync cursors from DB config
-    // Keep: outbound_relays, sync tuning params, storage settings, etc.
-    let identity_keys = [
-        "npub",
-        "hex_pubkey",
-    ];
-    for key in &identity_keys {
-        state
-            .db
-            .delete_config(key)
-            .map_err(|e| format!("Failed to delete config key {}: {}", key, e))?;
-    }
+    // Swap to lobby DB — the per-user DB keeps all data intact for later
+    let lobby_path = lobby_db_path(&state.data_dir);
+    let lobby_db = Arc::new(
+        Database::open(&lobby_path).map_err(|e| format!("Failed to open lobby DB: {}", e))?,
+    );
+    state.swap_db(lobby_db);
 
-    // Clear sync_state (per-relay cursors) so new account starts fresh
-    state
-        .db
-        .clear_sync_state()
-        .map_err(|e| format!("Failed to clear sync_state: {}", e))?;
+    // Clear npub from lobby so startup doesn't auto-load the old user
+    state.db().delete_config("npub").ok();
+    state.db().delete_config("hex_pubkey").ok();
 
-    // Clear v2 user cursors for fresh start
-    state
-        .db
-        .clear_user_cursors()
-        .map_err(|e| format!("Failed to clear user_cursors: {}", e))?;
+    // Clear WoT graph
+    state.wot_graph.clear();
 
     // Reset sync stats
     {
@@ -1387,7 +1470,7 @@ async fn change_account(
         *stats = SyncStats::default();
     }
 
-    // Clear identity from in-memory config (keep all other settings)
+    // Clear identity from in-memory config (keep relay/storage settings)
     {
         let mut config = state.config.write().await;
         config.npub = None;
@@ -1398,7 +1481,7 @@ async fn change_account(
     // Emit event to frontend to show wizard
     app_handle.emit("app:reset", ()).ok();
 
-    tracing::info!("Account change complete — identity cleared, events preserved");
+    tracing::info!("Account change complete — switched to lobby DB, user data preserved");
     Ok(())
 }
 
@@ -1447,7 +1530,7 @@ pub struct MediaBreakdown {
 #[tauri::command]
 async fn get_activity_data(state: State<'_, AppState>) -> Result<Vec<u64>, String> {
     tracing::debug!("[cmd:get_activity_data] called");
-    let counts = state.db.get_hourly_counts(24).map_err(|e| e.to_string())?;
+    let counts = state.db().get_hourly_counts(24).map_err(|e| e.to_string())?;
     let total: u64 = counts.iter().sum();
     tracing::debug!("[cmd:get_activity_data] 24h total={}", total);
     Ok(counts)
@@ -1542,7 +1625,7 @@ async fn get_relay_status(state: State<'_, AppState>) -> Result<Vec<RelayStatusI
 #[tauri::command]
 async fn get_kind_counts(state: State<'_, AppState>) -> Result<KindCounts, String> {
     tracing::debug!("[cmd:get_kind_counts] called");
-    let counts = state.db.get_kind_counts().map_err(|e| e.to_string())?;
+    let counts = state.db().get_kind_counts().map_err(|e| e.to_string())?;
     tracing::info!("[cmd:get_kind_counts] {} distinct kinds found", counts.len());
     Ok(KindCounts { counts })
 }
@@ -1555,8 +1638,7 @@ async fn get_dm_events(
 ) -> Result<Vec<NostrEvent>, String> {
     tracing::debug!("[cmd:get_dm_events] called for pubkey={}..., limit={:?}", &own_pubkey[..std::cmp::min(8, own_pubkey.len())], limit);
     let lim = limit.unwrap_or(200);
-    let events = state
-        .db
+    let events = state.db()
         .get_dm_events(&own_pubkey, lim)
         .map_err(|e| format!("Failed to query DM events: {}", e))?;
 
@@ -1606,9 +1688,7 @@ async fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
         sync_wot_batch_size: config.sync_wot_batch_size,
         sync_wot_events_per_batch: config.sync_wot_events_per_batch,
         max_event_age_days: config.max_event_age_days,
-        sync_fof_content: config.sync_fof_content,
-        sync_hop3_content: config.sync_hop3_content,
-        sync_fof_max_pubkeys: config.sync_fof_max_pubkeys,
+        sync_wot_notes_per_cycle: config.sync_wot_notes_per_cycle,
         offline_mode: config.offline_mode,
     })
 }
@@ -1632,6 +1712,7 @@ async fn save_settings(settings: Settings, app_handle: tauri::AppHandle, state: 
         .map(|r| sync::resolve_relay_url(r).to_string())
         .filter(|r| !r.trim().is_empty())
         .collect();
+    let relays_changed = !valid_relays.is_empty() && valid_relays != config.outbound_relays;
     if !valid_relays.is_empty() {
         config.outbound_relays = valid_relays.clone();
     }
@@ -1644,14 +1725,12 @@ async fn save_settings(settings: Settings, app_handle: tauri::AppHandle, state: 
     config.sync_wot_batch_size = settings.sync_wot_batch_size;
     config.sync_wot_events_per_batch = settings.sync_wot_events_per_batch;
     config.max_event_age_days = settings.max_event_age_days;
-    config.sync_fof_content = settings.sync_fof_content;
-    config.sync_hop3_content = settings.sync_hop3_content;
-    config.sync_fof_max_pubkeys = settings.sync_fof_max_pubkeys;
+    config.sync_wot_notes_per_cycle = settings.sync_wot_notes_per_cycle;
     config.offline_mode = settings.offline_mode;
 
     // Persist ALL settings to DB so they survive restart
     drop(config);
-    let db = &state.db;
+    let db = state.db();
 
     // Persist relay list — use the FILTERED/RESOLVED list, not the raw input.
     // BUG FIX: previously persisted raw settings.outbound_relays which could
@@ -1679,14 +1758,18 @@ async fn save_settings(settings: Settings, app_handle: tauri::AppHandle, state: 
     db.set_config("sync_wot_batch_size", &settings.sync_wot_batch_size.to_string()).ok();
     db.set_config("sync_wot_events_per_batch", &settings.sync_wot_events_per_batch.to_string()).ok();
     db.set_config("max_event_age_days", &settings.max_event_age_days.to_string()).ok();
-    db.set_config("sync_fof_content", if settings.sync_fof_content { "true" } else { "false" }).ok();
-    db.set_config("sync_hop3_content", if settings.sync_hop3_content { "true" } else { "false" }).ok();
-    db.set_config("sync_fof_max_pubkeys", &settings.sync_fof_max_pubkeys.to_string()).ok();
+    db.set_config("sync_wot_notes_per_cycle", &settings.sync_wot_notes_per_cycle.to_string()).ok();
     db.set_config("offline_mode", if settings.offline_mode { "true" } else { "false" }).ok();
     db.set_config("storage_own_media_gb", &settings.storage_own_media_gb.to_string()).ok();
     db.set_config("storage_tracked_media_gb", &settings.storage_tracked_media_gb.to_string()).ok();
     db.set_config("storage_wot_media_gb", &settings.storage_wot_media_gb.to_string()).ok();
     db.set_config("wot_event_retention_days", &settings.wot_event_retention_days.to_string()).ok();
+
+    // If relays changed, clear user cursors so the next cycle does a full lookback
+    if relays_changed {
+        tracing::info!("[cmd:save_settings] Relays changed — clearing user cursors for fresh sync");
+        db.clear_user_cursors().ok();
+    }
 
     // ── Restart sync engine with new settings (especially relay changes) ──
     // Without this, relay changes in Settings only take effect on app restart.
@@ -1714,13 +1797,11 @@ async fn save_settings(settings: Settings, app_handle: tauri::AppHandle, state: 
             wot_batch_size: config.sync_wot_batch_size,
             wot_events_per_batch: config.sync_wot_events_per_batch,
             cycle_interval_secs: config.sync_interval_secs,
-            fof_content: config.sync_fof_content,
-            hop3_content: config.sync_hop3_content,
-            fof_max_pubkeys: config.sync_fof_max_pubkeys,
+            wot_notes_per_cycle: config.sync_wot_notes_per_cycle,
         };
         let cancel = start_sync_engine(
             state.wot_graph.clone(),
-            state.db.clone(),
+            state.db(),
             config.outbound_relays.clone(),
             hex_pubkey.clone(),
             state.sync_tier.clone(),
@@ -1751,22 +1832,22 @@ async fn get_followers(pubkey: String, state: State<'_, AppState>) -> Result<Vec
 
 #[tauri::command]
 async fn is_tracked_profile(pubkey: String, state: State<'_, AppState>) -> Result<bool, String> {
-    state.db.is_tracked(&pubkey).map_err(|e| e.to_string())
+    state.db().is_tracked(&pubkey).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn is_pubkey_muted_cmd(pubkey: String, state: State<'_, AppState>) -> Result<bool, String> {
-    state.db.is_pubkey_muted(&pubkey).map_err(|e| e.to_string())
+    state.db().is_pubkey_muted(&pubkey).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn mute_pubkey(pubkey: String, state: State<'_, AppState>) -> Result<(), String> {
-    state.db.mute_pubkey(&pubkey).map_err(|e| e.to_string())
+    state.db().mute_pubkey(&pubkey).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn unmute_pubkey(pubkey: String, state: State<'_, AppState>) -> Result<(), String> {
-    state.db.unmute_pubkey(&pubkey).map_err(|e| e.to_string())
+    state.db().unmute_pubkey(&pubkey).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1792,19 +1873,19 @@ async fn track_profile(pubkey: String, note: Option<String>, state: State<'_, Ap
             .map_err(|e| format!("Invalid pubkey: {}", e))?
     };
     tracing::info!("[cmd:track_profile] pubkey={}...", &hex_pk[..hex_pk.len().min(12)]);
-    state.db.track_profile(&hex_pk, note.as_deref()).map_err(|e| e.to_string())
+    state.db().track_profile(&hex_pk, note.as_deref()).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn untrack_profile(pubkey: String, state: State<'_, AppState>) -> Result<(), String> {
     tracing::info!("[cmd:untrack_profile] pubkey={}...", &pubkey[..pubkey.len().min(12)]);
-    state.db.untrack_profile(&pubkey).map_err(|e| e.to_string())
+    state.db().untrack_profile(&pubkey).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn get_tracked_profiles(state: State<'_, AppState>) -> Result<Vec<serde_json::Value>, String> {
     tracing::debug!("[cmd:get_tracked_profiles] called");
-    let profiles = state.db.get_tracked_profiles().map_err(|e| e.to_string())?;
+    let profiles = state.db().get_tracked_profiles().map_err(|e| e.to_string())?;
     Ok(profiles.into_iter().map(|(pubkey, tracked_at, note)| {
         serde_json::json!({
             "pubkey": pubkey,
@@ -1817,15 +1898,15 @@ async fn get_tracked_profiles(state: State<'_, AppState>) -> Result<Vec<serde_js
 #[tauri::command]
 async fn get_tracked_profiles_detail(state: State<'_, AppState>) -> Result<Vec<TrackedProfileDetail>, String> {
     tracing::debug!("[cmd:get_tracked_profiles_detail] called");
-    let profiles = state.db.get_tracked_profiles().map_err(|e| e.to_string())?;
+    let profiles = state.db().get_tracked_profiles().map_err(|e| e.to_string())?;
     let pubkeys: Vec<String> = profiles.iter().map(|(pk, _, _)| pk.clone()).collect();
-    let profile_infos = state.db.get_profiles(&pubkeys).unwrap_or_default();
+    let profile_infos = state.db().get_profiles(&pubkeys).unwrap_or_default();
 
     let mut result = Vec::new();
     for (pubkey, tracked_at, note) in profiles {
-        let event_count = state.db.count_events_for_pubkey(&pubkey).unwrap_or(0);
-        let media_bytes = state.db.media_bytes_for_pubkey(&pubkey).unwrap_or(0);
-        let media_count = state.db.media_count_for_pubkey(&pubkey).unwrap_or(0);
+        let event_count = state.db().count_events_for_pubkey(&pubkey).unwrap_or(0);
+        let media_bytes = state.db().media_bytes_for_pubkey(&pubkey).unwrap_or(0);
+        let media_count = state.db().media_count_for_pubkey(&pubkey).unwrap_or(0);
         let info = profile_infos.iter().find(|p| p.pubkey == pubkey);
         result.push(TrackedProfileDetail {
             pubkey,
@@ -1849,9 +1930,9 @@ async fn get_kind_counts_for_category(category: String, state: State<'_, AppStat
     drop(config);
 
     let counts = match category.as_str() {
-        "own" => state.db.kind_counts_for_pubkey(&own_pubkey),
-        "tracked" => state.db.kind_counts_for_tracked(&own_pubkey),
-        "wot" => state.db.kind_counts_for_wot(&own_pubkey),
+        "own" => state.db().kind_counts_for_pubkey(&own_pubkey),
+        "tracked" => state.db().kind_counts_for_tracked(&own_pubkey),
+        "wot" => state.db().kind_counts_for_wot(&own_pubkey),
         _ => return Err("Invalid category. Use 'own', 'tracked', or 'wot'".into()),
     }.map_err(|e| e.to_string())?;
 
@@ -1864,7 +1945,7 @@ async fn get_media_breakdown_for_category(category: String, state: State<'_, App
     let own_pubkey = config.hex_pubkey.clone().unwrap_or_default();
     drop(config);
 
-    let (ic, ib, vc, vb, ac, ab, oc, ob, tc, tb, oldest, newest) = state.db
+    let (ic, ib, vc, vb, ac, ab, oc, ob, tc, tb, oldest, newest) = state.db()
         .media_breakdown_for_category(&own_pubkey, &category)
         .map_err(|e| e.to_string())?;
 
@@ -1887,7 +1968,7 @@ async fn get_media_breakdown_for_category(category: String, state: State<'_, App
 #[tauri::command]
 async fn requeue_profile_media(pubkey: String, state: State<'_, AppState>) -> Result<u32, String> {
     tracing::info!("[cmd:requeue_profile_media] pubkey={}...", &pubkey[..pubkey.len().min(12)]);
-    state.db.requeue_events_media(&pubkey).map_err(|e| e.to_string())
+    state.db().requeue_events_media(&pubkey).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1896,8 +1977,7 @@ async fn get_profiles(
     state: State<'_, AppState>,
 ) -> Result<Vec<ProfileInfo>, String> {
     tracing::debug!("[cmd:get_profiles] called for {} pubkeys", pubkeys.len());
-    state
-        .db
+    state.db()
         .get_profiles(&pubkeys)
         .map_err(|e| format!("Failed to get profiles: {}", e))
 }
@@ -1912,8 +1992,7 @@ async fn get_own_profile(state: State<'_, AppState>) -> Result<Option<ProfileInf
     };
     drop(config);
 
-    let profiles = state
-        .db
+    let profiles = state.db()
         .get_profiles(&[hex_pubkey])
         .map_err(|e| format!("Failed to get own profile: {}", e))?;
 
@@ -2026,7 +2105,7 @@ pub struct MediaStats {
 
 #[tauri::command]
 async fn get_media_stats(state: State<'_, AppState>) -> Result<MediaStats, String> {
-    let db = &state.db;
+    let db = state.db();
     let config = state.config.read().await;
     let own_pubkey = config.hex_pubkey.as_deref().unwrap_or("");
     let total_bytes = db.media_total_bytes().map_err(|e| e.to_string())?;
@@ -2067,7 +2146,7 @@ async fn get_own_media(state: State<'_, AppState>) -> Result<Vec<OwnMediaItem>, 
         return Err("Not initialized — no pubkey set".into());
     }
 
-    let records = state.db.get_own_media(&own_pubkey).map_err(|e| e.to_string())?;
+    let records = state.db().get_own_media(&own_pubkey).map_err(|e| e.to_string())?;
     tracing::info!("[cmd:get_own_media] returning {} own media items", records.len());
 
     let home = dirs::home_dir().unwrap_or_default();
@@ -2092,7 +2171,7 @@ async fn get_own_media(state: State<'_, AppState>) -> Result<Vec<OwnMediaItem>, 
 async fn get_profile_media(pubkey: String, state: State<'_, AppState>) -> Result<Vec<OwnMediaItem>, String> {
     tracing::debug!("[cmd:get_profile_media] called for pubkey={}...", &pubkey[..pubkey.len().min(8)]);
 
-    let records = state.db.get_profile_media(&pubkey).map_err(|e| e.to_string())?;
+    let records = state.db().get_profile_media(&pubkey).map_err(|e| e.to_string())?;
     tracing::info!("[cmd:get_profile_media] returning {} media items for {}...", records.len(), &pubkey[..pubkey.len().min(8)]);
 
     let home = dirs::home_dir().unwrap_or_default();
@@ -2292,7 +2371,8 @@ async fn do_fetch_profile(
 /// One-shot targeted fetch for a specific pubkey from all connected relays.
 #[tauri::command]
 async fn fetch_profile(pubkey: String, state: State<'_, AppState>) -> Result<ProfileFetchResult, String> {
-    do_fetch_profile(&pubkey, &state.db, &state.wot_graph, &state.config).await
+    let db = state.db();
+    do_fetch_profile(&pubkey, &db, &state.wot_graph, &state.config).await
 }
 
 #[tauri::command]
@@ -2302,11 +2382,11 @@ async fn get_profile_with_refresh(
     state: State<'_, AppState>,
 ) -> Result<Option<ProfileInfo>, String> {
     // 1. Return cached profile immediately
-    let profiles = state.db.get_profiles(&[pubkey.clone()]).map_err(|e| e.to_string())?;
+    let profiles = state.db().get_profiles(&[pubkey.clone()]).map_err(|e| e.to_string())?;
     let cached = profiles.into_iter().find(|p| p.pubkey == pubkey);
 
     // 2. Check if we need a background refresh
-    let fetched_at = state.db.get_profile_fetched_at(&pubkey).map_err(|e| e.to_string())?;
+    let fetched_at = state.db().get_profile_fetched_at(&pubkey).map_err(|e| e.to_string())?;
     let now = chrono::Utc::now().timestamp();
     let twelve_hours = 12 * 60 * 60;
     let needs_refresh = match fetched_at {
@@ -2317,7 +2397,7 @@ async fn get_profile_with_refresh(
     if needs_refresh {
         // 3. Spawn background fetch — don't block the response
         let pk = pubkey.clone();
-        let db = state.db.clone();
+        let db = state.db();
         let wot = state.wot_graph.clone();
         let config = state.config.clone();
         let handle = app_handle.clone();
@@ -2510,21 +2590,40 @@ pub fn run() {
 
     tracing::info!("[init] Starting nostrito");
 
-    // Determine DB path
-    let db_path = dirs::data_dir()
+    // Determine data directory
+    let data_dir = dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("nostrito")
-        .join("nostrito.db");
+        .join("nostrito");
+    std::fs::create_dir_all(&data_dir).expect("Failed to create data directory");
 
-    // Create parent directory
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent).expect("Failed to create data directory");
-    }
+    // Open lobby DB to check for saved npub
+    let lobby_path = lobby_db_path(&data_dir);
+    tracing::info!("[init] lobby_db_path={}", lobby_path.display());
+    let lobby_db = Database::open(&lobby_path).expect("Failed to open lobby database");
 
-    tracing::info!("[init] db_path={}", db_path.display());
+    // If there's a saved npub, open the per-npub database
+    let db = if let Ok(Some(ref npub)) = lobby_db.get_config("npub") {
+        let user_path = db_path_for_npub(&data_dir, npub);
+        tracing::info!("[init] Found saved npub={}, per-user db={}", npub, user_path.display());
 
-    // Initialize database
-    let db = Arc::new(Database::open(&db_path).expect("Failed to open database"));
+        if !user_path.exists() && lobby_db.event_count().unwrap_or(0) > 0 {
+            // Migrate: copy lobby DB as the per-user DB (one-time migration)
+            tracing::info!("[init] Migrating lobby DB → per-user DB");
+            drop(lobby_db);
+            std::fs::copy(&lobby_path, &user_path).expect("Failed to copy lobby DB");
+            Arc::new(Database::open(&user_path).expect("Failed to open per-user database"))
+        } else if user_path.exists() {
+            drop(lobby_db);
+            Arc::new(Database::open(&user_path).expect("Failed to open per-user database"))
+        } else {
+            drop(lobby_db);
+            Arc::new(Database::open(&user_path).expect("Failed to open per-user database"))
+        }
+    } else {
+        tracing::info!("[init] No saved npub, using lobby DB");
+        Arc::new(lobby_db)
+    };
+
     tracing::info!("[init] Database opened successfully");
 
     // Initialize WoT graph
@@ -2584,9 +2683,7 @@ pub fn run() {
     if let Ok(Some(v)) = db.get_config("sync_wot_batch_size") { if let Ok(n) = v.parse::<u32>() { config.sync_wot_batch_size = n; } }
     if let Ok(Some(v)) = db.get_config("sync_wot_events_per_batch") { if let Ok(n) = v.parse::<u32>() { config.sync_wot_events_per_batch = n; } }
     if let Ok(Some(v)) = db.get_config("max_event_age_days") { if let Ok(n) = v.parse::<u32>() { config.max_event_age_days = n; } }
-    if let Ok(Some(v)) = db.get_config("sync_fof_content") { config.sync_fof_content = v == "true"; }
-    if let Ok(Some(v)) = db.get_config("sync_hop3_content") { config.sync_hop3_content = v == "true"; }
-    if let Ok(Some(v)) = db.get_config("sync_fof_max_pubkeys") { if let Ok(n) = v.parse::<u32>() { config.sync_fof_max_pubkeys = n; } }
+    if let Ok(Some(v)) = db.get_config("sync_wot_notes_per_cycle") { if let Ok(n) = v.parse::<u32>() { config.sync_wot_notes_per_cycle = n; } }
     if let Ok(Some(v)) = db.get_config("offline_mode") { config.offline_mode = v == "true"; }
     if let Ok(Some(v)) = db.get_config("storage_own_media_gb") { if let Ok(n) = v.parse::<f64>() { config.storage_own_media_gb = n; } }
     if let Ok(Some(v)) = db.get_config("storage_tracked_media_gb") { if let Ok(n) = v.parse::<f64>() { config.storage_tracked_media_gb = n; } }
@@ -2647,9 +2744,9 @@ pub fn run() {
 
     let app_state = AppState {
         wot_graph,
-        db,
+        db: parking_lot::RwLock::new(db),
         config: Arc::new(RwLock::new(config)),
-        db_path,
+        data_dir,
         sync_cancel: Arc::new(RwLock::new(None)),
         sync_tier: Arc::new(AtomicU8::new(0)),
         sync_stats: Arc::new(RwLock::new(SyncStats::default())),
@@ -2667,7 +2764,7 @@ pub fn run() {
             let state = app.state::<AppState>();
             let config = state.config.clone();
             let wot_graph = state.wot_graph.clone();
-            let db = state.db.clone();
+            let db = state.db();
             let sync_tier = state.sync_tier.clone();
             let sync_stats = state.sync_stats.clone();
             let sync_cancel = state.sync_cancel.clone();
@@ -2675,7 +2772,7 @@ pub fn run() {
 
             // Auto-resume sync and relay if previously configured
             let relay_cancel_setup = state.relay_cancel.clone();
-            let db_relay = state.db.clone();
+            let db_relay = state.db();
 
             tauri::async_runtime::spawn(async move {
                 let cfg = config.read().await;
@@ -2701,9 +2798,7 @@ pub fn run() {
                         wot_batch_size: cfg2.sync_wot_batch_size,
                         wot_events_per_batch: cfg2.sync_wot_events_per_batch,
                         cycle_interval_secs: cfg2.sync_interval_secs,
-                        fof_content: cfg2.sync_fof_content,
-                        hop3_content: cfg2.sync_hop3_content,
-                        fof_max_pubkeys: cfg2.sync_fof_max_pubkeys,
+                        wot_notes_per_cycle: cfg2.sync_wot_notes_per_cycle,
                     };
                     drop(cfg2);
                     let cancel = start_sync_engine(
@@ -2785,6 +2880,9 @@ pub fn run() {
             get_profiles_batch,
             get_wot_distance,
             get_feed,
+            get_event,
+            get_note_replies,
+            get_note_reactions,
             fetch_global_feed,
             save_event,
             search_events,
@@ -2813,6 +2911,7 @@ pub fn run() {
             get_own_media,
             get_profile_media,
             restart_sync,
+            reset_sync_cursors,
             get_followers,
             is_tracked_profile,
             is_pubkey_muted_cmd,

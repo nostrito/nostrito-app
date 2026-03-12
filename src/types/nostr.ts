@@ -55,6 +55,7 @@ export interface AppStatus {
   sync_stats: SyncStats;
   media_stored: number;
   offline_mode: boolean;
+  sync_wot_notes_per_cycle: number;
   relayRunning?: boolean;
   relayPort?: number;
   eventsStored?: number;
@@ -72,6 +73,9 @@ export interface SyncStats {
   current_layer: string;
   pass_pubkeys_done: number;
   pass_pubkeys_total: number;
+  pass_relays_done: number;
+  pass_relays_total: number;
+  follows_count: number;
 }
 
 export interface SyncProgress {
@@ -85,6 +89,7 @@ export interface StoredEventNotification {
   kind: number;
   pubkey: string;
   content: string;
+  layer: string;
 }
 
 export interface RelayStatusInfo {
@@ -98,7 +103,9 @@ export interface FeedFilter {
   kinds?: number[];
   limit?: number;
   since?: number;
+  until?: number;
   wotOnly?: boolean;
+  author?: string;
 }
 
 export interface StorageStats {
@@ -131,7 +138,7 @@ export interface Settings {
   sync_wot_batch_size: number;
   sync_wot_events_per_batch: number;
   max_event_age_days: number;
-  sync_fof_content: boolean;
+  sync_wot_notes_per_cycle: number;
   relayPort?: number;
   maxStorageMb?: number;
   syncIntervalSecs?: number;

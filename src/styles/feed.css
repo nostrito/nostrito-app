@@ -725,3 +725,83 @@
   opacity: 0.8;
   cursor: default !important;
 }
+
+/* ── Mentions ─────────────────────────────────────────── */
+.mention {
+  color: var(--accent-light, var(--accent));
+  cursor: pointer;
+  font-weight: 500;
+  transition: opacity 0.15s;
+}
+.mention:hover {
+  opacity: 0.8;
+  text-decoration: underline;
+}
+
+/* ── Note Detail Page ─────────────────────────────────── */
+.note-detail-page {
+  padding: 0 20px 40px;
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+}
+.note-detail-original {
+  margin-bottom: 20px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 16px;
+}
+.note-detail-original .ev-text {
+  max-height: none;
+  -webkit-line-clamp: unset;
+}
+.note-detail-section-title {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 12px;
+}
+.note-detail-reactions {
+  margin-bottom: 24px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+}
+.note-detail-reaction-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.note-detail-reaction-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--bg-secondary, rgba(255,255,255,0.05));
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 4px 12px;
+  font-size: 0.82rem;
+  color: var(--text-dim);
+}
+.note-detail-reactors {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+}
+.note-detail-reactor-avatar {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  object-fit: cover;
+  cursor: pointer;
+}
+.note-detail-more-reactors {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  margin-left: 4px;
+}
+.note-detail-replies {
+  margin-top: 8px;
+}

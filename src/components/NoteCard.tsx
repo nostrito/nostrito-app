@@ -1,11 +1,13 @@
 /** Shared note/repost card used in Feed and ProfileView */
-import React from "react";
+import React, { useMemo } from "react";
 import { IconMessageCircle, IconRepeat, IconZap, IconBookmark } from "./Icon";
 import { Avatar } from "./Avatar";
 import { timeAgo } from "../utils/format";
 import { kindLabel } from "../utils/ui";
 import { renderMediaHtml, stripMediaUrls } from "../utils/media";
 import { profileDisplayName, type ProfileInfo } from "../utils/profiles";
+import { extractMentionedPubkeys, replaceMentions } from "../utils/mentions";
+import { useProfileContext } from "../context/ProfileContext";
 import type { NostrEvent } from "../types/nostr";
 
 function parseRepostContent(event: NostrEvent): { content: string; pubkey: string } | null {
@@ -21,10 +23,26 @@ function parseRepostContent(event: NostrEvent): { content: string; pubkey: strin
   return null;
 }
 
-function renderEventContent(content: string): { cleaned: string; mediaHtml: string } {
+function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function renderEventContent(
+  content: string,
+  mentionProfiles?: Map<string, ProfileInfo | undefined>,
+): { cleanedHtml: string; mediaHtml: string } {
   const mediaHtml = renderMediaHtml(content);
   const cleaned = stripMediaUrls(content).slice(0, 280);
-  return { cleaned, mediaHtml };
+  // Escape HTML first, then inject mention spans
+  const escaped = escapeHtml(cleaned);
+  const cleanedHtml = mentionProfiles && mentionProfiles.size > 0
+    ? replaceMentions(escaped, mentionProfiles)
+    : escaped;
+  return { cleanedHtml, mediaHtml };
 }
 
 interface NoteCardProps {
@@ -33,19 +51,43 @@ interface NoteCardProps {
   compact?: boolean;
   onSave?: (event: NostrEvent) => void;
   saved?: boolean;
+  onClick?: () => void;
 }
 
-export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, onSave, saved }) => {
+export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, onSave, saved, onClick }) => {
   const k = kindLabel(event.kind);
   const displayName = profileDisplayName(profile, event.pubkey);
+  const { ensureProfiles, getProfile } = useProfileContext();
+
+  // Extract and ensure profiles for mentioned pubkeys
+  const mentionedPubkeys = useMemo(() => {
+    const content = event.kind === 6 ? (parseRepostContent(event)?.content || "") : event.content;
+    const pks = extractMentionedPubkeys(content);
+    if (pks.length > 0) ensureProfiles(pks);
+    return pks;
+  }, [event.content, event.kind]);
+
+  // Build profile map for mentions
+  const mentionProfiles = useMemo(() => {
+    const map = new Map<string, ProfileInfo | undefined>();
+    for (const pk of mentionedPubkeys) {
+      map.set(pk, getProfile(pk));
+    }
+    return map;
+  }, [mentionedPubkeys, getProfile]);
 
   if (event.kind === 6) {
     const original = parseRepostContent(event);
     if (!original) return null;
-    const repostContent = renderEventContent(original.content);
+    const repostContent = renderEventContent(original.content, mentionProfiles);
+
+    const handleRepostClick = (e: React.MouseEvent) => {
+      if ((e.target as HTMLElement).closest("[data-pubkey]")) return;
+      onClick?.();
+    };
 
     return (
-      <div className="event-card" data-kind={k.tag}>
+      <div className="event-card" data-kind={k.tag} onClick={handleRepostClick} style={onClick ? { cursor: "pointer" } : undefined}>
         <Avatar picture={profile?.picture} pubkey={event.pubkey} className="ev-avatar" clickable />
         <div className="ev-content">
           <div className="ev-meta">
@@ -57,7 +99,7 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, onS
             </span>
             <span className="ev-time">{timeAgo(event.created_at, false)}</span>
           </div>
-          <div className="ev-text">{repostContent.cleaned}</div>
+          <div className="ev-text" dangerouslySetInnerHTML={{ __html: repostContent.cleanedHtml }} />
           {repostContent.mediaHtml && (
             <div dangerouslySetInnerHTML={{ __html: repostContent.mediaHtml }} />
           )}
@@ -82,10 +124,16 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, onS
     );
   }
 
-  const eventContent = renderEventContent(event.content);
+  const eventContent = renderEventContent(event.content, mentionProfiles);
+
+  const handleClick = (e: React.MouseEvent) => {
+    if ((e.target as HTMLElement).closest("[data-pubkey]")) return;
+    if ((e.target as HTMLElement).closest(".ev-actions")) return;
+    onClick?.();
+  };
 
   return (
-    <div className="event-card" data-kind={k.tag}>
+    <div className="event-card" data-kind={k.tag} onClick={handleClick} style={onClick ? { cursor: "pointer" } : undefined}>
       <Avatar picture={profile?.picture} pubkey={event.pubkey} className="ev-avatar" clickable />
       <div className="ev-content">
         <div className="ev-meta">
@@ -95,7 +143,7 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, onS
           <span className={`ev-kind-tag ${k.cls}`}>{k.tag}</span>
           <span className="ev-time">{timeAgo(event.created_at, false)}</span>
         </div>
-        <div className="ev-text">{eventContent.cleaned}</div>
+        <div className="ev-text" dangerouslySetInnerHTML={{ __html: eventContent.cleanedHtml }} />
         {eventContent.mediaHtml && (
           <div dangerouslySetInnerHTML={{ __html: eventContent.mediaHtml }} />
         )}

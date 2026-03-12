@@ -1,6 +1,7 @@
 /** Feed -- event feed view. All data from get_feed backend command. */
 
 import React, { useState, useEffect, useCallback, useRef } from "react";
+import { useNavigate } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { IconX } from "../components/Icon";
 import { NoteCard } from "../components/NoteCard";
@@ -121,6 +122,7 @@ function kindTag(kind: number): FilterTab {
 }
 
 export const Feed: React.FC = () => {
+  const navigate = useNavigate();
   const [view, setView] = useState<FeedView>({ kind: "feed" });
   const [feedMode, setFeedMode] = useState<FeedMode>("wot");
   const [activeFilter, setActiveFilter] = useState<FilterTab>("all");
@@ -644,6 +646,7 @@ export const Feed: React.FC = () => {
                 profile={getProfile(event.pubkey)}
                 onSave={feedMode === "global" ? saveEvent : undefined}
                 saved={savedEventIds.has(event.id)}
+                onClick={() => navigate(`/note/${event.id}`)}
               />
             ))}
 

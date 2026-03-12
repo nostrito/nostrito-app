@@ -17,6 +17,7 @@ import { Settings } from "./screens/Settings";
 import { MyMedia } from "./screens/MyMedia";
 import { Wizard } from "./screens/Wizard";
 import { ProfileView } from "./screens/ProfileView";
+import { NoteDetail } from "./screens/NoteDetail";
 import { StorageOwnEvents } from "./screens/StorageOwnEvents";
 import { StorageTrackedProfiles } from "./screens/StorageTrackedProfiles";
 import { StorageWotProfiles } from "./screens/StorageWotProfiles";
@@ -103,6 +104,7 @@ const AppRoutes: React.FC = () => {
         <Route path="/settings" element={<Settings />} />
         <Route path="/my-media" element={<MyMedia />} />
         <Route path="/profile/:pubkey" element={<ProfileView />} />
+        <Route path="/note/:noteId" element={<NoteDetail />} />
       </Route>
     </Routes>
   );

@@ -614,6 +614,91 @@ impl Database {
         Ok(rows)
     }
 
+    /// Query events that have a specific tag (e.g. ["e", note_id]).
+    /// Optionally restricted to WoT pubkeys.
+    pub fn query_events_by_tag(
+        &self,
+        tag_name: &str,
+        tag_value: &str,
+        kinds: Option<&[u32]>,
+        own_pubkey: Option<&str>,
+        until: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<(String, String, i64, i64, String, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+
+        let mut sql = String::from(
+            "SELECT id, pubkey, created_at, kind, tags, content, sig FROM nostr_events WHERE ",
+        );
+        let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        // Tag filter using json_each
+        let idx1 = param_values.len() + 1;
+        let idx2 = param_values.len() + 2;
+        sql.push_str(&format!(
+            "EXISTS (SELECT 1 FROM json_each(tags) WHERE json_extract(value, '$[0]') = ?{} AND json_extract(value, '$[1]') = ?{})",
+            idx1, idx2
+        ));
+        param_values.push(Box::new(tag_name.to_string()));
+        param_values.push(Box::new(tag_value.to_string()));
+
+        // WoT filter
+        if let Some(own_pk) = own_pubkey {
+            let idx = param_values.len() + 1;
+            sql.push_str(&format!(
+                " AND (pubkey IN (SELECT n2.pubkey FROM nodes n1 JOIN edges e ON e.follower_id = n1.id JOIN nodes n2 ON n2.id = e.followed_id WHERE n1.pubkey = ?{}) OR pubkey = ?{})",
+                idx, idx
+            ));
+            param_values.push(Box::new(own_pk.to_string()));
+        }
+
+        if let Some(kinds) = kinds {
+            if !kinds.is_empty() {
+                let placeholders: Vec<String> = (0..kinds.len())
+                    .map(|i| format!("?{}", param_values.len() + i + 1))
+                    .collect();
+                sql.push_str(&format!(" AND kind IN ({})", placeholders.join(",")));
+                for k in kinds {
+                    param_values.push(Box::new(*k as i64));
+                }
+            }
+        }
+
+        if let Some(until) = until {
+            let idx = param_values.len() + 1;
+            sql.push_str(&format!(" AND created_at <= ?{}", idx));
+            param_values.push(Box::new(until as i64));
+        }
+
+        sql.push_str(" ORDER BY created_at DESC");
+        {
+            let idx = param_values.len() + 1;
+            sql.push_str(&format!(" LIMIT ?{}", idx));
+            param_values.push(Box::new(limit as i64));
+        }
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(rows)
+    }
+
     /// Search events by keyword in content and/or by author pubkey.
     /// Returns feed-worthy kinds (1, 6, 30023) ordered by created_at DESC.
     pub fn search_events(
@@ -1732,6 +1817,23 @@ impl Database {
             .filter_map(|r| r.ok())
             .collect();
         Ok(rows)
+    }
+
+    /// Touch the cursor for a pubkey — updates `last_fetched_at` without requiring
+    /// a new event. Creates a cursor row if none exists (with `last_event_ts = 0`).
+    /// This ensures subsequent syncs can use `last_fetched_at` as a `since` bound
+    /// even when no new events were found.
+    pub fn touch_user_cursor(&self, pubkey: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO user_cursors (pubkey, last_event_ts, last_fetched_at)
+             VALUES (?1, 0, ?2)
+             ON CONFLICT(pubkey) DO UPDATE SET
+                last_fetched_at = ?2",
+            params![pubkey, now],
+        )?;
+        Ok(())
     }
 
     /// Clear all user cursors (used on account change).

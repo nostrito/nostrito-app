@@ -1,7 +1,5 @@
 import React, { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { useNavigate } from "react-router-dom";
-import { useAppContext } from "../context/AppContext";
 import { RELAYS, resolveRelayUrl, urlToAlias } from "../relays";
 import { getProfiles, profileDisplayName } from "../utils/profiles";
 import type { ProfileInfo } from "../utils/profiles";
@@ -52,8 +50,7 @@ interface Settings {
   sync_wot_batch_size: number;
   sync_wot_events_per_batch: number;
   max_event_age_days: number;
-  sync_fof_content: boolean;
-  sync_fof_max_pubkeys: number;
+  sync_wot_notes_per_cycle: number;
   offline_mode: boolean;
 }
 
@@ -101,7 +98,7 @@ const SYNC_PRESETS: Record<
     wotBatch: number;
     wotEvents: number;
     wotDepth: number;
-    fofMaxPubkeys: number;
+    wotNotes: number;
     interval: number;
   }
 > = {
@@ -114,7 +111,7 @@ const SYNC_PRESETS: Record<
     wotBatch: 3,
     wotEvents: 10,
     wotDepth: 1,
-    fofMaxPubkeys: 100,
+    wotNotes: 20,
     interval: 10,
   },
   balanced: {
@@ -126,7 +123,7 @@ const SYNC_PRESETS: Record<
     wotBatch: 5,
     wotEvents: 15,
     wotDepth: 2,
-    fofMaxPubkeys: 200,
+    wotNotes: 50,
     interval: 5,
   },
   power: {
@@ -138,7 +135,7 @@ const SYNC_PRESETS: Record<
     wotBatch: 15,
     wotEvents: 50,
     wotDepth: 3,
-    fofMaxPubkeys: 500,
+    wotNotes: 200,
     interval: 2,
   },
 };
@@ -164,8 +161,6 @@ const WOT_PRESETS = [
 /* ------------------------------------------------------------------ */
 
 export const Settings: React.FC = () => {
-  const navigate = useNavigate();
-  const { setInitialized } = useAppContext();
 
   /* --- core state --------------------------------------------------- */
   const [activeTab, setActiveTab] = useState<TabId>("identity");
@@ -185,6 +180,8 @@ export const Settings: React.FC = () => {
   const [wotMediaGb, setWotMediaGb] = useState(2);
   const [storageSaving, setStorageSaving] = useState(false);
   const [storageFeedback, setStorageFeedback] = useState<SaveFeedback | null>(null);
+  const [pruning, setPruning] = useState(false);
+  const [pruneResult, setPruneResult] = useState<{ type: "success" | "error"; msg: string } | null>(null);
 
   /* --- advanced ----------------------------------------------------- */
   const [syncLookback, setSyncLookback] = useState(30);
@@ -196,8 +193,7 @@ export const Settings: React.FC = () => {
   const [syncWotEvents, setSyncWotEvents] = useState(15);
   const [syncInterval, setSyncInterval] = useState(5);
   const [syncWotDepth, setSyncWotDepth] = useState(2);
-  const [syncFofContent, setSyncFofContent] = useState(true);
-  const [syncFofMaxPubkeys, setSyncFofMaxPubkeys] = useState(200);
+  const [syncWotNotes, setSyncWotNotes] = useState(50);
   const [autoStart, setAutoStart] = useState(false);
   const [advancedSaving, setAdvancedSaving] = useState(false);
   const [advancedFeedback, setAdvancedFeedback] = useState<SaveFeedback | null>(null);
@@ -265,8 +261,7 @@ export const Settings: React.FC = () => {
       setSyncWotEvents(s.sync_wot_events_per_batch);
       setSyncInterval(Math.round(s.sync_interval_secs / 60));
       setSyncWotDepth(s.wot_max_depth);
-      setSyncFofContent(s.sync_fof_content);
-      setSyncFofMaxPubkeys(s.sync_fof_max_pubkeys);
+      setSyncWotNotes(s.sync_wot_notes_per_cycle);
       setAutoStart(s.auto_start);
       setOfflineMode(s.offline_mode);
 
@@ -394,8 +389,7 @@ export const Settings: React.FC = () => {
       sync_wot_events_per_batch: syncWotEvents,
       sync_interval_secs: syncInterval * 60,
       wot_max_depth: syncWotDepth,
-      sync_fof_content: syncFofContent,
-      sync_fof_max_pubkeys: syncFofMaxPubkeys,
+      sync_wot_notes_per_cycle: syncWotNotes,
     };
 
     try {
@@ -431,8 +425,7 @@ export const Settings: React.FC = () => {
     setSyncWotEvents(DEFAULTS.sync_wot_events_per_batch);
     setSyncInterval(Math.round(DEFAULTS.sync_interval_secs / 60));
     setSyncWotDepth(DEFAULTS.wot_max_depth);
-    setSyncFofContent(true);
-    setSyncFofMaxPubkeys(200);
+    setSyncWotNotes(50);
     setResetDefaultsFeedback({
       type: "success",
       message: 'Defaults restored \u2014 click "Save & Restart Sync" to apply',
@@ -450,7 +443,7 @@ export const Settings: React.FC = () => {
     setSyncWotBatch(p.wotBatch);
     setSyncWotEvents(p.wotEvents);
     setSyncWotDepth(p.wotDepth);
-    setSyncFofMaxPubkeys(p.fofMaxPubkeys);
+    setSyncWotNotes(p.wotNotes);
     setSyncInterval(p.interval);
   }, []);
 
@@ -482,41 +475,61 @@ export const Settings: React.FC = () => {
     }
   }, []);
 
+  const [changeAccountConfirm, setChangeAccountConfirm] = useState(false);
+
   const handleChangeAccount = useCallback(async () => {
-    if (
-      confirm(
-        "You will be signed out and redirected to the setup wizard.\n\nYour event data will be preserved \u2014 if you re-enter the same npub later, it will resume where you left off.\n\nContinue?"
-      )
-    ) {
-      try {
-        console.log("[settings] Calling change_account...");
-        await invoke("change_account");
-        console.log("[settings] change_account complete \u2014 identity cleared, events preserved");
-        localStorage.removeItem("nostrito_initialized");
-        localStorage.removeItem("nostrito_config");
-        setInitialized(false);
-        navigate("/wizard");
-      } catch (e) {
-        console.error("[settings] Change account failed:", e);
-        alert("Failed to change account: " + e);
-      }
+    if (!changeAccountConfirm) {
+      setChangeAccountConfirm(true);
+      return;
     }
-  }, []);
+    try {
+      console.log("[settings] Calling change_account...");
+      await invoke("change_account");
+      console.log("[settings] change_account complete — identity cleared, events preserved");
+      // app:reset event from backend handles navigation via App.tsx listener
+    } catch (e) {
+      console.error("[settings] Change account failed:", e);
+      setChangeAccountConfirm(false);
+    }
+  }, [changeAccountConfirm]);
+
+  const [resetSyncBusy, setResetSyncBusy] = useState(false);
+  const [resetSyncConfirm, setResetSyncConfirm] = useState(false);
+
+  const handleResetSync = useCallback(async () => {
+    if (!resetSyncConfirm) {
+      setResetSyncConfirm(true);
+      return;
+    }
+    setResetSyncBusy(true);
+    try {
+      await invoke("reset_sync_cursors");
+      setAdvancedFeedback({ type: "success", message: "Sync cursors cleared — resyncing from scratch" });
+    } catch (e) {
+      setAdvancedFeedback({ type: "error", message: `Reset failed: ${e}` });
+    } finally {
+      setResetSyncBusy(false);
+      setResetSyncConfirm(false);
+    }
+  }, [resetSyncConfirm]);
+
+  const [resetAppConfirm, setResetAppConfirm] = useState(false);
 
   const handleResetApp = useCallback(async () => {
-    if (confirm("Are you sure? This will delete ALL data and return to the setup wizard.")) {
-      try {
-        console.log("[settings] Calling reset_app_data...");
-        await invoke("reset_app_data");
-        console.log("[settings] reset_app_data complete");
-        localStorage.removeItem("nostrito_initialized");
-        localStorage.removeItem("nostrito_config");
-        window.dispatchEvent(new CustomEvent("nostrito:reset"));
-      } catch (e) {
-        console.error("[settings] Reset failed:", e);
-      }
+    if (!resetAppConfirm) {
+      setResetAppConfirm(true);
+      return;
     }
-  }, []);
+    try {
+      console.log("[settings] Calling reset_app_data...");
+      await invoke("reset_app_data");
+      console.log("[settings] reset_app_data complete");
+      // app:reset event from backend handles navigation via App.tsx listener
+    } catch (e) {
+      console.error("[settings] Reset failed:", e);
+      setResetAppConfirm(false);
+    }
+  }, [resetAppConfirm]);
 
   /* --- browser integration ------------------------------------------ */
   const handleEnableBrowser = useCallback(async () => {
@@ -872,7 +885,7 @@ export const Settings: React.FC = () => {
                 </div>
               </div>
               <button className="btn-danger" id="btn-change-account" onClick={handleChangeAccount}>
-                Change Account
+                {changeAccountConfirm ? "Are you sure?" : "Change Account"}
               </button>
             </div>
           </div>
@@ -1060,6 +1073,64 @@ export const Settings: React.FC = () => {
                 />
               </div>
             </div>
+            <div className="storage-section" style={{ marginTop: 12 }}>
+              <div className="storage-row">
+                <div className="storage-row-info">
+                  <span className="storage-row-label">WoT notes per cycle</span>
+                  <span className="storage-row-meta">
+                    Random notes fetched from WoT peers each sync cycle (0 = disabled)
+                  </span>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 12, minWidth: 200 }}>
+                  <input
+                    type="range"
+                    min={0}
+                    max={500}
+                    step={10}
+                    value={syncWotNotes}
+                    onChange={(e) => setSyncWotNotes(Number(e.target.value))}
+                    style={{ flex: 1 }}
+                  />
+                  <span style={{ fontSize: "0.82rem", color: "var(--text-secondary)", minWidth: 40, textAlign: "right" }}>
+                    {syncWotNotes}
+                  </span>
+                </div>
+              </div>
+            </div>
+            <div className="storage-section" style={{ marginTop: 12 }}>
+              <div className="storage-row" style={{ alignItems: "center" }}>
+                <div className="storage-row-info">
+                  <span className="storage-row-label">Prune WoT data</span>
+                  <span className="storage-row-meta">
+                    Manually delete old events from WoT peers based on retention settings
+                  </span>
+                </div>
+                <button
+                  className="btn btn-secondary"
+                  style={{ fontSize: "0.78rem", padding: "6px 14px", whiteSpace: "nowrap" }}
+                  disabled={pruning}
+                  onClick={async () => {
+                    setPruning(true);
+                    setPruneResult(null);
+                    try {
+                      const msg = await invoke<string>("prune_wot_data");
+                      setPruneResult({ type: "success", msg });
+                    } catch (e) {
+                      setPruneResult({ type: "error", msg: String(e) });
+                    } finally {
+                      setPruning(false);
+                    }
+                  }}
+                >
+                  {pruning ? "Pruning..." : "Prune Now"}
+                </button>
+              </div>
+              {pruneResult && (
+                <div style={{ fontSize: "0.75rem", marginTop: 6, color: pruneResult.type === "success" ? "#34d399" : "#ef4444" }}>
+                  {pruneResult.msg}
+                </div>
+              )}
+            </div>
           </div>
 
           <button
@@ -1131,53 +1202,6 @@ export const Settings: React.FC = () => {
                 )}{" "}
                 {resetDefaultsFeedback.message}
               </span>
-            </div>
-          )}
-
-          {/* FoF Content Toggle */}
-          <div className="settings-field" style={{ marginBottom: 20 }}>
-            <div className="settings-field-info">
-              <span className="settings-field-label">Follows-of-follows content</span>
-              <span className="settings-field-desc">
-                Fetch posts from people your follows follow, prioritized by how many of your follows also follow them
-              </span>
-            </div>
-            <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
-              <input
-                type="checkbox"
-                checked={syncFofContent}
-                onChange={(e) => setSyncFofContent(e.target.checked)}
-                style={{ width: 18, height: 18, accentColor: "var(--accent)" }}
-              />
-              <span style={{ fontSize: "0.82rem", color: "var(--text-secondary)" }}>
-                {syncFofContent ? "Enabled" : "Disabled"}
-              </span>
-            </label>
-          </div>
-
-          {/* FoF Max Pubkeys (only when FoF enabled) */}
-          {syncFofContent && (
-            <div className="settings-field" style={{ marginBottom: 20 }}>
-              <div className="settings-field-info">
-                <span className="settings-field-label">WoT peers limit</span>
-                <span className="settings-field-desc">
-                  Max FoF accounts to fetch per cycle (half top-overlap, half random rotation)
-                </span>
-              </div>
-              <div style={{ display: "flex", alignItems: "center", gap: 12, minWidth: 200 }}>
-                <input
-                  type="range"
-                  min={50}
-                  max={1000}
-                  step={50}
-                  value={syncFofMaxPubkeys}
-                  onChange={(e) => setSyncFofMaxPubkeys(Number(e.target.value))}
-                  style={{ flex: 1 }}
-                />
-                <span style={{ fontSize: "0.82rem", color: "var(--text-secondary)", minWidth: 40, textAlign: "right" }}>
-                  {syncFofMaxPubkeys}
-                </span>
-              </div>
             </div>
           )}
 
@@ -1383,6 +1407,15 @@ export const Settings: React.FC = () => {
             </div>
           )}
 
+          <button
+            className="btn"
+            style={{ marginTop: 12, width: "100%", background: "var(--surface)", border: "1px solid var(--border)", color: "var(--text-secondary)" }}
+            disabled={resetSyncBusy}
+            onClick={handleResetSync}
+          >
+            {resetSyncBusy ? "Resetting..." : resetSyncConfirm ? "Are you sure? Click again to confirm" : "Reset Sync From Scratch"}
+          </button>
+
           {/* Low-level config */}
           <div style={{ marginTop: 24, paddingTop: 16, borderTop: "1px solid var(--border)" }}>
             <div className="settings-field">
@@ -1501,7 +1534,7 @@ export const Settings: React.FC = () => {
                 </div>
               </div>
               <button className="btn-danger" onClick={handleResetApp}>
-                Reset App Data
+                {resetAppConfirm ? "Are you sure?" : "Reset App Data"}
               </button>
             </div>
           </div>
