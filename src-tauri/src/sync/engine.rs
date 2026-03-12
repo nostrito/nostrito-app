@@ -120,6 +120,17 @@ impl SyncEngine {
             let cycle_start = std::time::Instant::now();
             info!("SyncEngine: ═══ starting cycle {} ═══", cycle);
 
+            // Reset per-cycle counters so the dashboard starts fresh
+            {
+                let mut ss = self.sync_stats.write().await;
+                ss.tier1_fetched = 0;
+                ss.tracked_fetched = 0;
+                ss.tier2_fetched = 0;
+                ss.tier3_fetched = 0;
+                ss.tier4_fetched = 0;
+                ss.follows_count = 0;
+            }
+
             // Phase 1: Own Data
             self.emit_phase(SyncPhase::OwnData);
             let phase_start = std::time::Instant::now();
@@ -244,6 +255,7 @@ impl SyncEngine {
             &self.hex_pubkey,            EventSource::OwnBackup,
             super::types::MEDIA_PRIORITY_OWNER,
             Some(&self.app_handle),
+            "0",
         );
 
         {
@@ -298,9 +310,7 @@ impl SyncEngine {
             Arc::clone(&self.pool),
             self.hex_pubkey.clone(),
             self.sync_config.lookback_days,
-            self.sync_config.fof_content,
-            self.sync_config.hop3_content,
-            self.sync_config.fof_max_pubkeys,
+            self.sync_config.wot_notes_per_cycle,
             Arc::clone(&self.sync_stats),
             self.app_handle.clone(),
         );
@@ -310,6 +320,8 @@ impl SyncEngine {
         // Clear layer state now that content passes are done
         if let Ok(mut ss) = self.sync_stats.try_write() {
             ss.current_layer = String::new();
+            ss.pass_pubkeys_done = 0;
+            ss.pass_pubkeys_total = 0;
         }
 
         self.emit_progress(3, stats.events_stored as u64, 0, "content");
@@ -423,6 +435,7 @@ impl SyncEngine {
                         EventSource::Sync,
                         super::types::MEDIA_PRIORITY_FOF,
                         Some(&self.app_handle),
+                        "2",
                     );
 
                     let mut ss = self.sync_stats.write().await;
@@ -449,15 +462,21 @@ impl SyncEngine {
     fn emit_phase(&self, phase: SyncPhase) {
         let layer = match phase {
             SyncPhase::OwnData => "0",
-            SyncPhase::Discovery => "0",
-            SyncPhase::ContentFetch => "0.5",
-            SyncPhase::ThreadContext => "thread",
-            SyncPhase::MediaDownload => "media",
+            SyncPhase::Discovery => "",
+            SyncPhase::ContentFetch => "",
+            SyncPhase::ThreadContext => "",
+            SyncPhase::MediaDownload => "",
         };
-        // Update sync_stats with current phase info
+        // Update sync_stats with current phase info and clear stale progress
         if let Ok(mut ss) = self.sync_stats.try_write() {
             ss.current_tier = phase as u8;
             ss.current_layer = layer.to_string();
+            // Clear progress counters so the dashboard doesn't show
+            // stale values from a previous phase/layer
+            ss.pass_pubkeys_done = 0;
+            ss.pass_pubkeys_total = 0;
+            ss.pass_relays_done = 0;
+            ss.pass_relays_total = 0;
         }
         let progress = SyncProgress {
             tier: phase as u8,
@@ -484,6 +503,8 @@ impl SyncEngine {
             if let Ok(mut ss) = self.sync_stats.try_write() {
                 ss.current_tier = 0;
                 ss.current_layer = String::new();
+                ss.pass_pubkeys_done = 0;
+                ss.pass_pubkeys_total = 0;
             }
         }
         self.app_handle.emit("sync:tier_complete", &TierComplete { tier }).ok();

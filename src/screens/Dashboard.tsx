@@ -1,11 +1,12 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
+import { useNavigate } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { IconChili } from "../components/Icon";
 import { Avatar } from "../components/Avatar";
 import { useTauriEvent } from "../hooks/useTauriEvent";
 import { useInterval } from "../hooks/useInterval";
-import { getProfiles, profileDisplayName, type ProfileInfo } from "../utils/profiles";
+import { getProfiles, invalidateProfileCache, profileDisplayName, type ProfileInfo } from "../utils/profiles";
 import type {
   AppStatus,
   SyncProgress,
@@ -26,6 +27,7 @@ interface LiveEntry {
   pubkey: string;
   content: string;
   ts: number; // local timestamp (Date.now())
+  layer: string;
 }
 
 const LAYER_IDS = ["0", "05", "1", "2"] as const;
@@ -65,6 +67,29 @@ function kindCssClass(kind: number): string {
   return "live-kind-other";
 }
 
+function layerLabel(layer: string): string {
+  switch (layer) {
+    case "0": return "L0";
+    case "0.5": return "T";
+    case "1": return "L1";
+    case "2": return "L2";
+    case "3": return "L3";
+    case "thread": return "Th";
+    default: return "";
+  }
+}
+
+function layerCssClass(layer: string): string {
+  switch (layer) {
+    case "0": return "live-layer-own";
+    case "0.5": return "live-layer-tracked";
+    case "1": return "live-layer-follows";
+    case "2": return "live-layer-fof";
+    case "3": return "live-layer-hop3";
+    default: return "live-layer-other";
+  }
+}
+
 function formatUptime(seconds: number): string {
   if (seconds > 3600) {
     return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
@@ -84,8 +109,14 @@ interface LayerBadge {
   className: string;
 }
 
-function getLayerBadge(layerId: LayerId, currentLayer: string): LayerBadge {
+function getLayerBadge(layerId: LayerId, currentLayer: string, wotNotes?: number): LayerBadge {
   const backendLayer = LAYER_TO_BACKEND[layerId];
+
+  // Show DISABLED for Layer 2 when WoT notes is 0
+  if (layerId === "2" && wotNotes === 0) {
+    return { text: "OFF", className: "sync-tier-badge disabled" };
+  }
+
   if (currentLayer === backendLayer) {
     return { text: "FAST", className: "sync-tier-badge fast" };
   }
@@ -102,17 +133,23 @@ function getLayerDetail(
   layerId: LayerId,
   syncStats: SyncStats,
   currentLayer: string,
-  progressRelay?: string
+  progressRelay?: string,
+  wotNotes?: number
 ): string {
   const backendLayer = LAYER_TO_BACKEND[layerId];
   const isActive = currentLayer === backendLayer;
   const s = syncStats;
 
-  // Build progress string like "42/200 (21%)" when a content pass is running
+  // Layer 2 disabled
+  if (layerId === "2" && wotNotes === 0) {
+    const count = (s.tier3_fetched || 0) + (s.tier4_fetched || 0);
+    return count > 0 ? `${count} events \u00b7 disabled` : "disabled";
+  }
+
+  // Build progress string like "42/200" when a content pass is running
   let progressStr = "";
   if (isActive && s.pass_pubkeys_total > 0) {
-    const pct = Math.round((s.pass_pubkeys_done / s.pass_pubkeys_total) * 100);
-    progressStr = `${s.pass_pubkeys_done}/${s.pass_pubkeys_total} (${pct}%)`;
+    progressStr = `${s.pass_pubkeys_done}/${s.pass_pubkeys_total}`;
   }
 
   let count = 0;
@@ -131,13 +168,18 @@ function getLayerDetail(
       break;
   }
 
+  // For Layer 1, append follows count
+  const followsSuffix = layerId === "1" && s.follows_count > 0
+    ? ` \u00b7 ${s.follows_count} follows`
+    : "";
+
   if (isActive && progressStr) {
     return count > 0
-      ? `${count} events \u00b7 ${progressStr}`
-      : `fetching \u00b7 ${progressStr}`;
+      ? `${count} events \u00b7 ${progressStr}${followsSuffix}`
+      : `fetching \u00b7 ${progressStr}${followsSuffix}`;
   }
 
-  if (count > 0) return `${count} events`;
+  if (count > 0) return `${count} events${followsSuffix}`;
 
   if (isActive) {
     return progressRelay ? `fetching \u00b7 ${progressRelay}` : "fetching...";
@@ -146,24 +188,32 @@ function getLayerDetail(
   const isDone =
     currentLayer !== "" &&
     LAYER_ORDER.indexOf(backendLayer) < LAYER_ORDER.indexOf(currentLayer);
-  return isDone ? "complete" : "\u2014";
+  return isDone ? `complete${followsSuffix}` : "\u2014";
 }
+
+/* ------------------------------------------------------------------ */
+/*  Module-level live stream cache (survives component remounts)       */
+/* ------------------------------------------------------------------ */
+
+let cachedLiveStream: LiveEntry[] = [];
+let cachedProfileMap: Map<string, ProfileInfo> = new Map();
 
 /* ------------------------------------------------------------------ */
 /*  Component                                                          */
 /* ------------------------------------------------------------------ */
 
 export const Dashboard: React.FC = () => {
+  const navigate = useNavigate();
   /* --- state -------------------------------------------------------- */
   const [status, setStatus] = useState<AppStatus | null>(null);
   const [uptime, setUptime] = useState<number>(0);
   const [activityData, setActivityData] = useState<number[]>(new Array(24).fill(0));
   const [relays, setRelays] = useState<RelayStatusInfo[]>([]);
   const [relaysLoaded, setRelaysLoaded] = useState(false);
-  /* --- live event stream state -------------------------------------- */
-  const [liveStream, setLiveStream] = useState<LiveEntry[]>([]);
-  const [liveProfileMap, setLiveProfileMap] = useState<Map<string, ProfileInfo>>(new Map());
-  const liveStreamRef = useRef<LiveEntry[]>([]);
+  /* --- live event stream state (initialized from cache) ------------- */
+  const [liveStream, setLiveStream] = useState<LiveEntry[]>(cachedLiveStream);
+  const [liveProfileMap, setLiveProfileMap] = useState<Map<string, ProfileInfo>>(cachedProfileMap);
+  const liveStreamRef = useRef<LiveEntry[]>(cachedLiveStream);
   const pendingProfilesRef = useRef<Set<string>>(new Set());
   const profileFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -190,6 +240,7 @@ export const Dashboard: React.FC = () => {
                 for (const [pk, info] of profiles) {
                   next.set(pk, info);
                 }
+                cachedProfileMap = next;
                 return next;
               });
             });
@@ -205,10 +256,12 @@ export const Dashboard: React.FC = () => {
         pubkey: event.payload.pubkey,
         content: event.payload.content || "",
         ts: Date.now(),
+        layer: event.payload.layer || "",
       };
 
       queueProfileFetch(entry.pubkey);
       liveStreamRef.current = [entry, ...liveStreamRef.current].slice(0, LIVE_STREAM_MAX);
+      cachedLiveStream = liveStreamRef.current;
       setLiveStream(liveStreamRef.current);
     }).then((fn) => { unlisten = fn; });
 
@@ -224,6 +277,9 @@ export const Dashboard: React.FC = () => {
     if (seededRef.current) return;
     seededRef.current = true;
 
+    // Skip seeding if we already have cached live entries
+    if (cachedLiveStream.length > 0) return;
+
     invoke<{ id: string; pubkey: string; created_at: number; kind: number; content: string }[]>(
       "get_feed", { filter: { limit: 20 } }
     )
@@ -237,18 +293,58 @@ export const Dashboard: React.FC = () => {
             pubkey: e.pubkey,
             content: e.content ? e.content.replace(/https?:\/\/\S+/g, "").trim().slice(0, 120) : "",
             ts: e.created_at * 1000,
+            layer: "",
           }));
 
         if (entries.length > 0) {
           const pubkeys = [...new Set(entries.map((e) => e.pubkey))];
           const profiles = await getProfiles(pubkeys);
-          setLiveProfileMap(new Map(profiles));
-          liveStreamRef.current = entries;
-          setLiveStream(entries);
+          const profileMap = new Map(profiles);
+          cachedProfileMap = profileMap;
+          setLiveProfileMap(profileMap);
+          // Merge: keep any live events that arrived while we were fetching,
+          // append seed entries behind them (deduped)
+          const liveIds = new Set(liveStreamRef.current.map((e) => e.id));
+          const merged = [
+            ...liveStreamRef.current,
+            ...entries.filter((e) => !liveIds.has(e.id)),
+          ].slice(0, LIVE_STREAM_MAX);
+          cachedLiveStream = merged;
+          liveStreamRef.current = merged;
+          setLiveStream(merged);
         }
       })
       .catch(() => {});
   }, []);
+
+  /* --- profile retry for missing pictures ----------------------------- */
+  useEffect(() => {
+    const timer = setInterval(() => {
+      const visible = liveStreamRef.current.slice(0, 20);
+      const missing = visible
+        .map((e) => e.pubkey)
+        .filter((pk) => {
+          const p = liveProfileMap.get(pk);
+          return !p || !p.picture;
+        });
+      if (missing.length > 0) {
+        const unique = [...new Set(missing)];
+        // Invalidate cache so getProfiles re-queries the DB
+        unique.forEach((pk) => invalidateProfileCache(pk));
+        getProfiles(unique).then((profiles) => {
+          setLiveProfileMap((prev) => {
+            const next = new Map(prev);
+            for (const [pk, info] of profiles) {
+              next.set(pk, info);
+            }
+            cachedProfileMap = next;
+            return next;
+          });
+        });
+      }
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [liveProfileMap]);
 
   /* --- data loaders ------------------------------------------------- */
   const loadStats = useCallback(async () => {
@@ -374,7 +470,7 @@ export const Dashboard: React.FC = () => {
         </div>
         <div className="dash-stat">
           <div className="dash-stat-val">
-            {status ? status.media_stored.toLocaleString() : "\u2014"}
+            {status ? `${(status.media_stored / 1_073_741_824).toFixed(2)} GB` : "\u2014"}
           </div>
           <div className="dash-stat-label">Media Stored</div>
         </div>
@@ -465,8 +561,16 @@ export const Dashboard: React.FC = () => {
                 const isNew = Date.now() - entry.ts < 1500;
 
                 return (
-                  <div className={`dash-live-row${isNew ? " live-row-new" : ""}`} key={entry.id}>
-                    <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <div
+                    className={`dash-live-row${isNew ? " live-row-new" : ""}`}
+                    key={entry.id}
+                    onClick={() => navigate(`/note/${entry.id}`)}
+                    style={{ cursor: "pointer" }}
+                  >
+                    <span
+                      style={{ display: "flex", alignItems: "center", gap: 8 }}
+                      onClick={(e) => { e.stopPropagation(); navigate(`/profile/${entry.pubkey}`); }}
+                    >
                       <Avatar
                         picture={profile?.picture}
                         pubkey={entry.pubkey}
@@ -476,6 +580,11 @@ export const Dashboard: React.FC = () => {
                       <span className="live-name">{name}</span>
                     </span>
                     <span className={`live-kind ${kindCls}`}>{kind}</span>
+                    {entry.layer && (
+                      <span className={`live-layer ${layerCssClass(entry.layer)}`}>
+                        {layerLabel(entry.layer)}
+                      </span>
+                    )}
                     <span className="live-preview">
                       {entry.content || `${entry.pubkey.slice(0, 8)}...`}
                     </span>
@@ -492,11 +601,12 @@ export const Dashboard: React.FC = () => {
           <div className="sync-engine-header">Sync Engine</div>
 
           {LAYER_IDS.map((lid) => {
+            const wotNotes = status?.sync_wot_notes_per_cycle ?? 0;
             const badge = status
-              ? getLayerBadge(lid, currentLayer)
+              ? getLayerBadge(lid, currentLayer, wotNotes)
               : { text: "IDLE", className: "sync-tier-badge idle" };
             const detail = status
-              ? getLayerDetail(lid, status.sync_stats, currentLayer, progressRelay)
+              ? getLayerDetail(lid, status.sync_stats, currentLayer, progressRelay, wotNotes)
               : "\u2014";
 
             const backendLayer = LAYER_TO_BACKEND[lid];
