@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 use std::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::types::{
     BACKOFF_SEQUENCE, GENERIC_NOTICE_PAUSE_SECS, RATE_LIMIT_PAUSE_SECS, RELAY_MIN_INTERVAL_SECS,
@@ -54,6 +54,7 @@ impl RelayPolicy {
             let elapsed = last.elapsed();
             if elapsed < self.min_interval {
                 let wait = self.min_interval - elapsed;
+                debug!("RelayPolicy: min-interval wait {:.1}s", wait.as_secs_f32());
                 tokio::time::sleep(wait).await;
             }
         }

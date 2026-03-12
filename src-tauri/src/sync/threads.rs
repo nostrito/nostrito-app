@@ -16,6 +16,7 @@ pub struct ThreadContext {
     graph: Arc<WotGraph>,
     pool: Arc<RelayPool>,
     own_pubkey: String,
+    app_handle: tauri::AppHandle,
 }
 
 impl ThreadContext {
@@ -24,8 +25,9 @@ impl ThreadContext {
         graph: Arc<WotGraph>,
         pool: Arc<RelayPool>,
         own_pubkey: String,
+        app_handle: tauri::AppHandle,
     ) -> Self {
-        Self { db, graph, pool, own_pubkey }
+        Self { db, graph, pool, own_pubkey, app_handle }
     }
 
     /// Run the thread context phase.
@@ -197,6 +199,7 @@ impl ThreadContext {
                     &self.own_pubkey,
                     EventSource::ThreadContext,
                     super::types::MEDIA_PRIORITY_OTHERS,
+                    Some(&self.app_handle),
                 );
                 if stored > 0 {
                     debug!("Thread: fetched {} events from {}", stored, relay_url);

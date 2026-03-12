@@ -141,16 +141,57 @@
   color: var(--text-muted);
   font-size: 0.82rem;
 }
+/* Live stream status indicators */
+.stream-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.stream-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--green);
+  animation: pulse-live 1.2s ease-in-out infinite;
+}
+.stream-dot-idle {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  opacity: 0.5;
+}
+.stream-status.syncing {
+  color: var(--green);
+}
+.stream-status.idle {
+  color: var(--text-muted);
+}
 .dash-live-row {
   display: flex;
   align-items: center;
   gap: 8px;
   padding: 6px 12px;
   border-bottom: 1px solid var(--border);
-  transition: background 0.15s;
+  transition: background 0.15s, opacity 0.3s;
 }
 .dash-live-row:last-child { border-bottom: none; }
 .dash-live-row:hover { background: var(--bg); }
+/* New event slide-in animation */
+.dash-live-row.live-row-new {
+  animation: liveRowIn 0.35s ease-out;
+  background: rgba(124, 58, 237, 0.06);
+}
+@keyframes liveRowIn {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
 .live-avatar {
   width: 24px;
   height: 24px;
@@ -265,6 +306,19 @@
   font-size: 0.7rem;
   color: var(--text-muted);
   font-family: var(--mono);
+}
+.sync-tier-bar {
+  height: 3px;
+  background: rgba(255,255,255,0.06);
+  border-radius: 2px;
+  margin-top: 5px;
+  overflow: hidden;
+}
+.sync-tier-bar-fill {
+  height: 100%;
+  background: var(--green);
+  border-radius: 2px;
+  transition: width 0.4s ease;
 }
 .pulse-dot {
   width: 7px;

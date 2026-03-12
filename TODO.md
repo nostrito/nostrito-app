@@ -1,5 +1,16 @@
 # Nostrito — TODO / Pending Features
 
+## Event Display Improvements
+
+- [ ] Make events clickable in the dashboard live stream and feed
+- [ ] Show full event content in a detail view when clicked
+- [ ] Display comments and replies threaded under parent notes
+- [ ] Show reply count and comment indicators on notes
+- [ ] Support viewing conversation threads from both feed and dashboard
+- [ ] Add "reply" action to open compose with proper thread tags
+- [ ] Render rich content: mentions, hashtags, embedded media previews
+- [ ] Show repost context (who reposted, original author)
+
 ## Long-Form Articles (kind 30023)
 
 - [ ] **Video rendering in article reader** — Embedded videos in markdown (`![](video.mp4)`) are queued for download but rendered as `<img>` tags in the reader. Detect video URLs and render `<video>` elements instead.

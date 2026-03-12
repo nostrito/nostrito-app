@@ -1,22 +1,32 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { IconChili } from "../components/Icon";
 import { Avatar } from "../components/Avatar";
 import { useTauriEvent } from "../hooks/useTauriEvent";
 import { useInterval } from "../hooks/useInterval";
-import { timeAgo } from "../utils/format";
 import { getProfiles, profileDisplayName, type ProfileInfo } from "../utils/profiles";
 import type {
-  NostrEvent,
   AppStatus,
   SyncProgress,
   SyncStats,
   RelayStatusInfo,
+  StoredEventNotification,
 } from "../types/nostr";
 
 /* ------------------------------------------------------------------ */
 /*  Constants                                                          */
 /* ------------------------------------------------------------------ */
+
+const LIVE_STREAM_MAX = 50;
+
+interface LiveEntry {
+  id: string;
+  kind: number;
+  pubkey: string;
+  content: string;
+  ts: number; // local timestamp (Date.now())
+}
 
 const LAYER_IDS = ["0", "05", "1", "2"] as const;
 type LayerId = (typeof LAYER_IDS)[number];
@@ -65,21 +75,6 @@ function formatUptime(seconds: number): string {
   return `${seconds}s`;
 }
 
-function contentPreview(event: NostrEvent): string {
-  // For reposts, try to parse the embedded event and show its content
-  if (event.kind === 6 && event.content.trim()) {
-    try {
-      const original = JSON.parse(event.content);
-      if (original && typeof original.content === "string" && original.content.trim()) {
-        return original.content.replace(/https?:\/\/\S+/g, "").trim().slice(0, 60) || "\u2014";
-      }
-    } catch {
-      // Not valid JSON, fall through
-    }
-  }
-  return event.content.replace(/https?:\/\/\S+/g, "").trim().slice(0, 60) || "\u2014";
-}
-
 /* ------------------------------------------------------------------ */
 /*  Sync layer badge helpers                                           */
 /* ------------------------------------------------------------------ */
@@ -106,30 +101,47 @@ function getLayerBadge(layerId: LayerId, currentLayer: string): LayerBadge {
 function getLayerDetail(
   layerId: LayerId,
   syncStats: SyncStats,
-  currentLayer: string
+  currentLayer: string,
+  progressRelay?: string
 ): string {
   const backendLayer = LAYER_TO_BACKEND[layerId];
+  const isActive = currentLayer === backendLayer;
   const s = syncStats;
 
-  let detail = "";
-  switch (layerId) {
-    case "0":
-      if (s.tier1_fetched > 0) detail = `${s.tier1_fetched} events`;
-      break;
-    case "05":
-      if ((s.tracked_fetched || 0) > 0) detail = `${s.tracked_fetched} events`;
-      break;
-    case "1":
-      if (s.tier2_fetched > 0) detail = `${s.tier2_fetched} events`;
-      break;
-    case "2": {
-      const total = (s.tier3_fetched || 0) + (s.tier4_fetched || 0);
-      if (total > 0) detail = `${total} events`;
-      break;
-    }
+  // Build progress string like "42/200 (21%)" when a content pass is running
+  let progressStr = "";
+  if (isActive && s.pass_pubkeys_total > 0) {
+    const pct = Math.round((s.pass_pubkeys_done / s.pass_pubkeys_total) * 100);
+    progressStr = `${s.pass_pubkeys_done}/${s.pass_pubkeys_total} (${pct}%)`;
   }
 
-  if (detail) return detail;
+  let count = 0;
+  switch (layerId) {
+    case "0":
+      count = s.tier1_fetched;
+      break;
+    case "05":
+      count = s.tracked_fetched || 0;
+      break;
+    case "1":
+      count = s.tier2_fetched;
+      break;
+    case "2":
+      count = (s.tier3_fetched || 0) + (s.tier4_fetched || 0);
+      break;
+  }
+
+  if (isActive && progressStr) {
+    return count > 0
+      ? `${count} events \u00b7 ${progressStr}`
+      : `fetching \u00b7 ${progressStr}`;
+  }
+
+  if (count > 0) return `${count} events`;
+
+  if (isActive) {
+    return progressRelay ? `fetching \u00b7 ${progressRelay}` : "fetching...";
+  }
 
   const isDone =
     currentLayer !== "" &&
@@ -148,13 +160,95 @@ export const Dashboard: React.FC = () => {
   const [activityData, setActivityData] = useState<number[]>(new Array(24).fill(0));
   const [relays, setRelays] = useState<RelayStatusInfo[]>([]);
   const [relaysLoaded, setRelaysLoaded] = useState(false);
-  const [events, setEvents] = useState<NostrEvent[]>([]);
-  const [profileMap, setProfileMap] = useState<Map<string, ProfileInfo>>(new Map());
-  const feedLoadingRef = useRef(false);
+  /* --- live event stream state -------------------------------------- */
+  const [liveStream, setLiveStream] = useState<LiveEntry[]>([]);
+  const [liveProfileMap, setLiveProfileMap] = useState<Map<string, ProfileInfo>>(new Map());
+  const liveStreamRef = useRef<LiveEntry[]>([]);
+  const pendingProfilesRef = useRef<Set<string>>(new Set());
+  const profileFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   /* --- Tauri event listeners ---------------------------------------- */
   const syncProgress = useTauriEvent<SyncProgress>("sync:progress");
   const tierComplete = useTauriEvent<{ tier: number }>("sync:tier_complete");
+
+  /* --- live event stream listener ------------------------------------ */
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let counter = 0;
+
+    const queueProfileFetch = (pubkey: string) => {
+      if (!pendingProfilesRef.current.has(pubkey)) {
+        pendingProfilesRef.current.add(pubkey);
+        if (!profileFlushTimerRef.current) {
+          profileFlushTimerRef.current = setTimeout(() => {
+            const pks = [...pendingProfilesRef.current];
+            pendingProfilesRef.current.clear();
+            profileFlushTimerRef.current = null;
+            getProfiles(pks).then((profiles) => {
+              setLiveProfileMap((prev) => {
+                const next = new Map(prev);
+                for (const [pk, info] of profiles) {
+                  next.set(pk, info);
+                }
+                return next;
+              });
+            });
+          }, 200);
+        }
+      }
+    };
+
+    listen<StoredEventNotification>("event:stored", (event) => {
+      const entry: LiveEntry = {
+        id: `live-${++counter}-${Date.now()}`,
+        kind: event.payload.kind,
+        pubkey: event.payload.pubkey,
+        content: event.payload.content || "",
+        ts: Date.now(),
+      };
+
+      queueProfileFetch(entry.pubkey);
+      liveStreamRef.current = [entry, ...liveStreamRef.current].slice(0, LIVE_STREAM_MAX);
+      setLiveStream(liveStreamRef.current);
+    }).then((fn) => { unlisten = fn; });
+
+    return () => {
+      if (unlisten) unlisten();
+      if (profileFlushTimerRef.current) clearTimeout(profileFlushTimerRef.current);
+    };
+  }, []);
+
+  /* --- seed stream from DB on mount so dashboard isn't empty --------- */
+  const seededRef = useRef(false);
+  useEffect(() => {
+    if (seededRef.current) return;
+    seededRef.current = true;
+
+    invoke<{ id: string; pubkey: string; created_at: number; kind: number; content: string }[]>(
+      "get_feed", { filter: { limit: 20 } }
+    )
+      .then(async (rawEvents) => {
+        const entries: LiveEntry[] = rawEvents
+          .sort((a, b) => b.created_at - a.created_at)
+          .slice(0, 20)
+          .map((e, i) => ({
+            id: `seed-${i}`,
+            kind: e.kind,
+            pubkey: e.pubkey,
+            content: e.content ? e.content.replace(/https?:\/\/\S+/g, "").trim().slice(0, 120) : "",
+            ts: e.created_at * 1000,
+          }));
+
+        if (entries.length > 0) {
+          const pubkeys = [...new Set(entries.map((e) => e.pubkey))];
+          const profiles = await getProfiles(pubkeys);
+          setLiveProfileMap(new Map(profiles));
+          liveStreamRef.current = entries;
+          setLiveStream(entries);
+        }
+      })
+      .catch(() => {});
+  }, []);
 
   /* --- data loaders ------------------------------------------------- */
   const loadStats = useCallback(async () => {
@@ -191,49 +285,19 @@ export const Dashboard: React.FC = () => {
     }
   }, []);
 
-  const loadFeed = useCallback(async () => {
-    if (feedLoadingRef.current) return;
-    feedLoadingRef.current = true;
-    try {
-      const rawEvents = await invoke<NostrEvent[]>("get_feed", {
-        filter: { limit: 30 },
-      });
-      const seen = new Set<string>();
-      const deduped = rawEvents
-        .filter((e) => {
-          if (seen.has(e.id)) return false;
-          seen.add(e.id);
-          return true;
-        })
-        .sort((a, b) => b.created_at - a.created_at)
-        .slice(0, 10);
-
-      const pubkeys = [...new Set(deduped.map((e) => e.pubkey))];
-      const profiles = await getProfiles(pubkeys);
-      setProfileMap(new Map(profiles));
-      setEvents(deduped);
-    } catch (_) {
-      /* ignore */
-    } finally {
-      feedLoadingRef.current = false;
-    }
-  }, []);
-
   /* --- initial load ------------------------------------------------- */
   useEffect(() => {
     loadStats();
-    loadFeed();
     loadActivityChart();
     loadRelayStatus();
-  }, [loadStats, loadFeed, loadActivityChart, loadRelayStatus]);
+  }, [loadStats, loadActivityChart, loadRelayStatus]);
 
   /* --- polling ------------------------------------------------------- */
   // Stats refresh every 1s
   useInterval(loadStats, 1000);
 
-  // Feed, activity chart, relays refresh every 15s
+  // Activity chart, relays refresh every 15s
   useInterval(() => {
-    loadFeed();
     loadActivityChart();
     loadRelayStatus();
   }, 15000);
@@ -242,18 +306,16 @@ export const Dashboard: React.FC = () => {
   useEffect(() => {
     if (syncProgress) {
       loadStats();
-      loadFeed();
       loadActivityChart();
     }
-  }, [syncProgress, loadStats, loadFeed, loadActivityChart]);
+  }, [syncProgress, loadStats, loadActivityChart]);
 
   useEffect(() => {
     if (tierComplete) {
       loadStats();
-      loadFeed();
       loadRelayStatus();
     }
-  }, [tierComplete, loadStats, loadFeed, loadRelayStatus]);
+  }, [tierComplete, loadStats, loadRelayStatus]);
 
   /* --- derived values ------------------------------------------------ */
   const relayUrl = status ? `wss://localhost:${status.relay_port}` : "";
@@ -261,6 +323,11 @@ export const Dashboard: React.FC = () => {
     status !== null &&
     (status.sync_tier > 0 || (status.sync_stats.current_layer || "") !== "");
   const currentLayer = status?.sync_stats.current_layer || "";
+
+  // Extract short relay progress string from syncProgress (e.g. "wss://relay.damus.io (3/12)" → "relay.damus.io (3/12)")
+  const progressRelay = syncProgress?.relay
+    ? syncProgress.relay.replace(/^wss?:\/\//, "")
+    : undefined;
 
   const activityMax = Math.max(...activityData, 1);
 
@@ -306,12 +373,20 @@ export const Dashboard: React.FC = () => {
           <div className="dash-stat-label">WoT Peers</div>
         </div>
         <div className="dash-stat">
-          <div className="dash-stat-val">{"\u2014"}</div>
-          <div className="dash-stat-label">Media Cached</div>
+          <div className="dash-stat-val">
+            {status ? status.media_stored.toLocaleString() : "\u2014"}
+          </div>
+          <div className="dash-stat-label">Media Stored</div>
         </div>
         <div className="dash-stat">
           <div className="dash-stat-val">
-            {status ? (isSyncing ? "~syncing" : "idle") : "\u2014"}
+            {status
+              ? status.offline_mode
+                ? "offline"
+                : isSyncing
+                  ? "~syncing"
+                  : "idle"
+              : "\u2014"}
           </div>
           <div className="dash-stat-label">Sync Rate</div>
         </div>
@@ -348,39 +423,63 @@ export const Dashboard: React.FC = () => {
 
       {/* Body: feed + sidebar */}
       <div className="dash-body">
-        {/* Latest Events */}
+        {/* Live Event Stream */}
         <div className="dash-live-events">
           <div className="dash-live-header">
-            <span className="dash-live-title">Latest Events</span>
+            <span className="dash-live-title">
+              {status?.offline_mode ? (
+                <span className="stream-status idle">
+                  <span className="stream-dot-idle"></span> Offline
+                </span>
+              ) : isSyncing ? (
+                <span className="stream-status syncing">
+                  <span className="stream-dot"></span> Syncing
+                </span>
+              ) : (
+                <span className="stream-status idle">
+                  <span className="stream-dot-idle"></span> Idle
+                </span>
+              )}
+            </span>
             <span className="dash-live-count">
-              {events.length > 0 ? `${events.length} events` : "\u2014"}
+              {liveStream.length > 0 ? `${liveStream.length} events` : "\u2014"}
             </span>
           </div>
           <div className="dash-live-table">
-            {events.length === 0 ? (
-              <div className="dash-live-empty">Waiting for events...</div>
+            {liveStream.length === 0 ? (
+              <div className="dash-live-empty">
+                {status?.offline_mode
+                  ? "Offline mode — sync disabled"
+                  : isSyncing
+                    ? "Waiting for events..."
+                    : "Idle — waiting for next sync cycle"}
+              </div>
             ) : (
-              events.map((e) => {
-                const profile = profileMap.get(e.pubkey);
-                const name = profileDisplayName(profile, e.pubkey);
-                const kind = kindLabel(e.kind);
-                const kindCls = kindCssClass(e.kind);
-                const preview = contentPreview(e);
+              liveStream.slice(0, 20).map((entry) => {
+                const profile = liveProfileMap.get(entry.pubkey);
+                const name = profileDisplayName(profile, entry.pubkey);
+                const kind = kindLabel(entry.kind);
+                const kindCls = kindCssClass(entry.kind);
+                const age = Math.max(0, Math.floor((Date.now() - entry.ts) / 1000));
+                const ageStr = age < 2 ? "now" : age < 60 ? `${age}s` : `${Math.floor(age / 60)}m`;
+                const isNew = Date.now() - entry.ts < 1500;
 
                 return (
-                  <div className="dash-live-row" key={e.id}>
-                    <span data-pubkey={e.pubkey} style={{ cursor: "pointer", display: "flex", alignItems: "center", gap: 8 }}>
+                  <div className={`dash-live-row${isNew ? " live-row-new" : ""}`} key={entry.id}>
+                    <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
                       <Avatar
                         picture={profile?.picture}
-                        pubkey={e.pubkey}
+                        pubkey={entry.pubkey}
                         className="live-avatar"
                         fallbackClassName="live-avatar-fallback"
                       />
                       <span className="live-name">{name}</span>
                     </span>
                     <span className={`live-kind ${kindCls}`}>{kind}</span>
-                    <span className="live-preview">{preview}</span>
-                    <span className="live-time">{timeAgo(e.created_at)}</span>
+                    <span className="live-preview">
+                      {entry.content || `${entry.pubkey.slice(0, 8)}...`}
+                    </span>
+                    <span className="live-time">{ageStr}</span>
                   </div>
                 );
               })
@@ -397,8 +496,15 @@ export const Dashboard: React.FC = () => {
               ? getLayerBadge(lid, currentLayer)
               : { text: "IDLE", className: "sync-tier-badge idle" };
             const detail = status
-              ? getLayerDetail(lid, status.sync_stats, currentLayer)
+              ? getLayerDetail(lid, status.sync_stats, currentLayer, progressRelay)
               : "\u2014";
+
+            const backendLayer = LAYER_TO_BACKEND[lid];
+            const isActive = currentLayer === backendLayer;
+            const ss = status?.sync_stats;
+            const pct = isActive && ss && ss.pass_pubkeys_total > 0
+              ? Math.round((ss.pass_pubkeys_done / ss.pass_pubkeys_total) * 100)
+              : 0;
 
             return (
               <div className="sync-tier" key={lid}>
@@ -407,6 +513,11 @@ export const Dashboard: React.FC = () => {
                   <span className={badge.className}>{badge.text}</span>
                 </div>
                 <div className="sync-tier-detail">{detail}</div>
+                {isActive && pct > 0 && (
+                  <div className="sync-tier-bar">
+                    <div className="sync-tier-bar-fill" style={{ width: `${pct}%` }} />
+                  </div>
+                )}
               </div>
             );
           })}

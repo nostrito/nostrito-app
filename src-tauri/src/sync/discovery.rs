@@ -15,6 +15,7 @@ pub struct Discovery {
     graph: Arc<WotGraph>,
     pool: Arc<RelayPool>,
     own_pubkey: String,
+    app_handle: tauri::AppHandle,
 }
 
 impl Discovery {
@@ -23,8 +24,9 @@ impl Discovery {
         graph: Arc<WotGraph>,
         pool: Arc<RelayPool>,
         own_pubkey: String,
+        app_handle: tauri::AppHandle,
     ) -> Self {
-        Self { db, graph, pool, own_pubkey }
+        Self { db, graph, pool, own_pubkey, app_handle }
     }
 
     /// Run the full discovery phase.
@@ -83,11 +85,6 @@ impl Discovery {
         info!("Discovery: bootstrapping relay info for {} follows from {}", follows.len(), DISCOVERY_RELAY);
 
         let relay_url = DISCOVERY_RELAY.to_string();
-        if self.pool.ensure_connected(&relay_url).await.is_err() {
-            warn!("Discovery: failed to connect to {}", DISCOVERY_RELAY);
-            return Ok(0);
-        }
-
         let mut total_processed = 0u32;
 
         // Batch queries of 100 pubkeys
@@ -119,6 +116,7 @@ impl Discovery {
                         &self.own_pubkey,
                         EventSource::Sync,
                         super::types::MEDIA_PRIORITY_OTHERS,
+                        Some(&self.app_handle),
                     );
                     total_processed += stored;
                 }

@@ -355,31 +355,12 @@ pub fn extract_urls_from_tags(tags_json: &str) -> Vec<String> {
 /// Extract URLs from text content.
 pub fn extract_urls_from_text(text: &str) -> Vec<String> {
     let mut urls = Vec::new();
-    let bytes = text.as_bytes();
-    let mut i = 0;
 
-    while i < bytes.len() {
-        let remaining = &text[i..];
-        let start = if remaining.starts_with("https://") || remaining.starts_with("http://") {
-            Some(i)
-        } else {
-            None
-        };
-
-        if let Some(start) = start {
-            let mut end = start;
-            for &b in &bytes[start..] {
-                if matches!(b, b' ' | b'\n' | b'\r' | b'\t' | b'"' | b'\'' | b'<' | b'>' | b']' | b')') {
-                    break;
-                }
-                end += 1;
-            }
-            if end > start + 10 {
-                urls.push(text[start..end].to_string());
-            }
-            i = end;
-        } else {
-            i += 1;
+    // Split on whitespace and common delimiters to find URL tokens
+    for token in text.split(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '<' || c == '>' || c == ')' || c == ']') {
+        let trimmed = token.trim();
+        if (trimmed.starts_with("https://") || trimmed.starts_with("http://")) && trimmed.len() > 10 {
+            urls.push(trimmed.to_string());
         }
     }
 

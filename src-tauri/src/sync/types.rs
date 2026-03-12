@@ -16,6 +16,14 @@ pub struct TierComplete {
     pub tier: u8,
 }
 
+/// Lightweight notification emitted for each newly stored event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredEventNotification {
+    pub kind: u32,
+    pub pubkey: String,
+    pub content: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SyncStats {
     pub tier1_fetched: u64,
@@ -26,6 +34,10 @@ pub struct SyncStats {
     pub current_tier: u8,
     /// Conceptual layer currently executing: "0", "0.5", "1", "2", "3", or "" (idle)
     pub current_layer: String,
+    /// Unique pubkeys covered so far in the current content pass.
+    pub pass_pubkeys_done: u64,
+    /// Total pubkeys in the current content pass.
+    pub pass_pubkeys_total: u64,
 }
 
 // ── Sync Config ────────────────────────────────────────────────────
@@ -44,6 +56,8 @@ pub struct SyncConfig {
     pub fof_content: bool,
     /// Fetch content from hop-3 pubkeys (lowest priority)
     pub hop3_content: bool,
+    /// Max number of FoF pubkeys to fetch content for (0 = unlimited)
+    pub fof_max_pubkeys: u32,
 }
 
 impl Default for SyncConfig {
@@ -57,8 +71,9 @@ impl Default for SyncConfig {
             wot_batch_size: 5,
             wot_events_per_batch: 15,
             cycle_interval_secs: 300,
-            fof_content: false,
+            fof_content: true,
             hop3_content: false,
+            fof_max_pubkeys: 200,
         }
     }
 }

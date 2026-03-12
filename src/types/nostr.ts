@@ -53,6 +53,8 @@ export interface AppStatus {
   sync_status: string;
   sync_tier: number;
   sync_stats: SyncStats;
+  media_stored: number;
+  offline_mode: boolean;
   relayRunning?: boolean;
   relayPort?: number;
   eventsStored?: number;
@@ -68,6 +70,8 @@ export interface SyncStats {
   tier4_fetched: number;
   current_tier: number;
   current_layer: string;
+  pass_pubkeys_done: number;
+  pass_pubkeys_total: number;
 }
 
 export interface SyncProgress {
@@ -75,6 +79,12 @@ export interface SyncProgress {
   fetched: number;
   total: number;
   relay: string;
+}
+
+export interface StoredEventNotification {
+  kind: number;
+  pubkey: string;
+  content: string;
 }
 
 export interface RelayStatusInfo {

@@ -1,12 +1,13 @@
 use nostr_sdk::prelude::*;
 use std::sync::Arc;
+use tauri::Emitter;
 use tracing::{debug, info, warn};
 
 use crate::storage::db::Database;
 use crate::storage::FollowUpdateBatch;
 use crate::wot::WotGraph;
 
-use super::types::EventSource;
+use super::types::{EventSource, StoredEventNotification};
 
 /// Result of processing a single event.
 #[derive(Debug, Default)]
@@ -506,6 +507,7 @@ fn is_media_url(url: &str) -> bool {
 }
 
 /// Process a batch of events, returning aggregate results.
+/// When `app_handle` is provided, emits `event:stored` for each newly stored event.
 pub fn process_events(
     events: &[Event],
     db: &Arc<Database>,
@@ -513,6 +515,7 @@ pub fn process_events(
     own_pubkey: &str,
     source: EventSource,
     media_priority: i32,
+    app_handle: Option<&tauri::AppHandle>,
 ) -> (u32, u32) {
     let mut stored = 0u32;
     let mut wot_updates = 0u32;
@@ -521,16 +524,67 @@ pub fn process_events(
     let mut sorted: Vec<&Event> = events.iter().collect();
     sorted.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
-    for event in sorted {
-        let result = process_event(event, db, graph, own_pubkey, source, media_priority);
+    info!("process_events: processing {} events (source={:?})", sorted.len(), source);
+
+    for (idx, event) in sorted.iter().enumerate() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            process_event(event, db, graph, own_pubkey, source, media_priority)
+        }));
+
+        let result = match result {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = e.downcast_ref::<String>()
+                    .map(|s| s.as_str())
+                    .or_else(|| e.downcast_ref::<&str>().copied())
+                    .unwrap_or("unknown panic");
+                warn!("process_events: PANIC at event {}/{} (kind={}, id={}): {}",
+                    idx + 1, events.len(), event.kind.as_u16(), &event.id.to_hex()[..12], msg);
+                continue;
+            }
+        };
+
         if result.stored {
             stored += 1;
+            if let Some(handle) = app_handle {
+                // Build content preview — all wrapped in catch_unwind for safety
+                let content = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let raw = event.content.to_string();
+                    let kind_u32 = event.kind.as_u16() as u32;
+                    let preview_text = if kind_u32 == 6 {
+                        serde_json::from_str::<serde_json::Value>(&raw)
+                            .ok()
+                            .and_then(|v| v.get("content")?.as_str().map(String::from))
+                            .unwrap_or_else(|| raw.clone())
+                    } else {
+                        raw
+                    };
+                    let cleaned: String = preview_text
+                        .split_whitespace()
+                        .filter(|w| !w.starts_with("http://") && !w.starts_with("https://"))
+                        .collect::<Vec<&str>>()
+                        .join(" ");
+                    if cleaned.chars().count() > 120 {
+                        let truncated: String = cleaned.chars().take(120).collect();
+                        format!("{}...", truncated)
+                    } else {
+                        cleaned
+                    }
+                })).unwrap_or_default();
+
+                handle.emit("event:stored", &StoredEventNotification {
+                    kind: event.kind.as_u16() as u32,
+                    pubkey: event.pubkey.to_hex(),
+                    content,
+                }).ok();
+            }
         }
         if result.wot_updated {
             wot_updates += 1;
         }
     }
 
+    info!("process_events: done — {} stored, {} wot updates", stored, wot_updates);
     (stored, wot_updates)
 }
 

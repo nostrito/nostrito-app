@@ -117,45 +117,56 @@ impl SyncEngine {
             }
 
             cycle += 1;
-            info!("SyncEngine: starting cycle {}", cycle);
+            let cycle_start = std::time::Instant::now();
+            info!("SyncEngine: ═══ starting cycle {} ═══", cycle);
 
             // Phase 1: Own Data
             self.emit_phase(SyncPhase::OwnData);
+            let phase_start = std::time::Instant::now();
             if let Err(e) = self.phase_own_data().await {
                 warn!("Phase 1 error: {}", e);
             }
+            info!("SyncEngine: Phase 1 (Own Data) took {:.1}s", phase_start.elapsed().as_secs_f32());
 
             if self.cancel.is_cancelled() { break; }
 
             // Phase 2: Discovery
             self.emit_phase(SyncPhase::Discovery);
+            let phase_start = std::time::Instant::now();
             if let Err(e) = self.phase_discovery().await {
                 warn!("Phase 2 error: {}", e);
             }
+            info!("SyncEngine: Phase 2 (Discovery) took {:.1}s", phase_start.elapsed().as_secs_f32());
 
             if self.cancel.is_cancelled() { break; }
 
             // Phase 3: Content Fetch
             self.emit_phase(SyncPhase::ContentFetch);
+            let phase_start = std::time::Instant::now();
             if let Err(e) = self.phase_content().await {
                 warn!("Phase 3 error: {}", e);
             }
+            info!("SyncEngine: Phase 3 (Content Fetch) took {:.1}s", phase_start.elapsed().as_secs_f32());
 
             if self.cancel.is_cancelled() { break; }
 
             // Phase 4: Thread Context
             self.emit_phase(SyncPhase::ThreadContext);
+            let phase_start = std::time::Instant::now();
             if let Err(e) = self.phase_threads().await {
                 warn!("Phase 4 error: {}", e);
             }
+            info!("SyncEngine: Phase 4 (Thread Context) took {:.1}s", phase_start.elapsed().as_secs_f32());
 
             if self.cancel.is_cancelled() { break; }
 
             // Phase 5: Media Download
             self.emit_phase(SyncPhase::MediaDownload);
+            let phase_start = std::time::Instant::now();
             if let Err(e) = self.phase_media().await {
                 warn!("Phase 5 error: {}", e);
             }
+            info!("SyncEngine: Phase 5 (Media Download) took {:.1}s", phase_start.elapsed().as_secs_f32());
 
             // Pruning: run every cycle after all phases
             if let Err(e) = self.run_pruning() {
@@ -173,7 +184,7 @@ impl SyncEngine {
             self.sync_tier.store(0, Ordering::Relaxed);
             self.emit_tier_complete(0);
 
-            info!("SyncEngine: cycle {} complete", cycle);
+            info!("SyncEngine: ═══ cycle {} complete in {:.1}s ═══", cycle, cycle_start.elapsed().as_secs_f32());
 
             // Wait for next cycle
             let interval = Duration::from_secs(self.sync_config.cycle_interval_secs as u64);
@@ -195,9 +206,6 @@ impl SyncEngine {
         self.sync_tier.store(1, Ordering::Relaxed);
 
         let pk = PublicKey::from_hex(&self.hex_pubkey)?;
-
-        // Connect to configured relays
-        self.pool.ensure_connected_many(&self.relay_urls).await;
 
         // Fetch own metadata + contacts
         let meta_filter = Filter::new()
@@ -292,6 +300,7 @@ impl SyncEngine {
             self.sync_config.lookback_days,
             self.sync_config.fof_content,
             self.sync_config.hop3_content,
+            self.sync_config.fof_max_pubkeys,
             Arc::clone(&self.sync_stats),
             self.app_handle.clone(),
         );
@@ -442,8 +451,8 @@ impl SyncEngine {
             SyncPhase::OwnData => "0",
             SyncPhase::Discovery => "0",
             SyncPhase::ContentFetch => "0.5",
-            SyncPhase::ThreadContext => "",
-            SyncPhase::MediaDownload => "",
+            SyncPhase::ThreadContext => "thread",
+            SyncPhase::MediaDownload => "media",
         };
         // Update sync_stats with current phase info
         if let Ok(mut ss) = self.sync_stats.try_write() {

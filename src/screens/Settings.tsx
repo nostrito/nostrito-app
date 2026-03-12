@@ -1,5 +1,7 @@
 import React, { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { useNavigate } from "react-router-dom";
+import { useAppContext } from "../context/AppContext";
 import { RELAYS, resolveRelayUrl, urlToAlias } from "../relays";
 import { getProfiles, profileDisplayName } from "../utils/profiles";
 import type { ProfileInfo } from "../utils/profiles";
@@ -51,6 +53,7 @@ interface Settings {
   sync_wot_events_per_batch: number;
   max_event_age_days: number;
   sync_fof_content: boolean;
+  sync_fof_max_pubkeys: number;
   offline_mode: boolean;
 }
 
@@ -98,6 +101,7 @@ const SYNC_PRESETS: Record<
     wotBatch: number;
     wotEvents: number;
     wotDepth: number;
+    fofMaxPubkeys: number;
     interval: number;
   }
 > = {
@@ -110,6 +114,7 @@ const SYNC_PRESETS: Record<
     wotBatch: 3,
     wotEvents: 10,
     wotDepth: 1,
+    fofMaxPubkeys: 100,
     interval: 10,
   },
   balanced: {
@@ -121,6 +126,7 @@ const SYNC_PRESETS: Record<
     wotBatch: 5,
     wotEvents: 15,
     wotDepth: 2,
+    fofMaxPubkeys: 200,
     interval: 5,
   },
   power: {
@@ -132,6 +138,7 @@ const SYNC_PRESETS: Record<
     wotBatch: 15,
     wotEvents: 50,
     wotDepth: 3,
+    fofMaxPubkeys: 500,
     interval: 2,
   },
 };
@@ -157,6 +164,9 @@ const WOT_PRESETS = [
 /* ------------------------------------------------------------------ */
 
 export const Settings: React.FC = () => {
+  const navigate = useNavigate();
+  const { setInitialized } = useAppContext();
+
   /* --- core state --------------------------------------------------- */
   const [activeTab, setActiveTab] = useState<TabId>("identity");
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -186,7 +196,8 @@ export const Settings: React.FC = () => {
   const [syncWotEvents, setSyncWotEvents] = useState(15);
   const [syncInterval, setSyncInterval] = useState(5);
   const [syncWotDepth, setSyncWotDepth] = useState(2);
-  const [syncFofContent, setSyncFofContent] = useState(false);
+  const [syncFofContent, setSyncFofContent] = useState(true);
+  const [syncFofMaxPubkeys, setSyncFofMaxPubkeys] = useState(200);
   const [autoStart, setAutoStart] = useState(false);
   const [advancedSaving, setAdvancedSaving] = useState(false);
   const [advancedFeedback, setAdvancedFeedback] = useState<SaveFeedback | null>(null);
@@ -255,6 +266,7 @@ export const Settings: React.FC = () => {
       setSyncInterval(Math.round(s.sync_interval_secs / 60));
       setSyncWotDepth(s.wot_max_depth);
       setSyncFofContent(s.sync_fof_content);
+      setSyncFofMaxPubkeys(s.sync_fof_max_pubkeys);
       setAutoStart(s.auto_start);
       setOfflineMode(s.offline_mode);
 
@@ -383,6 +395,7 @@ export const Settings: React.FC = () => {
       sync_interval_secs: syncInterval * 60,
       wot_max_depth: syncWotDepth,
       sync_fof_content: syncFofContent,
+      sync_fof_max_pubkeys: syncFofMaxPubkeys,
     };
 
     try {
@@ -418,7 +431,8 @@ export const Settings: React.FC = () => {
     setSyncWotEvents(DEFAULTS.sync_wot_events_per_batch);
     setSyncInterval(Math.round(DEFAULTS.sync_interval_secs / 60));
     setSyncWotDepth(DEFAULTS.wot_max_depth);
-    setSyncFofContent(false);
+    setSyncFofContent(true);
+    setSyncFofMaxPubkeys(200);
     setResetDefaultsFeedback({
       type: "success",
       message: 'Defaults restored \u2014 click "Save & Restart Sync" to apply',
@@ -436,6 +450,7 @@ export const Settings: React.FC = () => {
     setSyncWotBatch(p.wotBatch);
     setSyncWotEvents(p.wotEvents);
     setSyncWotDepth(p.wotDepth);
+    setSyncFofMaxPubkeys(p.fofMaxPubkeys);
     setSyncInterval(p.interval);
   }, []);
 
@@ -479,7 +494,8 @@ export const Settings: React.FC = () => {
         console.log("[settings] change_account complete \u2014 identity cleared, events preserved");
         localStorage.removeItem("nostrito_initialized");
         localStorage.removeItem("nostrito_config");
-        window.dispatchEvent(new CustomEvent("nostrito:reset"));
+        setInitialized(false);
+        navigate("/wizard");
       } catch (e) {
         console.error("[settings] Change account failed:", e);
         alert("Failed to change account: " + e);
@@ -1138,6 +1154,32 @@ export const Settings: React.FC = () => {
               </span>
             </label>
           </div>
+
+          {/* FoF Max Pubkeys (only when FoF enabled) */}
+          {syncFofContent && (
+            <div className="settings-field" style={{ marginBottom: 20 }}>
+              <div className="settings-field-info">
+                <span className="settings-field-label">WoT peers limit</span>
+                <span className="settings-field-desc">
+                  Max FoF accounts to fetch per cycle (half top-overlap, half random rotation)
+                </span>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 12, minWidth: 200 }}>
+                <input
+                  type="range"
+                  min={50}
+                  max={1000}
+                  step={50}
+                  value={syncFofMaxPubkeys}
+                  onChange={(e) => setSyncFofMaxPubkeys(Number(e.target.value))}
+                  style={{ flex: 1 }}
+                />
+                <span style={{ fontSize: "0.82rem", color: "var(--text-secondary)", minWidth: 40, textAlign: "right" }}>
+                  {syncFofMaxPubkeys}
+                </span>
+              </div>
+            </div>
+          )}
 
           {/* Sync Presets */}
           <div style={{ marginBottom: 20 }}>

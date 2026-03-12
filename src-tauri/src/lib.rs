@@ -60,6 +60,8 @@ pub struct AppConfig {
     pub sync_fof_content: bool,
     /// Fetch content from hop-3 pubkeys (lowest priority)
     pub sync_hop3_content: bool,
+    /// Max FoF pubkeys to fetch content for (limits Layer 2 scope)
+    pub sync_fof_max_pubkeys: u32,
     /// Offline mode — stop all outbound sync, work only with local data
     pub offline_mode: bool,
     /// Cached nsec (loaded from system keychain on startup)
@@ -95,8 +97,9 @@ impl Default for AppConfig {
             sync_wot_batch_size: 5,
             sync_wot_events_per_batch: 15,
             max_event_age_days: 30,
-            sync_fof_content: false,
+            sync_fof_content: true,
             sync_hop3_content: false,
+            sync_fof_max_pubkeys: 200,
             offline_mode: false,
             nsec: None,
         }
@@ -117,6 +120,8 @@ pub struct AppStatus {
     pub sync_status: String,
     pub sync_tier: u8,
     pub sync_stats: SyncStats,
+    pub media_stored: u64,
+    pub offline_mode: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -194,6 +199,7 @@ pub struct Settings {
     pub max_event_age_days: u32,
     pub sync_fof_content: bool,
     pub sync_hop3_content: bool,
+    pub sync_fof_max_pubkeys: u32,
     pub offline_mode: bool,
 }
 
@@ -269,8 +275,10 @@ async fn get_status(state: State<'_, AppState>) -> Result<AppStatus, String> {
     let current_tier = state.sync_tier.load(Ordering::Relaxed);
     let sync_stats = state.sync_stats.read().await.clone();
     let events_stored = state.db.event_count().unwrap_or(0);
+    let media_stored = state.db.media_file_count().unwrap_or(0);
+    let offline_mode = config.offline_mode;
 
-    tracing::info!("[cmd:get_status] relay_running={}, events={}, wot_nodes={}, sync_tier={}", relay_running, events_stored, stats.node_count, current_tier);
+    tracing::debug!("[cmd:get_status] relay_running={}, events={}, wot_nodes={}, sync_tier={}", relay_running, events_stored, stats.node_count, current_tier);
 
     Ok(AppStatus {
         initialized: config.npub.is_some(),
@@ -293,6 +301,8 @@ async fn get_status(state: State<'_, AppState>) -> Result<AppStatus, String> {
         },
         sync_tier: current_tier,
         sync_stats,
+        media_stored,
+        offline_mode,
     })
 }
 
@@ -389,6 +399,7 @@ async fn init_nostrito(
             cycle_interval_secs: config.sync_interval_secs,
             fof_content: config.sync_fof_content,
             hop3_content: config.sync_hop3_content,
+            fof_max_pubkeys: config.sync_fof_max_pubkeys,
         };
         let cancel = start_sync_engine(
             state.wot_graph.clone(),
@@ -569,6 +580,7 @@ async fn start_sync(
         cycle_interval_secs: config.sync_interval_secs,
         fof_content: config.sync_fof_content,
         hop3_content: config.sync_hop3_content,
+        fof_max_pubkeys: config.sync_fof_max_pubkeys,
     };
     let cancel = start_sync_engine(
         state.wot_graph.clone(),
@@ -647,6 +659,7 @@ async fn set_offline_mode(
                 cycle_interval_secs: config.sync_interval_secs,
                 fof_content: config.sync_fof_content,
                 hop3_content: config.sync_hop3_content,
+                fof_max_pubkeys: config.sync_fof_max_pubkeys,
             };
             let cancel = start_sync_engine(
                 state.wot_graph.clone(),
@@ -706,6 +719,7 @@ async fn restart_sync(state: State<'_, AppState>, app_handle: tauri::AppHandle) 
         cycle_interval_secs: config.sync_interval_secs,
         fof_content: config.sync_fof_content,
         hop3_content: config.sync_hop3_content,
+        fof_max_pubkeys: config.sync_fof_max_pubkeys,
     };
 
     let cancel = start_sync_engine(
@@ -1594,6 +1608,7 @@ async fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
         max_event_age_days: config.max_event_age_days,
         sync_fof_content: config.sync_fof_content,
         sync_hop3_content: config.sync_hop3_content,
+        sync_fof_max_pubkeys: config.sync_fof_max_pubkeys,
         offline_mode: config.offline_mode,
     })
 }
@@ -1631,6 +1646,7 @@ async fn save_settings(settings: Settings, app_handle: tauri::AppHandle, state: 
     config.max_event_age_days = settings.max_event_age_days;
     config.sync_fof_content = settings.sync_fof_content;
     config.sync_hop3_content = settings.sync_hop3_content;
+    config.sync_fof_max_pubkeys = settings.sync_fof_max_pubkeys;
     config.offline_mode = settings.offline_mode;
 
     // Persist ALL settings to DB so they survive restart
@@ -1665,6 +1681,7 @@ async fn save_settings(settings: Settings, app_handle: tauri::AppHandle, state: 
     db.set_config("max_event_age_days", &settings.max_event_age_days.to_string()).ok();
     db.set_config("sync_fof_content", if settings.sync_fof_content { "true" } else { "false" }).ok();
     db.set_config("sync_hop3_content", if settings.sync_hop3_content { "true" } else { "false" }).ok();
+    db.set_config("sync_fof_max_pubkeys", &settings.sync_fof_max_pubkeys.to_string()).ok();
     db.set_config("offline_mode", if settings.offline_mode { "true" } else { "false" }).ok();
     db.set_config("storage_own_media_gb", &settings.storage_own_media_gb.to_string()).ok();
     db.set_config("storage_tracked_media_gb", &settings.storage_tracked_media_gb.to_string()).ok();
@@ -1699,6 +1716,7 @@ async fn save_settings(settings: Settings, app_handle: tauri::AppHandle, state: 
             cycle_interval_secs: config.sync_interval_secs,
             fof_content: config.sync_fof_content,
             hop3_content: config.sync_hop3_content,
+            fof_max_pubkeys: config.sync_fof_max_pubkeys,
         };
         let cancel = start_sync_engine(
             state.wot_graph.clone(),
@@ -2472,7 +2490,7 @@ pub fn run() {
         std::mem::forget(_guard);
 
         let env_filter = EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new("info,nostrito_lib=info"));
+            .unwrap_or_else(|_| EnvFilter::new("info,nostrito_lib=info,nostrito_lib::sync=debug"));
 
         tracing_subscriber::registry()
             .with(env_filter)
@@ -2568,6 +2586,7 @@ pub fn run() {
     if let Ok(Some(v)) = db.get_config("max_event_age_days") { if let Ok(n) = v.parse::<u32>() { config.max_event_age_days = n; } }
     if let Ok(Some(v)) = db.get_config("sync_fof_content") { config.sync_fof_content = v == "true"; }
     if let Ok(Some(v)) = db.get_config("sync_hop3_content") { config.sync_hop3_content = v == "true"; }
+    if let Ok(Some(v)) = db.get_config("sync_fof_max_pubkeys") { if let Ok(n) = v.parse::<u32>() { config.sync_fof_max_pubkeys = n; } }
     if let Ok(Some(v)) = db.get_config("offline_mode") { config.offline_mode = v == "true"; }
     if let Ok(Some(v)) = db.get_config("storage_own_media_gb") { if let Ok(n) = v.parse::<f64>() { config.storage_own_media_gb = n; } }
     if let Ok(Some(v)) = db.get_config("storage_tracked_media_gb") { if let Ok(n) = v.parse::<f64>() { config.storage_tracked_media_gb = n; } }
@@ -2684,6 +2703,7 @@ pub fn run() {
                         cycle_interval_secs: cfg2.sync_interval_secs,
                         fof_content: cfg2.sync_fof_content,
                         hop3_content: cfg2.sync_hop3_content,
+                        fof_max_pubkeys: cfg2.sync_fof_max_pubkeys,
                     };
                     drop(cfg2);
                     let cancel = start_sync_engine(
