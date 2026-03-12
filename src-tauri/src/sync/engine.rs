@@ -37,7 +37,8 @@ pub struct SyncEngine {
     pub sync_tier: Arc<AtomicU8>,
     pub sync_stats: Arc<RwLock<SyncStats>>,
     app_handle: tauri::AppHandle,
-    storage_media_gb: f64,
+    tracked_media_gb: f64,
+    wot_media_gb: f64,
     sync_config: SyncConfig,
     pool: Arc<RelayPool>,
 }
@@ -51,7 +52,8 @@ impl SyncEngine {
         sync_tier: Arc<AtomicU8>,
         sync_stats: Arc<RwLock<SyncStats>>,
         app_handle: tauri::AppHandle,
-        storage_media_gb: f64,
+        tracked_media_gb: f64,
+        wot_media_gb: f64,
         sync_config: SyncConfig,
         _max_event_age_days: u32,
     ) -> Self {
@@ -85,7 +87,8 @@ impl SyncEngine {
             sync_tier,
             sync_stats,
             app_handle,
-            storage_media_gb,
+            tracked_media_gb,
+            wot_media_gb,
             sync_config,
             pool: Arc::new(RelayPool::new()),
         }
@@ -232,6 +235,7 @@ impl SyncEngine {
             &self.graph,
             &self.hex_pubkey,            EventSource::OwnBackup,
             super::types::MEDIA_PRIORITY_OWNER,
+            Some(&self.app_handle),
         );
 
         {
@@ -254,6 +258,7 @@ impl SyncEngine {
             Arc::clone(&self.graph),
             Arc::clone(&self.pool),
             self.hex_pubkey.clone(),
+            self.app_handle.clone(),
         );
 
         let stats = discovery.run().await?;
@@ -275,6 +280,7 @@ impl SyncEngine {
             Arc::clone(&self.graph),
             Arc::clone(&self.pool),
             self.hex_pubkey.clone(),
+            self.app_handle.clone(),
         );
         let needing_refresh = discovery.pubkeys_needing_relay_refresh()?;
 
@@ -287,9 +293,15 @@ impl SyncEngine {
             self.sync_config.fof_content,
             self.sync_config.hop3_content,
             Arc::clone(&self.sync_stats),
+            self.app_handle.clone(),
         );
 
         let stats = content.run(&needing_refresh).await?;
+
+        // Clear layer state now that content passes are done
+        if let Ok(mut ss) = self.sync_stats.try_write() {
+            ss.current_layer = String::new();
+        }
 
         self.emit_progress(3, stats.events_stored as u64, 0, "content");
         info!(
@@ -308,6 +320,7 @@ impl SyncEngine {
             Arc::clone(&self.graph),
             Arc::clone(&self.pool),
             self.hex_pubkey.clone(),
+            self.app_handle.clone(),
         );
 
         let stats = threads.run(&self.relay_urls).await?;
@@ -325,7 +338,8 @@ impl SyncEngine {
         let media = MediaDownloader::new(
             Arc::clone(&self.db),
             self.hex_pubkey.clone(),
-            self.storage_media_gb,
+            self.tracked_media_gb,
+            self.wot_media_gb,
         );
 
         let stats = media.run(50).await?;
@@ -399,6 +413,7 @@ impl SyncEngine {
                         &self.hex_pubkey,
                         EventSource::Sync,
                         super::types::MEDIA_PRIORITY_FOF,
+                        Some(&self.app_handle),
                     );
 
                     let mut ss = self.sync_stats.write().await;
@@ -426,9 +441,9 @@ impl SyncEngine {
         let layer = match phase {
             SyncPhase::OwnData => "0",
             SyncPhase::Discovery => "0",
-            SyncPhase::ContentFetch => "1",
-            SyncPhase::ThreadContext => "1",
-            SyncPhase::MediaDownload => "3",
+            SyncPhase::ContentFetch => "0.5",
+            SyncPhase::ThreadContext => "",
+            SyncPhase::MediaDownload => "",
         };
         // Update sync_stats with current phase info
         if let Ok(mut ss) = self.sync_stats.try_write() {

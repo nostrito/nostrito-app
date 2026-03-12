@@ -244,14 +244,15 @@ fn start_sync_engine(
     sync_tier: Arc<AtomicU8>,
     sync_stats: Arc<RwLock<SyncStats>>,
     app_handle: tauri::AppHandle,
-    media_gb: f64,
+    tracked_media_gb: f64,
+    wot_media_gb: f64,
     sync_config: SyncConfig,
     max_event_age_days: u32,
 ) -> CancellationToken {
     let relays = resolve_sync_relays(&db, &hex_pubkey, &fallback_relays);
     let engine = Arc::new(SyncEngine::new(
         wot_graph, db, relays, hex_pubkey, sync_tier, sync_stats,
-        app_handle, media_gb, sync_config, max_event_age_days,
+        app_handle, tracked_media_gb, wot_media_gb, sync_config, max_event_age_days,
     ));
     engine.start()
 }
@@ -300,7 +301,8 @@ async fn init_nostrito(
     npub: String,
     relays: Vec<String>,
     storage_others_gb: Option<f64>,
-    storage_media_gb: Option<f64>,
+    storage_tracked_media_gb: Option<f64>,
+    storage_wot_media_gb: Option<f64>,
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
@@ -334,8 +336,11 @@ async fn init_nostrito(
         if let Some(gb) = storage_others_gb {
             config.storage_others_gb = gb;
         }
-        if let Some(gb) = storage_media_gb {
-            config.storage_media_gb = gb;
+        if let Some(gb) = storage_tracked_media_gb {
+            config.storage_tracked_media_gb = gb;
+        }
+        if let Some(gb) = storage_wot_media_gb {
+            config.storage_wot_media_gb = gb;
         }
     }
 
@@ -353,6 +358,13 @@ async fn init_nostrito(
             .db
             .set_config("outbound_relays", &resolved_relays.join(","))
             .map_err(|e| format!("Failed to save relays: {}", e))?;
+    }
+
+    // Persist per-category media limits
+    {
+        let config = state.config.read().await;
+        state.db.set_config("storage_tracked_media_gb", &config.storage_tracked_media_gb.to_string()).ok();
+        state.db.set_config("storage_wot_media_gb", &config.storage_wot_media_gb.to_string()).ok();
     }
 
     // Load existing graph from DB
@@ -386,7 +398,8 @@ async fn init_nostrito(
             state.sync_tier.clone(),
             state.sync_stats.clone(),
             app_handle.clone(),
-            config.storage_media_gb,
+            config.storage_tracked_media_gb,
+            config.storage_wot_media_gb,
             sync_config,
             config.max_event_age_days,
         );
@@ -565,7 +578,8 @@ async fn start_sync(
         state.sync_tier.clone(),
         state.sync_stats.clone(),
         app_handle,
-        config.storage_media_gb,
+        config.storage_tracked_media_gb,
+        config.storage_wot_media_gb,
         sync_config,
         config.max_event_age_days,
     );
@@ -642,7 +656,8 @@ async fn set_offline_mode(
                 state.sync_tier.clone(),
                 state.sync_stats.clone(),
                 app_handle,
-                config.storage_media_gb,
+                config.storage_tracked_media_gb,
+                config.storage_wot_media_gb,
                 sync_config,
                 config.max_event_age_days,
             );
@@ -701,7 +716,8 @@ async fn restart_sync(state: State<'_, AppState>, app_handle: tauri::AppHandle) 
         state.sync_tier.clone(),
         state.sync_stats.clone(),
         app_handle.clone(),
-        config.storage_media_gb,
+        config.storage_tracked_media_gb,
+        config.storage_wot_media_gb,
         sync_config,
         config.max_event_age_days,
     );
@@ -1692,7 +1708,8 @@ async fn save_settings(settings: Settings, app_handle: tauri::AppHandle, state: 
             state.sync_tier.clone(),
             state.sync_stats.clone(),
             app_handle.clone(),
-            config.storage_media_gb,
+            config.storage_tracked_media_gb,
+            config.storage_wot_media_gb,
             sync_config,
             config.max_event_age_days,
         );
@@ -1983,19 +2000,31 @@ pub struct MediaStats {
     pub total_bytes: u64,
     pub file_count: u64,
     pub limit_bytes: u64,
+    pub tracked_bytes: u64,
+    pub tracked_limit_bytes: u64,
+    pub wot_bytes: u64,
+    pub wot_limit_bytes: u64,
 }
 
 #[tauri::command]
 async fn get_media_stats(state: State<'_, AppState>) -> Result<MediaStats, String> {
     let db = &state.db;
     let config = state.config.read().await;
+    let own_pubkey = config.hex_pubkey.as_deref().unwrap_or("");
     let total_bytes = db.media_total_bytes().map_err(|e| e.to_string())?;
     let file_count = db.media_file_count().map_err(|e| e.to_string())?;
-    let limit_bytes = (config.storage_media_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+    let tracked_bytes = db.media_tracked_bytes(own_pubkey).map_err(|e| e.to_string())?;
+    let wot_bytes = db.media_others_bytes(own_pubkey).map_err(|e| e.to_string())?;
+    let tracked_limit_bytes = (config.storage_tracked_media_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+    let wot_limit_bytes = (config.storage_wot_media_gb * 1024.0 * 1024.0 * 1024.0) as u64;
     Ok(MediaStats {
         total_bytes,
         file_count,
-        limit_bytes,
+        limit_bytes: tracked_limit_bytes + wot_limit_bytes,
+        tracked_bytes,
+        tracked_limit_bytes,
+        wot_bytes,
+        wot_limit_bytes,
     })
 }
 
@@ -2641,7 +2670,8 @@ pub fn run() {
                     tracing::info!("Auto-resuming sync for {}...", &hex[..8]);
 
                     let cfg2 = config.read().await;
-                    let media_gb = cfg2.storage_media_gb;
+                    let tracked_media_gb = cfg2.storage_tracked_media_gb;
+                    let wot_media_gb = cfg2.storage_wot_media_gb;
                     let max_age_days = cfg2.max_event_age_days;
                     let sync_config = SyncConfig {
                         lookback_days: cfg2.sync_lookback_days,
@@ -2664,7 +2694,8 @@ pub fn run() {
                         sync_tier,
                         sync_stats,
                         app_handle.clone(),
-                        media_gb,
+                        tracked_media_gb,
+                        wot_media_gb,
                         sync_config,
                         max_age_days,
                     );

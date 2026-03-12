@@ -85,7 +85,8 @@ export const Wizard: React.FC = () => {
     () => new Set(RELAYS.filter((r) => r.defaultOn).map((r) => r.id))
   );
   const [othersEventsGb, setOthersEventsGb] = useState(5);
-  const [othersMediaGb, setOthersMediaGb] = useState(2);
+  const [trackedMediaGb, setTrackedMediaGb] = useState(3);
+  const [wotMediaGb, setWotMediaGb] = useState(2);
   const [mediaTypes, setMediaTypes] = useState<MediaTypes>({ images: true, videos: true, audio: true });
   const [cleanupPolicy, setCleanupPolicy] = useState<CleanupPolicy>("oldest");
 
@@ -183,7 +184,8 @@ export const Wizard: React.FC = () => {
         npub,
         relays,
         storageOthersGb: othersEventsGb,
-        storageMediaGb: othersMediaGb,
+        storageTrackedMediaGb: trackedMediaGb,
+        storageWotMediaGb: wotMediaGb,
       });
 
       console.log("[wizard] init_nostrito succeeded");
@@ -204,7 +206,8 @@ export const Wizard: React.FC = () => {
           relays,
           storage: {
             othersEventsGb,
-            othersMediaGb,
+            trackedMediaGb,
+            wotMediaGb,
             mediaTypes: { ...mediaTypes },
             cleanupPolicy,
           },
@@ -374,8 +377,10 @@ export const Wizard: React.FC = () => {
               <StepStorage
                 othersEventsGb={othersEventsGb}
                 onOthersEventsGbChange={setOthersEventsGb}
-                othersMediaGb={othersMediaGb}
-                onOthersMediaGbChange={setOthersMediaGb}
+                trackedMediaGb={trackedMediaGb}
+                onTrackedMediaGbChange={setTrackedMediaGb}
+                wotMediaGb={wotMediaGb}
+                onWotMediaGbChange={setWotMediaGb}
                 mediaTypes={mediaTypes}
                 onToggleMediaType={toggleMediaType}
                 cleanupPolicy={cleanupPolicy}
@@ -553,8 +558,10 @@ const StepRelays: React.FC<StepRelaysProps> = ({ selectedRelays, onToggle }) => 
 interface StepStorageProps {
   othersEventsGb: number;
   onOthersEventsGbChange: (v: number) => void;
-  othersMediaGb: number;
-  onOthersMediaGbChange: (v: number) => void;
+  trackedMediaGb: number;
+  onTrackedMediaGbChange: (v: number) => void;
+  wotMediaGb: number;
+  onWotMediaGbChange: (v: number) => void;
   mediaTypes: MediaTypes;
   onToggleMediaType: (type: keyof MediaTypes) => void;
   cleanupPolicy: CleanupPolicy;
@@ -565,8 +572,10 @@ interface StepStorageProps {
 const StepStorage: React.FC<StepStorageProps> = ({
   othersEventsGb,
   onOthersEventsGbChange,
-  othersMediaGb,
-  onOthersMediaGbChange,
+  trackedMediaGb,
+  onTrackedMediaGbChange,
+  wotMediaGb,
+  onWotMediaGbChange,
   mediaTypes,
   onToggleMediaType,
   cleanupPolicy,
@@ -614,21 +623,40 @@ const StepStorage: React.FC<StepStorageProps> = ({
       </div>
     </div>
 
-    {/* Others' media (Blossom) */}
+    {/* Tracked profiles media */}
     <div className="storage-section">
       <div className="storage-row">
         <div className="storage-row-info">
-          <span className="storage-row-label">Others' media (Blossom)</span>
+          <span className="storage-row-label">Tracked profiles media</span>
+          <span className="storage-row-meta">Media from profiles you track</span>
+        </div>
+        <Slider
+          variant="storage"
+          id="trackedMediaSlider"
+          min={1}
+          max={50}
+          value={trackedMediaGb}
+          suffix=" GB"
+          onChange={onTrackedMediaGbChange}
+        />
+      </div>
+    </div>
+
+    {/* WoT media */}
+    <div className="storage-section">
+      <div className="storage-row">
+        <div className="storage-row-info">
+          <span className="storage-row-label">WoT media</span>
           <span className="storage-row-meta">Images, videos, audio from your network</span>
         </div>
         <Slider
           variant="storage"
-          id="othersMediaSlider"
+          id="wotMediaSlider"
           min={1}
           max={50}
-          value={othersMediaGb}
+          value={wotMediaGb}
           suffix=" GB"
-          onChange={onOthersMediaGbChange}
+          onChange={onWotMediaGbChange}
         />
       </div>
       <div className="media-toggles">

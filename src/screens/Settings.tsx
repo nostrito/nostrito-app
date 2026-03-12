@@ -347,7 +347,7 @@ export const Settings: React.FC = () => {
 
     const updated: Settings = {
       ...settings,
-      storage_own_media_gb: 0,
+      storage_own_media_gb: settings.storage_own_media_gb,
       storage_tracked_media_gb: trackedMediaGb,
       storage_wot_media_gb: wotMediaGb,
       wot_event_retention_days: wotRetentionDays,

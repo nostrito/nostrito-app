@@ -11,12 +11,13 @@ use crate::storage::db::Database;
 pub struct MediaDownloader {
     db: Arc<Database>,
     own_pubkey: String,
-    limit_bytes: u64,
+    tracked_limit_bytes: u64,
+    wot_limit_bytes: u64,
     tracked_pubkeys: HashSet<String>,
 }
 
 impl MediaDownloader {
-    pub fn new(db: Arc<Database>, own_pubkey: String, storage_gb: f64) -> Self {
+    pub fn new(db: Arc<Database>, own_pubkey: String, tracked_media_gb: f64, wot_media_gb: f64) -> Self {
         let tracked = db.get_tracked_pubkeys()
             .unwrap_or_default()
             .into_iter()
@@ -24,7 +25,8 @@ impl MediaDownloader {
         Self {
             db,
             own_pubkey,
-            limit_bytes: (storage_gb * 1_073_741_824.0) as u64,
+            tracked_limit_bytes: (tracked_media_gb * 1_073_741_824.0) as u64,
+            wot_limit_bytes: (wot_media_gb * 1_073_741_824.0) as u64,
             tracked_pubkeys: tracked,
         }
     }
@@ -63,8 +65,9 @@ impl MediaDownloader {
             }
         }
 
-        // Enforce storage limit
-        self.enforce_media_limit().await;
+        // Enforce storage limits per category
+        self.enforce_tracked_media_limit().await;
+        self.enforce_wot_media_limit().await;
 
         if stats.downloaded > 0 {
             info!(
@@ -107,8 +110,13 @@ impl MediaDownloader {
                 return Ok(false);
             }
             if !bypass_limit {
-                let used = self.db.media_total_bytes().unwrap_or(0);
-                if used + cl > self.limit_bytes {
+                let used = self.db.media_others_bytes(&self.own_pubkey).unwrap_or(0);
+                if used + cl > self.wot_limit_bytes {
+                    return Ok(false);
+                }
+            } else if pubkey != &self.own_pubkey && self.tracked_pubkeys.contains(pubkey) {
+                let used = self.db.media_tracked_bytes(&self.own_pubkey).unwrap_or(0);
+                if used + cl > self.tracked_limit_bytes {
                     return Ok(false);
                 }
             }
@@ -144,8 +152,13 @@ impl MediaDownloader {
         }
 
         if !bypass_limit {
-            let used = self.db.media_total_bytes().unwrap_or(0);
-            if used + size_bytes > self.limit_bytes {
+            let used = self.db.media_others_bytes(&self.own_pubkey).unwrap_or(0);
+            if used + size_bytes > self.wot_limit_bytes {
+                return Ok(false);
+            }
+        } else if pubkey != &self.own_pubkey && self.tracked_pubkeys.contains(pubkey) {
+            let used = self.db.media_tracked_bytes(&self.own_pubkey).unwrap_or(0);
+            if used + size_bytes > self.tracked_limit_bytes {
                 return Ok(false);
             }
         }
@@ -163,19 +176,54 @@ impl MediaDownloader {
         Ok(true)
     }
 
-    /// Enforce media storage limit — evict LRU items if over 95%.
-    async fn enforce_media_limit(&self) {
+    /// Enforce tracked media storage limit — evict LRU tracked items if over 95%.
+    async fn enforce_tracked_media_limit(&self) {
+        let used = match self.db.media_tracked_bytes(&self.own_pubkey) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+
+        if used < (self.tracked_limit_bytes as f64 * 0.95) as u64 {
+            return;
+        }
+
+        let target = (self.tracked_limit_bytes as f64 * 0.80) as u64;
+        info!("Media(tracked): over 95% ({}/{}), evicting to 80%", used, self.tracked_limit_bytes);
+
+        let candidates = self.db.media_list_lru_tracked(500, &self.own_pubkey).unwrap_or_default();
+        let mut evicted: Vec<String> = Vec::new();
+        let mut current = used;
+
+        for (hash, size) in candidates {
+            if current <= target { break; }
+            let path = media_file_path(&hash);
+            if let Err(e) = tokio::fs::remove_file(&path).await {
+                warn!("Media: evict failed {:?}: {}", path, e);
+            }
+            evicted.push(hash);
+            current = current.saturating_sub(size);
+        }
+
+        if !evicted.is_empty() {
+            let freed = used - current;
+            self.db.media_delete_records(&evicted).ok();
+            info!("Media(tracked): evicted {} items, freed {} bytes", evicted.len(), freed);
+        }
+    }
+
+    /// Enforce WoT media storage limit — evict LRU WoT items if over 95%.
+    async fn enforce_wot_media_limit(&self) {
         let used = match self.db.media_others_bytes(&self.own_pubkey) {
             Ok(b) => b,
             Err(_) => return,
         };
 
-        if used < (self.limit_bytes as f64 * 0.95) as u64 {
+        if used < (self.wot_limit_bytes as f64 * 0.95) as u64 {
             return;
         }
 
-        let target = (self.limit_bytes as f64 * 0.80) as u64;
-        info!("Media: over 95% ({}/{}), evicting to 80%", used, self.limit_bytes);
+        let target = (self.wot_limit_bytes as f64 * 0.80) as u64;
+        info!("Media(wot): over 95% ({}/{}), evicting to 80%", used, self.wot_limit_bytes);
 
         let candidates = self.db.media_list_lru_excluding_pubkey(500, &self.own_pubkey).unwrap_or_default();
         let mut evicted: Vec<String> = Vec::new();
@@ -194,7 +242,7 @@ impl MediaDownloader {
         if !evicted.is_empty() {
             let freed = used - current;
             self.db.media_delete_records(&evicted).ok();
-            info!("Media: evicted {} items, freed {} bytes", evicted.len(), freed);
+            info!("Media(wot): evicted {} items, freed {} bytes", evicted.len(), freed);
         }
     }
 }
