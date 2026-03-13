@@ -120,9 +120,9 @@ impl ContentFetch {
         Ok(stats)
     }
 
-    /// Fetch events for a set of pubkeys **one at a time**, sequentially.
-    /// Each pubkey is fetched from its best known relay.
-    /// Updates sync_stats after every pubkey so the dashboard shows 1/N, 2/N, ...
+    /// Fetch events for a set of pubkeys **batched by relay** using the routing plan.
+    /// Groups pubkeys by their best relay and fetches each batch in a single subscription,
+    /// drastically reducing the number of WebSocket connections.
     /// `stat_key` identifies which counter to update: "tracked", "tier2", "tier3".
     /// Returns (events_stored, wot_updates, relays_queried).
     async fn fetch_pubkey_set(
@@ -137,69 +137,89 @@ impl ContentFetch {
     ) -> (u32, u32, u32) {
         let mut events_stored = 0u32;
         let mut wot_updates = 0u32;
-        let mut relays_used: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         let total = pubkeys.len() as u64;
 
-        // Atomically update layer + progress so the frontend never sees
-        // a new layer with stale progress from the previous pass.
-        {
-            let mut ss = self.sync_stats.write().await;
-            ss.current_layer = layer.to_string();
-            ss.pass_pubkeys_done = 0;
-            ss.pass_pubkeys_total = total;
-            ss.pass_relays_done = 0;
-            ss.pass_relays_total = 0;
-        }
-
         // Filter out muted pubkeys
-        let muted_set: std::collections::HashSet<String> = pubkeys
+        let muted: Vec<String> = pubkeys
             .iter()
             .filter(|pk| self.db.is_pubkey_muted(pk).unwrap_or(false))
             .cloned()
             .collect();
 
-        for (i, pubkey) in pubkeys.iter().enumerate() {
-            if muted_set.contains(pubkey) {
-                let mut ss = self.sync_stats.write().await;
-                ss.pass_pubkeys_done = (i + 1) as u64;
+        // Build pubkey → relay map for the routing planner
+        let mut pubkey_relays: HashMap<String, Vec<(String, f64)>> = HashMap::new();
+        let mut no_relay_pubkeys: Vec<String> = Vec::new();
+
+        for pubkey in pubkeys {
+            if muted.contains(pubkey) {
                 continue;
             }
-
-            // Find best relay for this pubkey
-            let relay_urls: Vec<String> = match self.db.get_write_relays(pubkey) {
+            match self.db.get_write_relays(pubkey) {
                 Ok(relays) if !relays.is_empty() => {
-                    let mut scored: Vec<(String, f64)> = relays
+                    let scored: Vec<(String, f64)> = relays
                         .into_iter()
                         .map(|(url, _)| {
                             let score = self.db.get_relay_reliability(&url).unwrap_or(0.5);
                             (url, score)
                         })
                         .collect();
-                    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                    scored.into_iter().map(|(url, _)| url).take(2).collect()
+                    pubkey_relays.insert(pubkey.clone(), scored);
                 }
                 _ => {
-                    super::types::DEFAULT_RELAYS.iter().map(|r| r.to_string()).take(2).collect()
+                    no_relay_pubkeys.push(pubkey.clone());
                 }
-            };
+            }
+        }
 
-            let short_url = relay_urls[0].replace("wss://", "").replace("ws://", "");
+        // Add pubkeys with no relay info to default relays
+        for pubkey in &no_relay_pubkeys {
+            let defaults: Vec<(String, f64)> = super::types::DEFAULT_RELAYS
+                .iter()
+                .map(|r| (r.to_string(), 0.5))
+                .collect();
+            pubkey_relays.insert(pubkey.clone(), defaults);
+        }
+
+        // Build the routing plan: groups pubkeys by relay for batched fetching
+        let plan = scheduler::build_routing_plan(&pubkey_relays, &muted);
+
+        info!(
+            "Content[{}]: {} pubkeys → {} relay batches (was {} individual calls)",
+            stat_key, pubkeys.len(), plan.routes.len(), pubkeys.len()
+        );
+
+        // Atomically update layer + progress
+        {
+            let mut ss = self.sync_stats.write().await;
+            ss.current_layer = layer.to_string();
+            ss.pass_pubkeys_done = 0;
+            ss.pass_pubkeys_total = total;
+            ss.pass_relays_done = 0;
+            ss.pass_relays_total = plan.routes.len() as u64;
+        }
+
+        let mut pubkeys_done = muted.len() as u64;
+
+        for (relay_idx, route) in plan.routes.iter().enumerate() {
+            let short_url = route.relay_url.replace("wss://", "").replace("ws://", "");
 
             // Emit progress
             self.app_handle.emit("sync:progress", &SyncProgress {
                 tier: 3,
                 fetched: events_stored as u64,
                 total,
-                relay: format!("{} ({}/{})", short_url, i + 1, total),
+                relay: format!("{} ({} profiles, relay {}/{})", short_url, route.pubkeys.len(), relay_idx + 1, plan.routes.len()),
             }).ok();
 
-            // Fetch this single pubkey
+            // Fetch the entire batch for this relay in a single subscription
+            // Use a longer timeout for larger batches
+            let timeout_secs = if route.pubkeys.len() > 20 { 30 } else { 15 };
             let fetch_result = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(timeout_secs),
                 self.fetch_from_relay(
-                    &relay_urls[0],
-                    &[pubkey.clone()],
+                    &route.relay_url,
+                    &route.pubkeys,
                     bands,
                     refresh_set,
                     now,
@@ -211,23 +231,29 @@ impl ContentFetch {
             let (stored, wot) = match fetch_result {
                 Ok(stats) => stats,
                 Err(_) => {
-                    debug!("Content[{}]: timeout for {} via {}", stat_key, &pubkey[..8.min(pubkey.len())], short_url);
+                    warn!(
+                        "Content[{}]: timeout for {} ({} pubkeys) via {}",
+                        stat_key, route.pubkeys.len(), route.pubkeys.len(), short_url
+                    );
                     (0, 0)
                 }
             };
 
             events_stored += stored;
             wot_updates += wot;
-            relays_used.insert(relay_urls[0].clone());
 
-            // Touch cursor so next cycle knows we fetched this pubkey,
-            // even if no new events were found
-            self.db.touch_user_cursor(pubkey).ok();
+            // Touch cursors for all pubkeys in this batch
+            for pubkey in &route.pubkeys {
+                self.db.touch_user_cursor(pubkey).ok();
+            }
 
-            // Update counters after each pubkey
+            pubkeys_done += route.pubkeys.len() as u64;
+
+            // Update counters after each relay batch
             {
                 let mut ss = self.sync_stats.write().await;
-                ss.pass_pubkeys_done = (i + 1) as u64;
+                ss.pass_pubkeys_done = pubkeys_done;
+                ss.pass_relays_done = (relay_idx + 1) as u64;
                 match stat_key {
                     "tracked" => ss.tracked_fetched += stored as u64,
                     "tier2" => ss.tier2_fetched += stored as u64,
@@ -237,7 +263,7 @@ impl ContentFetch {
             }
 
             if stored > 0 {
-                self.db.record_relay_success(&relay_urls[0], stored, 0).ok();
+                self.db.record_relay_success(&route.relay_url, stored, 0).ok();
             }
         }
 
@@ -245,7 +271,7 @@ impl ContentFetch {
         // will overwrite these values. Clearing them causes the dashboard
         // counter to briefly jump to 0 between cycles.
 
-        (events_stored, wot_updates, relays_used.len() as u32)
+        (events_stored, wot_updates, plan.routes.len() as u32)
     }
 
     /// Fetch events from a single relay for a set of pubkeys.
@@ -294,11 +320,16 @@ impl ContentFetch {
                 band, band_pubkeys.len(), age_mins
             );
 
+            // Scale limit with batch size so we don't miss content from
+            // quieter authors when batching many pubkeys to one relay.
+            // At least 200 per author-band, capped at 5000 to avoid overwhelming relays.
+            let limit = (authors.len() * 10).max(200).min(5000);
+
             let content_filter = Filter::new()
                 .authors(authors)
                 .kinds(vec![Kind::TextNote, Kind::Repost, Kind::LongFormTextNote])
                 .since(Timestamp::from(since as u64))
-                .limit(200);
+                .limit(limit);
 
             filters.push(content_filter);
         }
@@ -481,9 +512,44 @@ impl ContentFetch {
     ) -> (u32, u32, u32) {
         let mut events_stored = 0u32;
         let mut wot_updates = 0u32;
-        let mut relays_used: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         let total = pubkeys.len() as u64;
+
+        // Filter out muted pubkeys
+        let muted: Vec<String> = pubkeys
+            .iter()
+            .filter(|pk| self.db.is_pubkey_muted(pk).unwrap_or(false))
+            .cloned()
+            .collect();
+
+        // Build pubkey → relay map
+        let mut pubkey_relays: HashMap<String, Vec<(String, f64)>> = HashMap::new();
+        for pubkey in pubkeys {
+            if muted.contains(pubkey) {
+                continue;
+            }
+            match self.db.get_write_relays(pubkey) {
+                Ok(relays) if !relays.is_empty() => {
+                    let scored: Vec<(String, f64)> = relays
+                        .into_iter()
+                        .map(|(url, _)| {
+                            let score = self.db.get_relay_reliability(&url).unwrap_or(0.5);
+                            (url, score)
+                        })
+                        .collect();
+                    pubkey_relays.insert(pubkey.clone(), scored);
+                }
+                _ => {
+                    let defaults: Vec<(String, f64)> = super::types::DEFAULT_RELAYS
+                        .iter()
+                        .map(|r| (r.to_string(), 0.5))
+                        .collect();
+                    pubkey_relays.insert(pubkey.clone(), defaults);
+                }
+            }
+        }
+
+        let plan = scheduler::build_routing_plan(&pubkey_relays, &muted);
 
         {
             let mut ss = self.sync_stats.write().await;
@@ -491,46 +557,19 @@ impl ContentFetch {
             ss.pass_pubkeys_done = 0;
             ss.pass_pubkeys_total = total;
             ss.pass_relays_done = 0;
-            ss.pass_relays_total = 0;
+            ss.pass_relays_total = plan.routes.len() as u64;
         }
 
-        let muted_set: std::collections::HashSet<String> = pubkeys
-            .iter()
-            .filter(|pk| self.db.is_pubkey_muted(pk).unwrap_or(false))
-            .cloned()
-            .collect();
+        let mut pubkeys_done = muted.len() as u64;
 
-        for (i, pubkey) in pubkeys.iter().enumerate() {
+        for (relay_idx, route) in plan.routes.iter().enumerate() {
             // Stop if we've collected enough notes
             if events_stored >= max_notes {
-                info!("WoT content: reached {} notes limit at peer {}/{}", max_notes, i, total);
+                info!("WoT content: reached {} notes limit at relay {}/{}", max_notes, relay_idx, plan.routes.len());
                 break;
             }
 
-            if muted_set.contains(pubkey) {
-                let mut ss = self.sync_stats.write().await;
-                ss.pass_pubkeys_done = (i + 1) as u64;
-                continue;
-            }
-
-            let relay_urls: Vec<String> = match self.db.get_write_relays(pubkey) {
-                Ok(relays) if !relays.is_empty() => {
-                    let mut scored: Vec<(String, f64)> = relays
-                        .into_iter()
-                        .map(|(url, _)| {
-                            let score = self.db.get_relay_reliability(&url).unwrap_or(0.5);
-                            (url, score)
-                        })
-                        .collect();
-                    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                    scored.into_iter().map(|(url, _)| url).take(2).collect()
-                }
-                _ => {
-                    super::types::DEFAULT_RELAYS.iter().map(|r| r.to_string()).take(2).collect()
-                }
-            };
-
-            let short_url = relay_urls[0].replace("wss://", "").replace("ws://", "");
+            let short_url = route.relay_url.replace("wss://", "").replace("ws://", "");
 
             self.app_handle.emit("sync:progress", &SyncProgress {
                 tier: 3,
@@ -539,11 +578,12 @@ impl ContentFetch {
                 relay: format!("{} ({}/{}notes)", short_url, events_stored, max_notes),
             }).ok();
 
+            let timeout_secs = if route.pubkeys.len() > 20 { 30 } else { 15 };
             let fetch_result = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(timeout_secs),
                 self.fetch_from_relay(
-                    &relay_urls[0],
-                    &[pubkey.clone()],
+                    &route.relay_url,
+                    &route.pubkeys,
                     bands,
                     refresh_set,
                     now,
@@ -555,26 +595,29 @@ impl ContentFetch {
             let (stored, wot) = match fetch_result {
                 Ok(stats) => stats,
                 Err(_) => {
-                    debug!("WoT content: timeout for {} via {}", &pubkey[..8.min(pubkey.len())], short_url);
+                    warn!("WoT content: timeout for {} ({} pubkeys) via {}", route.pubkeys.len(), route.pubkeys.len(), short_url);
                     (0, 0)
                 }
             };
 
             events_stored += stored;
             wot_updates += wot;
-            relays_used.insert(relay_urls[0].clone());
 
-            // Touch cursor so next cycle knows we fetched this pubkey
-            self.db.touch_user_cursor(pubkey).ok();
+            for pubkey in &route.pubkeys {
+                self.db.touch_user_cursor(pubkey).ok();
+            }
+
+            pubkeys_done += route.pubkeys.len() as u64;
 
             {
                 let mut ss = self.sync_stats.write().await;
-                ss.pass_pubkeys_done = (i + 1) as u64;
+                ss.pass_pubkeys_done = pubkeys_done;
+                ss.pass_relays_done = (relay_idx + 1) as u64;
                 ss.tier3_fetched += stored as u64;
             }
 
             if stored > 0 {
-                self.db.record_relay_success(&relay_urls[0], stored, 0).ok();
+                self.db.record_relay_success(&route.relay_url, stored, 0).ok();
             }
         }
 
@@ -582,7 +625,7 @@ impl ContentFetch {
         // will overwrite these values. Clearing them causes the dashboard
         // counter to briefly jump to 0 between cycles.
 
-        (events_stored, wot_updates, relays_used.len() as u32)
+        (events_stored, wot_updates, plan.routes.len() as u32)
     }
 
     /// Compute the `since` timestamp for a cursor band.

@@ -25,6 +25,8 @@ pub struct StoredEventNotification {
     pub content: String,
     /// Which sync layer produced this event ("0", "0.5", "1", "2", "3", or "")
     pub layer: String,
+    /// Media URLs extracted from event content (images, videos, etc.)
+    pub media_urls: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -90,11 +92,18 @@ pub fn resolve_relay_url(alias: &str) -> &str {
         "primal" => "wss://relay.primal.net",
         "damus" => "wss://relay.damus.io",
         "nos" => "wss://relay.nos.social",
+        "nos.lol" => "wss://nos.lol",
         "snort" => "wss://relay.snort.social",
         "coracle" => "wss://relay.coracle.social",
         "nostr.wine" => "wss://nostr.wine",
+        "relay.nostr.band" => "wss://relay.nostr.band",
         "amethyst" => "wss://nostr.band",
         "yakihonne" => "wss://relay.yakihonne.com",
+        "nostr.land" => "wss://nostr.land",
+        "relay.nostr.bg" => "wss://relay.nostr.bg",
+        "relay.noswhere.com" => "wss://relay.noswhere.com",
+        "purplepag.es" => "wss://purplepag.es",
+        "wot.utxo.one" => "wss://wot.utxo.one",
         _ => alias,
     }
 }
@@ -348,6 +357,8 @@ pub const DEFAULT_RELAYS: &[&str] = &[
     "wss://relay.damus.io",
     "wss://relay.primal.net",
     "wss://nos.lol",
+    "wss://relay.nostr.band",
+    "wss://nostr.wine",
 ];
 
 /// Discovery relay for NIP-65 lookups.

@@ -53,6 +53,12 @@ function renderInline(text: string): string {
     '<a class="md-link" href="$1" target="_blank" rel="noopener">$1</a>'
   );
 
+  // Highlight hashtags (require letter after #, preceded by whitespace or tag-end)
+  result = result.replace(
+    /(^|[\s>])#([a-zA-Z]\w{0,49})\b/gm,
+    '$1<span class="hashtag" data-hashtag="$2" style="cursor:pointer">#$2</span>'
+  );
+
   // Nostr entity links (npub, note, nevent, naddr, nprofile)
   result = result.replace(/nostr:((npub|nprofile|note|nevent|naddr)1[a-z0-9]+)/g, (_match, bech32str) => {
     const entity = decodeEntity(bech32str);

@@ -715,9 +715,11 @@ impl Database {
         let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
         if let Some(q) = keyword {
+            let lower_q = q.to_lowercase();
             let idx = param_values.len() + 1;
-            sql.push_str(&format!(" AND content LIKE ?{}", idx));
-            param_values.push(Box::new(format!("%{}%", q)));
+            // Case-insensitive search in content and tags (for hashtags)
+            sql.push_str(&format!(" AND (LOWER(content) LIKE ?{0} OR LOWER(tags) LIKE ?{0})", idx));
+            param_values.push(Box::new(format!("%{}%", lower_q)));
         }
 
         if let Some(author_pk) = author {
@@ -1111,6 +1113,40 @@ impl Database {
 
     // ── Media Cache Methods ────────────────────────────────────────
 
+    /// Batch lookup media_cache records by URL.
+    /// Returns a map: url → (hash, mime_type, size_bytes, downloaded_at).
+    pub fn media_cache_lookup_by_urls(&self, urls: &[String]) -> Result<HashMap<String, (String, String, u64, i64)>> {
+        if urls.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let conn = self.conn.lock().unwrap();
+        let mut map = HashMap::new();
+
+        // Process in batches of 200 to stay within SQLite parameter limits
+        for chunk in urls.chunks(200) {
+            let placeholders: Vec<String> = (0..chunk.len()).map(|i| format!("?{}", i + 1)).collect();
+            let sql = format!(
+                "SELECT url, hash, mime_type, size_bytes, downloaded_at FROM media_cache WHERE url IN ({})",
+                placeholders.join(",")
+            );
+            let params_refs: Vec<&dyn rusqlite::ToSql> = chunk.iter().map(|u| u as &dyn rusqlite::ToSql).collect();
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_refs.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? as u64,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?;
+            for row in rows.flatten() {
+                map.insert(row.0, (row.1, row.2, row.3, row.4));
+            }
+        }
+        Ok(map)
+    }
+
     /// Check if a media blob is already cached
     pub fn media_exists(&self, hash: &str) -> bool {
         let conn = self.conn.lock().unwrap();
@@ -1122,6 +1158,51 @@ impl Database {
             )
             .unwrap_or(0);
         count > 0
+    }
+
+    /// Reassign a media record's pubkey if the new pubkey has higher ownership priority.
+    /// Priority: own_pubkey > tracked > everything else.
+    pub fn media_reassign_if_higher_priority(
+        &self,
+        hash: &str,
+        new_pubkey: &str,
+        own_pubkey: &str,
+        tracked_pubkeys: &std::collections::HashSet<String>,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let existing_pubkey: String = conn.query_row(
+            "SELECT pubkey FROM media_cache WHERE hash = ?1",
+            params![hash],
+            |row| row.get(0),
+        )?;
+
+        if existing_pubkey == new_pubkey {
+            return Ok(false);
+        }
+
+        let priority = |pk: &str| -> u8 {
+            if pk == own_pubkey { 2 }
+            else if tracked_pubkeys.contains(pk) { 1 }
+            else { 0 }
+        };
+
+        if priority(new_pubkey) > priority(&existing_pubkey) {
+            conn.execute(
+                "UPDATE media_cache SET pubkey = ?1 WHERE hash = ?2",
+                params![new_pubkey, hash],
+            )?;
+            debug!(
+                "[db] media_reassign: {}… {} → {} (priority {} > {})",
+                &hash[..hash.len().min(12)],
+                &existing_pubkey[..existing_pubkey.len().min(8)],
+                &new_pubkey[..new_pubkey.len().min(8)],
+                priority(new_pubkey),
+                priority(&existing_pubkey),
+            );
+            return Ok(true);
+        }
+
+        Ok(false)
     }
 
     /// Record a downloaded media item (file already written to disk)

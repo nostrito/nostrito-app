@@ -117,6 +117,14 @@ const AppRoutes: React.FC = () => {
         }
         return;
       }
+
+      // Hashtag links → navigate to feed with search query
+      const hashtagEl = el.closest("[data-hashtag]") as HTMLElement | null;
+      if (hashtagEl) {
+        const tag = hashtagEl.dataset.hashtag;
+        if (tag) navigate(`/feed?q=${encodeURIComponent("#" + tag)}`);
+        return;
+      }
     };
     document.addEventListener("click", handler);
     return () => document.removeEventListener("click", handler);

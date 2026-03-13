@@ -50,6 +50,12 @@ impl MediaDownloader {
                 .unwrap_or_else(|| sha256_of_string(url));
 
             if self.db.media_exists(&hash) {
+                // Media already downloaded — but reassign to higher-priority pubkey if needed.
+                // Priority: own > tracked > wot. This ensures tracked/own profiles get credit
+                // for media that was first downloaded during a WoT sync pass.
+                self.db.media_reassign_if_higher_priority(
+                    &hash, pubkey, &self.own_pubkey, &self.tracked_pubkeys,
+                ).ok();
                 stats.skipped += 1;
                 continue;
             }

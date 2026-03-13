@@ -39,13 +39,14 @@ interface MediaBreakdown {
   newest_media: number;
 }
 
-interface MediaItem {
-  hash: string;
+interface EventMediaRef {
   url: string;
-  local_path: string;
+  local_path: string | null;
   mime_type: string;
   size_bytes: number;
-  downloaded_at: number;
+  downloaded: boolean;
+  pubkey: string;
+  created_at: number;
 }
 
 interface KindCategory {
@@ -102,7 +103,7 @@ export const StorageOwnEvents: React.FC = () => {
   const [notesHasMore, setNotesHasMore] = useState(true);
 
   // Media state
-  const [allMedia, setAllMedia] = useState<MediaItem[]>([]);
+  const [allMedia, setAllMedia] = useState<EventMediaRef[]>([]);
   const [mediaLoading, setMediaLoading] = useState(false);
   const [mediaFilter, setMediaFilter] = useState<MediaFilter>("all");
 
@@ -150,11 +151,11 @@ export const StorageOwnEvents: React.FC = () => {
     }
   }, [notes, loadNotes]);
 
-  // Load media when tab changes
+  // Load media when tab changes — scans events for all media references
   useEffect(() => {
     if (tab === "media" && allMedia.length === 0) {
       setMediaLoading(true);
-      invoke<MediaItem[]>("get_media_for_category", { category: "own" })
+      invoke<EventMediaRef[]>("get_event_media_for_category", { category: "own", limit: 500 })
         .then(setAllMedia)
         .catch(e => console.error("[storage:own] load media failed:", e))
         .finally(() => setMediaLoading(false));
@@ -348,33 +349,35 @@ export const StorageOwnEvents: React.FC = () => {
                 hint="Media from your posts will appear here as it downloads."
               />
             )}
-            {!mediaLoading && filteredMedia.map(item => {
-              const localSrc = convertFileSrc(item.local_path);
-              const date = new Date(item.downloaded_at * 1000).toLocaleDateString();
-              const tooltip = `${date} \u00B7 ${formatBytes(item.size_bytes)}`;
+            {!mediaLoading && filteredMedia.map((item, idx) => {
+              const src = item.local_path ? convertFileSrc(item.local_path) : item.url;
+              const date = new Date(item.created_at * 1000).toLocaleDateString();
+              const sizeLabel = item.size_bytes > 0 ? formatBytes(item.size_bytes) : (item.downloaded ? "" : "remote");
+              const tooltip = `${date}${sizeLabel ? ` \u00B7 ${sizeLabel}` : ""}`;
+              const key = `${item.url}-${idx}`;
 
               if (item.mime_type.startsWith("image/")) {
                 return (
-                  <div key={item.hash} className="my-media-card" onClick={() => openViewer(localSrc)} title={tooltip}>
-                    <img src={localSrc} loading="lazy" onError={handleImageError} />
-                    <div className="my-media-card-overlay">{formatBytes(item.size_bytes)}</div>
+                  <div key={key} className={`my-media-card${!item.downloaded ? " remote" : ""}`} onClick={() => openViewer(src)} title={tooltip}>
+                    <img src={src} loading="lazy" onError={handleImageError} />
+                    <div className="my-media-card-overlay">{sizeLabel}</div>
                   </div>
                 );
               }
               if (item.mime_type.startsWith("video/")) {
                 return (
-                  <div key={item.hash} className="my-media-card video" onClick={() => openViewer(localSrc, "video")} title={tooltip}>
-                    <video src={localSrc} preload="metadata" muted />
+                  <div key={key} className={`my-media-card video${!item.downloaded ? " remote" : ""}`} onClick={() => openViewer(src, "video")} title={tooltip}>
+                    <video src={src} preload="metadata" muted />
                     <div className="my-media-card-play">{"\u25B6"}</div>
-                    <div className="my-media-card-overlay">{formatBytes(item.size_bytes)}</div>
+                    <div className="my-media-card-overlay">{sizeLabel}</div>
                   </div>
                 );
               }
               if (item.mime_type.startsWith("audio/")) {
                 return (
-                  <div key={item.hash} className="my-media-card audio" title={tooltip}>
-                    <audio src={localSrc} controls preload="metadata" onClick={e => e.stopPropagation()} />
-                    <div className="my-media-card-overlay">{formatBytes(item.size_bytes)}</div>
+                  <div key={key} className={`my-media-card audio${!item.downloaded ? " remote" : ""}`} title={tooltip}>
+                    <audio src={src} controls preload="metadata" onClick={e => e.stopPropagation()} />
+                    <div className="my-media-card-overlay">{sizeLabel}</div>
                   </div>
                 );
               }

@@ -492,7 +492,7 @@ fn queue_profile_media(
 }
 
 /// Check if a URL looks like a media file.
-fn is_media_url(url: &str) -> bool {
+pub fn is_media_url(url: &str) -> bool {
     let lower = url.to_lowercase();
     let media_extensions = [
         ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg",
