@@ -19,7 +19,7 @@ export const Sidebar: React.FC = () => {
   return (
     <aside className="app-sidebar-nav">
       <div className="sidebar-logo">
-        <img src={logoUrl} alt="nostrito" style={{ width: 36, height: 36, borderRadius: 6, display: "block", margin: "0 auto 8px" }} />
+        <img src={logoUrl} alt="nostrito" style={{ width: 52, height: 52, borderRadius: 12, display: "block", margin: "0 auto 8px" }} />
       </div>
       {navItems.map((item) => (
         <NavLink
