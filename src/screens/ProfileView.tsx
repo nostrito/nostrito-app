@@ -66,9 +66,14 @@ export const ProfileView: React.FC = () => {
   const [isOwn, setIsOwn] = useState(false);
   const [activeTab, setActiveTab] = useState<ProfileTab>("notes");
   const [follows, setFollows] = useState<string[]>([]);
-  const [followSearch, setFollowSearch] = useState("");
+  const [followers, setFollowers] = useState<string[]>([]);
   const [followingCount, setFollowingCount] = useState<number>(0);
   const [followerCount, setFollowerCount] = useState<number>(0);
+
+  // Followers/following popup
+  const [listPopup, setListPopup] = useState<"following" | "followers" | null>(null);
+  const [listSearch, setListSearch] = useState("");
+  const listPopupRef = useRef<HTMLDivElement>(null);
 
   // Relationship badges
   const [followsMe, setFollowsMe] = useState(false);
@@ -116,6 +121,29 @@ export const ProfileView: React.FC = () => {
       return () => document.removeEventListener("mousedown", handleClick);
     }
   }, [menuOpen]);
+
+  /* --- close list popup on outside click / Escape ------------------- */
+  useEffect(() => {
+    if (!listPopup) return;
+    const handleClick = (e: MouseEvent) => {
+      if (listPopupRef.current && !listPopupRef.current.contains(e.target as Node)) {
+        setListPopup(null);
+        setListSearch("");
+      }
+    };
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setListPopup(null);
+        setListSearch("");
+      }
+    };
+    document.addEventListener("mousedown", handleClick);
+    document.addEventListener("keydown", handleKey);
+    return () => {
+      document.removeEventListener("mousedown", handleClick);
+      document.removeEventListener("keydown", handleKey);
+    };
+  }, [listPopup]);
 
   /* --- profile loading ---------------------------------------------- */
   useEffect(() => {
@@ -165,10 +193,16 @@ export const ProfileView: React.FC = () => {
         // Not critical
       }
 
-      // Load followers count
+      // Load followers
       try {
         const followerList = await invoke<string[]>("get_followers", { pubkey });
+        setFollowers(followerList);
         setFollowerCount(followerList.length);
+
+        // Batch-load follower profiles via context
+        if (followerList.length > 0) {
+          ensureProfiles(followerList.slice(0, 200));
+        }
       } catch (_) {
         // Not critical
       }
@@ -383,16 +417,18 @@ export const ProfileView: React.FC = () => {
     setMenuOpen(false);
   }, [pubkey, isTracked]);
 
-  /* --- follows filtering -------------------------------------------- */
-  const filteredFollows = useMemo(() => {
-    if (!followSearch.trim()) return follows;
-    const q = followSearch.toLowerCase();
-    return follows.filter((pk) => {
+  /* --- popup list filtering ----------------------------------------- */
+  const filteredListItems = useMemo(() => {
+    const source = listPopup === "following" ? follows : listPopup === "followers" ? followers : [];
+    if (!listSearch.trim()) return source;
+    const q = listSearch.toLowerCase();
+    return source.filter((pk) => {
       const fp = getProfile(pk);
       const name = fp ? (fp.name || fp.display_name || "") : "";
-      return name.toLowerCase().includes(q) || pk.toLowerCase().includes(q);
+      const nip05 = fp?.nip05 || "";
+      return name.toLowerCase().includes(q) || nip05.toLowerCase().includes(q) || pk.toLowerCase().includes(q);
     });
-  }, [follows, getProfile, followSearch]);
+  }, [listPopup, follows, followers, getProfile, listSearch]);
 
   /* --- derived values ----------------------------------------------- */
   const displayName = useMemo(() => {
@@ -524,8 +560,12 @@ export const ProfileView: React.FC = () => {
                 </div>
               )}
               <div className="profile-hero-stats">
-                <span className="profile-stat"><strong>{followingCount}</strong> Following</span>
-                <span className="profile-stat"><strong>{followerCount}</strong> Followers</span>
+                <span className="profile-stat profile-stat-clickable" onClick={() => { setListPopup("following"); setListSearch(""); }}>
+                  <strong>{followingCount}</strong> Following
+                </span>
+                <span className="profile-stat profile-stat-clickable" onClick={() => { setListPopup("followers"); setListSearch(""); }}>
+                  <strong>{followerCount}</strong> Followers
+                </span>
               </div>
             </div>
           </div>
@@ -556,9 +596,8 @@ export const ProfileView: React.FC = () => {
             </div>
           )}
 
-          {/* Split: content + sidebar */}
+          {/* Tabbed content */}
           <div className="profile-body">
-            {/* Left: tabbed content */}
             <div className="profile-content">
               {/* Tab bar */}
               <div className="profile-tabs">
@@ -708,48 +747,64 @@ export const ProfileView: React.FC = () => {
               </div>
             </div>
 
-            {/* Right: follows sidebar */}
-            <div className="profile-follows-sidebar">
-              <div className="profile-follows-search">
-                <input
-                  type="text"
-                  placeholder="Search follows..."
-                  value={followSearch}
-                  onChange={(e) => setFollowSearch(e.target.value)}
-                />
-              </div>
-              <div className="profile-follows-list">
-                {filteredFollows.slice(0, 50).map((pk) => {
-                  const fp = getProfile(pk);
-                  return (
-                    <div
-                      key={pk}
-                      className="profile-follow-item"
-                      onClick={() => navigate(`/profile/${pk}`)}
-                    >
-                      <Avatar
-                        picture={fp?.picture ?? null}
-                        pubkey={pk}
-                        className="profile-follow-avatar"
-                        fallbackClassName="profile-follow-avatar-fallback"
-                      />
-                      <div className="profile-follow-info">
-                        <div className="profile-follow-name">{profileDisplayName(fp, pk)}</div>
-                        <div className="profile-follow-npub">{shortPubkey(pk)}</div>
-                      </div>
-                    </div>
-                  );
-                })}
-                {filteredFollows.length > 50 && (
-                  <div className="profile-follows-more">+ {filteredFollows.length - 50} more</div>
-                )}
-                {follows.length === 0 && !profileLoading && (
-                  <div className="profile-follows-more">No follows found</div>
-                )}
-              </div>
-            </div>
           </div>
         </>
+      )}
+
+      {/* Followers / Following popup */}
+      {listPopup && (
+        <div className="profile-list-overlay">
+          <div className="profile-list-popup" ref={listPopupRef}>
+            <div className="profile-list-header">
+              <h3>{listPopup === "following" ? "Following" : "Followers"}</h3>
+              <button
+                className="profile-list-close"
+                onClick={() => { setListPopup(null); setListSearch(""); }}
+              >
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" width="18" height="18"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+              </button>
+            </div>
+            <div className="profile-list-search">
+              <input
+                type="text"
+                placeholder="Search by name, nip05, pubkey..."
+                value={listSearch}
+                onChange={(e) => setListSearch(e.target.value)}
+                autoFocus
+              />
+            </div>
+            <div className="profile-list-items">
+              {filteredListItems.length === 0 && (
+                <div className="profile-list-empty">
+                  {listSearch.trim() ? "No matches found" : listPopup === "following" ? "Not following anyone" : "No followers found"}
+                </div>
+              )}
+              {filteredListItems.map((pk) => {
+                const fp = getProfile(pk);
+                return (
+                  <div
+                    key={pk}
+                    className="profile-list-item"
+                    onClick={() => { setListPopup(null); setListSearch(""); navigate(`/profile/${pk}`); }}
+                  >
+                    <Avatar
+                      picture={fp?.picture ?? null}
+                      pubkey={pk}
+                      className="profile-follow-avatar"
+                      fallbackClassName="profile-follow-avatar-fallback"
+                    />
+                    <div className="profile-follow-info">
+                      <div className="profile-follow-name">{profileDisplayName(fp, pk)}</div>
+                      <div className="profile-follow-npub">
+                        {fp?.nip05 ? fp.nip05 : shortPubkey(pk)}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

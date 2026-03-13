@@ -782,7 +782,7 @@
   .wot-stats { flex-direction: column; }
   .settings-sub-nav { width: 50px; }
   .settings-sub-item { font-size: 0; padding: 11px 8px; text-align: center; }
-  .profile-follows-sidebar { display: none; }
+  .profile-list-popup { width: 100%; max-width: 100vw; max-height: 85vh; border-radius: 12px 12px 0 0; }
   .profile-hero-info { padding: 0 16px 12px; }
   .profile-bio-section { padding: 0 16px 12px; }
 }
@@ -1141,6 +1141,16 @@
   color: var(--text);
   font-weight: 700;
 }
+.profile-stat-clickable {
+  cursor: pointer;
+  border-radius: 6px;
+  padding: 2px 6px;
+  margin: -2px -6px;
+  transition: background 0.15s;
+}
+.profile-stat-clickable:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
 .profile-bio-section {
   padding: 0 24px 16px;
   border-bottom: 1px solid var(--border);
@@ -1177,54 +1187,100 @@
   display: flex;
   flex-direction: column;
 }
-.profile-follows-sidebar {
-  width: 220px;
-  border-left: 1px solid var(--border);
-  flex-shrink: 0;
+/* ── Followers / Following popup ── */
+.profile-list-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.profile-list-popup {
+  background: var(--bg-card, #111113);
+  border: 1px solid var(--border, #1e1e24);
+  border-radius: 12px;
+  width: 380px;
+  max-width: 92vw;
+  max-height: 70vh;
   display: flex;
   flex-direction: column;
-  max-height: calc(100vh - 300px);
+  overflow: hidden;
 }
-.profile-follows-search {
-  padding: 10px 12px;
-  border-bottom: 1px solid var(--border);
+.profile-list-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px 0;
 }
-.profile-follows-search input {
-  width: 100%;
-  background: var(--bg-card);
-  border: 1px solid var(--border-subtle);
+.profile-list-header h3 {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--text);
+}
+.profile-list-close {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 4px;
   border-radius: 6px;
-  padding: 6px 10px;
-  font-size: 0.78rem;
+  display: flex;
+  align-items: center;
+  transition: color 0.15s, background 0.15s;
+}
+.profile-list-close:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.06);
+}
+.profile-list-search {
+  padding: 12px 16px;
+}
+.profile-list-search input {
+  width: 100%;
+  background: var(--bg, #0a0a0c);
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 0.82rem;
   color: var(--text);
   font-family: var(--font);
   outline: none;
   transition: border-color 0.15s;
 }
-.profile-follows-search input:focus {
+.profile-list-search input:focus {
   border-color: var(--accent);
 }
-.profile-follows-search input::placeholder {
+.profile-list-search input::placeholder {
   color: var(--text-muted);
 }
-.profile-follows-list {
+.profile-list-items {
   overflow-y: auto;
   flex: 1;
+  padding-bottom: 8px;
 }
-.profile-follow-item {
+.profile-list-item {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 6px 12px;
+  gap: 10px;
+  padding: 8px 16px;
   cursor: pointer;
   transition: background 0.15s;
 }
-.profile-follow-item:hover {
-  background: rgba(255, 255, 255, 0.02);
+.profile-list-item:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+.profile-list-empty {
+  text-align: center;
+  padding: 24px 16px;
+  font-size: 0.82rem;
+  color: var(--text-muted);
 }
 .profile-follow-avatar {
-  width: 28px;
-  height: 28px;
+  width: 32px;
+  height: 32px;
   border-radius: 50%;
   object-fit: cover;
   flex-shrink: 0;
@@ -1241,7 +1297,7 @@
   min-width: 0;
 }
 .profile-follow-name {
-  font-size: 0.82rem;
+  font-size: 0.85rem;
   font-weight: 600;
   color: var(--text);
   white-space: nowrap;
@@ -1249,15 +1305,12 @@
   text-overflow: ellipsis;
 }
 .profile-follow-npub {
-  font-size: 0.62rem;
+  font-size: 0.65rem;
   color: var(--text-muted);
   font-family: var(--mono);
-}
-.profile-follows-more {
-  text-align: center;
-  padding: 10px;
-  font-size: 0.75rem;
-  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .profile-back-row {
   padding: 8px 16px;
