@@ -19,6 +19,7 @@ pub struct TierComplete {
 /// Lightweight notification emitted for each newly stored event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredEventNotification {
+    pub id: String,
     pub kind: u32,
     pub pubkey: String,
     pub content: String,

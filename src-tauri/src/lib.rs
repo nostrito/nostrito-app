@@ -1982,6 +1982,59 @@ async fn get_media_breakdown_for_category(category: String, state: State<'_, App
 }
 
 #[tauri::command]
+async fn get_events_for_category(
+    category: String,
+    kinds: Option<Vec<u32>>,
+    until: Option<u64>,
+    limit: Option<u32>,
+    state: State<'_, AppState>,
+) -> Result<Vec<NostrEvent>, String> {
+    let config = state.config.read().await;
+    let own_pubkey = config.hex_pubkey.clone().unwrap_or_default();
+    drop(config);
+
+    let limit = limit.unwrap_or(50);
+    let kinds_slice = kinds.as_deref();
+
+    let rows = state.db()
+        .query_events_for_category(&own_pubkey, &category, kinds_slice, until, limit)
+        .map_err(|e| e.to_string())?;
+
+    Ok(rows_to_events(rows))
+}
+
+#[tauri::command]
+async fn get_media_for_category(
+    category: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<OwnMediaItem>, String> {
+    let config = state.config.read().await;
+    let own_pubkey = config.hex_pubkey.clone().unwrap_or_default();
+    drop(config);
+
+    let records = state.db()
+        .get_media_for_category(&own_pubkey, &category)
+        .map_err(|e| e.to_string())?;
+
+    let home = dirs::home_dir().unwrap_or_default();
+    Ok(records.into_iter().map(|(hash, url, mime_type, size_bytes, downloaded_at)| {
+        let local_path = home.join(".nostrito/media")
+            .join(&hash[..2])
+            .join(&hash)
+            .to_string_lossy()
+            .to_string();
+        OwnMediaItem {
+            hash,
+            url,
+            local_path,
+            mime_type,
+            size_bytes,
+            downloaded_at: downloaded_at as u64,
+        }
+    }).collect())
+}
+
+#[tauri::command]
 async fn requeue_profile_media(pubkey: String, state: State<'_, AppState>) -> Result<u32, String> {
     tracing::info!("[cmd:requeue_profile_media] pubkey={}...", &pubkey[..pubkey.len().min(12)]);
     state.db().requeue_events_media(&pubkey).map_err(|e| e.to_string())
@@ -2940,6 +2993,8 @@ pub fn run() {
             get_tracked_profiles_detail,
             get_kind_counts_for_category,
             get_media_breakdown_for_category,
+            get_events_for_category,
+            get_media_for_category,
             requeue_profile_media,
             fetch_profile,
             get_profile_with_refresh,

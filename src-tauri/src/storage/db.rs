@@ -1605,6 +1605,108 @@ impl Database {
         Ok(row)
     }
 
+    /// Query events by ownership category (own/tracked/wot) with optional kind filter and pagination.
+    pub fn query_events_for_category(
+        &self,
+        own_pubkey: &str,
+        category: &str,
+        kinds: Option<&[u32]>,
+        until: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<(String, String, i64, i64, String, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+
+        let cat_filter = match category {
+            "own" => "pubkey = ?1",
+            "tracked" => "pubkey != ?1 AND pubkey IN (SELECT pubkey FROM tracked_profiles)",
+            "wot" => "pubkey != ?1 AND pubkey NOT IN (SELECT pubkey FROM tracked_profiles)",
+            _ => return Err(anyhow::anyhow!("Invalid category")),
+        };
+
+        let mut sql = format!(
+            "SELECT id, pubkey, created_at, kind, tags, content, sig FROM nostr_events WHERE {}",
+            cat_filter
+        );
+        let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        param_values.push(Box::new(own_pubkey.to_string()));
+
+        if let Some(kinds) = kinds {
+            if !kinds.is_empty() {
+                let placeholders: Vec<String> = (0..kinds.len())
+                    .map(|i| format!("?{}", param_values.len() + i + 1))
+                    .collect();
+                sql.push_str(&format!(" AND kind IN ({})", placeholders.join(",")));
+                for k in kinds {
+                    param_values.push(Box::new(*k as i64));
+                }
+            }
+        }
+
+        if let Some(until) = until {
+            let idx = param_values.len() + 1;
+            sql.push_str(&format!(" AND created_at < ?{}", idx));
+            param_values.push(Box::new(until as i64));
+        }
+
+        sql.push_str(" ORDER BY created_at DESC");
+        {
+            let idx = param_values.len() + 1;
+            sql.push_str(&format!(" LIMIT ?{}", idx));
+            param_values.push(Box::new(limit as i64));
+        }
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(rows)
+    }
+
+    /// Get media for a category (own/tracked/wot).
+    /// Returns (hash, url, mime_type, size_bytes, downloaded_at) sorted by downloaded_at DESC.
+    pub fn get_media_for_category(&self, own_pubkey: &str, category: &str) -> Result<Vec<(String, String, String, u64, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let filter = match category {
+            "own" => "WHERE pubkey = ?1",
+            "tracked" => "WHERE pubkey != ?1 AND pubkey IN (SELECT pubkey FROM tracked_profiles)",
+            "wot" => "WHERE pubkey != ?1 AND pubkey NOT IN (SELECT pubkey FROM tracked_profiles)",
+            _ => return Err(anyhow::anyhow!("Invalid category")),
+        };
+        let sql = format!(
+            "SELECT hash, url, mime_type, size_bytes, downloaded_at FROM media_cache {} ORDER BY downloaded_at DESC",
+            filter
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![own_pubkey], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? as u64,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
     /// Re-queue media URLs from existing events for a pubkey (for re-downloading).
     pub fn requeue_events_media(&self, pubkey: &str) -> Result<u32> {
         let events: Vec<(u32, String, String)> = {

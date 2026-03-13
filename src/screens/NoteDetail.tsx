@@ -138,6 +138,7 @@ export const NoteDetail: React.FC = () => {
             <NoteCard
               event={event}
               profile={getProfile(event.pubkey)}
+              full
             />
           </div>
 

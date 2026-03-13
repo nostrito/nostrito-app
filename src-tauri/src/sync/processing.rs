@@ -574,6 +574,7 @@ pub fn process_events(
                 })).unwrap_or_default();
 
                 handle.emit("event:stored", &StoredEventNotification {
+                    id: event.id.to_hex(),
                     kind: event.kind.as_u16() as u32,
                     pubkey: event.pubkey.to_hex(),
                     content,

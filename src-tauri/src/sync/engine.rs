@@ -218,13 +218,23 @@ impl SyncEngine {
 
         let pk = PublicKey::from_hex(&self.hex_pubkey)?;
 
-        // Fetch own metadata + contacts
+        // Fetch own metadata + contacts (replaceable events — always get latest)
         let meta_filter = Filter::new()
             .author(pk)
             .kinds(vec![Kind::Metadata, Kind::ContactList, Kind::MuteList, Kind::RelayList])
             .limit(10);
 
-        // Fetch all own events
+        // Use cursor to avoid re-fetching own events we already have
+        let now = chrono::Utc::now().timestamp();
+        let since = match self.db.get_user_cursor(&self.hex_pubkey) {
+            Ok(Some((last_ts, last_fetched_at))) => {
+                let ts = if last_ts > 0 { last_ts } else { last_fetched_at };
+                ts - super::types::CURSOR_OVERLAP_SECS as i64
+            }
+            _ => now - (self.sync_config.lookback_days as i64 * 86400),
+        };
+
+        // Fetch own events since last cursor
         let events_filter = Filter::new()
             .author(pk)
             .kinds(vec![
@@ -234,12 +244,14 @@ impl SyncEngine {
                 Kind::LongFormTextNote,
                 Kind::EncryptedDirectMessage,
             ])
+            .since(Timestamp::from(since as u64))
             .limit(1000);
 
-        // Fetch DMs addressed to us (where we're a p-tag recipient)
+        // Fetch DMs addressed to us since last cursor
         let received_dms_filter = Filter::new()
             .pubkey(pk)
             .kind(Kind::EncryptedDirectMessage)
+            .since(Timestamp::from(since as u64))
             .limit(500);
 
         let events = self.pool.subscribe_and_collect(
@@ -252,18 +264,22 @@ impl SyncEngine {
             &events,
             &self.db,
             &self.graph,
-            &self.hex_pubkey,            EventSource::OwnBackup,
+            &self.hex_pubkey,
+            EventSource::OwnBackup,
             super::types::MEDIA_PRIORITY_OWNER,
             Some(&self.app_handle),
             "0",
         );
+
+        // Touch own cursor so next cycle uses this as the since bound
+        self.db.touch_user_cursor(&self.hex_pubkey).ok();
 
         {
             let mut ss = self.sync_stats.write().await;
             ss.tier1_fetched += stored as u64;
         }
         self.emit_progress(1, stored as u64, events.len() as u64, "own");
-        info!("Phase 1: {} events stored, {} WoT updates", stored, wot);
+        info!("Phase 1: {} events stored, {} WoT updates (since={}min ago)", stored, wot, (now - since) / 60);
 
         self.emit_tier_complete(1);
         Ok(())

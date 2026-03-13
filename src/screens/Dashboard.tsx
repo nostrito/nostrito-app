@@ -224,7 +224,6 @@ export const Dashboard: React.FC = () => {
   /* --- live event stream listener ------------------------------------ */
   useEffect(() => {
     let unlisten: (() => void) | null = null;
-    let counter = 0;
 
     const queueProfileFetch = (pubkey: string) => {
       if (!pendingProfilesRef.current.has(pubkey)) {
@@ -251,7 +250,7 @@ export const Dashboard: React.FC = () => {
 
     listen<StoredEventNotification>("event:stored", (event) => {
       const entry: LiveEntry = {
-        id: `live-${++counter}-${Date.now()}`,
+        id: event.payload.id,
         kind: event.payload.kind,
         pubkey: event.payload.pubkey,
         content: event.payload.content || "",
@@ -288,7 +287,7 @@ export const Dashboard: React.FC = () => {
           .sort((a, b) => b.created_at - a.created_at)
           .slice(0, 20)
           .map((e, i) => ({
-            id: `seed-${i}`,
+            id: e.id,
             kind: e.kind,
             pubkey: e.pubkey,
             content: e.content ? e.content.replace(/https?:\/\/\S+/g, "").trim().slice(0, 120) : "",

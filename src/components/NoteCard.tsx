@@ -6,7 +6,7 @@ import { timeAgo } from "../utils/format";
 import { kindLabel } from "../utils/ui";
 import { renderMediaHtml, stripMediaUrls } from "../utils/media";
 import { profileDisplayName, type ProfileInfo } from "../utils/profiles";
-import { extractMentionedPubkeys, replaceMentions } from "../utils/mentions";
+import { extractMentionedPubkeys, replaceMentions, normalizeBareEntities } from "../utils/mentions";
 import { useProfileContext } from "../context/ProfileContext";
 import type { NostrEvent } from "../types/nostr";
 
@@ -34,25 +34,45 @@ function escapeHtml(str: string): string {
 function renderEventContent(
   content: string,
   mentionProfiles?: Map<string, ProfileInfo | undefined>,
+  full?: boolean,
 ): { cleanedHtml: string; mediaHtml: string } {
   const mediaHtml = renderMediaHtml(content);
-  const cleaned = stripMediaUrls(content).slice(0, 280);
+  const stripped = stripMediaUrls(content);
+  const normalized = normalizeBareEntities(stripped);
+  const cleaned = full ? normalized : normalized.slice(0, 280);
   // Escape HTML first, then inject mention spans
   const escaped = escapeHtml(cleaned);
-  const cleanedHtml = replaceMentions(escaped, mentionProfiles || new Map());
-  return { cleanedHtml, mediaHtml };
+  let html = replaceMentions(escaped, mentionProfiles || new Map());
+
+  // Auto-link bare URLs not already in href/src attributes
+  html = html.replace(
+    /(?<!href="|src=")(https?:\/\/[^\s<>"]+)/g,
+    '<a class="md-link" href="$1" target="_blank" rel="noopener">$1</a>'
+  );
+
+  // Highlight hashtags (require letter after #, preceded by whitespace or tag-end)
+  html = html.replace(
+    /(^|[\s>])#([a-zA-Z]\w{0,49})\b/gm,
+    '$1<span class="hashtag">#$2</span>'
+  );
+
+  // Convert newlines to <br>
+  html = html.replace(/\n/g, '<br>');
+
+  return { cleanedHtml: html, mediaHtml };
 }
 
 interface NoteCardProps {
   event: NostrEvent;
   profile?: ProfileInfo;
   compact?: boolean;
+  full?: boolean;
   onSave?: (event: NostrEvent) => void;
   saved?: boolean;
   onClick?: () => void;
 }
 
-export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, onSave, saved, onClick }) => {
+export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, full, onSave, saved, onClick }) => {
   const k = kindLabel(event.kind);
   const displayName = profileDisplayName(profile, event.pubkey);
   const { ensureProfiles, getProfile } = useProfileContext();
@@ -77,12 +97,14 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, onS
   if (event.kind === 6) {
     const original = parseRepostContent(event);
     if (!original) return null;
-    const repostContent = renderEventContent(original.content, mentionProfiles);
+    const repostContent = renderEventContent(original.content, mentionProfiles, full);
 
     const handleRepostClick = (e: React.MouseEvent) => {
       if ((e.target as HTMLElement).closest("[data-pubkey]")) return;
       if ((e.target as HTMLElement).closest("[data-note-id]")) return;
       if ((e.target as HTMLElement).closest("[data-naddr]")) return;
+      if ((e.target as HTMLElement).closest("[data-media-url]")) return;
+      if ((e.target as HTMLElement).closest("a")) return;
       onClick?.();
     };
 
@@ -124,12 +146,14 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, onS
     );
   }
 
-  const eventContent = renderEventContent(event.content, mentionProfiles);
+  const eventContent = renderEventContent(event.content, mentionProfiles, full);
 
   const handleClick = (e: React.MouseEvent) => {
     if ((e.target as HTMLElement).closest("[data-pubkey]")) return;
     if ((e.target as HTMLElement).closest("[data-note-id]")) return;
     if ((e.target as HTMLElement).closest("[data-naddr]")) return;
+    if ((e.target as HTMLElement).closest("[data-media-url]")) return;
+    if ((e.target as HTMLElement).closest("a")) return;
     if ((e.target as HTMLElement).closest(".ev-actions")) return;
     onClick?.();
   };

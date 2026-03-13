@@ -139,12 +139,21 @@ export function decodeEntity(bech32str: string): DecodedEntity | null {
   }
 }
 
+/** Normalize bare nostr entities (npub1..., note1..., etc.) by adding the nostr: prefix */
+export function normalizeBareEntities(content: string): string {
+  return content.replace(
+    /(?<![a-z0-9:\/])@?((npub|nprofile|note|nevent|naddr)1[a-z0-9]{20,})/g,
+    'nostr:$1'
+  );
+}
+
 /** Extract hex pubkeys of all nostr: entity mentions in content */
 export function extractMentionedPubkeys(content: string): string[] {
+  const normalized = normalizeBareEntities(content);
   const pubkeys: string[] = [];
   let match;
   const re = new RegExp(NOSTR_ENTITY_RE.source, NOSTR_ENTITY_RE.flags);
-  while ((match = re.exec(content)) !== null) {
+  while ((match = re.exec(normalized)) !== null) {
     const entity = decodeEntity(match[1]);
     if (entity?.pubkey) pubkeys.push(entity.pubkey);
   }

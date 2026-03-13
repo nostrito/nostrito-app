@@ -3,7 +3,7 @@
  * No external dependencies — handles the subset of markdown commonly used in Nostr articles.
  */
 
-import { decodeEntity } from "./mentions";
+import { decodeEntity, normalizeBareEntities } from "./mentions";
 
 function escapeHtml(str: string): string {
   return str
@@ -15,7 +15,7 @@ function escapeHtml(str: string): string {
 
 /** Render inline markdown: bold, italic, code, links, images */
 function renderInline(text: string): string {
-  let result = escapeHtml(text);
+  let result = escapeHtml(normalizeBareEntities(text));
 
   // Inline code (must come before bold/italic to avoid conflicts)
   result = result.replace(/`([^`]+)`/g, '<code class="md-inline-code">$1</code>');

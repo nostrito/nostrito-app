@@ -738,6 +738,25 @@
   text-decoration: underline;
 }
 
+/* ── Hashtags ─────────────────────────────────────────── */
+.hashtag {
+  color: var(--accent-light, var(--accent));
+  font-weight: 500;
+}
+
+/* ── Links in notes ──────────────────────────────────── */
+.ev-text .md-link {
+  color: var(--accent-light);
+  text-decoration: underline;
+  text-decoration-color: rgba(139, 92, 246, 0.4);
+  text-underline-offset: 2px;
+  word-break: break-all;
+  transition: text-decoration-color 0.15s;
+}
+.ev-text .md-link:hover {
+  text-decoration-color: var(--accent-light);
+}
+
 /* ── Note Detail Page ─────────────────────────────────── */
 .note-detail-page {
   padding: 0 20px 40px;

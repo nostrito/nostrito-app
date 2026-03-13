@@ -86,6 +86,7 @@ export interface SyncProgress {
 }
 
 export interface StoredEventNotification {
+  id: string;
   kind: number;
   pubkey: string;
   content: string;
