@@ -3274,12 +3274,21 @@ pub fn run() {
     let data_dir = dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("nostrito");
-    std::fs::create_dir_all(&data_dir).expect("Failed to create data directory");
+    if let Err(e) = std::fs::create_dir_all(&data_dir) {
+        tracing::error!("[init] Failed to create data directory {}: {}", data_dir.display(), e);
+        panic!("Failed to create data directory {}: {}", data_dir.display(), e);
+    }
 
     // Open lobby DB to check for saved npub
     let lobby_path = lobby_db_path(&data_dir);
     tracing::info!("[init] lobby_db_path={}", lobby_path.display());
-    let lobby_db = Database::open(&lobby_path).expect("Failed to open lobby database");
+    let lobby_db = match Database::open(&lobby_path) {
+        Ok(db) => db,
+        Err(e) => {
+            tracing::error!("[init] Failed to open lobby database {}: {}", lobby_path.display(), e);
+            panic!("Failed to open lobby database {}: {}", lobby_path.display(), e);
+        }
+    };
 
     // If there's a saved npub, open the per-npub database
     let db = if let Ok(Some(ref npub)) = lobby_db.get_config("npub") {
@@ -3290,14 +3299,20 @@ pub fn run() {
             // Migrate: copy lobby DB as the per-user DB (one-time migration)
             tracing::info!("[init] Migrating lobby DB → per-user DB");
             drop(lobby_db);
-            std::fs::copy(&lobby_path, &user_path).expect("Failed to copy lobby DB");
-            Arc::new(Database::open(&user_path).expect("Failed to open per-user database"))
-        } else if user_path.exists() {
-            drop(lobby_db);
-            Arc::new(Database::open(&user_path).expect("Failed to open per-user database"))
+            if let Err(e) = std::fs::copy(&lobby_path, &user_path) {
+                tracing::error!("[init] Failed to copy lobby DB to {}: {}", user_path.display(), e);
+                panic!("Failed to copy lobby DB: {}", e);
+            }
+            Arc::new(Database::open(&user_path).unwrap_or_else(|e| {
+                tracing::error!("[init] Failed to open per-user database {}: {}", user_path.display(), e);
+                panic!("Failed to open per-user database: {}", e);
+            }))
         } else {
             drop(lobby_db);
-            Arc::new(Database::open(&user_path).expect("Failed to open per-user database"))
+            Arc::new(Database::open(&user_path).unwrap_or_else(|e| {
+                tracing::error!("[init] Failed to open per-user database {}: {}", user_path.display(), e);
+                panic!("Failed to open per-user database: {}", e);
+            }))
         }
     } else {
         tracing::info!("[init] No saved npub, using lobby DB");
@@ -3626,5 +3641,8 @@ pub fn run() {
             get_addressable_event,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running nostrito");
+        .unwrap_or_else(|e| {
+            tracing::error!("[init] Fatal error running nostrito: {}", e);
+            panic!("Fatal error running nostrito: {}", e);
+        });
 }

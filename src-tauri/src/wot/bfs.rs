@@ -208,7 +208,7 @@ fn bidirectional_bfs(
                 let node = state.fwd_current[i];
                 let (_, node_paths) = state.fwd_visited[&node];
 
-                for &neighbor in &follows[node as usize] {
+                for &neighbor in follows.get(node as usize).map(|v| v.as_slice()).unwrap_or_default() {
                     if let Some(&(bwd_d, bwd_paths)) = state.bwd_visited.get(&neighbor) {
                         let total_dist = fwd_dist + bwd_d;
                         if best_distance.is_none() || total_dist < best_distance.unwrap() {
@@ -245,7 +245,7 @@ fn bidirectional_bfs(
                 let node = state.bwd_current[i];
                 let (_, node_paths) = state.bwd_visited[&node];
 
-                for &neighbor in &followers[node as usize] {
+                for &neighbor in followers.get(node as usize).map(|v| v.as_slice()).unwrap_or_default() {
                     if let Some(&(fwd_d, fwd_paths)) = state.fwd_visited.get(&neighbor) {
                         let total_dist = fwd_d + bwd_dist;
                         if best_distance.is_none() || total_dist < best_distance.unwrap() {
