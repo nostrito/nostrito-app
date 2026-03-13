@@ -103,6 +103,8 @@ impl Default for AppConfig {
                 "wss://relay.damus.io".into(),
                 "wss://relay.primal.net".into(),
                 "wss://nos.lol".into(),
+                "wss://relay.nostr.band".into(),
+                "wss://nostr.wine".into(),
             ],
             auto_start: true,
             storage_others_gb: 5.0,
@@ -1049,6 +1051,107 @@ async fn save_event(event: NostrEvent, state: State<'_, AppState>) -> Result<boo
 }
 
 #[tauri::command]
+async fn fetch_events_by_ids(ids: Vec<String>, state: State<'_, AppState>) -> Result<Vec<NostrEvent>, String> {
+    use nostr_sdk::prelude::*;
+
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    tracing::info!("[cmd:fetch_events_by_ids] fetching {} event(s) from relays", ids.len());
+
+    let cfg = state.config.read().await;
+    let hex_pubkey = cfg.hex_pubkey.clone().unwrap_or_default();
+    let fallback_relays = cfg.outbound_relays.clone();
+    drop(cfg);
+
+    let relay_urls = resolve_sync_relays(&state.db(), &hex_pubkey, &fallback_relays);
+    if relay_urls.is_empty() {
+        return Err("No relays available".into());
+    }
+
+    let event_ids: Vec<EventId> = ids.iter()
+        .filter_map(|id| EventId::from_hex(id).ok())
+        .collect();
+
+    if event_ids.is_empty() {
+        return Err("No valid event IDs".into());
+    }
+
+    let filter = Filter::new().ids(event_ids).limit(ids.len());
+
+    let client = Client::default();
+    for url in &relay_urls {
+        if let Err(e) = client.add_relay(url.as_str()).await {
+            tracing::warn!("[fetch_events_by_ids] Failed to add relay {}: {}", url, e);
+        }
+    }
+    client.connect().await;
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    let mut notifications = client.notifications();
+    let sub_id = match client.subscribe(vec![filter], None).await {
+        Ok(output) => output.val,
+        Err(e) => {
+            client.disconnect().await.ok();
+            return Err(format!("Subscribe failed: {}", e));
+        }
+    };
+
+    let mut all_events: Vec<Event> = Vec::new();
+    let deadline = tokio::time::sleep(std::time::Duration::from_secs(10));
+    tokio::pin!(deadline);
+
+    loop {
+        tokio::select! {
+            result = notifications.recv() => {
+                match result {
+                    Ok(RelayPoolNotification::Event { event, .. }) => {
+                        if !all_events.iter().any(|e| e.id == event.id) {
+                            all_events.push(*event);
+                        }
+                    }
+                    Ok(RelayPoolNotification::Message { message, .. }) => {
+                        if matches!(&message, RelayMessage::EndOfStoredEvents(_)) {
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            _ = &mut deadline => {
+                tracing::info!("[fetch_events_by_ids] timeout, got {} events", all_events.len());
+                break;
+            }
+        }
+    }
+
+    client.unsubscribe(sub_id).await;
+    client.disconnect().await.ok();
+
+    tracing::info!("[fetch_events_by_ids] {} events fetched", all_events.len());
+
+    Ok(all_events
+        .into_iter()
+        .map(|event| {
+            let tags: Vec<Vec<String>> = event.tags.iter()
+                .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
+                .collect();
+            NostrEvent {
+                id: event.id.to_hex(),
+                pubkey: event.pubkey.to_hex(),
+                created_at: event.created_at.as_u64(),
+                kind: event.kind.as_u16() as u32,
+                tags,
+                content: event.content.to_string(),
+                sig: event.sig.to_string(),
+            }
+        })
+        .collect())
+}
+
+#[tauri::command]
 async fn search_events(query: String, limit: Option<u32>, state: State<'_, AppState>) -> Result<Vec<NostrEvent>, String> {
     tracing::info!("[cmd:search_events] query={:?}, limit={:?}", query, limit);
     let lim = limit.unwrap_or(50);
@@ -1108,17 +1211,7 @@ async fn search_global(query: String, limit: Option<u32>, state: State<'_, AppSt
     let trimmed = query.trim().to_string();
     tracing::info!("[cmd:search_global] query={:?}, limit={}", trimmed, lim);
 
-    let cfg = state.config.read().await;
-    let hex_pubkey = cfg.hex_pubkey.clone().unwrap_or_default();
-    let fallback_relays = cfg.outbound_relays.clone();
-    drop(cfg);
-
-    let relay_urls = resolve_sync_relays(&state.db(), &hex_pubkey, &fallback_relays);
-    if relay_urls.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // Build filter: if query looks like a pubkey, filter by author; otherwise fetch recent and filter client-side
+    // Determine query type
     let mut author_hex: Option<String> = None;
 
     if trimmed.starts_with("npub1") {
@@ -1129,22 +1222,37 @@ async fn search_global(query: String, limit: Option<u32>, state: State<'_, AppSt
         author_hex = Some(trimmed.clone());
     }
 
+    // For author queries, use sync relays; for text queries, use NIP-50 search relays
+    let relay_urls: Vec<String> = if author_hex.is_some() {
+        let cfg = state.config.read().await;
+        let hex_pubkey = cfg.hex_pubkey.clone().unwrap_or_default();
+        let fallback_relays = cfg.outbound_relays.clone();
+        drop(cfg);
+        resolve_sync_relays(&state.db(), &hex_pubkey, &fallback_relays)
+    } else {
+        // NIP-50 search relays that support full-text search
+        vec![
+            "wss://relay.nostr.band".to_string(),
+            "wss://search.nos.today".to_string(),
+            "wss://nostr.wine".to_string(),
+        ]
+    };
+
+    if relay_urls.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let filter = if let Some(ref author) = author_hex {
         Filter::new()
             .kinds(vec![Kind::TextNote, Kind::Repost, Kind::LongFormTextNote])
             .authors(vec![PublicKey::from_hex(author).map_err(|e| format!("Invalid pubkey: {}", e))?])
             .limit(lim)
     } else {
-        // Keyword search: fetch recent events, filter client-side
-        let since_ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            .saturating_sub(7 * 86400); // last 7 days
+        // NIP-50 full-text search filter
         Filter::new()
             .kinds(vec![Kind::TextNote, Kind::LongFormTextNote])
-            .since(Timestamp::from(since_ts))
-            .limit(200) // fetch more to filter client-side
+            .search(&trimmed)
+            .limit(lim)
     };
 
     let client = Client::default();
@@ -1197,21 +1305,10 @@ async fn search_global(query: String, limit: Option<u32>, state: State<'_, AppSt
     client.unsubscribe(sub_id).await;
     client.disconnect().await.ok();
 
-    // Client-side keyword filter if not an author search
-    let keyword_lower = if author_hex.is_none() { Some(trimmed.to_lowercase()) } else { None };
-    let filtered: Vec<&Event> = all_events.iter()
-        .filter(|e| {
-            if let Some(ref kw) = keyword_lower {
-                e.content.to_string().to_lowercase().contains(kw)
-            } else {
-                true
-            }
-        })
-        .take(lim)
-        .collect();
+    let results: Vec<&Event> = all_events.iter().take(lim).collect();
 
     // Store matching events in DB
-    for event in &filtered {
+    for event in &results {
         let tags_json = serde_json::to_string(
             &event.tags.iter().map(|t| t.as_slice().iter().map(|s| s.to_string()).collect::<Vec<String>>()).collect::<Vec<Vec<String>>>()
         ).unwrap_or_else(|_| "[]".to_string());
@@ -1227,9 +1324,9 @@ async fn search_global(query: String, limit: Option<u32>, state: State<'_, AppSt
         ).ok();
     }
 
-    tracing::info!("[search_global] {} matched out of {} fetched", filtered.len(), all_events.len());
+    tracing::info!("[search_global] {} results from NIP-50 search", results.len());
 
-    Ok(filtered
+    Ok(results
         .into_iter()
         .map(|event| {
             let tags: Vec<Vec<String>> = event.tags.iter()
@@ -2032,6 +2129,127 @@ async fn get_media_for_category(
             downloaded_at: downloaded_at as u64,
         }
     }).collect())
+}
+
+/// A media reference extracted from a stored event, with optional local cache info.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventMediaRef {
+    pub url: String,
+    pub local_path: Option<String>,
+    pub mime_type: String,
+    pub size_bytes: u64,
+    pub downloaded: bool,
+    pub pubkey: String,
+    pub created_at: u64,
+}
+
+/// Scan stored events for a category and extract all media URLs,
+/// cross-referencing with media_cache for local copies.
+#[tauri::command]
+async fn get_event_media_for_category(
+    category: String,
+    limit: Option<u32>,
+    state: State<'_, AppState>,
+) -> Result<Vec<EventMediaRef>, String> {
+    use crate::sync::media::{extract_urls_from_text, extract_urls_from_tags, mime_type_from_url, is_nostr_media_cdn};
+    use crate::sync::processing::is_media_url;
+
+    let config = state.config.read().await;
+    let own_pubkey = config.hex_pubkey.clone().unwrap_or_default();
+    drop(config);
+
+    let limit = limit.unwrap_or(500);
+    let db = state.db();
+
+    // Fetch recent events with media-bearing kinds
+    let rows = db.query_events_for_category(
+        &own_pubkey, &category,
+        Some(&[0, 1, 6, 30023]),
+        None, limit,
+    ).map_err(|e| e.to_string())?;
+
+    // Extract media URLs from each event
+    let mut seen = std::collections::HashSet::new();
+    let mut items: Vec<(String, String, u64)> = Vec::new(); // (url, pubkey, created_at)
+
+    for (_, pubkey, created_at, kind, tags_json, content, _) in &rows {
+        let kind = *kind as u32;
+
+        if kind == 0 {
+            // Profile metadata: extract picture and banner
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) {
+                for field in &["picture", "banner"] {
+                    if let Some(url) = parsed.get(field).and_then(|v| v.as_str()) {
+                        if (url.starts_with("https://") || url.starts_with("http://"))
+                            && url.len() > 10
+                            && seen.insert(url.to_string())
+                        {
+                            items.push((url.to_string(), pubkey.clone(), *created_at as u64));
+                        }
+                    }
+                }
+            }
+        } else {
+            // Notes, reposts, articles: extract from content text + tags
+            let text_urls = extract_urls_from_text(content);
+            let tag_urls = extract_urls_from_tags(tags_json);
+
+            for url in text_urls.iter().chain(tag_urls.iter()) {
+                if (is_media_url(url) || is_nostr_media_cdn(url) || mime_type_from_url(url).is_some())
+                    && seen.insert(url.clone())
+                {
+                    items.push((url.clone(), pubkey.clone(), *created_at as u64));
+                }
+            }
+        }
+    }
+
+    // Batch lookup which URLs have local copies
+    let all_urls: Vec<String> = items.iter().map(|(u, _, _)| u.clone()).collect();
+    let cache_map = db.media_cache_lookup_by_urls(&all_urls).map_err(|e| e.to_string())?;
+
+    let home = dirs::home_dir().unwrap_or_default();
+    let result: Vec<EventMediaRef> = items.into_iter().map(|(url, pubkey, created_at)| {
+        if let Some((hash, mime, size, _downloaded_at)) = cache_map.get(&url) {
+            let local_path = home.join(".nostrito/media")
+                .join(&hash[..2])
+                .join(hash)
+                .to_string_lossy()
+                .to_string();
+            EventMediaRef {
+                url,
+                local_path: Some(local_path),
+                mime_type: mime.clone(),
+                size_bytes: *size,
+                downloaded: true,
+                pubkey,
+                created_at,
+            }
+        } else {
+            let mime = mime_type_from_url(&url)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| {
+                    if is_nostr_media_cdn(&url) { "image/jpeg".to_string() }
+                    else { "image/jpeg".to_string() }
+                });
+            EventMediaRef {
+                url,
+                local_path: None,
+                mime_type: mime,
+                size_bytes: 0,
+                downloaded: false,
+                pubkey,
+                created_at,
+            }
+        }
+    }).collect();
+
+    tracing::info!(
+        "[cmd:get_event_media_for_category] category={} scanned {} events, found {} media refs ({} cached)",
+        category, rows.len(), result.len(), result.iter().filter(|r| r.downloaded).count()
+    );
+
+    Ok(result)
 }
 
 #[tauri::command]
@@ -2954,6 +3172,7 @@ pub fn run() {
             get_note_reactions,
             fetch_global_feed,
             save_event,
+            fetch_events_by_ids,
             search_events,
             search_global,
             get_storage_stats,
@@ -2995,6 +3214,7 @@ pub fn run() {
             get_media_breakdown_for_category,
             get_events_for_category,
             get_media_for_category,
+            get_event_media_for_category,
             requeue_profile_media,
             fetch_profile,
             get_profile_with_refresh,

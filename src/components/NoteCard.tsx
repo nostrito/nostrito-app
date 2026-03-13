@@ -10,17 +10,33 @@ import { extractMentionedPubkeys, replaceMentions, normalizeBareEntities } from 
 import { useProfileContext } from "../context/ProfileContext";
 import type { NostrEvent } from "../types/nostr";
 
-function parseRepostContent(event: NostrEvent): { content: string; pubkey: string } | null {
+export function parseRepostContent(event: NostrEvent): { content: string; pubkey: string; id: string | null; created_at: number | null } | null {
   if (event.kind !== 6 || !event.content.trim()) return null;
   try {
     const original = JSON.parse(event.content);
     if (original && typeof original.content === "string" && original.content.trim()) {
-      return { content: original.content, pubkey: original.pubkey || event.pubkey };
+      return {
+        content: original.content,
+        pubkey: original.pubkey || event.pubkey,
+        id: typeof original.id === "string" ? original.id : null,
+        created_at: typeof original.created_at === "number" ? original.created_at : null,
+      };
     }
   } catch {
     // Not valid JSON
   }
   return null;
+}
+
+/** Extract the original event ID from a kind:6 repost (from JSON content or "e" tag). */
+export function getRepostOriginalId(event: NostrEvent): string | null {
+  if (event.kind !== 6) return null;
+  // Try JSON content first
+  const parsed = parseRepostContent(event);
+  if (parsed?.id) return parsed.id;
+  // Fall back to "e" tag
+  const eTag = event.tags.find((t) => t[0] === "e");
+  return eTag?.[1] ?? null;
 }
 
 function escapeHtml(str: string): string {
@@ -53,7 +69,7 @@ function renderEventContent(
   // Highlight hashtags (require letter after #, preceded by whitespace or tag-end)
   html = html.replace(
     /(^|[\s>])#([a-zA-Z]\w{0,49})\b/gm,
-    '$1<span class="hashtag">#$2</span>'
+    '$1<span class="hashtag" data-hashtag="$2" style="cursor:pointer">#$2</span>'
   );
 
   // Convert newlines to <br>
@@ -72,15 +88,193 @@ interface NoteCardProps {
   onClick?: () => void;
 }
 
+/** Grouped repost: multiple people reposted the same original note */
+export interface GroupedRepost {
+  originalId: string;
+  reposters: NostrEvent[]; // the kind:6 events
+  originalEvent: NostrEvent | null; // the fetched original, or null if not found
+  status: "loading" | "loaded" | "not-found";
+}
+
+/** Card for grouped reposts — shows "A, B, and N others reposted" + the original note */
+export const GroupedRepostCard: React.FC<{
+  group: GroupedRepost;
+  onSave?: (event: NostrEvent) => void;
+  saved?: boolean;
+  onClick?: () => void;
+}> = ({ group, onSave, saved, onClick }) => {
+  const { ensureProfiles, getProfile } = useProfileContext();
+
+  // Ensure reposter profiles
+  useMemo(() => {
+    const pks = group.reposters.map((e) => e.pubkey);
+    if (group.originalEvent) pks.push(group.originalEvent.pubkey);
+    ensureProfiles(pks);
+  }, [group.reposters, group.originalEvent]);
+
+  // Build reposter names
+  const reposterNames = group.reposters.slice(0, 3).map((e) => {
+    const p = getProfile(e.pubkey);
+    return { pubkey: e.pubkey, name: profileDisplayName(p, e.pubkey) };
+  });
+  const othersCount = group.reposters.length - reposterNames.length;
+
+  const handleClick = (e: React.MouseEvent) => {
+    if ((e.target as HTMLElement).closest("[data-pubkey]")) return;
+    if ((e.target as HTMLElement).closest("[data-note-id]")) return;
+    if ((e.target as HTMLElement).closest("[data-naddr]")) return;
+    if ((e.target as HTMLElement).closest("[data-media-url]")) return;
+    if ((e.target as HTMLElement).closest("[data-hashtag]")) return;
+    if ((e.target as HTMLElement).closest("a")) return;
+    onClick?.();
+  };
+
+  if (group.status === "loading") {
+    return (
+      <div className="event-card event-card-repost" data-kind="repost">
+        <div className="repost-indicator">
+          <span className="icon repost-indicator-icon"><IconRepeat /></span>
+          <span className="repost-indicator-text">
+            {reposterNames.map((r, i) => (
+              <React.Fragment key={r.pubkey}>
+                {i > 0 && ", "}
+                <span data-pubkey={r.pubkey} style={{ cursor: "pointer" }}>{r.name}</span>
+              </React.Fragment>
+            ))}
+            {othersCount > 0 && `, and ${othersCount} other${othersCount > 1 ? "s" : ""}`}
+            {" reposted"}
+          </span>
+        </div>
+        <div className="repost-original" style={{ padding: "12px 0 4px 52px", color: "var(--text-muted)", fontSize: "0.82rem" }}>
+          Loading original note...
+        </div>
+      </div>
+    );
+  }
+
+  if (group.status === "not-found" || !group.originalEvent) {
+    return (
+      <div className="event-card event-card-repost" data-kind="repost">
+        <div className="repost-indicator">
+          <span className="icon repost-indicator-icon"><IconRepeat /></span>
+          <span className="repost-indicator-text">
+            {reposterNames.map((r, i) => (
+              <React.Fragment key={r.pubkey}>
+                {i > 0 && ", "}
+                <span data-pubkey={r.pubkey} style={{ cursor: "pointer" }}>{r.name}</span>
+              </React.Fragment>
+            ))}
+            {othersCount > 0 && `, and ${othersCount} other${othersCount > 1 ? "s" : ""}`}
+            {" reposted"}
+          </span>
+        </div>
+        <div className="repost-original" style={{ padding: "12px 0 4px 52px", color: "var(--text-muted)", fontSize: "0.82rem" }}>
+          Original note not found
+        </div>
+      </div>
+    );
+  }
+
+  // Render the original note using NoteCard
+  return (
+    <div className="event-card event-card-repost" data-kind="repost" onClick={handleClick} style={onClick ? { cursor: "pointer" } : undefined}>
+      <div className="repost-indicator">
+        <span className="icon repost-indicator-icon"><IconRepeat /></span>
+        <span className="repost-indicator-text">
+          {reposterNames.map((r, i) => (
+            <React.Fragment key={r.pubkey}>
+              {i > 0 && ", "}
+              <span data-pubkey={r.pubkey} style={{ cursor: "pointer" }}>{r.name}</span>
+            </React.Fragment>
+          ))}
+          {othersCount > 0 && `, and ${othersCount} other${othersCount > 1 ? "s" : ""}`}
+          {" reposted"}
+        </span>
+      </div>
+      <NoteCardInner
+        event={group.originalEvent}
+        profile={getProfile(group.originalEvent.pubkey)}
+        onSave={onSave}
+        saved={saved}
+      />
+    </div>
+  );
+};
+
+/** Inner note content (avatar + content) without the outer event-card wrapper, for embedding. */
+const NoteCardInner: React.FC<{
+  event: NostrEvent;
+  profile?: ProfileInfo;
+  compact?: boolean;
+  full?: boolean;
+  onSave?: (event: NostrEvent) => void;
+  saved?: boolean;
+}> = ({ event, profile, compact, full, onSave, saved }) => {
+  const { ensureProfiles, getProfile } = useProfileContext();
+  const displayName = profileDisplayName(profile, event.pubkey);
+
+  const mentionedPubkeys = useMemo(() => {
+    const pks = extractMentionedPubkeys(event.content);
+    if (pks.length > 0) ensureProfiles(pks);
+    return pks;
+  }, [event.content]);
+
+  const mentionProfiles = useMemo(() => {
+    const map = new Map<string, ProfileInfo | undefined>();
+    for (const pk of mentionedPubkeys) {
+      map.set(pk, getProfile(pk));
+    }
+    return map;
+  }, [mentionedPubkeys, getProfile]);
+
+  const eventContent = renderEventContent(event.content, mentionProfiles, full);
+
+  return (
+    <div className="repost-original">
+      <Avatar picture={profile?.picture} pubkey={event.pubkey} className="ev-avatar" clickable />
+      <div className="ev-content">
+        <div className="ev-meta">
+          <span className="ev-npub" data-pubkey={event.pubkey} style={{ cursor: "pointer" }}>
+            {displayName}
+          </span>
+          <span className="ev-time">{timeAgo(event.created_at, false)}</span>
+        </div>
+        <div className="ev-text" dangerouslySetInnerHTML={{ __html: eventContent.cleanedHtml }} />
+        {eventContent.mediaHtml && (
+          <div dangerouslySetInnerHTML={{ __html: eventContent.mediaHtml }} />
+        )}
+        {!compact && (
+          <div className="ev-actions">
+            <button className="ev-action"><span className="icon"><IconMessageCircle /></span> 0</button>
+            <button className="ev-action"><span className="icon"><IconRepeat /></span> {0}</button>
+            <button className="ev-action"><span className="icon"><IconZap /></span> 0</button>
+            {onSave && (
+              <button
+                className={`ev-action${saved ? " ev-action-saved" : ""}`}
+                onClick={() => !saved && onSave(event)}
+                title={saved ? "Saved" : "Save to local DB"}
+              >
+                <span className="icon"><IconBookmark /></span>{saved ? " Saved" : " Save"}
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
 export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, full, onSave, saved, onClick }) => {
   const k = kindLabel(event.kind);
   const displayName = profileDisplayName(profile, event.pubkey);
   const { ensureProfiles, getProfile } = useProfileContext();
 
-  // Extract and ensure profiles for mentioned pubkeys
+  // Extract and ensure profiles for mentioned pubkeys (+ original author for reposts)
   const mentionedPubkeys = useMemo(() => {
-    const content = event.kind === 6 ? (parseRepostContent(event)?.content || "") : event.content;
+    const repost = event.kind === 6 ? parseRepostContent(event) : null;
+    const content = repost ? repost.content : event.content;
     const pks = extractMentionedPubkeys(content);
+    if (repost && repost.pubkey !== event.pubkey) pks.push(repost.pubkey);
     if (pks.length > 0) ensureProfiles(pks);
     return pks;
   }, [event.content, event.kind]);
@@ -97,6 +291,9 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, ful
   if (event.kind === 6) {
     const original = parseRepostContent(event);
     if (!original) return null;
+    const originalProfile = getProfile(original.pubkey);
+    const originalDisplayName = profileDisplayName(originalProfile, original.pubkey);
+    const reposterDisplayName = displayName;
     const repostContent = renderEventContent(original.content, mentionProfiles, full);
 
     const handleRepostClick = (e: React.MouseEvent) => {
@@ -104,43 +301,50 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, ful
       if ((e.target as HTMLElement).closest("[data-note-id]")) return;
       if ((e.target as HTMLElement).closest("[data-naddr]")) return;
       if ((e.target as HTMLElement).closest("[data-media-url]")) return;
+      if ((e.target as HTMLElement).closest("[data-hashtag]")) return;
       if ((e.target as HTMLElement).closest("a")) return;
       onClick?.();
     };
 
     return (
-      <div className="event-card" data-kind={k.tag} onClick={handleRepostClick} style={onClick ? { cursor: "pointer" } : undefined}>
-        <Avatar picture={profile?.picture} pubkey={event.pubkey} className="ev-avatar" clickable />
-        <div className="ev-content">
-          <div className="ev-meta">
-            <span className="ev-npub" data-pubkey={event.pubkey} style={{ cursor: "pointer" }}>
-              {displayName}
-            </span>
-            <span className={`ev-kind-tag ${k.cls}`}>
-              <span className="icon"><IconRepeat /></span> repost
-            </span>
-            <span className="ev-time">{timeAgo(event.created_at, false)}</span>
-          </div>
-          <div className="ev-text" dangerouslySetInnerHTML={{ __html: repostContent.cleanedHtml }} />
-          {repostContent.mediaHtml && (
-            <div dangerouslySetInnerHTML={{ __html: repostContent.mediaHtml }} />
-          )}
-          {!compact && (
-            <div className="ev-actions">
-              <button className="ev-action"><span className="icon"><IconMessageCircle /></span> 0</button>
-              <button className="ev-action"><span className="icon"><IconRepeat /></span> 0</button>
-              <button className="ev-action"><span className="icon"><IconZap /></span> 0</button>
-              {onSave && (
-                <button
-                  className={`ev-action${saved ? " ev-action-saved" : ""}`}
-                  onClick={() => !saved && onSave(event)}
-                  title={saved ? "Saved" : "Save to local DB"}
-                >
-                  <span className="icon"><IconBookmark /></span>{saved ? " Saved" : " Save"}
-                </button>
-              )}
+      <div className="event-card event-card-repost" data-kind={k.tag} onClick={handleRepostClick} style={onClick ? { cursor: "pointer" } : undefined}>
+        <div className="repost-indicator">
+          <span className="icon repost-indicator-icon"><IconRepeat /></span>
+          <span className="repost-indicator-text">
+            <span data-pubkey={event.pubkey} style={{ cursor: "pointer" }}>{reposterDisplayName}</span>
+            {" reposted"}
+          </span>
+        </div>
+        <div className="repost-original">
+          <Avatar picture={originalProfile?.picture} pubkey={original.pubkey} className="ev-avatar" clickable />
+          <div className="ev-content">
+            <div className="ev-meta">
+              <span className="ev-npub" data-pubkey={original.pubkey} style={{ cursor: "pointer" }}>
+                {originalDisplayName}
+              </span>
+              <span className="ev-time">{timeAgo(original.created_at ?? event.created_at, false)}</span>
             </div>
-          )}
+            <div className="ev-text" dangerouslySetInnerHTML={{ __html: repostContent.cleanedHtml }} />
+            {repostContent.mediaHtml && (
+              <div dangerouslySetInnerHTML={{ __html: repostContent.mediaHtml }} />
+            )}
+            {!compact && (
+              <div className="ev-actions">
+                <button className="ev-action"><span className="icon"><IconMessageCircle /></span> 0</button>
+                <button className="ev-action"><span className="icon"><IconRepeat /></span> 0</button>
+                <button className="ev-action"><span className="icon"><IconZap /></span> 0</button>
+                {onSave && (
+                  <button
+                    className={`ev-action${saved ? " ev-action-saved" : ""}`}
+                    onClick={() => !saved && onSave(event)}
+                    title={saved ? "Saved" : "Save to local DB"}
+                  >
+                    <span className="icon"><IconBookmark /></span>{saved ? " Saved" : " Save"}
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
         </div>
       </div>
     );

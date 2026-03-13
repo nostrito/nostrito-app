@@ -1,10 +1,10 @@
 /** Feed -- event feed view. All data from get_feed backend command. */
 
 import React, { useState, useEffect, useCallback, useRef } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { IconX } from "../components/Icon";
-import { NoteCard } from "../components/NoteCard";
+import { NoteCard, GroupedRepostCard, getRepostOriginalId, type GroupedRepost } from "../components/NoteCard";
 import { ArticleCard, getArticleTitle, getArticleImage, getArticleTimestamp } from "../components/ArticleCard";
 import { Avatar } from "../components/Avatar";
 import { formatDate } from "../utils/format";
@@ -123,6 +123,7 @@ function kindTag(kind: number): FilterTab {
 
 export const Feed: React.FC = () => {
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [view, setView] = useState<FeedView>({ kind: "feed" });
   const [feedMode, setFeedMode] = useState<FeedMode>("wot");
   const [activeFilter, setActiveFilter] = useState<FilterTab>("all");
@@ -141,6 +142,9 @@ export const Feed: React.FC = () => {
   const [relayFetched, setRelayFetched] = useState(false);
 
   const { getProfile, ensureProfiles } = useProfileContext();
+
+  const [groupedReposts, setGroupedReposts] = useState<Map<string, GroupedRepost>>(new Map());
+  const fetchedOriginalIdsRef = useRef(new Set<string>());
 
   const renderedEventIdsRef = useRef(new Set<string>());
   const feedLoadingRef = useRef(false);
@@ -229,6 +233,128 @@ export const Feed: React.FC = () => {
       oldestArticleTimestamp.current = null;
     }
   }, [feedEvents]);
+
+  // Group reposts by original event ID and auto-fetch missing originals (3+ reposts threshold)
+  useEffect(() => {
+    const reposts = feedEvents.filter((e) => e.kind === 6);
+    if (reposts.length === 0) return;
+
+    // Count reposts per original event ID
+    const repostsByOriginal = new Map<string, NostrEvent[]>();
+    for (const ev of reposts) {
+      const origId = getRepostOriginalId(ev);
+      if (!origId) continue;
+      const list = repostsByOriginal.get(origId) || [];
+      list.push(ev);
+      repostsByOriginal.set(origId, list);
+    }
+
+    // Only group when 3+ reposts reference the same original
+    const groups = new Map<string, GroupedRepost>();
+    const idsToFetch: string[] = [];
+
+    for (const [origId, reposters] of repostsByOriginal) {
+      if (reposters.length < 3) continue;
+
+      // Check if the original event already exists in feedEvents (as a kind:1 note)
+      const existingOriginal = feedEvents.find((e) => e.id === origId && e.kind !== 6);
+
+      // Or check if any repost has the full content embedded
+      let embeddedOriginal: NostrEvent | null = null;
+      if (!existingOriginal) {
+        for (const r of reposters) {
+          try {
+            const parsed = JSON.parse(r.content);
+            if (parsed && parsed.id && parsed.content && parsed.pubkey) {
+              embeddedOriginal = {
+                id: parsed.id,
+                pubkey: parsed.pubkey,
+                created_at: parsed.created_at ?? r.created_at,
+                kind: parsed.kind ?? 1,
+                tags: parsed.tags ?? [],
+                content: parsed.content,
+                sig: parsed.sig ?? "",
+              };
+              break;
+            }
+          } catch { /* no embedded content */ }
+        }
+      }
+
+      const originalEvent = existingOriginal ?? embeddedOriginal;
+
+      if (originalEvent) {
+        groups.set(origId, {
+          originalId: origId,
+          reposters,
+          originalEvent,
+          status: "loaded",
+        });
+      } else if (!fetchedOriginalIdsRef.current.has(origId)) {
+        // Need to fetch from relays
+        groups.set(origId, {
+          originalId: origId,
+          reposters,
+          originalEvent: null,
+          status: "loading",
+        });
+        idsToFetch.push(origId);
+      } else {
+        // Already tried fetching, not found
+        groups.set(origId, {
+          originalId: origId,
+          reposters,
+          originalEvent: null,
+          status: "not-found",
+        });
+      }
+    }
+
+    if (groups.size > 0) {
+      setGroupedReposts(groups);
+    }
+
+    // Fetch missing originals from relays
+    if (idsToFetch.length > 0) {
+      for (const id of idsToFetch) {
+        fetchedOriginalIdsRef.current.add(id);
+      }
+      invoke<NostrEvent[]>("fetch_events_by_ids", { ids: idsToFetch })
+        .then((fetched) => {
+          const fetchedMap = new Map(fetched.map((e) => [e.id, e]));
+          if (fetched.length > 0) {
+            const pks = fetched.map((e) => e.pubkey);
+            ensureProfiles(pks);
+          }
+          setGroupedReposts((prev) => {
+            const next = new Map(prev);
+            for (const id of idsToFetch) {
+              const group = next.get(id);
+              if (!group) continue;
+              const found = fetchedMap.get(id);
+              next.set(id, {
+                ...group,
+                originalEvent: found ?? null,
+                status: found ? "loaded" : "not-found",
+              });
+            }
+            return next;
+          });
+        })
+        .catch((err) => {
+          console.warn("[feed] Failed to fetch repost originals:", err);
+          setGroupedReposts((prev) => {
+            const next = new Map(prev);
+            for (const id of idsToFetch) {
+              const group = next.get(id);
+              if (!group) continue;
+              next.set(id, { ...group, status: "not-found" });
+            }
+            return next;
+          });
+        });
+    }
+  }, [feedEvents, ensureProfiles]);
 
   const loadMoreEvents = useCallback(async () => {
     if (feedLoadingRef.current || isSearchMode || !hasMore) return;
@@ -358,8 +484,10 @@ export const Feed: React.FC = () => {
   // Reset feed when mode changes
   useEffect(() => {
     renderedEventIdsRef.current.clear();
+    fetchedOriginalIdsRef.current.clear();
     setFeedEvents([]);
     setSavedEventIds(new Set());
+    setGroupedReposts(new Map());
     setHasMore(true);
     setHasMoreArticles(true);
     setRelayFetched(false);
@@ -399,9 +527,50 @@ export const Feed: React.FC = () => {
     loadEvents();
   }, [loadEvents]);
 
+  // Track whether relay search is available/in-progress for the current query
+  const [searchRelayAvailable, setSearchRelayAvailable] = useState(false);
+  const [searchRelayLoading, setSearchRelayLoading] = useState(false);
+  const activeSearchQueryRef = useRef<string>("");
+
+  const searchRelaysForQuery = useCallback(async (query: string) => {
+    setSearchRelayLoading(true);
+    setSearchRelayAvailable(false);
+    try {
+      const globalResults = await invoke<NostrEvent[]>("search_global", { query, limit: 50 });
+      const newResults = globalResults.filter((e) => {
+        // Deduplicate against existing feed events
+        return !renderedEventIdsRef.current.has(e.id);
+      });
+
+      if (newResults.length > 0) {
+        const pubkeys = [...new Set(newResults.map((e) => e.pubkey))];
+        ensureProfiles(pubkeys);
+        for (const e of newResults) renderedEventIdsRef.current.add(e.id);
+        setFeedEvents((prev) => {
+          const existingIds = new Set(prev.map((e) => e.id));
+          const toAdd = newResults.filter((e) => !existingIds.has(e.id));
+          return [...prev, ...toAdd];
+        });
+      }
+
+      setSearchStatus((prev) => {
+        const localMatch = prev?.match(/^(\d+)/);
+        const localCount = localMatch ? parseInt(localMatch[1], 10) : 0;
+        const total = localCount + newResults.length;
+        return `${total} result${total !== 1 ? "s" : ""} for "${activeSearchQueryRef.current}" (${localCount} local, ${newResults.length} relay)`;
+      });
+    } catch {
+      setSearchStatus((prev) => (prev ? prev.replace(/ \u2014 searching relays\u2026$/, " (relay search failed)") : prev));
+    } finally {
+      setSearchRelayLoading(false);
+    }
+  }, [ensureProfiles]);
+
   const performSearch = useCallback(async (query: string) => {
     setSearchStatus("Searching\u2026");
     setIsSearchMode(true);
+    setSearchRelayAvailable(false);
+    setSearchRelayLoading(false);
 
     let sq = query;
 
@@ -417,46 +586,34 @@ export const Feed: React.FC = () => {
       }
     }
 
+    activeSearchQueryRef.current = sq;
+
     // Local search first
     try {
       const localResults = await invoke<NostrEvent[]>("search_events", { query: sq, limit: 50 });
-
       const localCount = localResults.length;
-      setSearchStatus(`${localCount} local result${localCount !== 1 ? "s" : ""} for "${query}" \u2014 searching relays\u2026`);
 
       if (localResults.length > 0) {
         const pubkeys = [...new Set(localResults.map((e) => e.pubkey))];
         ensureProfiles(pubkeys);
+        for (const e of localResults) renderedEventIdsRef.current.add(e.id);
       }
       setFeedEvents([...localResults]);
 
-      // Global search from relays (async, appends results)
-      try {
-        const globalResults = await invoke<NostrEvent[]>("search_global", { query: sq, limit: 50 });
-        const localIds = new Set(localResults.map((e) => e.id));
-        const newResults = globalResults.filter((e) => !localIds.has(e.id));
-
-        if (newResults.length > 0) {
-          const pubkeys = [...new Set(newResults.map((e) => e.pubkey))];
-          ensureProfiles(pubkeys);
-          setFeedEvents((prev) => {
-            const existingIds = new Set(prev.map((e) => e.id));
-            const toAdd = newResults.filter((e) => !existingIds.has(e.id));
-            return [...prev, ...toAdd];
-          });
-        }
-
-        const totalCount = localCount + newResults.length;
-        setSearchStatus(`${totalCount} result${totalCount !== 1 ? "s" : ""} for "${query}" (${localCount} local, ${newResults.length} relay)`);
-      } catch {
-        // Relay search failed, keep local results
-        setSearchStatus(`${localCount} result${localCount !== 1 ? "s" : ""} for "${query}" (local only)`);
+      if (localCount === 0) {
+        // Nothing found locally → auto-search relays immediately
+        setSearchStatus(`No local results for "${query}" \u2014 searching relays\u2026`);
+        searchRelaysForQuery(sq);
+      } else {
+        // Found locally → show results + offer relay search button
+        setSearchStatus(`${localCount} local result${localCount !== 1 ? "s" : ""} for "${query}"`);
+        setSearchRelayAvailable(true);
       }
     } catch {
       setSearchStatus("Search failed");
       setFeedEvents([]);
     }
-  }, [ensureProfiles]);
+  }, [ensureProfiles, searchRelaysForQuery]);
 
   const handleSearchInput = useCallback(
     (val: string) => {
@@ -467,6 +624,9 @@ export const Feed: React.FC = () => {
       if (!val.trim()) {
         setIsSearchMode(false);
         setSearchStatus(null);
+        setSearchRelayAvailable(false);
+        setSearchRelayLoading(false);
+        activeSearchQueryRef.current = "";
         renderedEventIdsRef.current.clear();
         setFeedEvents([]);
         setLoading(true);
@@ -486,12 +646,25 @@ export const Feed: React.FC = () => {
     setSearchQuery("");
     setIsSearchMode(false);
     setSearchStatus(null);
+    setSearchRelayAvailable(false);
+    setSearchRelayLoading(false);
+    activeSearchQueryRef.current = "";
     renderedEventIdsRef.current.clear();
     setFeedEvents([]);
     setLoading(true);
     setHasMore(true);
     setHasMoreArticles(true);
   }, []);
+
+  // Pick up ?q= search param (e.g. from hashtag clicks)
+  useEffect(() => {
+    const q = searchParams.get("q");
+    if (q) {
+      setSearchQuery(q);
+      setSearchParams({}, { replace: true });
+      performSearch(q);
+    }
+  }, [searchParams, setSearchParams, performSearch]);
 
   // Cleanup debounce timer
   useEffect(() => {
@@ -535,10 +708,19 @@ export const Feed: React.FC = () => {
   const articles = feedEvents.filter((e) => e.kind === 30023);
   const notes = feedEvents.filter((e) => e.kind !== 30023);
 
-  // Apply filter visibility
-  const filteredNotes = activeFilter === "all"
+  // Collect IDs of reposts that are part of a group (to skip individually)
+  const groupedRepostEventIds = new Set<string>();
+  for (const group of groupedReposts.values()) {
+    for (const r of group.reposters) {
+      groupedRepostEventIds.add(r.id);
+    }
+  }
+
+  // Apply filter visibility, excluding individually grouped reposts
+  const filteredNotes = (activeFilter === "all"
     ? notes
-    : notes.filter((e) => kindTag(e.kind) === activeFilter);
+    : notes.filter((e) => kindTag(e.kind) === activeFilter)
+  ).filter((e) => !groupedRepostEventIds.has(e.id));
 
   // Layout: articles on left carousel, notes on right
   const showArticleColumn = (activeFilter === "all" || activeFilter === "long-form") && articles.length > 0;
@@ -597,7 +779,21 @@ export const Feed: React.FC = () => {
       </div>
 
       {searchStatus && (
-        <div className="feed-search-status">{searchStatus}</div>
+        <div className="feed-search-status">
+          {searchStatus}
+          {searchRelayAvailable && !searchRelayLoading && (
+            <button
+              className="feed-search-relay-btn"
+              onClick={() => searchRelaysForQuery(activeSearchQueryRef.current)}
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" width="12" height="12"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+              Search relays
+            </button>
+          )}
+          {searchRelayLoading && (
+            <span className="feed-search-relay-loading">searching relays\u2026</span>
+          )}
+        </div>
       )}
 
       <div className="feed-layout">
@@ -633,11 +829,22 @@ export const Feed: React.FC = () => {
               </div>
             )}
 
-            {isSearchMode && feedEvents.length === 0 && searchStatus && !searchStatus.includes("Searching") && !searchStatus.includes("Resolving") && (
+            {isSearchMode && feedEvents.length === 0 && searchStatus && !searchStatus.includes("Searching") && !searchStatus.includes("Resolving") && !searchRelayLoading && !searchStatus.includes("searching relays") && (
               <div className="event-card" style={{ justifyContent: "center", color: "var(--text-muted)", padding: 32 }}>
                 No events found
               </div>
             )}
+
+            {/* Render grouped reposts at the top when visible */}
+            {(activeFilter === "all" || activeFilter === "repost") && Array.from(groupedReposts.values()).map((group) => (
+              <GroupedRepostCard
+                key={`group-${group.originalId}`}
+                group={group}
+                onSave={feedMode === "global" ? saveEvent : undefined}
+                saved={group.originalEvent ? savedEventIds.has(group.originalEvent.id) : false}
+                onClick={group.originalEvent ? () => navigate(`/note/${group.originalEvent!.id}`) : undefined}
+              />
+            ))}
 
             {filteredNotes.map((event) => (
               <NoteCard
