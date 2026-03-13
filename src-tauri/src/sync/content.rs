@@ -14,7 +14,7 @@ use super::processing;
 use super::scheduler;
 use super::types::{CursorBand, EventSource, SyncProgress, SyncStats, CURSOR_OVERLAP_SECS};
 
-/// Phase 3: Content Fetch — per-pubkey sequential event retrieval.
+/// Phase 3: Content Fetch — batched event retrieval grouped by relay.
 pub struct ContentFetch {
     db: Arc<Database>,
     graph: Arc<WotGraph>,

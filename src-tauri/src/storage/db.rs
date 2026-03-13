@@ -1022,7 +1022,47 @@ impl Database {
             params![pubkey, note],
         )?;
         info!("[db] track_profile: {}", &pubkey[..std::cmp::min(12, pubkey.len())]);
+        drop(conn);
+        // Reassign any existing media_cache entries for this pubkey's events
+        let reassigned = self.reassign_media_for_pubkey(pubkey).unwrap_or(0);
+        if reassigned > 0 {
+            info!("[db] track_profile: reassigned {} media entries for {}", reassigned, &pubkey[..std::cmp::min(12, pubkey.len())]);
+        }
+        // Queue media download for this profile's existing events
+        let queued = self.requeue_events_media(pubkey).unwrap_or(0);
+        if queued > 0 {
+            info!("[db] track_profile: queued {} media URLs for download for {}", queued, &pubkey[..std::cmp::min(12, pubkey.len())]);
+        }
         Ok(())
+    }
+
+    /// Reassign media_cache entries to this pubkey where the media URL is
+    /// referenced by this pubkey's events but currently attributed to someone else.
+    pub fn reassign_media_for_pubkey(&self, pubkey: &str) -> Result<u32> {
+        let urls = self.extract_media_urls_for_pubkey(pubkey)?;
+        if urls.is_empty() {
+            return Ok(0);
+        }
+
+        // Batch update: reassign media_cache entries where url matches and pubkey differs
+        let conn = self.conn.lock().unwrap();
+        let mut count = 0u32;
+        for chunk in urls.chunks(200) {
+            let placeholders: Vec<String> = (0..chunk.len()).map(|i| format!("?{}", i + 2)).collect();
+            let sql = format!(
+                "UPDATE media_cache SET pubkey = ?1 WHERE pubkey != ?1 AND url IN ({})",
+                placeholders.join(",")
+            );
+            let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(chunk.len() + 1);
+            params_vec.push(Box::new(pubkey.to_string()));
+            for url in chunk {
+                params_vec.push(Box::new(url.clone()));
+            }
+            let param_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+            count += conn.execute(&sql, param_refs.as_slice())? as u32;
+        }
+
+        Ok(count)
     }
 
     /// Untrack a profile.
@@ -1401,11 +1441,17 @@ impl Database {
     // ── Media queue ─────────────────────────────────────────────
 
     /// Queue a media URL for later download. Higher priority upgrades existing entries.
+    /// Also updates the pubkey if the new pubkey is a tracked profile (higher ownership priority).
     pub fn queue_media_url(&self, url: &str, pubkey: &str, priority: i32) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO media_queue (url, pubkey, priority) VALUES (?1, ?2, ?3)
-             ON CONFLICT(url) DO UPDATE SET priority = MAX(priority, excluded.priority)",
+             ON CONFLICT(url) DO UPDATE SET
+               priority = MAX(priority, excluded.priority),
+               pubkey = CASE
+                 WHEN excluded.pubkey IN (SELECT pubkey FROM tracked_profiles) THEN excluded.pubkey
+                 ELSE media_queue.pubkey
+               END",
             params![url, pubkey, priority],
         )?;
         Ok(())
@@ -1535,13 +1581,37 @@ impl Database {
 
     /// Total media bytes from tracked profiles (excluding own pubkey).
     pub fn tracked_media_bytes(&self, own_pubkey: &str) -> Result<u64> {
+        // First try the simple pubkey-based query
         let conn = self.conn.lock().unwrap();
-        let total: i64 = conn.query_row(
+        let simple_total: i64 = conn.query_row(
             "SELECT COALESCE(SUM(size_bytes), 0) FROM media_cache WHERE pubkey != ?1 AND pubkey IN (SELECT pubkey FROM tracked_profiles)",
             params![own_pubkey],
             |row| row.get(0),
         )?;
-        Ok(total as u64)
+        if simple_total > 0 {
+            return Ok(simple_total as u64);
+        }
+
+        // Fallback: compute by extracting URLs from tracked profile events and matching against media_cache
+        let tracked_pks: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT pubkey FROM tracked_profiles WHERE pubkey != ?1")?;
+            let rows = stmt.query_map(params![own_pubkey], |row| row.get::<_, String>(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            rows
+        };
+        drop(conn);
+
+        if tracked_pks.is_empty() {
+            return Ok(0);
+        }
+
+        let mut all_urls = Vec::new();
+        for tpk in &tracked_pks {
+            all_urls.extend(self.extract_media_urls_for_pubkey(tpk)?);
+        }
+
+        self.sum_media_bytes_by_urls(&all_urls)
     }
 
     /// Count events from WoT profiles (not own, not tracked — everything else).
@@ -1566,7 +1636,94 @@ impl Database {
         Ok(total as u64)
     }
 
-    /// Media bytes for a specific pubkey.
+    /// Extract all media URLs referenced by a pubkey's events.
+    fn extract_media_urls_for_pubkey(&self, pubkey: &str) -> Result<Vec<String>> {
+        use crate::sync::media::{extract_urls_from_text, extract_urls_from_tags, is_nostr_media_cdn, mime_type_from_url};
+
+        let events: Vec<(u32, String, String)> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT kind, content, tags FROM nostr_events WHERE pubkey = ?1 AND kind IN (0, 1, 6, 30023)"
+            )?;
+            let rows = stmt.query_map(params![pubkey], |row| {
+                Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+            rows
+        };
+
+        let mut urls = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (kind, content, tags_json) in &events {
+            if *kind == 0 {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) {
+                    for field in &["picture", "banner"] {
+                        if let Some(url) = parsed.get(field).and_then(|v| v.as_str()) {
+                            if (url.starts_with("https://") || url.starts_with("http://"))
+                                && url.len() > 10
+                                && seen.insert(url.to_string())
+                            {
+                                urls.push(url.to_string());
+                            }
+                        }
+                    }
+                }
+            } else {
+                for url in extract_urls_from_tags(tags_json) {
+                    if seen.insert(url.clone()) { urls.push(url); }
+                }
+                for url in extract_urls_from_text(content) {
+                    if (is_nostr_media_cdn(&url) || mime_type_from_url(&url).is_some())
+                        && seen.insert(url.clone())
+                    {
+                        urls.push(url);
+                    }
+                }
+            }
+        }
+        Ok(urls)
+    }
+
+    /// Sum media_cache size_bytes for a list of URLs (in batches).
+    fn sum_media_bytes_by_urls(&self, urls: &[String]) -> Result<u64> {
+        if urls.is_empty() { return Ok(0); }
+        let conn = self.conn.lock().unwrap();
+        let mut total: u64 = 0;
+        for chunk in urls.chunks(200) {
+            let placeholders: Vec<String> = (0..chunk.len()).map(|i| format!("?{}", i + 1)).collect();
+            let sql = format!(
+                "SELECT COALESCE(SUM(size_bytes), 0) FROM media_cache WHERE url IN ({})",
+                placeholders.join(",")
+            );
+            let params_vec: Vec<Box<dyn rusqlite::ToSql>> = chunk.iter().map(|u| Box::new(u.clone()) as Box<dyn rusqlite::ToSql>).collect();
+            let param_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+            let chunk_total: i64 = conn.query_row(&sql, param_refs.as_slice(), |row| row.get(0))?;
+            total += chunk_total as u64;
+        }
+        Ok(total)
+    }
+
+    /// Count media_cache entries for a list of URLs (in batches).
+    fn count_media_by_urls(&self, urls: &[String]) -> Result<u64> {
+        if urls.is_empty() { return Ok(0); }
+        let conn = self.conn.lock().unwrap();
+        let mut total: u64 = 0;
+        for chunk in urls.chunks(200) {
+            let placeholders: Vec<String> = (0..chunk.len()).map(|i| format!("?{}", i + 1)).collect();
+            let sql = format!(
+                "SELECT COUNT(*) FROM media_cache WHERE url IN ({})",
+                placeholders.join(",")
+            );
+            let params_vec: Vec<Box<dyn rusqlite::ToSql>> = chunk.iter().map(|u| Box::new(u.clone()) as Box<dyn rusqlite::ToSql>).collect();
+            let param_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+            let chunk_count: i64 = conn.query_row(&sql, param_refs.as_slice(), |row| row.get(0))?;
+            total += chunk_count as u64;
+        }
+        Ok(total)
+    }
+
+    /// Media bytes for a specific pubkey. Falls back to URL-based lookup from events.
     pub fn media_bytes_for_pubkey(&self, pubkey: &str) -> Result<u64> {
         let conn = self.conn.lock().unwrap();
         let total: i64 = conn.query_row(
@@ -1574,10 +1731,16 @@ impl Database {
             params![pubkey],
             |row| row.get(0),
         )?;
-        Ok(total as u64)
+        drop(conn);
+        if total > 0 {
+            return Ok(total as u64);
+        }
+        // Fallback: find media by URLs in this pubkey's events
+        let urls = self.extract_media_urls_for_pubkey(pubkey)?;
+        self.sum_media_bytes_by_urls(&urls)
     }
 
-    /// Media file count for a specific pubkey.
+    /// Media file count for a specific pubkey. Falls back to URL-based lookup from events.
     pub fn media_count_for_pubkey(&self, pubkey: &str) -> Result<u64> {
         let conn = self.conn.lock().unwrap();
         let count: i64 = conn.query_row(
@@ -1585,7 +1748,13 @@ impl Database {
             params![pubkey],
             |row| row.get(0),
         )?;
-        Ok(count as u64)
+        drop(conn);
+        if count > 0 {
+            return Ok(count as u64);
+        }
+        // Fallback: find media by URLs in this pubkey's events
+        let urls = self.extract_media_urls_for_pubkey(pubkey)?;
+        self.count_media_by_urls(&urls)
     }
 
     /// Kind counts for a specific pubkey.

@@ -1374,6 +1374,29 @@ async fn get_ownership_storage_stats(state: State<'_, AppState>) -> Result<Owner
     }
 
     let db = state.db();
+
+    // Reconcile media for tracked profiles: reassign misattributed media and
+    // queue any undownloaded media for profiles that have events but no cached media
+    let tracked_pks_for_reassign = db.get_tracked_pubkeys().unwrap_or_default();
+    for tpk in &tracked_pks_for_reassign {
+        if tpk != &own_pubkey {
+            if let Ok(n) = db.reassign_media_for_pubkey(tpk) {
+                if n > 0 {
+                    tracing::info!("[cmd:get_ownership_storage_stats] reassigned {} media for tracked {}...", n, &tpk[..tpk.len().min(12)]);
+                }
+            }
+            // Re-queue media for tracked profiles that have no cached media yet
+            let has_media = db.get_profile_media(tpk).map(|m| !m.is_empty()).unwrap_or(false);
+            if !has_media {
+                if let Ok(queued) = db.requeue_events_media(tpk) {
+                    if queued > 0 {
+                        tracing::info!("[cmd:get_ownership_storage_stats] queued {} media URLs for tracked {}...", queued, &tpk[..tpk.len().min(12)]);
+                    }
+                }
+            }
+        }
+    }
+
     let own_events_count = db.own_event_count(&own_pubkey).map_err(|e| e.to_string())?;
     let own_media_bytes = db.own_media_bytes(&own_pubkey).map_err(|e| e.to_string())?;
     let tracked_events_count = db.tracked_event_count(&own_pubkey).map_err(|e| e.to_string())?;
@@ -2256,6 +2279,45 @@ async fn get_event_media_for_category(
 async fn requeue_profile_media(pubkey: String, state: State<'_, AppState>) -> Result<u32, String> {
     tracing::info!("[cmd:requeue_profile_media] pubkey={}...", &pubkey[..pubkey.len().min(12)]);
     state.db().requeue_events_media(&pubkey).map_err(|e| e.to_string())
+}
+
+/// Download pending media for tracked profiles immediately (doesn't wait for sync cycle).
+#[tauri::command]
+async fn download_tracked_media(state: State<'_, AppState>) -> Result<u32, String> {
+    tracing::info!("[cmd:download_tracked_media] starting immediate download for tracked profiles");
+    let config = state.config.read().await;
+    let own_pubkey = config.hex_pubkey.clone().unwrap_or_default();
+    let tracked_media_gb = config.storage_tracked_media_gb;
+    let wot_media_gb = config.storage_wot_media_gb;
+    drop(config);
+
+    let db = state.db();
+
+    // Ensure tracked profiles' media is queued
+    let tracked_pks = db.get_tracked_pubkeys().unwrap_or_default();
+    for tpk in &tracked_pks {
+        if tpk != &own_pubkey {
+            db.requeue_events_media(tpk).ok();
+        }
+    }
+
+    // Run media downloader for queued items
+    let downloader = sync::media::MediaDownloader::new(
+        db.clone(),
+        own_pubkey,
+        tracked_media_gb,
+        wot_media_gb,
+    );
+    match downloader.run(200).await {
+        Ok(stats) => {
+            tracing::info!(
+                "[cmd:download_tracked_media] done: downloaded={}, skipped={}, failed={}",
+                stats.downloaded, stats.skipped, stats.failed
+            );
+            Ok(stats.downloaded)
+        }
+        Err(e) => Err(format!("Media download failed: {}", e)),
+    }
 }
 
 #[tauri::command]
@@ -3216,6 +3278,7 @@ pub fn run() {
             get_media_for_category,
             get_event_media_for_category,
             requeue_profile_media,
+            download_tracked_media,
             fetch_profile,
             get_profile_with_refresh,
             nsec_to_npub,

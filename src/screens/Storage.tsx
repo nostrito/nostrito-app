@@ -161,6 +161,18 @@ export const Storage: React.FC = () => {
         setWotAvatarPubkeys(picked);
       })
       .catch(() => {});
+
+    // Trigger immediate download of tracked profile media, then refresh stats
+    invoke<number>("download_tracked_media")
+      .then((downloaded) => {
+        if (downloaded > 0) {
+          // Refresh stats after downloading
+          invoke<OwnershipStorageStats>("get_ownership_storage_stats")
+            .then(setOwnershipStats)
+            .catch(() => {});
+        }
+      })
+      .catch(() => {});
   }, []);
 
   /* --- derived values ----------------------------------------------- */
