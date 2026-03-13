@@ -1,6 +1,6 @@
 import React from "react";
 import { NavLink } from "react-router-dom";
-import { IconDashboard, IconFeed, IconMessageCircle, IconNetwork, IconDatabase, IconSettings, IconImage } from "./Icon";
+import { IconDashboard, IconFeed, IconMessageCircle, IconNetwork, IconDatabase, IconSettings } from "./Icon";
 import { useAppContext } from "../context/AppContext";
 
 export const Sidebar: React.FC = () => {
@@ -12,7 +12,6 @@ export const Sidebar: React.FC = () => {
     { to: "/dms", icon: <IconMessageCircle />, label: "DMs" },
     { to: "/wot", icon: <IconNetwork />, label: "WoT" },
     { to: "/storage", icon: <IconDatabase />, label: "Storage" },
-    { to: "/my-media", icon: <IconImage />, label: "My Media" },
     { to: "/settings", icon: <IconSettings />, label: "Settings" },
   ];
 

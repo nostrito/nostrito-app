@@ -14,7 +14,6 @@ import { Dms } from "./screens/Dms";
 import { Wot } from "./screens/Wot";
 import { Storage } from "./screens/Storage";
 import { Settings } from "./screens/Settings";
-import { MyMedia } from "./screens/MyMedia";
 import { Wizard } from "./screens/Wizard";
 import { ProfileView } from "./screens/ProfileView";
 import { NoteDetail } from "./screens/NoteDetail";
@@ -32,7 +31,6 @@ const SCREEN_LABELS: Record<string, string> = {
   "/storage/tracked-profiles": "Storage / Tracked Profiles",
   "/storage/wot-profiles": "Storage / WoT Profiles",
   "/settings": "Settings",
-  "/my-media": "My Media",
 };
 
 const AppShell: React.FC = () => {
@@ -143,7 +141,6 @@ const AppRoutes: React.FC = () => {
         <Route path="/storage/tracked-profiles" element={<StorageTrackedProfiles />} />
         <Route path="/storage/wot-profiles" element={<StorageWotProfiles />} />
         <Route path="/settings" element={<Settings />} />
-        <Route path="/my-media" element={<MyMedia />} />
         <Route path="/profile/:pubkey" element={<ProfileView />} />
         <Route path="/note/:noteId" element={<NoteDetail />} />
       </Route>

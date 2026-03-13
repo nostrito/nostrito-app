@@ -162,4 +162,4 @@ export interface Conversation {
   lastTimestamp: number;
 }
 
-export type Screen = "wizard" | "dashboard" | "feed" | "dms" | "wot" | "storage" | "settings" | "my-media";
+export type Screen = "wizard" | "dashboard" | "feed" | "dms" | "wot" | "storage" | "settings";
