@@ -228,8 +228,9 @@ impl SyncEngine {
         let now = chrono::Utc::now().timestamp();
         let since = match self.db.get_user_cursor(&self.hex_pubkey) {
             Ok(Some((last_ts, last_fetched_at))) => {
-                let ts = if last_ts > 0 { last_ts } else { last_fetched_at };
-                ts - super::types::CURSOR_OVERLAP_SECS as i64
+                // Use whichever is more recent: last event we posted, or last time we checked.
+                // If we haven't posted in days but fetched 5 min ago, use the fetch time.
+                last_ts.max(last_fetched_at) - super::types::CURSOR_OVERLAP_SECS as i64
             }
             _ => now - (self.sync_config.lookback_days as i64 * 86400),
         };
