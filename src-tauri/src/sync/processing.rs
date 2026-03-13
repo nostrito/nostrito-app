@@ -548,8 +548,8 @@ pub fn process_events(
         if result.stored {
             stored += 1;
             if let Some(handle) = app_handle {
-                // Build content preview — all wrapped in catch_unwind for safety
-                let content = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Build content preview and extract media URLs — all wrapped in catch_unwind for safety
+                let (content, media_urls) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let raw = event.content.to_string();
                     let kind_u32 = event.kind.as_u16() as u32;
                     let preview_text = if kind_u32 == 6 {
@@ -560,17 +560,31 @@ pub fn process_events(
                     } else {
                         raw
                     };
+
+                    // Extract media URLs before stripping
+                    let urls: Vec<String> = preview_text
+                        .split_whitespace()
+                        .filter(|w| {
+                            (w.starts_with("http://") || w.starts_with("https://"))
+                                && (is_media_url(w)
+                                    || super::media::is_nostr_media_cdn(w)
+                                    || super::media::mime_type_from_url(w).is_some())
+                        })
+                        .map(|w| w.to_string())
+                        .collect();
+
                     let cleaned: String = preview_text
                         .split_whitespace()
                         .filter(|w| !w.starts_with("http://") && !w.starts_with("https://"))
                         .collect::<Vec<&str>>()
                         .join(" ");
-                    if cleaned.chars().count() > 120 {
+                    let content = if cleaned.chars().count() > 120 {
                         let truncated: String = cleaned.chars().take(120).collect();
                         format!("{}...", truncated)
                     } else {
                         cleaned
-                    }
+                    };
+                    (content, urls)
                 })).unwrap_or_default();
 
                 handle.emit("event:stored", &StoredEventNotification {
@@ -579,6 +593,7 @@ pub fn process_events(
                     pubkey: event.pubkey.to_hex(),
                     content,
                     layer: layer.to_string(),
+                    media_urls,
                 }).ok();
             }
         }

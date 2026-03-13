@@ -201,8 +201,8 @@ mod tests {
 
     #[test]
     fn test_pool_construction() {
-        let pool = RelayPool::new();
-        assert_eq!(pool.max_connections, MAX_CONNECTIONS);
+        let _pool = RelayPool::new();
+        // Pool is now stateless per-call — just verify construction works
     }
 
     #[tokio::test]

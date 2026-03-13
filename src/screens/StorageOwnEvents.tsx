@@ -352,13 +352,13 @@ export const StorageOwnEvents: React.FC = () => {
             {!mediaLoading && filteredMedia.map((item, idx) => {
               const src = item.local_path ? convertFileSrc(item.local_path) : item.url;
               const date = new Date(item.created_at * 1000).toLocaleDateString();
-              const sizeLabel = item.size_bytes > 0 ? formatBytes(item.size_bytes) : (item.downloaded ? "" : "remote");
+              const sizeLabel = item.size_bytes > 0 ? formatBytes(item.size_bytes) : "";
               const tooltip = `${date}${sizeLabel ? ` \u00B7 ${sizeLabel}` : ""}`;
               const key = `${item.url}-${idx}`;
 
               if (item.mime_type.startsWith("image/")) {
                 return (
-                  <div key={key} className={`my-media-card${!item.downloaded ? " remote" : ""}`} onClick={() => openViewer(src)} title={tooltip}>
+                  <div key={key} className={`my-media-card`} onClick={() => openViewer(src)} title={tooltip}>
                     <img src={src} loading="lazy" onError={handleImageError} />
                     <div className="my-media-card-overlay">{sizeLabel}</div>
                   </div>
@@ -366,7 +366,7 @@ export const StorageOwnEvents: React.FC = () => {
               }
               if (item.mime_type.startsWith("video/")) {
                 return (
-                  <div key={key} className={`my-media-card video${!item.downloaded ? " remote" : ""}`} onClick={() => openViewer(src, "video")} title={tooltip}>
+                  <div key={key} className={`my-media-card video`} onClick={() => openViewer(src, "video")} title={tooltip}>
                     <video src={src} preload="metadata" muted />
                     <div className="my-media-card-play">{"\u25B6"}</div>
                     <div className="my-media-card-overlay">{sizeLabel}</div>
@@ -375,7 +375,7 @@ export const StorageOwnEvents: React.FC = () => {
               }
               if (item.mime_type.startsWith("audio/")) {
                 return (
-                  <div key={key} className={`my-media-card audio${!item.downloaded ? " remote" : ""}`} title={tooltip}>
+                  <div key={key} className={`my-media-card audio`} title={tooltip}>
                     <audio src={src} controls preload="metadata" onClick={e => e.stopPropagation()} />
                     <div className="my-media-card-overlay">{sizeLabel}</div>
                   </div>

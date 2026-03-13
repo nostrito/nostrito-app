@@ -91,6 +91,7 @@ export interface StoredEventNotification {
   pubkey: string;
   content: string;
   layer: string;
+  media_urls: string[];
 }
 
 export interface RelayStatusInfo {

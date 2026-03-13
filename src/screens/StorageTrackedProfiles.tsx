@@ -120,8 +120,6 @@ export const StorageTrackedProfiles: React.FC = () => {
   const [kindCounts, setKindCounts] = useState<Record<string, number> | null>(null);
   const [mediaBreakdown, setMediaBreakdown] = useState<MediaBreakdown | null>(null);
   const [loading, setLoading] = useState(true);
-  const [requeueing, setRequeueing] = useState<string | null>(null);
-  const [requeueResult, setRequeueResult] = useState<{ pubkey: string; count: number } | null>(null);
   const [expandedPubkey, setExpandedPubkey] = useState<string | null>(null);
   const [profileMedia, setProfileMedia] = useState<MediaItem[]>([]);
   const [mediaLoadingProfile, setMediaLoadingProfile] = useState(false);
@@ -154,34 +152,6 @@ export const StorageTrackedProfiles: React.FC = () => {
       .then(setMediaBreakdown)
       .catch(() => {});
   }, []);
-
-  const handleRequeueMedia = useCallback(async (pubkey: string) => {
-    setRequeueing(pubkey);
-    setRequeueResult(null);
-    try {
-      const count = await invoke<number>("requeue_profile_media", { pubkey });
-      setRequeueResult({ pubkey, count });
-    } catch (e) {
-      console.error("[storage] requeue failed:", e);
-    }
-    setRequeueing(null);
-  }, []);
-
-  const handleRequeueAll = useCallback(async () => {
-    setRequeueing("all");
-    setRequeueResult(null);
-    let totalCount = 0;
-    for (const p of profiles) {
-      try {
-        const count = await invoke<number>("requeue_profile_media", { pubkey: p.pubkey });
-        totalCount += count;
-      } catch (e) {
-        console.error("[storage] requeue failed for", p.pubkey, e);
-      }
-    }
-    setRequeueResult({ pubkey: "all", count: totalCount });
-    setRequeueing(null);
-  }, [profiles]);
 
   const toggleProfileMedia = useCallback(async (pubkey: string) => {
     if (expandedPubkey === pubkey) {
@@ -327,23 +297,6 @@ export const StorageTrackedProfiles: React.FC = () => {
       {/* Overview tab */}
       {tab === "overview" && (
         <>
-          {/* Re-queue all button */}
-          {profiles.length > 0 && (
-            <div style={{ marginBottom: 16 }}>
-              <button
-                className="storage-requeue-btn"
-                onClick={handleRequeueAll}
-                disabled={requeueing !== null}
-              >
-                <svg className="icon-sm" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>
-                {requeueing === "all" ? "Queueing..." : "Retry All Media Downloads"}
-              </button>
-              {requeueResult && requeueResult.pubkey === "all" && (
-                <span className="storage-requeue-result">Queued {requeueResult.count} URLs for download</span>
-              )}
-            </div>
-          )}
-
           {/* Profile list */}
           <div className="tracked-profiles-section">
             <div className="kind-breakdown-title">Profiles</div>
@@ -394,21 +347,6 @@ export const StorageTrackedProfiles: React.FC = () => {
                         <span className="tracked-profile-stat-label">files</span>
                       </div>
                     </div>
-                    <button
-                      className="storage-requeue-btn-sm"
-                      onClick={(e) => { e.stopPropagation(); handleRequeueMedia(p.pubkey); }}
-                      disabled={requeueing !== null}
-                      title="Retry media download for this profile"
-                    >
-                      {requeueing === p.pubkey ? (
-                        <svg className="icon-sm spinning" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
-                      ) : (
-                        <svg className="icon-sm" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>
-                      )}
-                    </button>
-                    {requeueResult && requeueResult.pubkey === p.pubkey && (
-                      <span className="storage-requeue-result-inline">+{requeueResult.count}</span>
-                    )}
                   </div>
                   {isExpanded && (
                     <div className="tracked-profile-media-panel">
@@ -588,13 +526,13 @@ export const StorageTrackedProfiles: React.FC = () => {
             {!mediaLoading && filteredMedia.map((item, idx) => {
               const src = item.local_path ? convertFileSrc(item.local_path) : item.url;
               const date = new Date(item.created_at * 1000).toLocaleDateString();
-              const sizeLabel = item.size_bytes > 0 ? formatBytes(item.size_bytes) : (item.downloaded ? "" : "remote");
+              const sizeLabel = item.size_bytes > 0 ? formatBytes(item.size_bytes) : "";
               const tooltip = `${date}${sizeLabel ? ` \u00B7 ${sizeLabel}` : ""}`;
               const key = `${item.url}-${idx}`;
 
               if (item.mime_type.startsWith("image/")) {
                 return (
-                  <div key={key} className={`my-media-card${!item.downloaded ? " remote" : ""}`} onClick={() => openViewer(src)} title={tooltip}>
+                  <div key={key} className={`my-media-card`} onClick={() => openViewer(src)} title={tooltip}>
                     <img src={src} loading="lazy" onError={handleImageError} />
                     <div className="my-media-card-overlay">{sizeLabel}</div>
                   </div>
@@ -602,7 +540,7 @@ export const StorageTrackedProfiles: React.FC = () => {
               }
               if (item.mime_type.startsWith("video/")) {
                 return (
-                  <div key={key} className={`my-media-card video${!item.downloaded ? " remote" : ""}`} onClick={() => openViewer(src, "video")} title={tooltip}>
+                  <div key={key} className={`my-media-card video`} onClick={() => openViewer(src, "video")} title={tooltip}>
                     <video src={src} preload="metadata" muted />
                     <div className="my-media-card-play">{"\u25B6"}</div>
                     <div className="my-media-card-overlay">{sizeLabel}</div>
@@ -611,7 +549,7 @@ export const StorageTrackedProfiles: React.FC = () => {
               }
               if (item.mime_type.startsWith("audio/")) {
                 return (
-                  <div key={key} className={`my-media-card audio${!item.downloaded ? " remote" : ""}`} title={tooltip}>
+                  <div key={key} className={`my-media-card audio`} title={tooltip}>
                     <audio src={src} controls preload="metadata" onClick={e => e.stopPropagation()} />
                     <div className="my-media-card-overlay">{sizeLabel}</div>
                   </div>

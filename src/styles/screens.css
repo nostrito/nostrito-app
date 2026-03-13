@@ -42,7 +42,7 @@
 .ownership-card {
   display: flex; flex-direction: column; padding: 18px 20px;
   background: var(--bg); border: 1px solid var(--border); border-radius: 12px;
-  transition: border-color 0.2s;
+  transition: border-color 0.2s; min-width: 0;
 }
 .ownership-card:hover { border-color: rgba(124,58,237,0.3); }
 .ownership-card.own { border-left: 3px solid var(--accent); }
@@ -76,6 +76,55 @@
   font-size: 0.72rem; color: var(--text-muted); border-top: 1px solid var(--border);
   padding-top: 10px; margin-top: auto;
 }
+
+/* Ownership card header with avatars */
+.ownership-card-header-left {
+  display: flex; align-items: center; gap: 8px;
+  min-width: 0; overflow: hidden;
+}
+.ownership-avatar {
+  width: 28px; height: 28px; border-radius: 50%; object-fit: cover;
+  border: 2px solid var(--accent);
+  flex-shrink: 0;
+}
+.ownership-avatar-fallback {
+  width: 28px; height: 28px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 0.65rem; font-weight: 700; color: #fff;
+  border: 2px solid var(--accent);
+  flex-shrink: 0;
+}
+
+/* Tracked profiles: side-by-side row */
+.ownership-avatar-row {
+  display: flex; align-items: center; gap: 0;
+}
+.ownership-avatar-sm {
+  width: 22px; height: 22px; border-radius: 50%; object-fit: cover;
+  border: 2px solid var(--bg);
+  margin-left: -6px; flex-shrink: 0;
+  position: relative;
+}
+.ownership-avatar-sm:first-child { margin-left: 0; }
+.ownership-avatar-sm-fallback {
+  width: 22px; height: 22px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 0.5rem; font-weight: 700; color: #fff;
+  border: 2px solid var(--bg);
+  flex-shrink: 0;
+}
+
+/* WoT: stacked/bubbled avatars */
+.ownership-avatar-stack {
+  display: flex; align-items: center; position: relative;
+  width: 52px; height: 26px; flex-shrink: 0;
+}
+.ownership-avatar-bubble {
+  position: absolute; border: 2px solid var(--bg);
+}
+.ownership-avatar-bubble-0 { left: 0; z-index: 3; }
+.ownership-avatar-bubble-1 { left: 14px; z-index: 2; }
+.ownership-avatar-bubble-2 { left: 28px; z-index: 1; }
 
 /* Storage detail pages */
 .storage-detail-page {

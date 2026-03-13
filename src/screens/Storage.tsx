@@ -2,7 +2,10 @@ import React, { useState, useEffect, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Link } from "react-router-dom";
 import { Badge } from "../components/Badge";
+import { Avatar } from "../components/Avatar";
 import { formatBytes } from "../utils/format";
+import { useAppContext } from "../context/AppContext";
+import { useProfileContext } from "../context/ProfileContext";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -28,6 +31,11 @@ interface StorageStats {
 
 interface KindCountsResult {
   counts: Record<string, number>;
+}
+
+interface TrackedProfileSummary {
+  pubkey: string;
+  picture: string | null;
 }
 
 interface KindCategory {
@@ -97,12 +105,17 @@ function aggregateKindRows(counts: Record<string, number>): KindRow[] {
 /* ------------------------------------------------------------------ */
 
 export const Storage: React.FC = () => {
+  const { ownProfile } = useAppContext();
+  const { ensureProfiles, getProfile } = useProfileContext();
+
   /* --- state -------------------------------------------------------- */
   const [ownershipStats, setOwnershipStats] = useState<OwnershipStorageStats | null>(null);
   const [storageStats, setStorageStats] = useState<StorageStats | null>(null);
   const [kindCounts, setKindCounts] = useState<Record<string, number> | null>(null);
   const [ownershipError, setOwnershipError] = useState(false);
   const [kindError, setKindError] = useState(false);
+  const [trackedAvatars, setTrackedAvatars] = useState<TrackedProfileSummary[]>([]);
+  const [wotAvatarPubkeys, setWotAvatarPubkeys] = useState<string[]>([]);
 
   /* --- data loading ------------------------------------------------- */
   useEffect(() => {
@@ -123,6 +136,31 @@ export const Storage: React.FC = () => {
         console.error("[storage] get_kind_counts failed:", e);
         setKindError(true);
       });
+
+    // Fetch tracked profiles for avatar display
+    invoke<{ pubkey: string; picture: string | null }[]>("get_tracked_profiles_detail")
+      .then((profiles) => {
+        setTrackedAvatars(profiles.slice(0, 3).map((p) => ({ pubkey: p.pubkey, picture: p.picture })));
+      })
+      .catch((e) => {
+        console.error("[storage] get_tracked_profiles_detail failed:", e);
+      });
+
+    // Fetch a few WoT events to get pubkeys for avatar display
+    invoke<{ pubkey: string }[]>("get_events_for_category", {
+      category: "wot",
+      kinds: [1],
+      limit: 30,
+    })
+      .then((events) => {
+        const unique = [...new Set(events.map((e) => e.pubkey))];
+        // Pick 3 random pubkeys
+        const shuffled = unique.sort(() => Math.random() - 0.5);
+        const picked = shuffled.slice(0, 3);
+        if (picked.length > 0) ensureProfiles(picked);
+        setWotAvatarPubkeys(picked);
+      })
+      .catch(() => {});
   }, []);
 
   /* --- derived values ----------------------------------------------- */
@@ -205,7 +243,17 @@ export const Storage: React.FC = () => {
         {/* Own Events */}
         <Link to="/storage/own-events" className="ownership-card own" style={{ textDecoration: "none", color: "inherit" }}>
           <div className="ownership-card-header">
-            <span className="ownership-card-label">Own Events</span>
+            <div className="ownership-card-header-left">
+              {ownProfile && (
+                <Avatar
+                  picture={ownProfile.picture}
+                  pubkey={ownProfile.pubkey}
+                  className="ownership-avatar"
+                  fallbackClassName="ownership-avatar-fallback"
+                />
+              )}
+              <span className="ownership-card-label">Own Events</span>
+            </div>
             <Badge text="YOU" className="ownership-card-badge" variant="own" />
           </div>
           <div className="ownership-card-body">
@@ -230,7 +278,22 @@ export const Storage: React.FC = () => {
         {/* Tracked Profiles */}
         <Link to="/storage/tracked-profiles" className="ownership-card tracked" style={{ textDecoration: "none", color: "inherit" }}>
           <div className="ownership-card-header">
-            <span className="ownership-card-label">Tracked Profiles</span>
+            <div className="ownership-card-header-left">
+              {trackedAvatars.length > 0 && (
+                <div className="ownership-avatar-row">
+                  {trackedAvatars.map((p) => (
+                    <Avatar
+                      key={p.pubkey}
+                      picture={p.picture}
+                      pubkey={p.pubkey}
+                      className="ownership-avatar-sm"
+                      fallbackClassName="ownership-avatar-sm-fallback"
+                    />
+                  ))}
+                </div>
+              )}
+              <span className="ownership-card-label">Tracked Profiles</span>
+            </div>
             <Badge text="TRACKED" className="ownership-card-badge" variant="tracked" />
           </div>
           <div className="ownership-card-body">
@@ -255,7 +318,25 @@ export const Storage: React.FC = () => {
         {/* WoT Profiles */}
         <Link to="/storage/wot-profiles" className="ownership-card wot" style={{ textDecoration: "none", color: "inherit" }}>
           <div className="ownership-card-header">
-            <span className="ownership-card-label">WoT Profiles</span>
+            <div className="ownership-card-header-left">
+              {wotAvatarPubkeys.length > 0 && (
+                <div className="ownership-avatar-stack">
+                  {wotAvatarPubkeys.map((pk, i) => {
+                    const p = getProfile(pk);
+                    return (
+                      <Avatar
+                        key={pk}
+                        picture={p?.picture}
+                        pubkey={pk}
+                        className={`ownership-avatar-sm ownership-avatar-bubble ownership-avatar-bubble-${i}`}
+                        fallbackClassName="ownership-avatar-sm-fallback"
+                      />
+                    );
+                  })}
+                </div>
+              )}
+              <span className="ownership-card-label">WoT Profiles</span>
+            </div>
             <Badge text="WOT" className="ownership-card-badge" variant="wot" />
           </div>
           <div className="ownership-card-body">

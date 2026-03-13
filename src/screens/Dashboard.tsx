@@ -28,6 +28,7 @@ interface LiveEntry {
   content: string;
   ts: number; // local timestamp (Date.now())
   layer: string;
+  media_urls: string[];
 }
 
 const LAYER_IDS = ["0", "05", "1", "2"] as const;
@@ -256,6 +257,7 @@ export const Dashboard: React.FC = () => {
         content: event.payload.content || "",
         ts: Date.now(),
         layer: event.payload.layer || "",
+        media_urls: event.payload.media_urls || [],
       };
 
       queueProfileFetch(entry.pubkey);
@@ -283,17 +285,24 @@ export const Dashboard: React.FC = () => {
       "get_feed", { filter: { limit: 20 } }
     )
       .then(async (rawEvents) => {
+        const mediaExts = /\.(jpg|jpeg|png|gif|webp|svg|mp4|webm|mov)/i;
+        const mediaCdns = /nostr\.build|void\.cat|image\.|\/media\//i;
         const entries: LiveEntry[] = rawEvents
           .sort((a, b) => b.created_at - a.created_at)
           .slice(0, 20)
-          .map((e, i) => ({
-            id: e.id,
-            kind: e.kind,
-            pubkey: e.pubkey,
-            content: e.content ? e.content.replace(/https?:\/\/\S+/g, "").trim().slice(0, 120) : "",
-            ts: e.created_at * 1000,
-            layer: "",
-          }));
+          .map((e) => {
+            const urls = e.content ? (e.content.match(/https?:\/\/\S+/g) || []) : [];
+            const imgUrls = urls.filter(u => mediaExts.test(u) || mediaCdns.test(u));
+            return {
+              id: e.id,
+              kind: e.kind,
+              pubkey: e.pubkey,
+              content: e.content ? e.content.replace(/https?:\/\/\S+/g, "").trim().slice(0, 120) : "",
+              ts: e.created_at * 1000,
+              layer: "",
+              media_urls: imgUrls,
+            };
+          });
 
         if (entries.length > 0) {
           const pubkeys = [...new Set(entries.map((e) => e.pubkey))];
@@ -586,6 +595,19 @@ export const Dashboard: React.FC = () => {
                     )}
                     <span className="live-preview">
                       {entry.content || `${entry.pubkey.slice(0, 8)}...`}
+                      {entry.media_urls.length > 0 && (
+                        <span className="live-media-thumbs">
+                          {entry.media_urls.slice(0, 3).map((url, i) => (
+                            <img
+                              key={i}
+                              src={url}
+                              className="live-media-thumb"
+                              loading="lazy"
+                              onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+                            />
+                          ))}
+                        </span>
+                      )}
                     </span>
                     <span className="live-time">{ageStr}</span>
                   </div>

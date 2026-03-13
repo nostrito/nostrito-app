@@ -199,71 +199,101 @@ impl ContentFetch {
             ss.pass_relays_total = plan.routes.len() as u64;
         }
 
+        // Flatten routes into chunks: split large relay batches into groups of
+        // MAX_PUBKEYS_PER_SUB to avoid hitting relay filter limits and to keep
+        // the event limit meaningful per author.
+        const MAX_PUBKEYS_PER_SUB: usize = 30;
+
+        let mut chunks: Vec<(&str, Vec<&[String]>)> = Vec::new();
+        let mut total_chunks = 0usize;
+        for route in &plan.routes {
+            let sub_chunks: Vec<&[String]> = route.pubkeys.chunks(MAX_PUBKEYS_PER_SUB).collect();
+            total_chunks += sub_chunks.len();
+            chunks.push((&route.relay_url, sub_chunks));
+        }
+
+        info!(
+            "Content[{}]: {} relay batches → {} sub-chunks (max {} pubkeys each)",
+            stat_key, plan.routes.len(), total_chunks, MAX_PUBKEYS_PER_SUB
+        );
+
+        // Update relay totals to reflect actual chunks
+        {
+            let mut ss = self.sync_stats.write().await;
+            ss.pass_relays_total = total_chunks as u64;
+        }
+
         let mut pubkeys_done = muted.len() as u64;
+        let mut chunk_idx = 0usize;
 
-        for (relay_idx, route) in plan.routes.iter().enumerate() {
-            let short_url = route.relay_url.replace("wss://", "").replace("ws://", "");
+        for (relay_url, sub_chunks) in &chunks {
+            for chunk in sub_chunks {
+                let short_url = relay_url.replace("wss://", "").replace("ws://", "");
 
-            // Emit progress
-            self.app_handle.emit("sync:progress", &SyncProgress {
-                tier: 3,
-                fetched: events_stored as u64,
-                total,
-                relay: format!("{} ({} profiles, relay {}/{})", short_url, route.pubkeys.len(), relay_idx + 1, plan.routes.len()),
-            }).ok();
+                // Emit progress
+                self.app_handle.emit("sync:progress", &SyncProgress {
+                    tier: 3,
+                    fetched: events_stored as u64,
+                    total,
+                    relay: format!("{} ({} profiles, {}/{})", short_url, chunk.len(), chunk_idx + 1, total_chunks),
+                }).ok();
 
-            // Fetch the entire batch for this relay in a single subscription
-            // Use a longer timeout for larger batches
-            let timeout_secs = if route.pubkeys.len() > 20 { 30 } else { 15 };
-            let fetch_result = tokio::time::timeout(
-                std::time::Duration::from_secs(timeout_secs),
-                self.fetch_from_relay(
-                    &route.relay_url,
-                    &route.pubkeys,
+                // Scale subscription timeout with batch size:
+                // larger batches need more time for relays to stream events
+                let sub_timeout = if chunk.len() > 20 { 30u64 } else { 15u64 };
+                let fetch_result = self.fetch_from_relay(
+                    relay_url,
+                    chunk,
                     bands,
                     refresh_set,
                     now,
                     media_priority,
                     layer,
-                ),
-            ).await;
+                    sub_timeout,
+                ).await;
 
-            let (stored, wot) = match fetch_result {
-                Ok(stats) => stats,
-                Err(_) => {
-                    warn!(
-                        "Content[{}]: timeout for {} ({} pubkeys) via {}",
-                        stat_key, route.pubkeys.len(), route.pubkeys.len(), short_url
-                    );
-                    (0, 0)
+                let (stored, wot) = match &fetch_result {
+                    Ok(stats) => *stats,
+                    Err(e) => {
+                        warn!(
+                            "Content[{}]: failed {} pubkeys via {}: {}",
+                            stat_key, chunk.len(), short_url, e
+                        );
+                        (0, 0)
+                    }
+                };
+
+                events_stored += stored;
+                wot_updates += wot;
+
+                // Only advance cursors if the relay actually responded.
+                // On failure, leave cursors untouched so the next cycle
+                // retries with the same lookback window.
+                if fetch_result.is_ok() {
+                    for pubkey in *chunk {
+                        self.db.touch_user_cursor(pubkey).ok();
+                    }
                 }
-            };
 
-            events_stored += stored;
-            wot_updates += wot;
+                pubkeys_done += chunk.len() as u64;
+                chunk_idx += 1;
 
-            // Touch cursors for all pubkeys in this batch
-            for pubkey in &route.pubkeys {
-                self.db.touch_user_cursor(pubkey).ok();
-            }
-
-            pubkeys_done += route.pubkeys.len() as u64;
-
-            // Update counters after each relay batch
-            {
-                let mut ss = self.sync_stats.write().await;
-                ss.pass_pubkeys_done = pubkeys_done;
-                ss.pass_relays_done = (relay_idx + 1) as u64;
-                match stat_key {
-                    "tracked" => ss.tracked_fetched += stored as u64,
-                    "tier2" => ss.tier2_fetched += stored as u64,
-                    "tier3" => ss.tier3_fetched += stored as u64,
-                    _ => {}
+                // Update counters after each chunk
+                {
+                    let mut ss = self.sync_stats.write().await;
+                    ss.pass_pubkeys_done = pubkeys_done;
+                    ss.pass_relays_done = chunk_idx as u64;
+                    match stat_key {
+                        "tracked" => ss.tracked_fetched += stored as u64,
+                        "tier2" => ss.tier2_fetched += stored as u64,
+                        "tier3" => ss.tier3_fetched += stored as u64,
+                        _ => {}
+                    }
                 }
-            }
 
-            if stored > 0 {
-                self.db.record_relay_success(&route.relay_url, stored, 0).ok();
+                if stored > 0 {
+                    self.db.record_relay_success(relay_url, stored, 0).ok();
+                }
             }
         }
 
@@ -275,6 +305,8 @@ impl ContentFetch {
     }
 
     /// Fetch events from a single relay for a set of pubkeys.
+    /// Returns `Ok((stored, wot_updates))` on success (even if 0 events),
+    /// or `Err` if the relay connection/subscription failed.
     async fn fetch_from_relay(
         &self,
         relay_url: &str,
@@ -284,7 +316,8 @@ impl ContentFetch {
         now: i64,
         media_priority: i32,
         layer: &str,
-    ) -> (u32, u32) {
+        subscription_timeout_secs: u64,
+    ) -> Result<(u32, u32)> {
         let mut filters = Vec::new();
 
         // Build per-band content filters
@@ -351,14 +384,14 @@ impl ContentFetch {
 
         if filters.is_empty() {
             debug!("Content: {} — no filters built, skipping", relay_url);
-            return (0, 0);
+            return Ok((0, 0));
         }
 
-        debug!("Content: {} — subscribing with {} filters", relay_url, filters.len());
+        debug!("Content: {} — subscribing with {} filters (timeout={}s)", relay_url, filters.len(), subscription_timeout_secs);
         match self.pool.subscribe_and_collect(
             &[relay_url.to_string()],
             filters,
-            15,
+            subscription_timeout_secs,
         ).await {
             Ok(events) => {
                 debug!("Content: {} — received {} events, processing...", relay_url, events.len());
@@ -428,12 +461,12 @@ impl ContentFetch {
                     relay_url, events.len(), stored, wot, thread_stored
                 );
 
-                (stored + thread_stored, wot)
+                Ok((stored + thread_stored, wot))
             }
             Err(e) => {
                 warn!("Content: fetch from {} FAILED: {}", relay_url, e);
                 self.db.record_relay_failure(relay_url).ok();
-                (0, 0)
+                Err(e)
             }
         }
     }
@@ -551,73 +584,87 @@ impl ContentFetch {
 
         let plan = scheduler::build_routing_plan(&pubkey_relays, &muted);
 
+        const MAX_PUBKEYS_PER_SUB: usize = 30;
+
+        let mut chunks: Vec<(&str, Vec<&[String]>)> = Vec::new();
+        let mut total_chunks = 0usize;
+        for route in &plan.routes {
+            let sub_chunks: Vec<&[String]> = route.pubkeys.chunks(MAX_PUBKEYS_PER_SUB).collect();
+            total_chunks += sub_chunks.len();
+            chunks.push((&route.relay_url, sub_chunks));
+        }
+
         {
             let mut ss = self.sync_stats.write().await;
             ss.current_layer = layer.to_string();
             ss.pass_pubkeys_done = 0;
             ss.pass_pubkeys_total = total;
             ss.pass_relays_done = 0;
-            ss.pass_relays_total = plan.routes.len() as u64;
+            ss.pass_relays_total = total_chunks as u64;
         }
 
         let mut pubkeys_done = muted.len() as u64;
+        let mut chunk_idx = 0usize;
 
-        for (relay_idx, route) in plan.routes.iter().enumerate() {
-            // Stop if we've collected enough notes
-            if events_stored >= max_notes {
-                info!("WoT content: reached {} notes limit at relay {}/{}", max_notes, relay_idx, plan.routes.len());
-                break;
-            }
+        'outer: for (relay_url, sub_chunks) in &chunks {
+            for chunk in sub_chunks {
+                // Stop if we've collected enough notes
+                if events_stored >= max_notes {
+                    info!("WoT content: reached {} notes limit at chunk {}/{}", max_notes, chunk_idx, total_chunks);
+                    break 'outer;
+                }
 
-            let short_url = route.relay_url.replace("wss://", "").replace("ws://", "");
+                let short_url = relay_url.replace("wss://", "").replace("ws://", "");
 
-            self.app_handle.emit("sync:progress", &SyncProgress {
-                tier: 3,
-                fetched: events_stored as u64,
-                total: max_notes as u64,
-                relay: format!("{} ({}/{}notes)", short_url, events_stored, max_notes),
-            }).ok();
+                self.app_handle.emit("sync:progress", &SyncProgress {
+                    tier: 3,
+                    fetched: events_stored as u64,
+                    total: max_notes as u64,
+                    relay: format!("{} ({}/{}notes)", short_url, events_stored, max_notes),
+                }).ok();
 
-            let timeout_secs = if route.pubkeys.len() > 20 { 30 } else { 15 };
-            let fetch_result = tokio::time::timeout(
-                std::time::Duration::from_secs(timeout_secs),
-                self.fetch_from_relay(
-                    &route.relay_url,
-                    &route.pubkeys,
+                let sub_timeout = if chunk.len() > 20 { 30u64 } else { 15u64 };
+                let fetch_result = self.fetch_from_relay(
+                    relay_url,
+                    chunk,
                     bands,
                     refresh_set,
                     now,
                     media_priority,
                     layer,
-                ),
-            ).await;
+                    sub_timeout,
+                ).await;
 
-            let (stored, wot) = match fetch_result {
-                Ok(stats) => stats,
-                Err(_) => {
-                    warn!("WoT content: timeout for {} ({} pubkeys) via {}", route.pubkeys.len(), route.pubkeys.len(), short_url);
-                    (0, 0)
+                let (stored, wot) = match &fetch_result {
+                    Ok(stats) => *stats,
+                    Err(e) => {
+                        warn!("WoT content: failed {} pubkeys via {}: {}", chunk.len(), short_url, e);
+                        (0, 0)
+                    }
+                };
+
+                events_stored += stored;
+                wot_updates += wot;
+
+                if fetch_result.is_ok() {
+                    for pubkey in *chunk {
+                        self.db.touch_user_cursor(pubkey).ok();
+                    }
                 }
-            };
 
-            events_stored += stored;
-            wot_updates += wot;
+                pubkeys_done += chunk.len() as u64;
+                chunk_idx += 1;
 
-            for pubkey in &route.pubkeys {
-                self.db.touch_user_cursor(pubkey).ok();
-            }
+                {
+                    let mut ss = self.sync_stats.write().await;
+                    ss.pass_pubkeys_done = pubkeys_done;
+                    ss.pass_relays_done = chunk_idx as u64;
+                    ss.tier3_fetched += stored as u64;
+                }
 
-            pubkeys_done += route.pubkeys.len() as u64;
-
-            {
-                let mut ss = self.sync_stats.write().await;
-                ss.pass_pubkeys_done = pubkeys_done;
-                ss.pass_relays_done = (relay_idx + 1) as u64;
-                ss.tier3_fetched += stored as u64;
-            }
-
-            if stored > 0 {
-                self.db.record_relay_success(&route.relay_url, stored, 0).ok();
+                if stored > 0 {
+                    self.db.record_relay_success(relay_url, stored, 0).ok();
+                }
             }
         }
 
@@ -625,7 +672,7 @@ impl ContentFetch {
         // will overwrite these values. Clearing them causes the dashboard
         // counter to briefly jump to 0 between cycles.
 
-        (events_stored, wot_updates, plan.routes.len() as u32)
+        (events_stored, wot_updates, total_chunks as u32)
     }
 
     /// Compute the `since` timestamp for a cursor band.

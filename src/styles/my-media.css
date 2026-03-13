@@ -94,10 +94,6 @@
   pointer-events: none;
 }
 
-.my-media-card.remote {
-  border-style: dashed;
-}
-
 .my-media-card img,
 .my-media-card video {
   width: 100%;

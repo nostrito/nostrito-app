@@ -252,6 +252,22 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.live-media-thumbs {
+  display: inline-flex;
+  gap: 3px;
+  flex-shrink: 0;
+}
+.live-media-thumb {
+  width: 22px;
+  height: 22px;
+  border-radius: 3px;
+  object-fit: cover;
+  opacity: 0.85;
+  flex-shrink: 0;
 }
 .live-time {
   font-size: 0.68rem;
