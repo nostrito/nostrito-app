@@ -935,11 +935,11 @@ async fn get_note_reactions(
 }
 
 #[tauri::command]
-async fn fetch_global_feed(limit: Option<u32>, until: Option<u64>, state: State<'_, AppState>) -> Result<Vec<NostrEvent>, String> {
+async fn fetch_global_feed(limit: Option<u32>, until: Option<u64>, kinds: Option<Vec<u32>>, state: State<'_, AppState>) -> Result<Vec<NostrEvent>, String> {
     use nostr_sdk::prelude::*;
 
     let lim = limit.unwrap_or(50);
-    tracing::info!("[cmd:fetch_global_feed] limit={}, until={:?}", lim, until);
+    tracing::info!("[cmd:fetch_global_feed] limit={}, until={:?}, kinds={:?}", lim, until, kinds);
 
     let cfg = state.config.read().await;
     let hex_pubkey = cfg.hex_pubkey.clone().unwrap_or_default();
@@ -954,22 +954,30 @@ async fn fetch_global_feed(limit: Option<u32>, until: Option<u64>, state: State<
     let relay_count = relay_urls.len();
     tracing::info!("[fetch_global_feed] querying {} relays", relay_count);
 
+    let feed_kinds = match &kinds {
+        Some(k) => k.iter().map(|&n| Kind::from(n as u16)).collect(),
+        None => vec![Kind::TextNote, Kind::Repost, Kind::LongFormTextNote],
+    };
     let mut filter = Filter::new()
-        .kinds(vec![Kind::TextNote, Kind::Repost, Kind::LongFormTextNote])
+        .kinds(feed_kinds)
         .limit(lim as usize);
+
+    // Use a wider time window for article-only queries since they're published less frequently
+    let articles_only = matches!(&kinds, Some(k) if k.len() == 1 && k[0] == 30023);
+    let window_secs: u64 = if articles_only { 86400 * 30 } else { 86400 };
 
     if let Some(until_ts) = until {
         // Pagination: fetch events before this timestamp
         filter = filter.until(Timestamp::from(until_ts));
-        let since_ts = until_ts.saturating_sub(86400);
+        let since_ts = until_ts.saturating_sub(window_secs);
         filter = filter.since(Timestamp::from(since_ts));
     } else {
-        // Initial load: last 24h
+        // Initial load
         let since_ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs()
-            .saturating_sub(86400);
+            .saturating_sub(window_secs);
         filter = filter.since(Timestamp::from(since_ts));
     }
 
@@ -1035,6 +1043,202 @@ async fn fetch_global_feed(limit: Option<u32>, until: Option<u64>, state: State<
     tracing::info!("[fetch_global_feed] {} events fetched (not persisted)", all_events.len());
 
     Ok(all_events
+        .into_iter()
+        .map(|event| {
+            let tags: Vec<Vec<String>> = event.tags.iter()
+                .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
+                .collect();
+            NostrEvent {
+                id: event.id.to_hex(),
+                pubkey: event.pubkey.to_hex(),
+                created_at: event.created_at.as_u64(),
+                kind: event.kind.as_u16() as u32,
+                tags,
+                content: event.content.to_string(),
+                sig: event.sig.to_string(),
+            }
+        })
+        .collect())
+}
+
+/// Fetch articles (kind 30023) from relays for WoT pubkeys.
+/// `layer`: "follows" fetches from direct follows, "wot" from follows-of-follows.
+/// `until`: optional pagination cursor (fetch articles older than this timestamp).
+/// `limit`: max articles to return.
+///
+/// Articles are persisted to the local DB so subsequent calls to get_feed find them.
+#[tauri::command]
+async fn fetch_wot_articles(
+    layer: String,
+    until: Option<u64>,
+    limit: Option<u32>,
+    state: State<'_, AppState>,
+) -> Result<Vec<NostrEvent>, String> {
+    use nostr_sdk::prelude::*;
+
+    let lim = limit.unwrap_or(20);
+    tracing::info!("[cmd:fetch_wot_articles] layer={}, until={:?}, limit={}", layer, until, lim);
+
+    let cfg = state.config.read().await;
+    let hex_pubkey = cfg.hex_pubkey.clone().unwrap_or_default();
+    drop(cfg);
+
+    // Resolve pubkeys for the requested layer
+    let follows = state.wot_graph.get_follows(&hex_pubkey).unwrap_or_default();
+
+    let pubkeys: Vec<String> = if layer == "follows" {
+        follows.clone()
+    } else {
+        // WoT layer: follows-of-follows, excluding direct follows
+        let follow_set: std::collections::HashSet<&str> =
+            follows.iter().map(|s| s.as_str()).collect();
+        let mut fof = Vec::new();
+        for f in &follows {
+            if let Some(ff) = state.wot_graph.get_follows(f) {
+                for pk in ff {
+                    if !follow_set.contains(pk.as_str()) && pk != hex_pubkey {
+                        fof.push(pk);
+                    }
+                }
+            }
+        }
+        fof.sort();
+        fof.dedup();
+        // Sample up to 200 FoF to keep relay connections manageable
+        if fof.len() > 200 {
+            use rand::seq::SliceRandom;
+            use rand::thread_rng;
+            let mut rng = thread_rng();
+            fof.shuffle(&mut rng);
+            fof.truncate(200);
+        }
+        fof
+    };
+
+    if pubkeys.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Group pubkeys by their write relays for efficient batching
+    let db = state.db();
+    let mut relay_to_authors: std::collections::HashMap<String, Vec<PublicKey>> =
+        std::collections::HashMap::new();
+
+    for pk in &pubkeys {
+        let relays = db.get_write_relays(pk).unwrap_or_default();
+        let author = match PublicKey::from_hex(pk.as_str()) {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        if relays.is_empty() {
+            // Fall back to default relays
+            for r in sync::types::DEFAULT_RELAYS {
+                relay_to_authors.entry(r.to_string()).or_default().push(author);
+            }
+        } else {
+            for (url, _) in relays {
+                relay_to_authors.entry(url).or_default().push(author);
+            }
+        }
+    }
+
+    // Cap at 10 relays to keep it fast
+    let mut relay_batches: Vec<(String, Vec<PublicKey>)> = relay_to_authors.into_iter().collect();
+    relay_batches.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    relay_batches.truncate(10);
+
+    let mut all_events: Vec<Event> = Vec::new();
+    let target = lim as usize;
+
+    for (relay_url, authors) in &relay_batches {
+        if all_events.len() >= target {
+            break;
+        }
+
+        let mut filter = Filter::new()
+            .authors(authors.clone())
+            .kind(Kind::LongFormTextNote)
+            .limit(target);
+
+        if let Some(until_ts) = until {
+            filter = filter.until(Timestamp::from(until_ts));
+        }
+
+        let client = Client::default();
+        if let Err(e) = client.add_relay(relay_url.as_str()).await {
+            tracing::warn!("[fetch_wot_articles] Failed to add relay {}: {}", relay_url, e);
+            continue;
+        }
+        client.connect().await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let mut notifications = client.notifications();
+        let sub_id = match client.subscribe(vec![filter], None).await {
+            Ok(output) => output.val,
+            Err(e) => {
+                tracing::warn!("[fetch_wot_articles] Subscribe failed on {}: {}", relay_url, e);
+                client.disconnect().await.ok();
+                continue;
+            }
+        };
+
+        let deadline = tokio::time::sleep(std::time::Duration::from_secs(8));
+        tokio::pin!(deadline);
+
+        loop {
+            tokio::select! {
+                result = notifications.recv() => {
+                    match result {
+                        Ok(RelayPoolNotification::Event { event, .. }) => {
+                            if !all_events.iter().any(|e| e.id == event.id) {
+                                all_events.push(*event);
+                            }
+                            if all_events.len() >= target {
+                                break;
+                            }
+                        }
+                        Ok(RelayPoolNotification::Message { message, .. }) => {
+                            if matches!(&message, RelayMessage::EndOfStoredEvents(_)) {
+                                break;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+                _ = &mut deadline => {
+                    tracing::info!("[fetch_wot_articles] timeout on {}, got {} events", relay_url, all_events.len());
+                    break;
+                }
+            }
+        }
+
+        client.unsubscribe(sub_id).await;
+        client.disconnect().await.ok();
+    }
+
+    tracing::info!("[fetch_wot_articles] fetched {} articles from relays", all_events.len());
+
+    // Persist articles to local DB
+    let graph = Arc::clone(&state.wot_graph);
+    let db_arc = state.db();
+    sync::processing::process_events(
+        &all_events,
+        &db_arc,
+        &graph,
+        &hex_pubkey,
+        sync::types::EventSource::OwnBackup,
+        sync::types::MEDIA_PRIORITY_FOLLOWS,
+        None,
+        if layer == "follows" { "1" } else { "2" },
+    );
+
+    // Sort newest-first and return
+    let mut sorted = all_events;
+    sorted.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    sorted.truncate(target);
+
+    Ok(sorted
         .into_iter()
         .map(|event| {
             let tags: Vec<Vec<String>> = event.tags.iter()
@@ -3360,6 +3564,7 @@ pub fn run() {
             get_note_replies,
             get_note_reactions,
             fetch_global_feed,
+            fetch_wot_articles,
             save_event,
             bookmark_media,
             unbookmark_media,

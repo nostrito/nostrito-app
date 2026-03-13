@@ -138,6 +138,8 @@ export const Feed: React.FC = () => {
   const [hasMore, setHasMore] = useState(true);
   const [loadingMoreArticles, setLoadingMoreArticles] = useState(false);
   const [hasMoreArticles, setHasMoreArticles] = useState(true);
+  // Article fetch stages: "local" → "relay-follows" → "relay-wot" → "done"
+  const articleStageRef = useRef<"local" | "relay-follows" | "relay-wot" | "done">("local");
   const [fetchingRelay, setFetchingRelay] = useState(false);
   const [relayFetched, setRelayFetched] = useState(false);
 
@@ -222,19 +224,13 @@ export const Feed: React.FC = () => {
     }
   }, [feedMode, ensureProfiles, feedEvents.length]);
 
-  // Track oldest timestamps for pagination
+  // Track oldest note timestamp for pagination (articles tracked separately in loadMoreArticles)
   useEffect(() => {
     const notes = feedEvents.filter((e) => e.kind !== 30023);
     if (notes.length > 0) {
       oldestNoteTimestamp.current = Math.min(...notes.map((e) => e.created_at));
     } else {
       oldestNoteTimestamp.current = null;
-    }
-    const arts = feedEvents.filter((e) => e.kind === 30023);
-    if (arts.length > 0) {
-      oldestArticleTimestamp.current = Math.min(...arts.map((e) => e.created_at));
-    } else {
-      oldestArticleTimestamp.current = null;
     }
   }, [feedEvents]);
 
@@ -376,7 +372,7 @@ export const Feed: React.FC = () => {
         rawEvents = await invoke<NostrEvent[]>("fetch_global_feed", { limit: 50, until });
       } else {
         rawEvents = await invoke<NostrEvent[]>("get_feed", {
-          filter: { kinds: [1, 6], limit: 50, wot_only: true, until },
+          filter: { kinds: [1, 6, 30023], limit: 50, wot_only: true, until },
         });
       }
 
@@ -410,54 +406,104 @@ export const Feed: React.FC = () => {
     }
   }, [feedMode, isSearchMode, hasMore, ensureProfiles]);
 
+  /** Append article results to state, returns count of new (non-dupe) events added. */
+  const appendArticles = useCallback((rawEvents: NostrEvent[]): number => {
+    const oldest = oldestArticleTimestamp.current;
+    const oldestFetched = Math.min(...rawEvents.map((e) => e.created_at));
+    if (oldest === null || oldestFetched < oldest) {
+      oldestArticleTimestamp.current = oldestFetched;
+    }
+
+    const newEvents = rawEvents.filter((e) => !renderedEventIdsRef.current.has(e.id));
+    if (newEvents.length === 0) return 0;
+
+    const pubkeys = [...new Set(newEvents.map((e) => e.pubkey))];
+    ensureProfiles(pubkeys);
+
+    for (const e of newEvents) {
+      renderedEventIdsRef.current.add(e.id);
+    }
+
+    setFeedEvents((prev) => {
+      const existingIds = new Set(prev.map((e) => e.id));
+      const toAdd = newEvents.filter((e) => !existingIds.has(e.id));
+      return deduplicateArticles([...prev, ...toAdd]);
+    });
+
+    return newEvents.length;
+  }, [ensureProfiles]);
+
   const loadMoreArticles = useCallback(async () => {
     if (articleLoadingRef.current || isSearchMode || !hasMoreArticles) return;
-    const oldest = oldestArticleTimestamp.current;
-    if (oldest === null) return;
-    const until = oldest - 1;
 
     articleLoadingRef.current = true;
     setLoadingMoreArticles(true);
 
     try {
-      let rawEvents: NostrEvent[];
+      const oldest = oldestArticleTimestamp.current;
+      const until = oldest !== null ? oldest - 1 : undefined;
 
-      if (feedMode === "global") {
-        rawEvents = await invoke<NostrEvent[]>("fetch_global_feed", { limit: 30, until });
-        rawEvents = rawEvents.filter((e) => e.kind === 30023);
-      } else {
-        rawEvents = await invoke<NostrEvent[]>("get_feed", {
-          filter: { kinds: [30023], limit: 20, wot_only: true, until },
+      // Stage 1: Try local DB first (for both WoT and global)
+      if (articleStageRef.current === "local") {
+        let rawEvents: NostrEvent[];
+
+        if (feedMode === "global") {
+          rawEvents = await invoke<NostrEvent[]>("fetch_global_feed", {
+            limit: 20, kinds: [30023], ...(until !== undefined && { until }),
+          });
+        } else {
+          rawEvents = await invoke<NostrEvent[]>("get_feed", {
+            filter: { kinds: [30023], limit: 20, wot_only: true, ...(until !== undefined && { until }) },
+          });
+        }
+
+        if (rawEvents.length > 0) {
+          appendArticles(rawEvents);
+          return;
+        }
+
+        // Local exhausted — move to relay fetching
+        articleStageRef.current = "relay-follows";
+      }
+
+      // Stage 2: Fetch from follows' relays
+      if (articleStageRef.current === "relay-follows") {
+        const rawEvents = await invoke<NostrEvent[]>("fetch_wot_articles", {
+          layer: "follows", limit: 20, ...(until !== undefined && { until }),
         });
+
+        if (rawEvents.length > 0) {
+          appendArticles(rawEvents);
+          return;
+        }
+
+        // Follows exhausted — move to WoT
+        articleStageRef.current = "relay-wot";
       }
 
-      if (rawEvents.length === 0) {
-        setHasMoreArticles(false);
-        return;
+      // Stage 3: Fetch from WoT (follows-of-follows) relays
+      if (articleStageRef.current === "relay-wot") {
+        const rawEvents = await invoke<NostrEvent[]>("fetch_wot_articles", {
+          layer: "wot", limit: 20, ...(until !== undefined && { until }),
+        });
+
+        if (rawEvents.length > 0) {
+          appendArticles(rawEvents);
+          return;
+        }
+
+        // All stages exhausted
+        articleStageRef.current = "done";
       }
 
-      const newEvents = rawEvents.filter((e) => !renderedEventIdsRef.current.has(e.id));
-      if (newEvents.length === 0) return;
-
-      const pubkeys = [...new Set(newEvents.map((e) => e.pubkey))];
-      ensureProfiles(pubkeys);
-
-      for (const e of newEvents) {
-        renderedEventIdsRef.current.add(e.id);
-      }
-
-      setFeedEvents((prev) => {
-        const existingIds = new Set(prev.map((e) => e.id));
-        const toAdd = newEvents.filter((e) => !existingIds.has(e.id));
-        return deduplicateArticles([...prev, ...toAdd]);
-      });
+      setHasMoreArticles(false);
     } catch (err) {
       console.warn("[feed] Failed to load more articles:", err);
     } finally {
       articleLoadingRef.current = false;
       setLoadingMoreArticles(false);
     }
-  }, [isSearchMode, hasMoreArticles, feedMode, ensureProfiles]);
+  }, [isSearchMode, hasMoreArticles, feedMode, ensureProfiles, appendArticles]);
 
   const fetchFromRelays = useCallback(async () => {
     if (fetchingRelay) return;
@@ -500,6 +546,8 @@ export const Feed: React.FC = () => {
     setGroupedReposts(new Map());
     setHasMore(true);
     setHasMoreArticles(true);
+    articleStageRef.current = "local";
+    oldestArticleTimestamp.current = null;
     setRelayFetched(false);
     setNewPostCount(0);
     if (feedMode === "global") {
@@ -708,6 +756,19 @@ export const Feed: React.FC = () => {
     [loadMoreArticles],
   );
 
+  // Auto-fetch articles when the article column is visible but empty
+  const articles = feedEvents.filter((e) => e.kind === 30023);
+  useEffect(() => {
+    if (
+      (activeFilter === "all" || activeFilter === "long-form") &&
+      articles.length === 0 &&
+      !loading &&
+      hasMoreArticles
+    ) {
+      loadMoreArticles();
+    }
+  }, [activeFilter, articles.length, loading, hasMoreArticles, loadMoreArticles]);
+
   // Article reader view
   if (view.kind === "article") {
     return (
@@ -718,8 +779,7 @@ export const Feed: React.FC = () => {
     );
   }
 
-  // Separate articles and notes for rendering
-  const articles = feedEvents.filter((e) => e.kind === 30023);
+  // Notes for rendering (articles already computed above)
   const notes = feedEvents.filter((e) => e.kind !== 30023);
 
   // Collect IDs of reposts that are part of a group (to skip individually)
@@ -737,7 +797,7 @@ export const Feed: React.FC = () => {
   ).filter((e) => !groupedRepostEventIds.has(e.id));
 
   // Layout: articles on right column, notes on left
-  const showArticleColumn = (activeFilter === "all" || activeFilter === "long-form") && articles.length > 0;
+  const showArticleColumn = activeFilter === "all" || activeFilter === "long-form";
   const showNotesColumn = activeFilter !== "long-form";
 
   const filterTabs: { key: FilterTab; label: string }[] = [
@@ -915,10 +975,19 @@ export const Feed: React.FC = () => {
                 onClick={() => setView({ kind: "article", event })}
               />
             ))}
-            {hasMoreArticles && articles.length > 0 && (
+            {hasMoreArticles && (
               <div className="feed-sentinel">
-                {loadingMoreArticles && <span className="feed-sentinel-text">Loading more...</span>}
+                {loadingMoreArticles && (
+                  <span className="feed-sentinel-text">
+                    {articleStageRef.current === "relay-follows" ? "Fetching from follows\u2026" :
+                     articleStageRef.current === "relay-wot" ? "Fetching from network\u2026" :
+                     "Loading more\u2026"}
+                  </span>
+                )}
               </div>
+            )}
+            {!hasMoreArticles && articles.length === 0 && (
+              <div className="feed-end" style={{ color: "var(--text-muted)", padding: 32 }}>No articles found</div>
             )}
             {!hasMoreArticles && articles.length > 0 && (
               <div className="feed-end">No more articles</div>
@@ -939,23 +1008,23 @@ export const Feed: React.FC = () => {
                 />
               ))}
             </div>
-            {hasMoreArticles && articles.length > 0 && (
+            {hasMoreArticles && (
               <div className="feed-sentinel">
-                {loadingMoreArticles && <span className="feed-sentinel-text">Loading more...</span>}
+                {loadingMoreArticles && (
+                  <span className="feed-sentinel-text">
+                    {articleStageRef.current === "relay-follows" ? "Fetching from follows\u2026" :
+                     articleStageRef.current === "relay-wot" ? "Fetching from network\u2026" :
+                     "Loading more\u2026"}
+                  </span>
+                )}
               </div>
+            )}
+            {!hasMoreArticles && articles.length === 0 && (
+              <div className="feed-end" style={{ color: "var(--text-muted)", padding: 32 }}>No long-form events yet</div>
             )}
             {!hasMoreArticles && articles.length > 0 && (
               <div className="feed-end">No more articles</div>
             )}
-          </div>
-        )}
-
-        {/* Empty state for long-form filter with no articles */}
-        {!showArticleColumn && !showNotesColumn && !loading && (
-          <div className="feed-notes-column">
-            <div className="event-card" style={{ justifyContent: "center", color: "var(--text-muted)", padding: 32 }}>
-              No long-form events yet
-            </div>
           </div>
         )}
       </div>

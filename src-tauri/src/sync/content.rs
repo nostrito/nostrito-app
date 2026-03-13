@@ -372,12 +372,24 @@ impl ContentFetch {
             let limit = (authors.len() * 10).max(200).min(5000);
 
             let content_filter = Filter::new()
-                .authors(authors)
-                .kinds(vec![Kind::TextNote, Kind::Repost, Kind::LongFormTextNote])
+                .authors(authors.clone())
+                .kinds(vec![Kind::TextNote, Kind::Repost])
                 .since(Timestamp::from(since as u64))
                 .limit(limit);
 
             filters.push(content_filter);
+
+            // Separate filter for articles so they don't get drowned out by notes
+            let article_limit = (authors.len() * 5).max(50).min(500);
+            let article_since = self.compute_since(band, &band_pubkeys, now)
+                .min(now - 86400 * 30); // Look back at least 30 days for articles
+            let article_filter = Filter::new()
+                .authors(authors)
+                .kind(Kind::LongFormTextNote)
+                .since(Timestamp::from(article_since as u64))
+                .limit(article_limit);
+
+            filters.push(article_filter);
         }
 
         // Metadata filter for pubkeys needing relay refresh

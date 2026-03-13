@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Link } from "react-router-dom";
 import { Badge } from "../components/Badge";
 import { Avatar } from "../components/Avatar";
+import { KindBreakdownChart } from "../components/KindBreakdownChart";
 import { formatBytes } from "../utils/format";
 import { useAppContext } from "../context/AppContext";
 import { useProfileContext } from "../context/ProfileContext";
@@ -36,68 +37,6 @@ interface KindCountsResult {
 interface TrackedProfileSummary {
   pubkey: string;
   picture: string | null;
-}
-
-interface KindCategory {
-  label: string;
-  emoji: string;
-  kinds: number[];
-}
-
-/* ------------------------------------------------------------------ */
-/*  Constants                                                          */
-/* ------------------------------------------------------------------ */
-
-const KIND_CATEGORIES: KindCategory[] = [
-  { label: "Notes",      emoji: "\u{1F4DD}", kinds: [1] },
-  { label: "Reposts",    emoji: "\u{1F501}", kinds: [6] },
-  { label: "Reactions",  emoji: "\u{2764}\u{FE0F}", kinds: [7] },
-  { label: "Profiles",   emoji: "\u{1F464}", kinds: [0] },
-  { label: "Contacts",   emoji: "\u{1F465}", kinds: [3] },
-  { label: "Articles",   emoji: "\u{1F4C4}", kinds: [30023] },
-  { label: "Zaps",       emoji: "\u{26A1}",  kinds: [9735] },
-  { label: "DMs",        emoji: "\u{1F512}", kinds: [4, 1059] },
-];
-
-/* ------------------------------------------------------------------ */
-/*  Helper: aggregate kind counts into categorised rows               */
-/* ------------------------------------------------------------------ */
-
-interface KindRow {
-  label: string;
-  emoji: string;
-  count: number;
-}
-
-function aggregateKindRows(counts: Record<string, number>): KindRow[] {
-  const remaining = new Map<number, number>();
-  for (const [k, v] of Object.entries(counts)) {
-    remaining.set(Number(k), v);
-  }
-
-  const rows: KindRow[] = [];
-
-  for (const cat of KIND_CATEGORIES) {
-    let total = 0;
-    for (const k of cat.kinds) {
-      total += remaining.get(k) || 0;
-      remaining.delete(k);
-    }
-    if (total > 0) {
-      rows.push({ label: cat.label, emoji: cat.emoji, count: total });
-    }
-  }
-
-  // Other -- everything not categorised
-  let otherCount = 0;
-  for (const v of remaining.values()) otherCount += v;
-  if (otherCount > 0) {
-    rows.push({ label: "Other", emoji: "\u{1F4E6}", count: otherCount });
-  }
-
-  // Sort descending by count
-  rows.sort((a, b) => b.count - a.count);
-  return rows;
 }
 
 /* ------------------------------------------------------------------ */
@@ -203,16 +142,6 @@ export const Storage: React.FC = () => {
         : "\u2014";
     return `Event range: ${oldest} \u2192 ${newest}`;
   }, [storageStats]);
-
-  const kindRows = useMemo(() => {
-    if (!kindCounts) return null;
-    return aggregateKindRows(kindCounts);
-  }, [kindCounts]);
-
-  const maxKindCount = useMemo(() => {
-    if (!kindRows || kindRows.length === 0) return 0;
-    return kindRows[0].count;
-  }, [kindRows]);
 
   /* --- render ------------------------------------------------------- */
   return (
@@ -381,44 +310,7 @@ export const Storage: React.FC = () => {
       {/* ---- Kind breakdown ---- */}
       <div className="kind-breakdown-separator" />
 
-      <div className="kind-breakdown-section">
-        <div className="kind-breakdown-title">Event Breakdown</div>
-        <div className="kind-breakdown-list">
-          {/* Loading state */}
-          {!kindCounts && !kindError && (
-            <div style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>Loading...</div>
-          )}
-
-          {/* Error state */}
-          {kindError && (
-            <div style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>
-              Unable to load breakdown
-            </div>
-          )}
-
-          {/* Empty state */}
-          {kindRows && kindRows.length === 0 && (
-            <div style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>No events stored</div>
-          )}
-
-          {/* Breakdown rows */}
-          {kindRows &&
-            kindRows.length > 0 &&
-            kindRows.map((row) => {
-              const pct = maxKindCount > 0 ? (row.count / maxKindCount) * 100 : 0;
-              return (
-                <div className="kind-breakdown-row" key={row.label}>
-                  <span className="kind-breakdown-emoji">{row.emoji}</span>
-                  <span className="kind-breakdown-label">{row.label}</span>
-                  <div className="kind-breakdown-bar-wrap">
-                    <div className="kind-breakdown-bar" style={{ width: `${pct}%` }} />
-                  </div>
-                  <span className="kind-breakdown-count">{row.count.toLocaleString()}</span>
-                </div>
-              );
-            })}
-        </div>
-      </div>
+      <KindBreakdownChart title="Event Breakdown" kindCounts={kindCounts} error={kindError} />
     </div>
   );
 };
