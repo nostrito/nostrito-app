@@ -1,5 +1,6 @@
 import React from "react";
 import { NavLink } from "react-router-dom";
+import logoUrl from "../assets/logo.png";
 import { IconDashboard, IconFeed, IconMessageCircle, IconNetwork, IconDatabase, IconSettings } from "./Icon";
 import { useAppContext } from "../context/AppContext";
 
@@ -17,6 +18,9 @@ export const Sidebar: React.FC = () => {
 
   return (
     <aside className="app-sidebar-nav">
+      <div className="sidebar-logo">
+        <img src={logoUrl} alt="nostrito" style={{ width: 36, height: 36, borderRadius: 6, display: "block", margin: "0 auto 8px" }} />
+      </div>
       {navItems.map((item) => (
         <NavLink
           key={item.to}
