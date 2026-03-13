@@ -152,6 +152,8 @@ export const Feed: React.FC = () => {
   const oldestNoteTimestamp = useRef<number | null>(null);
   const oldestArticleTimestamp = useRef<number | null>(null);
   const articleLoadingRef = useRef(false);
+  const feedColumnRef = useRef<HTMLDivElement>(null);
+  const [newPostCount, setNewPostCount] = useState(0);
 
   // Listen for sync tier completion to trigger refresh
   const tierEvent = useTauriEvent<{ tier: number }>("sync:tier_complete");
@@ -178,15 +180,11 @@ export const Feed: React.FC = () => {
       let rawEvents: NostrEvent[];
 
       if (feedMode === "global") {
-        // Fetch from relays for global mode (events are NOT persisted)
         rawEvents = await invoke<NostrEvent[]>("fetch_global_feed", { limit: 50 });
       } else {
-        // WoT mode: query local DB (follows only)
-        const [rawNotes, rawArticles] = await Promise.all([
-          invoke<NostrEvent[]>("get_feed", { filter: { kinds: [1, 6], limit: 50, wot_only: true } }),
-          invoke<NostrEvent[]>("get_feed", { filter: { kinds: [30023], limit: 20, wot_only: true } }),
-        ]);
-        rawEvents = [...rawArticles, ...rawNotes];
+        rawEvents = await invoke<NostrEvent[]>("get_feed", {
+          filter: { kinds: [1, 6, 30023], limit: 50, wot_only: true },
+        });
       }
 
       const kindFiltered = rawEvents.filter((e) => FEED_KINDS.includes(e.kind));
@@ -203,6 +201,12 @@ export const Feed: React.FC = () => {
         renderedEventIdsRef.current.add(e.id);
       }
 
+      // Track new posts for banner when user is scrolled down
+      const scrollEl = feedColumnRef.current;
+      if (scrollEl && scrollEl.scrollTop > 50 && feedEvents.length > 0) {
+        setNewPostCount((prev) => prev + newEvents.length);
+      }
+
       setFeedEvents((prev) => {
         const existingIds = new Set(prev.map((e) => e.id));
         const toAdd = newEvents.filter((e) => !existingIds.has(e.id));
@@ -216,7 +220,7 @@ export const Feed: React.FC = () => {
     } finally {
       feedLoadingRef.current = false;
     }
-  }, [feedMode, ensureProfiles]);
+  }, [feedMode, ensureProfiles, feedEvents.length]);
 
   // Track oldest timestamps for pagination
   useEffect(() => {
@@ -376,7 +380,6 @@ export const Feed: React.FC = () => {
         });
       }
 
-      // Only mark end when backend returned fewer than requested
       if (rawEvents.length === 0) {
         setHasMore(false);
         return;
@@ -408,7 +411,7 @@ export const Feed: React.FC = () => {
   }, [feedMode, isSearchMode, hasMore, ensureProfiles]);
 
   const loadMoreArticles = useCallback(async () => {
-    if (articleLoadingRef.current || isSearchMode || !hasMoreArticles || feedMode === "global") return;
+    if (articleLoadingRef.current || isSearchMode || !hasMoreArticles) return;
     const oldest = oldestArticleTimestamp.current;
     if (oldest === null) return;
     const until = oldest - 1;
@@ -417,9 +420,16 @@ export const Feed: React.FC = () => {
     setLoadingMoreArticles(true);
 
     try {
-      const rawEvents = await invoke<NostrEvent[]>("get_feed", {
-        filter: { kinds: [30023], limit: 20, wot_only: true, until },
-      });
+      let rawEvents: NostrEvent[];
+
+      if (feedMode === "global") {
+        rawEvents = await invoke<NostrEvent[]>("fetch_global_feed", { limit: 30, until });
+        rawEvents = rawEvents.filter((e) => e.kind === 30023);
+      } else {
+        rawEvents = await invoke<NostrEvent[]>("get_feed", {
+          filter: { kinds: [30023], limit: 20, wot_only: true, until },
+        });
+      }
 
       if (rawEvents.length === 0) {
         setHasMoreArticles(false);
@@ -491,6 +501,7 @@ export const Feed: React.FC = () => {
     setHasMore(true);
     setHasMoreArticles(true);
     setRelayFetched(false);
+    setNewPostCount(0);
     if (feedMode === "global") {
       setGlobalConsent(false);
       setLoading(false);
@@ -673,10 +684,13 @@ export const Feed: React.FC = () => {
     };
   }, []);
 
-  // Scroll handlers for infinite scroll (must be before any conditional returns — Rules of Hooks)
+  // Scroll handlers for infinite scroll
   const handleNotesScroll = useCallback(
     (e: React.UIEvent<HTMLDivElement>) => {
       const el = e.currentTarget;
+      if (el.scrollTop < 50) {
+        setNewPostCount(0);
+      }
       if (el.scrollHeight - el.scrollTop - el.clientHeight < 400) {
         loadMoreEvents();
       }
@@ -722,7 +736,7 @@ export const Feed: React.FC = () => {
     : notes.filter((e) => kindTag(e.kind) === activeFilter)
   ).filter((e) => !groupedRepostEventIds.has(e.id));
 
-  // Layout: articles on left carousel, notes on right
+  // Layout: articles on right column, notes on left
   const showArticleColumn = (activeFilter === "all" || activeFilter === "long-form") && articles.length > 0;
   const showNotesColumn = activeFilter !== "long-form";
 
@@ -799,7 +813,20 @@ export const Feed: React.FC = () => {
       <div className="feed-layout">
         {/* Notes column (left) with infinite scroll */}
         {showNotesColumn && (
-          <div className="feed-notes-column" onScroll={handleNotesScroll}>
+          <div className="feed-notes-column" ref={feedColumnRef} onScroll={handleNotesScroll}>
+            {newPostCount > 0 && (
+              <button
+                className="feed-new-posts-banner"
+                onClick={() => {
+                  feedColumnRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+                  setNewPostCount(0);
+                }}
+              >
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" width="14" height="14"><path d="M12 19V5"/><path d="M5 12l7-7 7 7"/></svg>
+                {newPostCount} new post{newPostCount > 1 ? "s" : ""}
+              </button>
+            )}
+
             {feedMode === "global" && !globalConsent && !isSearchMode && (
               <div className="global-consent">
                 <div className="global-consent-icon">
@@ -893,12 +920,8 @@ export const Feed: React.FC = () => {
                 {loadingMoreArticles && <span className="feed-sentinel-text">Loading more...</span>}
               </div>
             )}
-            {!hasMoreArticles && articles.length > 0 && feedMode === "wot" && !relayFetched && (
-              <div className="feed-end feed-relay-prompt">
-                <button className="feed-relay-fetch-btn" onClick={fetchFromRelays} disabled={fetchingRelay}>
-                  {fetchingRelay ? "Fetching..." : "Fetch from relays?"}
-                </button>
-              </div>
+            {!hasMoreArticles && articles.length > 0 && (
+              <div className="feed-end">No more articles</div>
             )}
           </div>
         )}
@@ -921,12 +944,8 @@ export const Feed: React.FC = () => {
                 {loadingMoreArticles && <span className="feed-sentinel-text">Loading more...</span>}
               </div>
             )}
-            {!hasMoreArticles && articles.length > 0 && feedMode === "wot" && !relayFetched && (
-              <div className="feed-end feed-relay-prompt">
-                <button className="feed-relay-fetch-btn" onClick={fetchFromRelays} disabled={fetchingRelay}>
-                  {fetchingRelay ? "Fetching..." : "Fetch from relays?"}
-                </button>
-              </div>
+            {!hasMoreArticles && articles.length > 0 && (
+              <div className="feed-end">No more articles</div>
             )}
           </div>
         )}

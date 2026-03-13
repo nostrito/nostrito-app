@@ -76,6 +76,7 @@ export interface SyncStats {
   pass_relays_done: number;
   pass_relays_total: number;
   follows_count: number;
+  current_phase: string;
 }
 
 export interface SyncProgress {

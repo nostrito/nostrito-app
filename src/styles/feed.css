@@ -617,11 +617,65 @@
   overflow-y: auto;
 }
 
-/* Right notes column */
+/* Notes column */
 .feed-notes-column {
   flex: 1;
   overflow-y: auto;
   min-width: 0;
+  position: relative;
+}
+
+/* New posts banner */
+.feed-new-posts-banner {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  padding: 8px 16px;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  font-size: 0.82rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.feed-new-posts-banner:hover {
+  background: var(--accent-hover, #6d28d9);
+}
+
+/* Reply context */
+.reply-context {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  padding: 4px 0 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border-left: 2px solid var(--border);
+  padding-left: 8px;
+  margin-bottom: 6px;
+}
+.reply-context-header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.reply-context-preview {
+  color: var(--text-dim, #888);
+  font-size: 0.75rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 500px;
+}
+.reply-context-loading,
+.reply-context-missing {
+  font-style: italic;
 }
 
 /* Infinite scroll sentinel */

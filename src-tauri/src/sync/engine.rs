@@ -214,8 +214,6 @@ impl SyncEngine {
 
     /// Phase 1: Fetch own profile, contact list, and all own events.
     async fn phase_own_data(&self) -> Result<()> {
-        self.sync_tier.store(1, Ordering::Relaxed);
-
         let pk = PublicKey::from_hex(&self.hex_pubkey)?;
 
         // Fetch own metadata + contacts (replaceable events — always get latest)
@@ -288,8 +286,6 @@ impl SyncEngine {
 
     /// Phase 2: Discover relay information for follows.
     async fn phase_discovery(&self) -> Result<()> {
-        self.sync_tier.store(2, Ordering::Relaxed);
-
         let discovery = Discovery::new(
             Arc::clone(&self.db),
             Arc::clone(&self.graph),
@@ -310,8 +306,6 @@ impl SyncEngine {
 
     /// Phase 3: Relay-centric content fetch.
     async fn phase_content(&self) -> Result<()> {
-        self.sync_tier.store(3, Ordering::Relaxed);
-
         let discovery = Discovery::new(
             Arc::clone(&self.db),
             Arc::clone(&self.graph),
@@ -371,8 +365,6 @@ impl SyncEngine {
 
     /// Phase 5: Download queued media.
     async fn phase_media(&self) -> Result<()> {
-        self.sync_tier.store(4, Ordering::Relaxed);
-
         let media = MediaDownloader::new(
             Arc::clone(&self.db),
             self.hex_pubkey.clone(),
@@ -390,7 +382,7 @@ impl SyncEngine {
             ss.tier4_fetched += stats.downloaded as u64;
         }
 
-        self.emit_tier_complete(4);
+        self.emit_tier_complete(5);
         Ok(())
     }
 
@@ -405,6 +397,22 @@ impl SyncEngine {
 
     /// WoT crawl — fetch contact lists for follows-of-follows.
     async fn phase_wot_crawl(&self) -> Result<()> {
+        // Make WoT crawl visible to the dashboard (runs after the 5 main phases)
+        self.sync_tier.store(6, Ordering::Relaxed);
+        if let Ok(mut ss) = self.sync_stats.try_write() {
+            ss.current_tier = 6;
+            ss.current_layer = "2".to_string();
+            ss.current_phase = "WoT Crawl".to_string();
+            ss.pass_pubkeys_done = 0;
+            ss.pass_pubkeys_total = 0;
+        }
+        self.app_handle.emit("sync:progress", &SyncProgress {
+            tier: 6,
+            fetched: 0,
+            total: 0,
+            relay: "WoT Crawl".to_string(),
+        }).ok();
+
         let follows = self.graph.get_follows(&self.hex_pubkey).unwrap_or_default();
 
         // Get follows-of-follows that need contact list updates
@@ -481,13 +489,19 @@ impl SyncEngine {
             SyncPhase::OwnData => "0",
             SyncPhase::Discovery => "",
             SyncPhase::ContentFetch => "",
-            SyncPhase::ThreadContext => "",
+            SyncPhase::ThreadContext => "thread",
             SyncPhase::MediaDownload => "",
         };
+
+        // Set sync_tier atomically BEFORE updating stats and emitting events,
+        // so any IPC call to get_status sees the correct tier immediately.
+        self.sync_tier.store(phase as u8, Ordering::Relaxed);
+
         // Update sync_stats with current phase info and clear stale progress
         if let Ok(mut ss) = self.sync_stats.try_write() {
             ss.current_tier = phase as u8;
             ss.current_layer = layer.to_string();
+            ss.current_phase = phase.label().to_string();
             // Clear progress counters so the dashboard doesn't show
             // stale values from a previous phase/layer
             ss.pass_pubkeys_done = 0;
@@ -520,6 +534,7 @@ impl SyncEngine {
             if let Ok(mut ss) = self.sync_stats.try_write() {
                 ss.current_tier = 0;
                 ss.current_layer = String::new();
+                ss.current_phase = String::new();
                 ss.pass_pubkeys_done = 0;
                 ss.pass_pubkeys_total = 0;
             }

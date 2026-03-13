@@ -42,7 +42,17 @@ impl ContentFetch {
     }
 
     /// Run the full content fetch phase.
-    /// Fetches in priority order: tracked accounts first, then follows, then optionally FoF.
+    ///
+    /// Fetches in three priority passes (layers), each with its own media priority
+    /// and cursor logic:
+    ///   - **Pass 1 (Layer 0.5):** Tracked profiles — explicitly pinned by the user.
+    ///   - **Pass 2 (Layer 1):** Direct follows — the user's contact list.
+    ///   - **Pass 3 (Layer 2):** WoT peers — a random sample of follows-of-follows,
+    ///     weighted by social overlap. Capped at `wot_notes_per_cycle` events to
+    ///     avoid overwhelming bandwidth for the thousands of FoF pubkeys in the graph.
+    ///
+    /// Each pass groups pubkeys by relay (NIP-65 outbox model) and fetches in
+    /// sub-chunks of 30 to respect relay filter limits.
     pub async fn run(
         &self,
         pubkeys_needing_relay_refresh: &[String],
@@ -201,7 +211,10 @@ impl ContentFetch {
 
         // Flatten routes into chunks: split large relay batches into groups of
         // MAX_PUBKEYS_PER_SUB to avoid hitting relay filter limits and to keep
-        // the event limit meaningful per author.
+        // the event limit meaningful per author.  With 30 authors and a limit
+        // of ~200-300 events, each author gets a fair share of the result set.
+        // Larger batches risk relays rejecting the filter or returning results
+        // heavily skewed towards the most prolific authors.
         const MAX_PUBKEYS_PER_SUB: usize = 30;
 
         let mut chunks: Vec<(&str, Vec<&[String]>)> = Vec::new();
@@ -471,10 +484,14 @@ impl ContentFetch {
         }
     }
 
-    /// Get follows-of-follows sorted by how many of our follows also follow them.
-    /// Returns up to 200 FoF pubkeys, excluding direct follows and self.
-    /// Get a random sample of WoT peers (FoF and beyond), weighted by overlap.
+    /// Get a random sample of WoT peers (follows-of-follows and beyond).
     /// Excludes own pubkey, tracked profiles, and direct follows.
+    ///
+    /// Weighting: peers are repeated in the shuffle pool proportional to
+    /// `sqrt(overlap_count)` — the number of your follows who also follow them.
+    /// sqrt dampens the bias so high-overlap peers are *more likely* to be
+    /// picked but don't completely crowd out low-overlap ones, giving the
+    /// broader WoT a chance to surface interesting content.
     fn get_random_wot_peers(
         &self,
         follows: &[String],
@@ -584,6 +601,7 @@ impl ContentFetch {
 
         let plan = scheduler::build_routing_plan(&pubkey_relays, &muted);
 
+        // Same chunk size as fetch_pubkey_set — see comment there.
         const MAX_PUBKEYS_PER_SUB: usize = 30;
 
         let mut chunks: Vec<(&str, Vec<&[String]>)> = Vec::new();
@@ -608,7 +626,8 @@ impl ContentFetch {
 
         'outer: for (relay_url, sub_chunks) in &chunks {
             for chunk in sub_chunks {
-                // Stop if we've collected enough notes
+                // Stop once we've hit the per-cycle budget (wot_notes_per_cycle).
+                // We don't need to sync the entire WoT each cycle — just sample it.
                 if events_stored >= max_notes {
                     info!("WoT content: reached {} notes limit at chunk {}/{}", max_notes, chunk_idx, total_chunks);
                     break 'outer;

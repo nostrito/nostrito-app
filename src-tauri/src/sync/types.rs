@@ -49,6 +49,9 @@ pub struct SyncStats {
     pub pass_relays_total: u64,
     /// Number of direct follows (for Layer 1 display).
     pub follows_count: u64,
+    /// Human-readable phase name: "Own Data", "Discovery", "Content Fetch",
+    /// "Thread Context", "Media Download", "WoT Crawl", or "" (idle).
+    pub current_phase: String,
 }
 
 // ── Sync Config ────────────────────────────────────────────────────
@@ -78,6 +81,10 @@ impl Default for SyncConfig {
             wot_batch_size: 5,
             wot_events_per_batch: 15,
             cycle_interval_secs: 300,
+            // Budget of WoT (FoF) notes to fetch per cycle. Kept low because
+            // the WoT graph can contain tens of thousands of peers; fetching
+            // all of them would be slow and bandwidth-heavy. A small sample
+            // each cycle gradually builds a picture of the broader network.
             wot_notes_per_cycle: 50,
         }
     }

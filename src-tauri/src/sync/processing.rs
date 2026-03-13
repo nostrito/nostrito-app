@@ -507,7 +507,8 @@ pub fn is_media_url(url: &str) -> bool {
 }
 
 /// Process a batch of events, returning aggregate results.
-/// When `app_handle` is provided, emits `event:stored` for each newly stored event.
+/// When `app_handle` is provided, emits a single `events:batch` with all newly stored events
+/// (batched to reduce IPC overhead and prevent race conditions with tier status).
 pub fn process_events(
     events: &[Event],
     db: &Arc<Database>,
@@ -520,6 +521,7 @@ pub fn process_events(
 ) -> (u32, u32) {
     let mut stored = 0u32;
     let mut wot_updates = 0u32;
+    let mut batch: Vec<StoredEventNotification> = Vec::new();
 
     // Sort newest-first so replaceable events are processed correctly
     let mut sorted: Vec<&Event> = events.iter().collect();
@@ -547,7 +549,7 @@ pub fn process_events(
 
         if result.stored {
             stored += 1;
-            if let Some(handle) = app_handle {
+            if app_handle.is_some() {
                 // Build content preview and extract media URLs — all wrapped in catch_unwind for safety
                 let (content, media_urls) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let raw = event.content.to_string();
@@ -587,18 +589,25 @@ pub fn process_events(
                     (content, urls)
                 })).unwrap_or_default();
 
-                handle.emit("event:stored", &StoredEventNotification {
+                batch.push(StoredEventNotification {
                     id: event.id.to_hex(),
                     kind: event.kind.as_u16() as u32,
                     pubkey: event.pubkey.to_hex(),
                     content,
                     layer: layer.to_string(),
                     media_urls,
-                }).ok();
+                });
             }
         }
         if result.wot_updated {
             wot_updates += 1;
+        }
+    }
+
+    // Emit all stored events as a single batch to reduce IPC overhead
+    if !batch.is_empty() {
+        if let Some(handle) = app_handle {
+            handle.emit("events:batch", &batch).ok();
         }
     }
 
