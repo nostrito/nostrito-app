@@ -130,6 +130,17 @@ impl Database {
                 tracked_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
                 note TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS bookmarked_media (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL,
+                media_url TEXT NOT NULL,
+                event_json TEXT NOT NULL,
+                profile_json TEXT NOT NULL,
+                bookmarked_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                UNIQUE(event_id, media_url)
+            );
+            CREATE INDEX IF NOT EXISTS idx_bookmarked_media_at ON bookmarked_media(bookmarked_at DESC);
         "#,
         )?;
 
@@ -716,10 +727,27 @@ impl Database {
 
         if let Some(q) = keyword {
             let lower_q = q.to_lowercase();
-            let idx = param_values.len() + 1;
-            // Case-insensitive search in content and tags (for hashtags)
-            sql.push_str(&format!(" AND (LOWER(content) LIKE ?{0} OR LOWER(tags) LIKE ?{0})", idx));
-            param_values.push(Box::new(format!("%{}%", lower_q)));
+            if lower_q.starts_with('#') && lower_q.len() > 1 {
+                // Hashtag search: match in content AND search t-tags in JSON
+                let tag_name = &lower_q[1..];
+                let idx_content = param_values.len() + 1;
+                let idx_tag = param_values.len() + 2;
+                sql.push_str(&format!(
+                    " AND (LOWER(content) LIKE ?{} OR EXISTS (\
+                        SELECT 1 FROM json_each(tags) \
+                        WHERE json_extract(value, '$[0]') = 't' \
+                        AND LOWER(json_extract(value, '$[1]')) = ?{}\
+                    ))",
+                    idx_content, idx_tag
+                ));
+                param_values.push(Box::new(format!("%{}%", lower_q)));
+                param_values.push(Box::new(tag_name.to_string()));
+            } else {
+                // General keyword search in content and tags
+                let idx = param_values.len() + 1;
+                sql.push_str(&format!(" AND (LOWER(content) LIKE ?{0} OR LOWER(tags) LIKE ?{0})", idx));
+                param_values.push(Box::new(format!("%{}%", lower_q)));
+            }
         }
 
         if let Some(author_pk) = author {
@@ -2592,6 +2620,105 @@ impl Database {
         }
 
         Ok(ids_to_delete.len() as u64)
+    }
+
+    // ── Bookmarked Media Methods ──────────────────────────────────
+
+    pub fn bookmark_media(
+        &self,
+        event_id: &str,
+        media_url: &str,
+        event_json: &str,
+        profile_json: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "INSERT OR IGNORE INTO bookmarked_media (event_id, media_url, event_json, profile_json)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![event_id, media_url, event_json, profile_json],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn unbookmark_media(&self, event_id: &str, media_url: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "DELETE FROM bookmarked_media WHERE event_id = ?1 AND media_url = ?2",
+            params![event_id, media_url],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn is_media_bookmarked(&self, event_id: &str, media_url: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM bookmarked_media WHERE event_id = ?1 AND media_url = ?2",
+            params![event_id, media_url],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn get_bookmarked_media(&self) -> Result<Vec<(String, String, String, String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT event_id, media_url, event_json, profile_json, bookmarked_at
+             FROM bookmarked_media ORDER BY bookmarked_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Find an event whose content contains the given media URL.
+    pub fn find_event_by_media_url(&self, media_url: &str, pubkey: Option<&str>) -> Result<Option<(String, String, i64, i64, String, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let row = if let Some(pk) = pubkey {
+            conn.query_row(
+                "SELECT id, pubkey, created_at, kind, tags, content, sig FROM nostr_events
+                 WHERE pubkey = ?1 AND content LIKE '%' || ?2 || '%' LIMIT 1",
+                params![pk, media_url],
+                |row| Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                )),
+            )
+        } else {
+            conn.query_row(
+                "SELECT id, pubkey, created_at, kind, tags, content, sig FROM nostr_events
+                 WHERE content LIKE '%' || ?1 || '%' LIMIT 1",
+                params![media_url],
+                |row| Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                )),
+            )
+        };
+        match row {
+            Ok(r) => Ok(Some(r)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 

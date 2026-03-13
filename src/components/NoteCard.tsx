@@ -1,10 +1,11 @@
 /** Shared note/repost card used in Feed and ProfileView */
-import React, { useMemo } from "react";
+import React, { useMemo, useState, useEffect } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { IconMessageCircle, IconRepeat, IconZap, IconBookmark } from "./Icon";
 import { Avatar } from "./Avatar";
 import { timeAgo } from "../utils/format";
 import { kindLabel } from "../utils/ui";
-import { renderMediaHtml, stripMediaUrls } from "../utils/media";
+import { renderMediaHtml, stripMediaUrls, type MediaContext } from "../utils/media";
 import { profileDisplayName, type ProfileInfo } from "../utils/profiles";
 import { extractMentionedPubkeys, replaceMentions, normalizeBareEntities } from "../utils/mentions";
 import { useProfileContext } from "../context/ProfileContext";
@@ -47,12 +48,86 @@ function escapeHtml(str: string): string {
     .replace(/"/g, "&quot;");
 }
 
+/** Extract the parent event ID from a reply note's e-tags (NIP-10). */
+function getReplyParentId(event: NostrEvent): string | null {
+  if (event.kind !== 1) return null;
+  const eTags = event.tags.filter((t) => t[0] === "e");
+  if (eTags.length === 0) return null;
+  const replyTag = eTags.find((t) => t[3] === "reply");
+  if (replyTag) return replyTag[1];
+  const rootTag = eTags.find((t) => t[3] === "root");
+  if (rootTag && eTags.length === 1) return rootTag[1];
+  return eTags[eTags.length - 1][1];
+}
+
+/** Shows parent note context for reply notes. */
+const ReplyContext: React.FC<{ parentId: string }> = ({ parentId }) => {
+  const [parent, setParent] = useState<NostrEvent | null>(null);
+  const [status, setStatus] = useState<"loading" | "loaded" | "not-found">("loading");
+  const { getProfile, ensureProfiles } = useProfileContext();
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const ev = await invoke<NostrEvent | null>("get_event", { id: parentId });
+        if (cancelled) return;
+        if (ev) {
+          setParent(ev);
+          setStatus("loaded");
+          ensureProfiles([ev.pubkey]);
+        } else {
+          const fetched = await invoke<NostrEvent[]>("fetch_events_by_ids", { ids: [parentId] });
+          if (cancelled) return;
+          if (fetched.length > 0) {
+            setParent(fetched[0]);
+            setStatus("loaded");
+            ensureProfiles([fetched[0].pubkey]);
+          } else {
+            setStatus("not-found");
+          }
+        }
+      } catch {
+        if (!cancelled) setStatus("not-found");
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [parentId, ensureProfiles]);
+
+  if (status === "loading") {
+    return <div className="reply-context reply-context-loading">Loading parent note...</div>;
+  }
+  if (status === "not-found" || !parent) {
+    return (
+      <div className="reply-context reply-context-missing">
+        <span className="reply-context-header">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" width="12" height="12"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg>
+          Replying to a note (not found)
+        </span>
+      </div>
+    );
+  }
+  const profile = getProfile(parent.pubkey);
+  const name = profileDisplayName(profile, parent.pubkey);
+  const preview = parent.content.slice(0, 120) + (parent.content.length > 120 ? "\u2026" : "");
+  return (
+    <div className="reply-context" data-note-id={parent.id} style={{ cursor: "pointer" }}>
+      <span className="reply-context-header">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" width="12" height="12"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg>
+        Replying to <span data-pubkey={parent.pubkey} style={{ color: "var(--accent-light)", cursor: "pointer" }}>{name}</span>
+      </span>
+      <span className="reply-context-preview">{preview}</span>
+    </div>
+  );
+};
+
 function renderEventContent(
   content: string,
   mentionProfiles?: Map<string, ProfileInfo | undefined>,
   full?: boolean,
+  mediaCtx?: MediaContext,
 ): { cleanedHtml: string; mediaHtml: string } {
-  const mediaHtml = renderMediaHtml(content);
+  const mediaHtml = renderMediaHtml(content, mediaCtx);
   const stripped = stripMediaUrls(content);
   const normalized = normalizeBareEntities(stripped);
   const cleaned = full ? normalized : normalized.slice(0, 280);
@@ -227,7 +302,7 @@ const NoteCardInner: React.FC<{
     return map;
   }, [mentionedPubkeys, getProfile]);
 
-  const eventContent = renderEventContent(event.content, mentionProfiles, full);
+  const eventContent = renderEventContent(event.content, mentionProfiles, full, { eventId: event.id, pubkey: event.pubkey });
 
   return (
     <div className="repost-original">
@@ -294,7 +369,7 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, ful
     const originalProfile = getProfile(original.pubkey);
     const originalDisplayName = profileDisplayName(originalProfile, original.pubkey);
     const reposterDisplayName = displayName;
-    const repostContent = renderEventContent(original.content, mentionProfiles, full);
+    const repostContent = renderEventContent(original.content, mentionProfiles, full, { eventId: original.id || event.id, pubkey: original.pubkey });
 
     const handleRepostClick = (e: React.MouseEvent) => {
       if ((e.target as HTMLElement).closest("[data-pubkey]")) return;
@@ -350,7 +425,8 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, ful
     );
   }
 
-  const eventContent = renderEventContent(event.content, mentionProfiles, full);
+  const eventContent = renderEventContent(event.content, mentionProfiles, full, { eventId: event.id, pubkey: event.pubkey });
+  const replyParentId = useMemo(() => getReplyParentId(event), [event.id, event.tags]);
 
   const handleClick = (e: React.MouseEvent) => {
     if ((e.target as HTMLElement).closest("[data-pubkey]")) return;
@@ -373,6 +449,7 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, ful
           <span className={`ev-kind-tag ${k.cls}`}>{k.tag}</span>
           <span className="ev-time">{timeAgo(event.created_at, false)}</span>
         </div>
+        {replyParentId && <ReplyContext parentId={replyParentId} />}
         <div className="ev-text" dangerouslySetInnerHTML={{ __html: eventContent.cleanedHtml }} />
         {eventContent.mediaHtml && (
           <div dangerouslySetInnerHTML={{ __html: eventContent.mediaHtml }} />

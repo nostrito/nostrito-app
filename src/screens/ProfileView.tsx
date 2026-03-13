@@ -310,9 +310,9 @@ export const ProfileView: React.FC = () => {
   }, [loadMoreNotes, hasMoreNotes, activeTab]);
 
   /* --- media viewer opener ------------------------------------------ */
-  const openViewer = useCallback((url: string) => {
+  const openViewer = useCallback((url: string, type?: "image" | "video", originalUrl?: string) => {
     if (typeof (window as any).openMediaViewer === "function") {
-      (window as any).openMediaViewer(url);
+      (window as any).openMediaViewer(url, type, { pubkey, originalUrl: originalUrl || url });
     }
   }, []);
 
@@ -653,7 +653,7 @@ export const ProfileView: React.FC = () => {
                             <div
                               key={item.hash}
                               className="my-media-card"
-                              onClick={() => openViewer(localSrc)}
+                              onClick={() => openViewer(localSrc, "image", item.url)}
                               title={tooltip}
                             >
                               <img
@@ -673,7 +673,7 @@ export const ProfileView: React.FC = () => {
                             <div
                               key={item.hash}
                               className="my-media-card video"
-                              onClick={() => openViewer(localSrc)}
+                              onClick={() => openViewer(localSrc, "video", item.url)}
                               title={tooltip}
                             >
                               <video src={localSrc} preload="metadata" muted />

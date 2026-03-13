@@ -155,7 +155,7 @@ pub struct WotStatus {
     pub nodes_with_follows: usize,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NostrEvent {
     pub id: String,
     pub pubkey: String,
@@ -314,7 +314,9 @@ async fn get_status(state: State<'_, AppState>) -> Result<AppStatus, String> {
                 1 => "syncing (phase 1: own data)".into(),
                 2 => "syncing (phase 2: discovery)".into(),
                 3 => "syncing (phase 3: content)".into(),
-                4 => "syncing (phase 4: media)".into(),
+                4 => "syncing (phase 4: threads)".into(),
+                5 => "syncing (phase 5: media)".into(),
+                6 => "syncing (wot crawl)".into(),
                 _ => "idle".into(),
             }
         } else {
@@ -933,11 +935,11 @@ async fn get_note_reactions(
 }
 
 #[tauri::command]
-async fn fetch_global_feed(limit: Option<u32>, state: State<'_, AppState>) -> Result<Vec<NostrEvent>, String> {
+async fn fetch_global_feed(limit: Option<u32>, until: Option<u64>, state: State<'_, AppState>) -> Result<Vec<NostrEvent>, String> {
     use nostr_sdk::prelude::*;
 
     let lim = limit.unwrap_or(50);
-    tracing::info!("[cmd:fetch_global_feed] limit={}", lim);
+    tracing::info!("[cmd:fetch_global_feed] limit={}, until={:?}", lim, until);
 
     let cfg = state.config.read().await;
     let hex_pubkey = cfg.hex_pubkey.clone().unwrap_or_default();
@@ -949,18 +951,27 @@ async fn fetch_global_feed(limit: Option<u32>, state: State<'_, AppState>) -> Re
         return Err("No relays available".into());
     }
 
-    tracing::info!("[fetch_global_feed] querying {} relays", relay_urls.len());
+    let relay_count = relay_urls.len();
+    tracing::info!("[fetch_global_feed] querying {} relays", relay_count);
 
-    let since_ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .saturating_sub(86400); // last 24h
-
-    let filter = Filter::new()
+    let mut filter = Filter::new()
         .kinds(vec![Kind::TextNote, Kind::Repost, Kind::LongFormTextNote])
-        .since(Timestamp::from(since_ts))
         .limit(lim as usize);
+
+    if let Some(until_ts) = until {
+        // Pagination: fetch events before this timestamp
+        filter = filter.until(Timestamp::from(until_ts));
+        let since_ts = until_ts.saturating_sub(86400);
+        filter = filter.since(Timestamp::from(since_ts));
+    } else {
+        // Initial load: last 24h
+        let since_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_sub(86400);
+        filter = filter.since(Timestamp::from(since_ts));
+    }
 
     let client = Client::default();
     for url in &relay_urls {
@@ -981,6 +992,7 @@ async fn fetch_global_feed(limit: Option<u32>, state: State<'_, AppState>) -> Re
     };
 
     let mut all_events: Vec<Event> = Vec::new();
+    let mut eose_count: usize = 0;
     let deadline = tokio::time::sleep(std::time::Duration::from_secs(10));
     tokio::pin!(deadline);
 
@@ -992,10 +1004,16 @@ async fn fetch_global_feed(limit: Option<u32>, state: State<'_, AppState>) -> Re
                         if !all_events.iter().any(|e| e.id == event.id) {
                             all_events.push(*event);
                         }
+                        if all_events.len() >= lim as usize {
+                            break;
+                        }
                     }
                     Ok(RelayPoolNotification::Message { message, .. }) => {
                         if matches!(&message, RelayMessage::EndOfStoredEvents(_)) {
-                            break;
+                            eose_count += 1;
+                            if eose_count >= relay_count {
+                                break;
+                            }
                         }
                     }
                     Ok(_) => {}
@@ -1003,7 +1021,7 @@ async fn fetch_global_feed(limit: Option<u32>, state: State<'_, AppState>) -> Re
                 }
             }
             _ = &mut deadline => {
-                tracing::info!("[fetch_global_feed] timeout, got {} events", all_events.len());
+                tracing::info!("[fetch_global_feed] timeout, got {} events (eose {}/{})", all_events.len(), eose_count, relay_count);
                 break;
             }
         }
@@ -1048,6 +1066,115 @@ async fn save_event(event: NostrEvent, state: State<'_, AppState>) -> Result<boo
         &event.content,
         &event.sig,
     ).map_err(|e| format!("Failed to save event: {}", e))
+}
+
+// ── Bookmarked Media Commands ──────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BookmarkedMediaItem {
+    pub event_id: String,
+    pub media_url: String,
+    pub event: NostrEvent,
+    pub profile: serde_json::Value,
+    pub bookmarked_at: u64,
+}
+
+#[tauri::command]
+async fn bookmark_media(
+    event_id: String,
+    media_url: String,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    tracing::info!("[cmd:bookmark_media] event={}... url={}...", &event_id[..event_id.len().min(12)], &media_url[..media_url.len().min(40)]);
+    let db = state.db();
+
+    // Look up the event
+    let rows = db.query_events(Some(&[event_id.clone()]), None, None, None, None, 1)
+        .map_err(|e| format!("Failed to find event: {}", e))?;
+    let event_row = rows.into_iter().next()
+        .ok_or_else(|| "Event not found in local database".to_string())?;
+
+    let event = NostrEvent {
+        id: event_row.0,
+        pubkey: event_row.1.clone(),
+        created_at: event_row.2 as u64,
+        kind: event_row.3 as u32,
+        tags: serde_json::from_str(&event_row.4).unwrap_or_default(),
+        content: event_row.5,
+        sig: event_row.6,
+    };
+    let event_json = serde_json::to_string(&event).map_err(|e| e.to_string())?;
+
+    // Look up the profile
+    let profiles = db.get_profiles(&[event.pubkey.clone()]).map_err(|e| e.to_string())?;
+    let profile = profiles.into_iter().next().unwrap_or(ProfileInfo {
+        pubkey: event.pubkey.clone(),
+        name: None,
+        display_name: None,
+        picture: None,
+        nip05: None,
+        about: None,
+        banner: None,
+        website: None,
+        lud16: None,
+    });
+    let profile_json = serde_json::to_string(&profile).map_err(|e| e.to_string())?;
+
+    db.bookmark_media(&event_id, &media_url, &event_json, &profile_json)
+        .map_err(|e| format!("Failed to bookmark: {}", e))
+}
+
+#[tauri::command]
+async fn unbookmark_media(
+    event_id: String,
+    media_url: String,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    tracing::info!("[cmd:unbookmark_media] event={}...", &event_id[..event_id.len().min(12)]);
+    state.db().unbookmark_media(&event_id, &media_url)
+        .map_err(|e| format!("Failed to unbookmark: {}", e))
+}
+
+#[tauri::command]
+async fn is_media_bookmarked(
+    event_id: String,
+    media_url: String,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    state.db().is_media_bookmarked(&event_id, &media_url)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_bookmarked_media(state: State<'_, AppState>) -> Result<Vec<BookmarkedMediaItem>, String> {
+    let rows = state.db().get_bookmarked_media().map_err(|e| e.to_string())?;
+    Ok(rows.into_iter().filter_map(|(event_id, media_url, event_json, profile_json, bookmarked_at)| {
+        let event: NostrEvent = serde_json::from_str(&event_json).ok()?;
+        let profile: serde_json::Value = serde_json::from_str(&profile_json).unwrap_or(serde_json::Value::Null);
+        Some(BookmarkedMediaItem { event_id, media_url, event, profile, bookmarked_at: bookmarked_at as u64 })
+    }).collect())
+}
+
+#[tauri::command]
+async fn find_event_for_media(
+    media_url: String,
+    pubkey: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Option<NostrEvent>, String> {
+    let row = state.db()
+        .find_event_by_media_url(&media_url, pubkey.as_deref())
+        .map_err(|e| e.to_string())?;
+    Ok(row.map(|(id, pk, created_at, kind, tags_json, content, sig)| {
+        NostrEvent {
+            id,
+            pubkey: pk,
+            created_at: created_at as u64,
+            kind: kind as u32,
+            tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+            content,
+            sig,
+        }
+    }))
 }
 
 #[tauri::command]
@@ -3234,6 +3361,11 @@ pub fn run() {
             get_note_reactions,
             fetch_global_feed,
             save_event,
+            bookmark_media,
+            unbookmark_media,
+            is_media_bookmarked,
+            get_bookmarked_media,
+            find_event_for_media,
             fetch_events_by_ids,
             search_events,
             search_global,

@@ -110,12 +110,17 @@ interface LayerBadge {
   className: string;
 }
 
-function getLayerBadge(layerId: LayerId, currentLayer: string, wotNotes?: number): LayerBadge {
+function getLayerBadge(layerId: LayerId, currentLayer: string, currentPhase: string, wotNotes?: number): LayerBadge {
   const backendLayer = LAYER_TO_BACKEND[layerId];
 
   // Show DISABLED for Layer 2 when WoT notes is 0
   if (layerId === "2" && wotNotes === 0) {
     return { text: "OFF", className: "sync-tier-badge disabled" };
+  }
+
+  // During Thread Context or Media Download, all content layers are complete
+  if (currentPhase === "Thread Context" || currentPhase === "Media Download") {
+    return { text: "\u2713", className: "sync-tier-badge done" };
   }
 
   if (currentLayer === backendLayer) {
@@ -249,19 +254,21 @@ export const Dashboard: React.FC = () => {
       }
     };
 
-    listen<StoredEventNotification>("event:stored", (event) => {
-      const entry: LiveEntry = {
-        id: event.payload.id,
-        kind: event.payload.kind,
-        pubkey: event.payload.pubkey,
-        content: event.payload.content || "",
+    listen<StoredEventNotification[]>("events:batch", (event) => {
+      const entries: LiveEntry[] = event.payload.map((n) => ({
+        id: n.id,
+        kind: n.kind,
+        pubkey: n.pubkey,
+        content: n.content || "",
         ts: Date.now(),
-        layer: event.payload.layer || "",
-        media_urls: event.payload.media_urls || [],
-      };
+        layer: n.layer || "",
+        media_urls: n.media_urls || [],
+      }));
 
-      queueProfileFetch(entry.pubkey);
-      liveStreamRef.current = [entry, ...liveStreamRef.current].slice(0, LIVE_STREAM_MAX);
+      for (const entry of entries) {
+        queueProfileFetch(entry.pubkey);
+      }
+      liveStreamRef.current = [...entries, ...liveStreamRef.current].slice(0, LIVE_STREAM_MAX);
       cachedLiveStream = liveStreamRef.current;
       setLiveStream(liveStreamRef.current);
     }).then((fn) => { unlisten = fn; });
@@ -423,9 +430,15 @@ export const Dashboard: React.FC = () => {
 
   /* --- derived values ------------------------------------------------ */
   const relayUrl = status ? `wss://localhost:${status.relay_port}` : "";
+  // Idle detection: combine multiple signals. current_phase is the most
+  // reliable positive "engine is active" signal since it's set atomically
+  // with sync_tier inside emit_phase().
+  const currentPhase = status?.sync_stats.current_phase || "";
   const isSyncing =
     status !== null &&
-    (status.sync_tier > 0 || (status.sync_stats.current_layer || "") !== "");
+    (status.sync_tier > 0 ||
+      currentPhase !== "" ||
+      (tierComplete !== null && tierComplete.tier !== 0));
   const currentLayer = status?.sync_stats.current_layer || "";
 
   // Extract short relay progress string from syncProgress (e.g. "wss://relay.damus.io (3/12)" → "relay.damus.io (3/12)")
@@ -474,7 +487,7 @@ export const Dashboard: React.FC = () => {
           <div className="dash-stat-val">
             {status ? status.wot_nodes.toLocaleString() : "\u2014"}
           </div>
-          <div className="dash-stat-label">WoT Peers</div>
+          <div className="dash-stat-label" title="Total unique pubkeys discovered in the social graph (follows, follows-of-follows, and beyond). Only a small sample is synced each cycle.">WoT Peers</div>
         </div>
         <div className="dash-stat">
           <div className="dash-stat-val">
@@ -603,6 +616,11 @@ export const Dashboard: React.FC = () => {
                               src={url}
                               className="live-media-thumb"
                               loading="lazy"
+                              data-media-url={url}
+                              data-original-url={url}
+                              data-event-id={entry.id}
+                              data-event-pubkey={entry.pubkey}
+                              style={{ cursor: "pointer" }}
                               onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
                             />
                           ))}
@@ -624,7 +642,7 @@ export const Dashboard: React.FC = () => {
           {LAYER_IDS.map((lid) => {
             const wotNotes = status?.sync_wot_notes_per_cycle ?? 0;
             const badge = status
-              ? getLayerBadge(lid, currentLayer, wotNotes)
+              ? getLayerBadge(lid, currentLayer, currentPhase, wotNotes)
               : { text: "IDLE", className: "sync-tier-badge idle" };
             const detail = status
               ? getLayerDetail(lid, status.sync_stats, currentLayer, progressRelay, wotNotes)
@@ -652,6 +670,25 @@ export const Dashboard: React.FC = () => {
               </div>
             );
           })}
+
+          {/* Phase indicator for non-content phases */}
+          {currentPhase && !["", "Own Data", "Discovery", "Content Fetch"].includes(currentPhase) && (
+            <div className="sync-tier">
+              <div className="sync-tier-head">
+                <span className="sync-tier-label">{currentPhase}</span>
+                <span className="sync-tier-badge fast">ACTIVE</span>
+              </div>
+              <div className="sync-tier-detail">
+                {currentPhase === "Thread Context"
+                  ? "fetching missing thread roots"
+                  : currentPhase === "WoT Crawl"
+                    ? "updating follow graphs"
+                    : currentPhase === "Media Download"
+                      ? "downloading queued media"
+                      : "working..."}
+              </div>
+            </div>
+          )}
 
           {/* Relays */}
           <div className="sync-tier">

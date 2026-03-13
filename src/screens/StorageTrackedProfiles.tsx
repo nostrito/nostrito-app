@@ -171,9 +171,9 @@ export const StorageTrackedProfiles: React.FC = () => {
     setMediaLoadingProfile(false);
   }, [expandedPubkey]);
 
-  const openViewer = useCallback((url: string, type?: "image" | "video") => {
+  const openViewer = useCallback((url: string, type?: "image" | "video", originalUrl?: string, pubkey?: string) => {
     if (typeof (window as any).openMediaViewer === "function") {
-      (window as any).openMediaViewer(url, type);
+      (window as any).openMediaViewer(url, type, { pubkey, originalUrl: originalUrl || url });
     }
   }, []);
 
@@ -365,7 +365,7 @@ export const StorageTrackedProfiles: React.FC = () => {
 
                             if (item.mime_type.startsWith("image/")) {
                               return (
-                                <div key={item.hash} className="my-media-card" onClick={() => openViewer(localSrc)} title={tooltip}>
+                                <div key={item.hash} className="my-media-card" onClick={() => openViewer(localSrc, "image", item.url, expandedPubkey || undefined)} title={tooltip}>
                                   <img src={localSrc} loading="lazy" onError={handleImageError} />
                                   <div className="my-media-card-overlay">{formatBytes(item.size_bytes)}</div>
                                 </div>
@@ -373,7 +373,7 @@ export const StorageTrackedProfiles: React.FC = () => {
                             }
                             if (item.mime_type.startsWith("video/")) {
                               return (
-                                <div key={item.hash} className="my-media-card video" onClick={() => openViewer(localSrc, "video")} title={tooltip}>
+                                <div key={item.hash} className="my-media-card video" onClick={() => openViewer(localSrc, "video", item.url, expandedPubkey || undefined)} title={tooltip}>
                                   <video src={localSrc} preload="metadata" muted />
                                   <div className="my-media-card-play">{"\u25B6"}</div>
                                   <div className="my-media-card-overlay">{formatBytes(item.size_bytes)}</div>
@@ -532,7 +532,7 @@ export const StorageTrackedProfiles: React.FC = () => {
 
               if (item.mime_type.startsWith("image/")) {
                 return (
-                  <div key={key} className={`my-media-card`} onClick={() => openViewer(src)} title={tooltip}>
+                  <div key={key} className={`my-media-card`} onClick={() => openViewer(src, "image", item.url, item.pubkey)} title={tooltip}>
                     <img src={src} loading="lazy" onError={handleImageError} />
                     <div className="my-media-card-overlay">{sizeLabel}</div>
                   </div>
@@ -540,7 +540,7 @@ export const StorageTrackedProfiles: React.FC = () => {
               }
               if (item.mime_type.startsWith("video/")) {
                 return (
-                  <div key={key} className={`my-media-card video`} onClick={() => openViewer(src, "video")} title={tooltip}>
+                  <div key={key} className={`my-media-card video`} onClick={() => openViewer(src, "video", item.url, item.pubkey)} title={tooltip}>
                     <video src={src} preload="metadata" muted />
                     <div className="my-media-card-play">{"\u25B6"}</div>
                     <div className="my-media-card-overlay">{sizeLabel}</div>

@@ -125,7 +125,18 @@ const AppRoutes: React.FC = () => {
       }
     };
     document.addEventListener("click", handler);
-    return () => document.removeEventListener("click", handler);
+
+    // Media viewer "View Event" navigation
+    const navHandler = (e: Event) => {
+      const { noteId } = (e as CustomEvent).detail || {};
+      if (noteId) navigate(`/note/${noteId}`);
+    };
+    window.addEventListener("navigate-to-note", navHandler);
+
+    return () => {
+      document.removeEventListener("click", handler);
+      window.removeEventListener("navigate-to-note", navHandler);
+    };
   }, [navigate]);
 
   return (

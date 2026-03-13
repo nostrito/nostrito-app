@@ -3,7 +3,7 @@ use rusqlite::Connection;
 use tracing::info;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Get the current schema version from the database.
 pub fn get_schema_version(conn: &Connection) -> u32 {
@@ -46,6 +46,10 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
 
     if current < 4 {
         migrate_v3_to_v4(conn)?;
+    }
+
+    if current < 5 {
+        migrate_v4_to_v5(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -334,6 +338,30 @@ fn migrate_v3_to_v4(conn: &Connection) -> Result<()> {
     )?;
 
     info!("Migration v3 → v4 complete");
+    Ok(())
+}
+
+/// Migrate from v4 to v5:
+/// - Add bookmarked_media table for permanent media bookmarks
+fn migrate_v4_to_v5(conn: &Connection) -> Result<()> {
+    info!("Running migration v4 → v5...");
+
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS bookmarked_media (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT NOT NULL,
+            media_url TEXT NOT NULL,
+            event_json TEXT NOT NULL,
+            profile_json TEXT NOT NULL,
+            bookmarked_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+            UNIQUE(event_id, media_url)
+        );
+        CREATE INDEX IF NOT EXISTS idx_bookmarked_media_at ON bookmarked_media(bookmarked_at DESC);
+        "#,
+    )?;
+
+    info!("Migration v4 → v5 complete");
     Ok(())
 }
 
