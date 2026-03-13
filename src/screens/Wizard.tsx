@@ -454,8 +454,7 @@ const StepIdentity: React.FC<StepIdentityProps> = ({
         onClick={() => onIdentityModeChange("readonly")}
       >
         <div className="wiz-identity-title">
-          <span className="icon"><IconBookOpen /></span> Read-only{" "}
-          <span className="wiz-identity-badge">Recommended</span>
+          <span className="icon"><IconBookOpen /></span> Read-only
         </div>
         <div className="wiz-identity-desc">
           Paste your npub. DMs disabled, everything else works.

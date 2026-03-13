@@ -155,7 +155,8 @@ function getLayerDetail(
   // Build progress string like "42/200" when a content pass is running
   let progressStr = "";
   if (isActive && s.pass_pubkeys_total > 0) {
-    progressStr = `${s.pass_pubkeys_done}/${s.pass_pubkeys_total}`;
+    const done = Math.min(s.pass_pubkeys_done, s.pass_pubkeys_total);
+    progressStr = `${done}/${s.pass_pubkeys_total}`;
   }
 
   let count = 0;
@@ -652,7 +653,7 @@ export const Dashboard: React.FC = () => {
             const isActive = currentLayer === backendLayer;
             const ss = status?.sync_stats;
             const pct = isActive && ss && ss.pass_pubkeys_total > 0
-              ? Math.round((ss.pass_pubkeys_done / ss.pass_pubkeys_total) * 100)
+              ? Math.min(100, Math.round((ss.pass_pubkeys_done / ss.pass_pubkeys_total) * 100))
               : 0;
 
             return (
