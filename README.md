@@ -46,6 +46,10 @@ npm run tauri dev
 
 # Build for production
 npm run tauri build
+
+# Build macOS DMG installer
+npm run tauri build -- --bundles dmg
+# Output: src-tauri/target/release/bundle/dmg/nostrito_<version>_<arch>.dmg
 ```
 
 ### Prerequisites

@@ -1,6 +1,6 @@
 {
   "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-cli/schema.json",
-  "identifier": "lat.nostrito.app",
+  "identifier": "lat.nostrito",
   "productName": "nostrito",
   "version": "0.1.0",
   "build": {

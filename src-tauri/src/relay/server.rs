@@ -615,7 +615,7 @@ async fn write_nip11_response(
 
     <div class="cta">
       Connect with <strong>{ws_scheme}://localhost:{port}</strong> in Damus, Amethyst, or any Nostr client.<br><br>
-      <a href="https://nostrito.fabri.lat">Learn more about nostrito →</a>
+      <a href="https://nostrito.com">Learn more about nostrito →</a>
     </div>
   </div>
 </body>
