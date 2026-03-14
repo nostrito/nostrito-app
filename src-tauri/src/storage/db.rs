@@ -123,7 +123,6 @@ impl Database {
                 queued_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
                 priority INTEGER NOT NULL DEFAULT 0
             );
-            CREATE INDEX IF NOT EXISTS idx_media_queue_priority ON media_queue(priority DESC, queued_at ASC);
 
             CREATE TABLE IF NOT EXISTS tracked_profiles (
                 pubkey TEXT PRIMARY KEY,
