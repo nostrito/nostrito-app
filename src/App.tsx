@@ -14,9 +14,12 @@ import { Dms } from "./screens/Dms";
 import { Wot } from "./screens/Wot";
 import { Storage } from "./screens/Storage";
 import { Settings } from "./screens/Settings";
-import { MyMedia } from "./screens/MyMedia";
 import { Wizard } from "./screens/Wizard";
 import { ProfileView } from "./screens/ProfileView";
+import { NoteDetail } from "./screens/NoteDetail";
+import { StorageOwnEvents } from "./screens/StorageOwnEvents";
+import { StorageTrackedProfiles } from "./screens/StorageTrackedProfiles";
+import { StorageWotProfiles } from "./screens/StorageWotProfiles";
 
 const SCREEN_LABELS: Record<string, string> = {
   "/": "Dashboard",
@@ -24,8 +27,10 @@ const SCREEN_LABELS: Record<string, string> = {
   "/dms": "DMs",
   "/wot": "WoT",
   "/storage": "Storage",
+  "/storage/own-events": "Storage / Own Events",
+  "/storage/tracked-profiles": "Storage / Tracked Profiles",
+  "/storage/wot-profiles": "Storage / WoT Profiles",
   "/settings": "Settings",
-  "/my-media": "My Media",
 };
 
 const AppShell: React.FC = () => {
@@ -70,16 +75,68 @@ const AppRoutes: React.FC = () => {
     };
   }, [navigate, setInitialized]);
 
-  // Pubkey click delegation for [data-pubkey] elements
+  // Click delegation for [data-pubkey], [data-note-id], [data-naddr] elements
   useEffect(() => {
-    const handler = (e: MouseEvent) => {
-      const target = (e.target as HTMLElement).closest("[data-pubkey]") as HTMLElement | null;
-      if (!target) return;
-      const pubkey = target.dataset.pubkey;
-      if (pubkey) navigate(`/profile/${pubkey}`);
+    const handler = async (e: MouseEvent) => {
+      const el = e.target as HTMLElement;
+
+      // Profile links
+      const pubkeyEl = el.closest("[data-pubkey]") as HTMLElement | null;
+      if (pubkeyEl) {
+        const pubkey = pubkeyEl.dataset.pubkey;
+        if (pubkey) navigate(`/profile/${pubkey}`);
+        return;
+      }
+
+      // Note/nevent links
+      const noteEl = el.closest("[data-note-id]") as HTMLElement | null;
+      if (noteEl) {
+        const noteId = noteEl.dataset.noteId;
+        if (noteId) navigate(`/note/${noteId}`);
+        return;
+      }
+
+      // naddr links (addressable events)
+      const naddrEl = el.closest("[data-naddr]") as HTMLElement | null;
+      if (naddrEl) {
+        try {
+          const data = JSON.parse(naddrEl.dataset.naddr || "{}");
+          const { invoke } = await import("@tauri-apps/api/core");
+          const ev = await invoke<{ id: string } | null>("get_addressable_event", {
+            kind: data.kind,
+            pubkey: data.pubkey,
+            dTag: data.dTag,
+          });
+          if (ev) {
+            navigate(`/note/${ev.id}`);
+          }
+        } catch (err) {
+          console.error("[naddr] Failed to resolve addressable event:", err);
+        }
+        return;
+      }
+
+      // Hashtag links → navigate to feed with search query
+      const hashtagEl = el.closest("[data-hashtag]") as HTMLElement | null;
+      if (hashtagEl) {
+        const tag = hashtagEl.dataset.hashtag;
+        if (tag) navigate(`/feed?q=${encodeURIComponent("#" + tag)}`);
+        return;
+      }
     };
     document.addEventListener("click", handler);
-    return () => document.removeEventListener("click", handler);
+
+    // Media viewer "View Event" navigation
+    const navHandler = (e: Event) => {
+      const { noteId } = (e as CustomEvent).detail || {};
+      if (noteId) navigate(`/note/${noteId}`);
+    };
+    window.addEventListener("navigate-to-note", navHandler);
+
+    return () => {
+      document.removeEventListener("click", handler);
+      window.removeEventListener("navigate-to-note", navHandler);
+    };
   }, [navigate]);
 
   return (
@@ -91,9 +148,12 @@ const AppRoutes: React.FC = () => {
         <Route path="/dms" element={<Dms />} />
         <Route path="/wot" element={<Wot />} />
         <Route path="/storage" element={<Storage />} />
+        <Route path="/storage/own-events" element={<StorageOwnEvents />} />
+        <Route path="/storage/tracked-profiles" element={<StorageTrackedProfiles />} />
+        <Route path="/storage/wot-profiles" element={<StorageWotProfiles />} />
         <Route path="/settings" element={<Settings />} />
-        <Route path="/my-media" element={<MyMedia />} />
         <Route path="/profile/:pubkey" element={<ProfileView />} />
+        <Route path="/note/:noteId" element={<NoteDetail />} />
       </Route>
     </Routes>
   );

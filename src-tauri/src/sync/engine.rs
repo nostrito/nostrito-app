@@ -6,7 +6,7 @@ use std::time::Duration;
 use tauri::Emitter;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::storage::db::Database;
 use crate::wot::WotGraph;
@@ -37,7 +37,8 @@ pub struct SyncEngine {
     pub sync_tier: Arc<AtomicU8>,
     pub sync_stats: Arc<RwLock<SyncStats>>,
     app_handle: tauri::AppHandle,
-    storage_media_gb: f64,
+    tracked_media_gb: f64,
+    wot_media_gb: f64,
     sync_config: SyncConfig,
     pool: Arc<RelayPool>,
 }
@@ -51,7 +52,8 @@ impl SyncEngine {
         sync_tier: Arc<AtomicU8>,
         sync_stats: Arc<RwLock<SyncStats>>,
         app_handle: tauri::AppHandle,
-        storage_media_gb: f64,
+        tracked_media_gb: f64,
+        wot_media_gb: f64,
         sync_config: SyncConfig,
         _max_event_age_days: u32,
     ) -> Self {
@@ -85,7 +87,8 @@ impl SyncEngine {
             sync_tier,
             sync_stats,
             app_handle,
-            storage_media_gb,
+            tracked_media_gb,
+            wot_media_gb,
             sync_config,
             pool: Arc::new(RelayPool::new()),
         }
@@ -114,45 +117,56 @@ impl SyncEngine {
             }
 
             cycle += 1;
-            info!("SyncEngine: starting cycle {}", cycle);
+            let cycle_start = std::time::Instant::now();
+            info!("SyncEngine: ═══ starting cycle {} ═══", cycle);
 
             // Phase 1: Own Data
-            self.emit_phase(SyncPhase::OwnData);
+            self.emit_phase(SyncPhase::OwnData).await;
+            let phase_start = std::time::Instant::now();
             if let Err(e) = self.phase_own_data().await {
                 warn!("Phase 1 error: {}", e);
             }
+            info!("SyncEngine: Phase 1 (Own Data) took {:.1}s", phase_start.elapsed().as_secs_f32());
 
             if self.cancel.is_cancelled() { break; }
 
             // Phase 2: Discovery
-            self.emit_phase(SyncPhase::Discovery);
+            self.emit_phase(SyncPhase::Discovery).await;
+            let phase_start = std::time::Instant::now();
             if let Err(e) = self.phase_discovery().await {
                 warn!("Phase 2 error: {}", e);
             }
+            info!("SyncEngine: Phase 2 (Discovery) took {:.1}s", phase_start.elapsed().as_secs_f32());
 
             if self.cancel.is_cancelled() { break; }
 
             // Phase 3: Content Fetch
-            self.emit_phase(SyncPhase::ContentFetch);
+            self.emit_phase(SyncPhase::ContentFetch).await;
+            let phase_start = std::time::Instant::now();
             if let Err(e) = self.phase_content().await {
                 warn!("Phase 3 error: {}", e);
             }
+            info!("SyncEngine: Phase 3 (Content Fetch) took {:.1}s", phase_start.elapsed().as_secs_f32());
 
             if self.cancel.is_cancelled() { break; }
 
             // Phase 4: Thread Context
-            self.emit_phase(SyncPhase::ThreadContext);
+            self.emit_phase(SyncPhase::ThreadContext).await;
+            let phase_start = std::time::Instant::now();
             if let Err(e) = self.phase_threads().await {
                 warn!("Phase 4 error: {}", e);
             }
+            info!("SyncEngine: Phase 4 (Thread Context) took {:.1}s", phase_start.elapsed().as_secs_f32());
 
             if self.cancel.is_cancelled() { break; }
 
             // Phase 5: Media Download
-            self.emit_phase(SyncPhase::MediaDownload);
+            self.emit_phase(SyncPhase::MediaDownload).await;
+            let phase_start = std::time::Instant::now();
             if let Err(e) = self.phase_media().await {
                 warn!("Phase 5 error: {}", e);
             }
+            info!("SyncEngine: Phase 5 (Media Download) took {:.1}s", phase_start.elapsed().as_secs_f32());
 
             // Pruning: run every cycle after all phases
             if let Err(e) = self.run_pruning() {
@@ -168,9 +182,9 @@ impl SyncEngine {
 
             // Mark cycle complete
             self.sync_tier.store(0, Ordering::Relaxed);
-            self.emit_tier_complete(0);
+            self.emit_tier_complete(0).await;
 
-            info!("SyncEngine: cycle {} complete", cycle);
+            info!("SyncEngine: ═══ cycle {} complete in {:.1}s ═══", cycle, cycle_start.elapsed().as_secs_f32());
 
             // Wait for next cycle
             let interval = Duration::from_secs(self.sync_config.cycle_interval_secs as u64);
@@ -189,20 +203,30 @@ impl SyncEngine {
 
     /// Phase 1: Fetch own profile, contact list, and all own events.
     async fn phase_own_data(&self) -> Result<()> {
-        self.sync_tier.store(1, Ordering::Relaxed);
-
+        {
+            let mut ss = self.sync_stats.write().await;
+            ss.tier1_fetched = 0;
+        }
         let pk = PublicKey::from_hex(&self.hex_pubkey)?;
 
-        // Connect to configured relays
-        self.pool.ensure_connected_many(&self.relay_urls).await;
-
-        // Fetch own metadata + contacts
+        // Fetch own metadata + contacts (replaceable events — always get latest)
         let meta_filter = Filter::new()
             .author(pk)
             .kinds(vec![Kind::Metadata, Kind::ContactList, Kind::MuteList, Kind::RelayList])
             .limit(10);
 
-        // Fetch all own events
+        // Use cursor to avoid re-fetching own events we already have
+        let now = chrono::Utc::now().timestamp();
+        let since = match self.db.get_user_cursor(&self.hex_pubkey) {
+            Ok(Some((last_ts, last_fetched_at))) => {
+                // Use whichever is more recent: last event we posted, or last time we checked.
+                // If we haven't posted in days but fetched 5 min ago, use the fetch time.
+                last_ts.max(last_fetched_at) - super::types::CURSOR_OVERLAP_SECS as i64
+            }
+            _ => now - (self.sync_config.lookback_days as i64 * 86400),
+        };
+
+        // Fetch own events since last cursor
         let events_filter = Filter::new()
             .author(pk)
             .kinds(vec![
@@ -212,12 +236,14 @@ impl SyncEngine {
                 Kind::LongFormTextNote,
                 Kind::EncryptedDirectMessage,
             ])
+            .since(Timestamp::from(since as u64))
             .limit(1000);
 
-        // Fetch DMs addressed to us (where we're a p-tag recipient)
+        // Fetch DMs addressed to us since last cursor
         let received_dms_filter = Filter::new()
             .pubkey(pk)
             .kind(Kind::EncryptedDirectMessage)
+            .since(Timestamp::from(since as u64))
             .limit(500);
 
         let events = self.pool.subscribe_and_collect(
@@ -231,25 +257,34 @@ impl SyncEngine {
             &self.db,
             &self.graph,
             &self.hex_pubkey,
-            EventSource::Sync,
+            EventSource::OwnBackup,
+            super::types::MEDIA_PRIORITY_OWNER,
+            Some(&self.app_handle),
+            "0",
         );
 
-        self.emit_progress(1, stored as u64, events.len() as u64, "own");
-        info!("Phase 1: {} events stored, {} WoT updates", stored, wot);
+        // Touch own cursor so next cycle uses this as the since bound
+        self.db.touch_user_cursor(&self.hex_pubkey).ok();
 
-        self.emit_tier_complete(1);
+        {
+            let mut ss = self.sync_stats.write().await;
+            ss.tier1_fetched += stored as u64;
+        }
+        self.emit_progress(1, stored as u64, events.len() as u64, "own");
+        info!("Phase 1: {} events stored, {} WoT updates (since={}min ago)", stored, wot, (now - since) / 60);
+
+        self.emit_tier_complete(1).await;
         Ok(())
     }
 
     /// Phase 2: Discover relay information for follows.
     async fn phase_discovery(&self) -> Result<()> {
-        self.sync_tier.store(2, Ordering::Relaxed);
-
         let discovery = Discovery::new(
             Arc::clone(&self.db),
             Arc::clone(&self.graph),
             Arc::clone(&self.pool),
             self.hex_pubkey.clone(),
+            self.app_handle.clone(),
         );
 
         let stats = discovery.run().await?;
@@ -258,19 +293,25 @@ impl SyncEngine {
             stats.local_hints, stats.bootstrap_relays, stats.needing_refresh
         );
 
-        self.emit_tier_complete(2);
+        self.emit_tier_complete(2).await;
         Ok(())
     }
 
     /// Phase 3: Relay-centric content fetch.
     async fn phase_content(&self) -> Result<()> {
-        self.sync_tier.store(3, Ordering::Relaxed);
-
+        {
+            let mut ss = self.sync_stats.write().await;
+            ss.tracked_fetched = 0;
+            ss.tier2_fetched = 0;
+            ss.tier3_fetched = 0;
+            ss.follows_count = 0;
+        }
         let discovery = Discovery::new(
             Arc::clone(&self.db),
             Arc::clone(&self.graph),
             Arc::clone(&self.pool),
             self.hex_pubkey.clone(),
+            self.app_handle.clone(),
         );
         let needing_refresh = discovery.pubkeys_needing_relay_refresh()?;
 
@@ -280,14 +321,19 @@ impl SyncEngine {
             Arc::clone(&self.pool),
             self.hex_pubkey.clone(),
             self.sync_config.lookback_days,
-            self.sync_config.fof_content,
+            self.sync_config.wot_notes_per_cycle,
+            Arc::clone(&self.sync_stats),
+            self.app_handle.clone(),
         );
 
         let stats = content.run(&needing_refresh).await?;
 
+        // Clear layer state now that content passes are done
         {
             let mut ss = self.sync_stats.write().await;
-            ss.tier2_fetched += stats.events_stored as u64;
+            ss.current_layer = String::new();
+            ss.pass_pubkeys_done = 0;
+            ss.pass_pubkeys_total = 0;
         }
 
         self.emit_progress(3, stats.events_stored as u64, 0, "content");
@@ -296,7 +342,7 @@ impl SyncEngine {
             stats.events_stored, stats.relays_queried
         );
 
-        self.emit_tier_complete(3);
+        self.emit_tier_complete(3).await;
         Ok(())
     }
 
@@ -307,6 +353,7 @@ impl SyncEngine {
             Arc::clone(&self.graph),
             Arc::clone(&self.pool),
             self.hex_pubkey.clone(),
+            self.app_handle.clone(),
         );
 
         let stats = threads.run(&self.relay_urls).await?;
@@ -319,12 +366,15 @@ impl SyncEngine {
 
     /// Phase 5: Download queued media.
     async fn phase_media(&self) -> Result<()> {
-        self.sync_tier.store(4, Ordering::Relaxed);
-
+        {
+            let mut ss = self.sync_stats.write().await;
+            ss.tier4_fetched = 0;
+        }
         let media = MediaDownloader::new(
             Arc::clone(&self.db),
             self.hex_pubkey.clone(),
-            self.storage_media_gb,
+            self.tracked_media_gb,
+            self.wot_media_gb,
         );
 
         let stats = media.run(50).await?;
@@ -337,7 +387,7 @@ impl SyncEngine {
             ss.tier4_fetched += stats.downloaded as u64;
         }
 
-        self.emit_tier_complete(4);
+        self.emit_tier_complete(5).await;
         Ok(())
     }
 
@@ -347,11 +397,53 @@ impl SyncEngine {
         if stats.total() > 0 {
             info!("Pruning: {} events deleted", stats.total());
         }
+
+        // Size-based safety net: read max_storage_mb from config, default to 2 GB
+        let max_bytes = self.db.get_config("max_storage_mb")
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(2048) * 1024 * 1024;
+
+        match pruning::prune_to_size_limit(&self.db, &self.graph, &self.hex_pubkey, max_bytes) {
+            Ok(deleted) if deleted > 0 => {
+                info!("[size-prune] Deleted {} additional events to stay under size limit", deleted);
+            }
+            Err(e) => {
+                warn!("[size-prune] failed: {}", e);
+            }
+            _ => {}
+        }
+
+        // Debug-mode storage estimation
+        if let Err(e) = crate::storage::estimation::estimate_storage(
+            &self.db, &self.graph, &self.hex_pubkey,
+        ) {
+            debug!("[storage-estimate] failed: {}", e);
+        }
+
         Ok(())
     }
 
     /// WoT crawl — fetch contact lists for follows-of-follows.
     async fn phase_wot_crawl(&self) -> Result<()> {
+        // Make WoT crawl visible to the dashboard (runs after the 5 main phases)
+        self.sync_tier.store(6, Ordering::Relaxed);
+        {
+            let mut ss = self.sync_stats.write().await;
+            ss.current_tier = 6;
+            ss.current_layer = "2".to_string();
+            ss.current_phase = "WoT Crawl".to_string();
+            ss.pass_pubkeys_done = 0;
+            ss.pass_pubkeys_total = 0;
+        }
+        self.app_handle.emit("sync:progress", &SyncProgress {
+            tier: 6,
+            fetched: 0,
+            total: 0,
+            relay: "WoT Crawl".to_string(),
+        }).ok();
+
         let follows = self.graph.get_follows(&self.hex_pubkey).unwrap_or_default();
 
         // Get follows-of-follows that need contact list updates
@@ -397,6 +489,9 @@ impl SyncEngine {
                         &self.graph,
                         &self.hex_pubkey,
                         EventSource::Sync,
+                        super::types::MEDIA_PRIORITY_FOF,
+                        Some(&self.app_handle),
+                        "2",
                     );
 
                     let mut ss = self.sync_stats.write().await;
@@ -420,7 +515,30 @@ impl SyncEngine {
 
     // ── Event Emission ───────────────────────────────────────────
 
-    fn emit_phase(&self, phase: SyncPhase) {
+    async fn emit_phase(&self, phase: SyncPhase) {
+        let layer = match phase {
+            SyncPhase::OwnData => "0",
+            SyncPhase::Discovery => "",
+            SyncPhase::ContentFetch => "",
+            SyncPhase::ThreadContext => "thread",
+            SyncPhase::MediaDownload => "",
+        };
+
+        // Set sync_tier atomically BEFORE updating stats and emitting events,
+        // so any IPC call to get_status sees the correct tier immediately.
+        self.sync_tier.store(phase as u8, Ordering::Relaxed);
+
+        // Update sync_stats with current phase info and clear stale progress
+        {
+            let mut ss = self.sync_stats.write().await;
+            ss.current_tier = phase as u8;
+            ss.current_layer = layer.to_string();
+            ss.current_phase = phase.label().to_string();
+            ss.pass_pubkeys_done = 0;
+            ss.pass_pubkeys_total = 0;
+            ss.pass_relays_done = 0;
+            ss.pass_relays_total = 0;
+        }
         let progress = SyncProgress {
             tier: phase as u8,
             fetched: 0,
@@ -440,7 +558,16 @@ impl SyncEngine {
         self.app_handle.emit("sync:progress", &progress).ok();
     }
 
-    fn emit_tier_complete(&self, tier: u8) {
+    async fn emit_tier_complete(&self, tier: u8) {
+        if tier == 0 {
+            // Cycle complete — mark as idle
+            let mut ss = self.sync_stats.write().await;
+            ss.current_tier = 0;
+            ss.current_layer = String::new();
+            ss.current_phase = String::new();
+            ss.pass_pubkeys_done = 0;
+            ss.pass_pubkeys_total = 0;
+        }
         self.app_handle.emit("sync:tier_complete", &TierComplete { tier }).ok();
     }
 }

@@ -15,7 +15,15 @@ import {
   IconVolume,
   IconClipboard,
   IconParty,
+  IconFeather,
+  IconScale,
+  IconArchive,
 } from "../components/Icon";
+import {
+  STORAGE_PRESETS,
+  STORAGE_PRESET_KEYS,
+  estimateStorage,
+} from "../utils/storagePresets";
 import { RelayCard } from "../components/RelayCard";
 import { Slider } from "../components/Slider";
 import { useAppContext } from "../context/AppContext";
@@ -28,8 +36,6 @@ import { RELAYS, resolveRelayUrl } from "../relays";
 
 type IdentityMode = "readonly" | "full";
 type SignerType = "nsec" | "bunker" | "connect" | "new";
-type CleanupPolicy = "oldest" | "least-interacted";
-
 interface MediaTypes {
   images: boolean;
   videos: boolean;
@@ -84,10 +90,12 @@ export const Wizard: React.FC = () => {
   const [selectedRelays, setSelectedRelays] = useState<Set<string>>(
     () => new Set(RELAYS.filter((r) => r.defaultOn).map((r) => r.id))
   );
+  const [storagePreset, setStoragePreset] = useState<string>("balanced");
+  const [customMode, setCustomMode] = useState(false);
   const [othersEventsGb, setOthersEventsGb] = useState(5);
-  const [othersMediaGb, setOthersMediaGb] = useState(2);
+  const [trackedMediaGb, setTrackedMediaGb] = useState(3);
+  const [wotMediaGb, setWotMediaGb] = useState(2);
   const [mediaTypes, setMediaTypes] = useState<MediaTypes>({ images: true, videos: true, audio: true });
-  const [cleanupPolicy, setCleanupPolicy] = useState<CleanupPolicy>("oldest");
 
   // Step 4 state (relay URL screen)
   const [relayPort, setRelayPort] = useState(4869);
@@ -121,6 +129,17 @@ export const Wizard: React.FC = () => {
   /* --- media type toggle -------------------------------------------- */
   const toggleMediaType = useCallback((type: keyof MediaTypes) => {
     setMediaTypes((prev) => ({ ...prev, [type]: !prev[type] }));
+  }, []);
+
+  /* --- storage preset application ---------------------------------- */
+  const applyStoragePreset = useCallback((key: string) => {
+    const preset = STORAGE_PRESETS[key];
+    if (!preset) return;
+    setStoragePreset(key);
+    setOthersEventsGb(preset.othersEventsGb);
+    setTrackedMediaGb(preset.trackedMediaGb);
+    setWotMediaGb(preset.wotMediaGb);
+    setMediaTypes({ ...preset.mediaTypes });
   }, []);
 
   /* --- navigation logic --------------------------------------------- */
@@ -178,12 +197,18 @@ export const Wizard: React.FC = () => {
     const relays = Array.from(selectedRelays).map(resolveRelayUrl);
 
     try {
-      console.log("[wizard] Calling init_nostrito...");
+      const preset = STORAGE_PRESETS[storagePreset];
+      console.log("[wizard] Calling init_nostrito with preset:", storagePreset);
       await invoke("init_nostrito", {
         npub,
         relays,
         storageOthersGb: othersEventsGb,
-        storageMediaGb: othersMediaGb,
+        storageTrackedMediaGb: trackedMediaGb,
+        storageWotMediaGb: wotMediaGb,
+        wotRetentionDays: preset?.wotRetentionDays ?? 30,
+        maxEventAgeDays: preset?.maxEventAgeDays ?? 30,
+        retentionOverrides: preset ? JSON.stringify(preset.retentionOverrides) : undefined,
+        storagePreset,
       });
 
       console.log("[wizard] init_nostrito succeeded");
@@ -202,11 +227,12 @@ export const Wizard: React.FC = () => {
           npub,
           signerType: signerType || undefined,
           relays,
+          storagePreset,
           storage: {
             othersEventsGb,
-            othersMediaGb,
+            trackedMediaGb,
+            wotMediaGb,
             mediaTypes: { ...mediaTypes },
-            cleanupPolicy,
           },
         })
       );
@@ -372,14 +398,18 @@ export const Wizard: React.FC = () => {
             )}
             {step === 3 && (
               <StepStorage
+                storagePreset={storagePreset}
+                onPresetChange={applyStoragePreset}
+                customMode={customMode}
+                onCustomModeToggle={() => setCustomMode((p) => !p)}
                 othersEventsGb={othersEventsGb}
                 onOthersEventsGbChange={setOthersEventsGb}
-                othersMediaGb={othersMediaGb}
-                onOthersMediaGbChange={setOthersMediaGb}
+                trackedMediaGb={trackedMediaGb}
+                onTrackedMediaGbChange={setTrackedMediaGb}
+                wotMediaGb={wotMediaGb}
+                onWotMediaGbChange={setWotMediaGb}
                 mediaTypes={mediaTypes}
                 onToggleMediaType={toggleMediaType}
-                cleanupPolicy={cleanupPolicy}
-                onCleanupPolicyChange={setCleanupPolicy}
                 finishError={finishError}
               />
             )}
@@ -449,8 +479,7 @@ const StepIdentity: React.FC<StepIdentityProps> = ({
         onClick={() => onIdentityModeChange("readonly")}
       >
         <div className="wiz-identity-title">
-          <span className="icon"><IconBookOpen /></span> Read-only{" "}
-          <span className="wiz-identity-badge">Recommended</span>
+          <span className="icon"><IconBookOpen /></span> Read-only
         </div>
         <div className="wiz-identity-desc">
           Paste your npub. DMs disabled, everything else works.
@@ -550,133 +579,198 @@ const StepRelays: React.FC<StepRelaysProps> = ({ selectedRelays, onToggle }) => 
 /*  Step 3: Storage                                                    */
 /* ================================================================== */
 
+const PRESET_ICONS: Record<string, React.ReactNode> = {
+  minimal: <IconFeather />,
+  balanced: <IconScale />,
+  archive: <IconArchive />,
+};
+
+const PRESET_DETAILS: Record<string, string[]> = {
+  minimal: ["Last 7 days for follows & WoT", "Tracked profiles: full history", "Images only, no WoT media"],
+  balanced: ["Last 30 days for follows, 7 days for WoT", "Tracked profiles: full history", "All media types, 2 GB WoT media"],
+  archive: ["Last year for follows, 90 days for WoT", "Tracked profiles: full history", "All media types, 10 GB WoT media"],
+};
+
 interface StepStorageProps {
+  storagePreset: string;
+  onPresetChange: (key: string) => void;
+  customMode: boolean;
+  onCustomModeToggle: () => void;
   othersEventsGb: number;
   onOthersEventsGbChange: (v: number) => void;
-  othersMediaGb: number;
-  onOthersMediaGbChange: (v: number) => void;
+  trackedMediaGb: number;
+  onTrackedMediaGbChange: (v: number) => void;
+  wotMediaGb: number;
+  onWotMediaGbChange: (v: number) => void;
   mediaTypes: MediaTypes;
   onToggleMediaType: (type: keyof MediaTypes) => void;
-  cleanupPolicy: CleanupPolicy;
-  onCleanupPolicyChange: (policy: CleanupPolicy) => void;
   finishError: string | null;
 }
 
 const StepStorage: React.FC<StepStorageProps> = ({
+  storagePreset,
+  onPresetChange,
+  customMode,
+  onCustomModeToggle,
   othersEventsGb,
   onOthersEventsGbChange,
-  othersMediaGb,
-  onOthersMediaGbChange,
+  trackedMediaGb,
+  onTrackedMediaGbChange,
+  wotMediaGb,
+  onWotMediaGbChange,
   mediaTypes,
   onToggleMediaType,
-  cleanupPolicy,
-  onCleanupPolicyChange,
   finishError,
-}) => (
-  <>
-    <h3 className="wiz-title">Storage</h3>
-    <p className="wiz-subtitle">Control what gets stored and how much space to use.</p>
+}) => {
+  const estimate = estimateStorage(200, storagePreset);
 
-    {/* Your events & media — locked */}
-    <div className="storage-section">
-      <div className="storage-row locked">
-        <div className="storage-row-info">
-          <span className="storage-row-label">Your events &amp; media</span>
-          <span className="storage-row-meta">
-            <span className="icon"><IconLock /></span> Always stored. No exceptions.
-          </span>
-        </div>
-        <div className="storage-bar-wrap">
-          <div className="storage-bar">
-            <div className="storage-bar-fill" />
+  return (
+    <>
+      <h3 className="wiz-title">Storage</h3>
+      <p className="wiz-subtitle">Choose how much to store. You can change this later in Settings.</p>
+
+      {/* Your events & media — locked */}
+      <div className="storage-section">
+        <div className="storage-row locked">
+          <div className="storage-row-info">
+            <span className="storage-row-label">Your events &amp; media</span>
+            <span className="storage-row-meta">
+              <span className="icon"><IconLock /></span> Always stored. No exceptions.
+            </span>
           </div>
-          <span className="storage-bar-label">100%</span>
-        </div>
-      </div>
-    </div>
-
-    {/* Others' events */}
-    <div className="storage-section">
-      <div className="storage-row">
-        <div className="storage-row-info">
-          <span className="storage-row-label">Others' events</span>
-          <span className="storage-row-meta">From your Web of Trust</span>
-        </div>
-        <Slider
-          variant="storage"
-          id="othersEventsSlider"
-          min={1}
-          max={50}
-          value={othersEventsGb}
-          suffix=" GB"
-          onChange={onOthersEventsGbChange}
-        />
-      </div>
-    </div>
-
-    {/* Others' media (Blossom) */}
-    <div className="storage-section">
-      <div className="storage-row">
-        <div className="storage-row-info">
-          <span className="storage-row-label">Others' media (Blossom)</span>
-          <span className="storage-row-meta">Images, videos, audio from your network</span>
-        </div>
-        <Slider
-          variant="storage"
-          id="othersMediaSlider"
-          min={1}
-          max={50}
-          value={othersMediaGb}
-          suffix=" GB"
-          onChange={onOthersMediaGbChange}
-        />
-      </div>
-      <div className="media-toggles">
-        <div
-          className={`media-toggle${mediaTypes.images ? " active" : ""}`}
-          onClick={() => onToggleMediaType("images")}
-        >
-          <span className="icon"><IconImage /></span> Images
-        </div>
-        <div
-          className={`media-toggle${mediaTypes.videos ? " active" : ""}`}
-          onClick={() => onToggleMediaType("videos")}
-        >
-          <span className="icon"><IconVideo /></span> Videos
-        </div>
-        <div
-          className={`media-toggle${mediaTypes.audio ? " active" : ""}`}
-          onClick={() => onToggleMediaType("audio")}
-        >
-          <span className="icon"><IconVolume /></span> Audio
-        </div>
-      </div>
-    </div>
-
-    {/* Auto-cleanup */}
-    <div className="storage-section">
-      <div className="storage-row">
-        <div className="storage-row-info">
-          <span className="storage-row-label">Auto-cleanup</span>
-          <span className="storage-row-meta">When storage limit is reached</span>
-        </div>
-        <div className="cleanup-group">
-          <div
-            className={`cleanup-radio${cleanupPolicy === "oldest" ? " active" : ""}`}
-            onClick={() => onCleanupPolicyChange("oldest")}
-          >
-            Oldest first
-          </div>
-          <div
-            className={`cleanup-radio${cleanupPolicy === "least-interacted" ? " active" : ""}`}
-            onClick={() => onCleanupPolicyChange("least-interacted")}
-          >
-            Least interacted
+          <div className="storage-bar-wrap">
+            <div className="storage-bar">
+              <div className="storage-bar-fill" />
+            </div>
+            <span className="storage-bar-label">100%</span>
           </div>
         </div>
       </div>
-    </div>
 
-    {finishError && <p className="wiz-error">{finishError}</p>}
-  </>
-);
+      {/* Preset cards */}
+      <div className="storage-preset-grid">
+        {STORAGE_PRESET_KEYS.map((key) => {
+          const preset = STORAGE_PRESETS[key];
+          const details = PRESET_DETAILS[key] || [];
+          const isSelected = storagePreset === key;
+          return (
+            <div
+              key={key}
+              className={`storage-preset-card${isSelected ? " selected" : ""}`}
+              onClick={() => onPresetChange(key)}
+            >
+              <div className="storage-preset-card-header">
+                <span className="icon">{PRESET_ICONS[key]}</span>
+                <span className="storage-preset-card-name">{preset.label}</span>
+              </div>
+              <span className="storage-preset-card-size">
+                ~{preset.estimatedGb.low}-{preset.estimatedGb.typical} GB
+              </span>
+              <p className="storage-preset-card-desc">{preset.description}</p>
+              <ul className="storage-preset-card-details">
+                {details.map((d, i) => (
+                  <li key={i}>{d}</li>
+                ))}
+              </ul>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Estimation summary */}
+      <div className="storage-estimate-summary">
+        With ~200 follows: ~{estimate.eventsPerDay.toLocaleString()} events/day, ~{estimate.growthGbPerMonth} GB/month
+      </div>
+
+      {/* Custom mode toggle */}
+      <div className="storage-custom-toggle" onClick={onCustomModeToggle}>
+        {customMode ? "Hide" : "Customize"} advanced settings
+      </div>
+
+      {/* Advanced sliders (shown when custom mode is on) */}
+      {customMode && (
+        <>
+          {/* Others' events */}
+          <div className="storage-section">
+            <div className="storage-row">
+              <div className="storage-row-info">
+                <span className="storage-row-label">Others' events</span>
+                <span className="storage-row-meta">From your Web of Trust</span>
+              </div>
+              <Slider
+                variant="storage"
+                id="othersEventsSlider"
+                min={1}
+                max={50}
+                value={othersEventsGb}
+                suffix=" GB"
+                onChange={onOthersEventsGbChange}
+              />
+            </div>
+          </div>
+
+          {/* Tracked profiles media */}
+          <div className="storage-section">
+            <div className="storage-row">
+              <div className="storage-row-info">
+                <span className="storage-row-label">Tracked profiles media</span>
+                <span className="storage-row-meta">Media from profiles you track</span>
+              </div>
+              <Slider
+                variant="storage"
+                id="trackedMediaSlider"
+                min={1}
+                max={50}
+                value={trackedMediaGb}
+                suffix=" GB"
+                onChange={onTrackedMediaGbChange}
+              />
+            </div>
+          </div>
+
+          {/* WoT media */}
+          <div className="storage-section">
+            <div className="storage-row">
+              <div className="storage-row-info">
+                <span className="storage-row-label">WoT media</span>
+                <span className="storage-row-meta">Images, videos, audio from your network</span>
+              </div>
+              <Slider
+                variant="storage"
+                id="wotMediaSlider"
+                min={1}
+                max={50}
+                value={wotMediaGb}
+                suffix=" GB"
+                onChange={onWotMediaGbChange}
+              />
+            </div>
+            <div className="media-toggles">
+              <div
+                className={`media-toggle${mediaTypes.images ? " active" : ""}`}
+                onClick={() => onToggleMediaType("images")}
+              >
+                <span className="icon"><IconImage /></span> Images
+              </div>
+              <div
+                className={`media-toggle${mediaTypes.videos ? " active" : ""}`}
+                onClick={() => onToggleMediaType("videos")}
+              >
+                <span className="icon"><IconVideo /></span> Videos
+              </div>
+              <div
+                className={`media-toggle${mediaTypes.audio ? " active" : ""}`}
+                onClick={() => onToggleMediaType("audio")}
+              >
+                <span className="icon"><IconVolume /></span> Audio
+              </div>
+            </div>
+          </div>
+
+        </>
+      )}
+
+      {finishError && <p className="wiz-error">{finishError}</p>}
+    </>
+  );
+};

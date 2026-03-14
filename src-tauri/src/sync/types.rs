@@ -16,6 +16,19 @@ pub struct TierComplete {
     pub tier: u8,
 }
 
+/// Lightweight notification emitted for each newly stored event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredEventNotification {
+    pub id: String,
+    pub kind: u32,
+    pub pubkey: String,
+    pub content: String,
+    /// Which sync layer produced this event ("0", "0.5", "1", "2", "3", or "")
+    pub layer: String,
+    /// Media URLs extracted from event content (images, videos, etc.)
+    pub media_urls: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SyncStats {
     pub tier1_fetched: u64,
@@ -26,6 +39,19 @@ pub struct SyncStats {
     pub current_tier: u8,
     /// Conceptual layer currently executing: "0", "0.5", "1", "2", "3", or "" (idle)
     pub current_layer: String,
+    /// Unique pubkeys covered so far in the current content pass.
+    pub pass_pubkeys_done: u64,
+    /// Total pubkeys in the current content pass.
+    pub pass_pubkeys_total: u64,
+    /// Relays completed in the current content pass.
+    pub pass_relays_done: u64,
+    /// Total relays to query in the current content pass.
+    pub pass_relays_total: u64,
+    /// Number of direct follows (for Layer 1 display).
+    pub follows_count: u64,
+    /// Human-readable phase name: "Own Data", "Discovery", "Content Fetch",
+    /// "Thread Context", "Media Download", "WoT Crawl", or "" (idle).
+    pub current_phase: String,
 }
 
 // ── Sync Config ────────────────────────────────────────────────────
@@ -40,8 +66,8 @@ pub struct SyncConfig {
     pub wot_batch_size: u32,
     pub wot_events_per_batch: u32,
     pub cycle_interval_secs: u32,
-    /// Fetch content from follows-of-follows, prioritized by overlap count
-    pub fof_content: bool,
+    /// How many notes to fetch from WoT peers each cycle (0 = disabled).
+    pub wot_notes_per_cycle: u32,
 }
 
 impl Default for SyncConfig {
@@ -55,7 +81,11 @@ impl Default for SyncConfig {
             wot_batch_size: 5,
             wot_events_per_batch: 15,
             cycle_interval_secs: 300,
-            fof_content: false,
+            // Budget of WoT (FoF) notes to fetch per cycle. Kept low because
+            // the WoT graph can contain tens of thousands of peers; fetching
+            // all of them would be slow and bandwidth-heavy. A small sample
+            // each cycle gradually builds a picture of the broader network.
+            wot_notes_per_cycle: 50,
         }
     }
 }
@@ -69,11 +99,18 @@ pub fn resolve_relay_url(alias: &str) -> &str {
         "primal" => "wss://relay.primal.net",
         "damus" => "wss://relay.damus.io",
         "nos" => "wss://relay.nos.social",
+        "nos.lol" => "wss://nos.lol",
         "snort" => "wss://relay.snort.social",
         "coracle" => "wss://relay.coracle.social",
         "nostr.wine" => "wss://nostr.wine",
+        "relay.nostr.band" => "wss://relay.nostr.band",
         "amethyst" => "wss://nostr.band",
         "yakihonne" => "wss://relay.yakihonne.com",
+        "nostr.land" => "wss://nostr.land",
+        "relay.nostr.bg" => "wss://relay.nostr.bg",
+        "relay.noswhere.com" => "wss://relay.noswhere.com",
+        "purplepag.es" => "wss://purplepag.es",
+        "wot.utxo.one" => "wss://wot.utxo.one",
         _ => alias,
     }
 }
@@ -116,7 +153,9 @@ pub enum RetentionTier {
     Follows,
     /// Hop 2 — follows of follows.
     FollowsOfFollows,
-    /// Hop 3+ or not in WoT.
+    /// Hop 3 — three hops out.
+    Hop3,
+    /// Hop 4+ or not in WoT.
     Others,
 }
 
@@ -126,6 +165,7 @@ impl RetentionTier {
         match self {
             Self::Follows => Some("follows"),
             Self::FollowsOfFollows => Some("fof"),
+            Self::Hop3 => Some("hop3"),
             Self::Others => Some("others"),
             _ => None, // Own and Tracked have no configurable limits
         }
@@ -136,6 +176,7 @@ impl RetentionTier {
         match self {
             Self::Follows => Some(50),
             Self::FollowsOfFollows => Some(10),
+            Self::Hop3 => Some(3),
             Self::Others => Some(5),
             _ => None,
         }
@@ -146,6 +187,7 @@ impl RetentionTier {
         match self {
             Self::Follows => Some(2_592_000),         // 30 days
             Self::FollowsOfFollows => Some(604_800),  // 7 days
+            Self::Hop3 => Some(172_800),              // 2 days
             Self::Others => Some(259_200),             // 3 days
             _ => None,
         }
@@ -215,6 +257,8 @@ impl RelaySource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventSource {
     Sync,
+    /// Phase 1 own-data backup. Kind:5 deletions are stored but not executed.
+    OwnBackup,
     ThreadContext,
     Search,
 }
@@ -223,6 +267,7 @@ impl EventSource {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Sync => "sync",
+            Self::OwnBackup => "own_backup",
             Self::ThreadContext => "thread_context",
             Self::Search => "search",
         }
@@ -230,6 +275,7 @@ impl EventSource {
 
     pub fn from_str(s: &str) -> Self {
         match s {
+            "own_backup" => Self::OwnBackup,
             "thread_context" => Self::ThreadContext,
             "search" => Self::Search,
             _ => Self::Sync,
@@ -280,6 +326,16 @@ pub struct RoutingPlan {
 
 // ── Constants ────────────────────────────────────────────────────
 
+// ── Media Priority ──────────────────────────────────────────────
+
+/// Media download priority: owner (highest) → tracked → follows → FoF → hop3 → others (lowest).
+pub const MEDIA_PRIORITY_OWNER: i32 = 100;
+pub const MEDIA_PRIORITY_TRACKED: i32 = 80;
+pub const MEDIA_PRIORITY_FOLLOWS: i32 = 60;
+pub const MEDIA_PRIORITY_FOF: i32 = 40;
+pub const MEDIA_PRIORITY_HOP3: i32 = 20;
+pub const MEDIA_PRIORITY_OTHERS: i32 = 0;
+
 /// Relay polite interval between requests (seconds).
 pub const RELAY_MIN_INTERVAL_SECS: u64 = 3;
 /// Pause between relay subscription batches (seconds).
@@ -308,6 +364,8 @@ pub const DEFAULT_RELAYS: &[&str] = &[
     "wss://relay.damus.io",
     "wss://relay.primal.net",
     "wss://nos.lol",
+    "wss://relay.nostr.band",
+    "wss://nostr.wine",
 ];
 
 /// Discovery relay for NIP-65 lookups.
@@ -327,6 +385,9 @@ mod tests {
     fn test_retention_tier_defaults() {
         assert_eq!(RetentionTier::Follows.default_min_events(), Some(50));
         assert_eq!(RetentionTier::FollowsOfFollows.default_time_window_secs(), Some(604_800));
+        assert_eq!(RetentionTier::Hop3.default_min_events(), Some(3));
+        assert_eq!(RetentionTier::Hop3.default_time_window_secs(), Some(172_800));
+        assert_eq!(RetentionTier::Hop3.config_key(), Some("hop3"));
         assert_eq!(RetentionTier::Own.config_key(), None);
         assert_eq!(RetentionTier::Others.config_key(), Some("others"));
     }
@@ -346,7 +407,7 @@ mod tests {
 
     #[test]
     fn test_event_source_roundtrip() {
-        for src in [EventSource::Sync, EventSource::ThreadContext, EventSource::Search] {
+        for src in [EventSource::Sync, EventSource::OwnBackup, EventSource::ThreadContext, EventSource::Search] {
             assert_eq!(EventSource::from_str(src.as_str()), src);
         }
     }

@@ -11,11 +11,31 @@ use super::processing;
 use super::types::{EventSource, THREAD_CONTEXT_LIMIT};
 
 /// Phase 4: Thread Context — fetch missing root events for reply threads.
+///
+/// When content fetch (Phase 3) pulls in replies, those replies reference parent
+/// events via `e` tags that may not have been fetched yet. This phase resolves
+/// those gaps so threads render completely.
+///
+/// ## Algorithm
+///
+/// 1. Scans the 2000 most recent kind:1/6/30023 events for `e` tag references
+///    to events not stored locally (`find_missing_roots`).
+/// 2. Fetches up to `THREAD_CONTEXT_LIMIT` missing roots in a first pass:
+///    - Events with a relay hint in the `e` tag are fetched from that relay.
+///    - Events without a hint are fetched from all configured relays.
+/// 3. If the first pass fetched any events, runs one recursive pass (up to 200
+///    additional roots) to resolve parents-of-parents.
+///
+/// ## Termination
+///
+/// At most **2 fetch passes** run per sync cycle (initial + one recursive).
+/// Deeper thread chains are resolved over successive sync cycles.
 pub struct ThreadContext {
     db: Arc<Database>,
     graph: Arc<WotGraph>,
     pool: Arc<RelayPool>,
     own_pubkey: String,
+    app_handle: tauri::AppHandle,
 }
 
 impl ThreadContext {
@@ -24,12 +44,15 @@ impl ThreadContext {
         graph: Arc<WotGraph>,
         pool: Arc<RelayPool>,
         own_pubkey: String,
+        app_handle: tauri::AppHandle,
     ) -> Self {
-        Self { db, graph, pool, own_pubkey }
+        Self { db, graph, pool, own_pubkey, app_handle }
     }
 
-    /// Run the thread context phase.
-    /// Scans stored events for missing `e` tag references and fetches them.
+    /// Run the thread context phase (2-pass maximum).
+    ///
+    /// Returns [`ThreadStats`] with the number of missing roots found and
+    /// how many were successfully fetched across both passes.
     pub async fn run(&self, relay_urls: &[String]) -> Result<ThreadStats> {
         let mut stats = ThreadStats::default();
 
@@ -111,7 +134,9 @@ impl ThreadContext {
         Ok(stats)
     }
 
-    /// Find events referenced by e-tags that we don't have stored locally.
+    /// Scan the 2000 most recent kind:1/6/30023 events for `e` tag references
+    /// pointing to event IDs not present in the local database. Deduplicates
+    /// by event ID and extracts the optional relay hint from tag position 2.
     fn find_missing_roots(&self) -> Result<Vec<MissingRoot>> {
         // Query recent kind:1/6/30023 events that have reply tags
         let events = self.db.query_events(
@@ -167,7 +192,8 @@ impl ThreadContext {
         Ok(missing)
     }
 
-    /// Fetch specific events by ID from a relay.
+    /// Fetch specific events by ID from a single relay (10s timeout).
+    /// Stores fetched events via `process_events` and returns the count stored.
     async fn fetch_events_by_id(&self, relay_url: &str, event_ids: &[String]) -> u32 {
         if event_ids.is_empty() {
             return 0;
@@ -196,6 +222,9 @@ impl ThreadContext {
                     &self.graph,
                     &self.own_pubkey,
                     EventSource::ThreadContext,
+                    super::types::MEDIA_PRIORITY_OTHERS,
+                    Some(&self.app_handle),
+                    "thread",
                 );
                 if stored > 0 {
                     debug!("Thread: fetched {} events from {}", stored, relay_url);
@@ -210,15 +239,21 @@ impl ThreadContext {
     }
 }
 
+/// An event referenced by an `e` tag that is not yet stored locally.
 #[derive(Debug)]
 struct MissingRoot {
+    /// Hex-encoded event ID from the `e` tag.
     event_id: String,
+    /// Optional `wss://` or `ws://` relay URL from tag position 2.
     relay_hint: Option<String>,
 }
 
+/// Summary of a single thread-context run.
 #[derive(Debug, Default)]
 pub struct ThreadStats {
+    /// Total missing roots found in the initial scan.
     pub missing: u32,
+    /// Events successfully fetched across both passes.
     pub fetched: u32,
 }
 

@@ -6,7 +6,6 @@ import "./styles/wizard.css";
 import "./styles/dashboard.css";
 import "./styles/feed.css";
 import "./styles/screens.css";
-import "./styles/my-media.css";
 
 const root = document.getElementById("app");
 if (!root) throw new Error("Missing #app element");

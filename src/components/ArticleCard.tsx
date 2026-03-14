@@ -53,7 +53,16 @@ export const ArticleCard: React.FC<ArticleCardProps> = ({ event, profile, onClic
   const displayName = profileDisplayName(profile, event.pubkey);
 
   return (
-    <div className="article-card" data-kind="long-form" data-event-id={event.id} onClick={onClick}>
+    <div
+      className="article-card"
+      data-kind="long-form"
+      data-event-id={event.id}
+      onClick={(e) => {
+        // Don't open reader when clicking author (let profile navigation handle it)
+        if ((e.target as HTMLElement).closest("[data-pubkey]")) return;
+        onClick?.();
+      }}
+    >
       {image && (
         <div className="article-card-cover">
           <img
@@ -77,8 +86,15 @@ export const ArticleCard: React.FC<ArticleCardProps> = ({ event, profile, onClic
               pubkey={event.pubkey}
               className="article-card-avatar"
               fallbackClassName="article-card-avatar article-card-avatar-fallback"
+              clickable
             />
-            <span className="article-card-author-name">{displayName}</span>
+            <span
+              className="article-card-author-name"
+              data-pubkey={event.pubkey}
+              style={{ cursor: "pointer" }}
+            >
+              {displayName}
+            </span>
           </div>
           <span className="article-card-date">{formatDate(ts)}</span>
         </div>

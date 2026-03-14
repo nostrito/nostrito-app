@@ -1,12 +1,13 @@
 use nostr_sdk::prelude::*;
 use std::sync::Arc;
+use tauri::Emitter;
 use tracing::{debug, info, warn};
 
 use crate::storage::db::Database;
 use crate::storage::FollowUpdateBatch;
 use crate::wot::WotGraph;
 
-use super::types::EventSource;
+use super::types::{EventSource, StoredEventNotification};
 
 /// Result of processing a single event.
 #[derive(Debug, Default)]
@@ -40,6 +41,7 @@ pub fn process_event(
     graph: &Arc<WotGraph>,
     own_pubkey: &str,
     source: EventSource,
+    media_priority: i32,
 ) -> ProcessResult {
     let mut result = ProcessResult::default();
 
@@ -66,7 +68,10 @@ pub fn process_event(
     match kind {
         5 => {
             // Deletion event — verify and create tombstones
-            process_deletion(event, &event_id, &pubkey, created_at, &tags, db);
+            // Skip deletion execution during Phase 1 own-data backup to prevent self-tombstoning
+            if source != EventSource::OwnBackup {
+                process_deletion(event, &event_id, &pubkey, created_at, &tags, db);
+            }
             // Store the deletion event itself
             result.stored = store_event(db, &event_id, &pubkey, created_at, kind, &tags_json, event, source);
         }
@@ -121,7 +126,7 @@ pub fn process_event(
 
     // Queue media for newly stored content events
     if result.stored && matches!(kind, 1 | 6 | 30023) {
-        result.media_urls_queued = queue_media_urls(db, &pubkey, &event.content.to_string(), &tags);
+        result.media_urls_queued = queue_media_urls(db, &pubkey, &event.content.to_string(), &tags, media_priority);
 
         // Populate thread_refs for pruning protection
         let e_tag_refs: Vec<String> = tags
@@ -132,6 +137,11 @@ pub fn process_event(
         if !e_tag_refs.is_empty() {
             db.insert_thread_refs(&event_id, &e_tag_refs).ok();
         }
+    }
+
+    // Queue profile picture/banner from kind:0 metadata events
+    if result.stored && kind == 0 {
+        result.media_urls_queued = queue_profile_media(db, &pubkey, &event.content.to_string(), media_priority);
     }
 
     // Advance cursor for stored events
@@ -422,30 +432,34 @@ fn queue_media_urls(
     pubkey: &str,
     content: &str,
     tags: &[Vec<String>],
+    priority: i32,
 ) -> u32 {
     let mut count = 0u32;
 
-    // Extract URLs from content (simple pattern)
-    for word in content.split_whitespace() {
-        if (word.starts_with("https://") || word.starts_with("http://"))
-            && is_media_url(word)
+    // Extract URLs from content using byte-scan (handles markdown syntax, inline URLs, etc.)
+    let text_urls = super::media::extract_urls_from_text(content);
+    for url in &text_urls {
+        if is_media_url(url)
+            || super::media::is_nostr_media_cdn(url)
+            || super::media::mime_type_from_url(url).is_some()
         {
-            if db.queue_media_url(word, pubkey).is_ok() {
+            if db.queue_media_url(url, pubkey, priority).is_ok() {
                 count += 1;
             }
         }
     }
 
-    // Extract from image/video tags
-    for tag in tags {
-        if tag.len() >= 2 && (tag[0] == "image" || tag[0] == "thumb" || tag[0] == "url") {
-            let url = &tag[1];
-            if (url.starts_with("https://") || url.starts_with("http://"))
-                && is_media_url(url)
-            {
-                if db.queue_media_url(url, pubkey).is_ok() {
-                    count += 1;
-                }
+    // Extract from image/video/imeta tags
+    let tag_urls = super::media::extract_urls_from_tags(
+        &serde_json::to_string(tags).unwrap_or_default(),
+    );
+    for url in &tag_urls {
+        if is_media_url(url)
+            || super::media::is_nostr_media_cdn(url)
+            || super::media::mime_type_from_url(url).is_some()
+        {
+            if db.queue_media_url(url, pubkey, priority).is_ok() {
+                count += 1;
             }
         }
     }
@@ -453,8 +467,32 @@ fn queue_media_urls(
     count
 }
 
+/// Queue profile picture and banner from kind:0 metadata JSON content.
+fn queue_profile_media(
+    db: &Database,
+    pubkey: &str,
+    content: &str,
+    priority: i32,
+) -> u32 {
+    let mut count = 0u32;
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) {
+        for field in &["picture", "banner"] {
+            if let Some(url) = parsed.get(field).and_then(|v| v.as_str()) {
+                if (url.starts_with("https://") || url.starts_with("http://"))
+                    && url.len() > 10
+                {
+                    if db.queue_media_url(url, pubkey, priority).is_ok() {
+                        count += 1;
+                    }
+                }
+            }
+        }
+    }
+    count
+}
+
 /// Check if a URL looks like a media file.
-fn is_media_url(url: &str) -> bool {
+pub fn is_media_url(url: &str) -> bool {
     let lower = url.to_lowercase();
     let media_extensions = [
         ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg",
@@ -469,30 +507,111 @@ fn is_media_url(url: &str) -> bool {
 }
 
 /// Process a batch of events, returning aggregate results.
+/// When `app_handle` is provided, emits a single `events:batch` with all newly stored events
+/// (batched to reduce IPC overhead and prevent race conditions with tier status).
 pub fn process_events(
     events: &[Event],
     db: &Arc<Database>,
     graph: &Arc<WotGraph>,
     own_pubkey: &str,
     source: EventSource,
+    media_priority: i32,
+    app_handle: Option<&tauri::AppHandle>,
+    layer: &str,
 ) -> (u32, u32) {
     let mut stored = 0u32;
     let mut wot_updates = 0u32;
+    let mut batch: Vec<StoredEventNotification> = Vec::new();
 
     // Sort newest-first so replaceable events are processed correctly
     let mut sorted: Vec<&Event> = events.iter().collect();
     sorted.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
-    for event in sorted {
-        let result = process_event(event, db, graph, own_pubkey, source);
+    info!("process_events: processing {} events (source={:?})", sorted.len(), source);
+
+    for (idx, event) in sorted.iter().enumerate() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            process_event(event, db, graph, own_pubkey, source, media_priority)
+        }));
+
+        let result = match result {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = e.downcast_ref::<String>()
+                    .map(|s| s.as_str())
+                    .or_else(|| e.downcast_ref::<&str>().copied())
+                    .unwrap_or("unknown panic");
+                warn!("process_events: PANIC at event {}/{} (kind={}, id={}): {}",
+                    idx + 1, events.len(), event.kind.as_u16(), &event.id.to_hex()[..12], msg);
+                continue;
+            }
+        };
+
         if result.stored {
             stored += 1;
+            if app_handle.is_some() {
+                // Build content preview and extract media URLs — all wrapped in catch_unwind for safety
+                let (content, media_urls) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let raw = event.content.to_string();
+                    let kind_u32 = event.kind.as_u16() as u32;
+                    let preview_text = if kind_u32 == 6 {
+                        serde_json::from_str::<serde_json::Value>(&raw)
+                            .ok()
+                            .and_then(|v| v.get("content")?.as_str().map(String::from))
+                            .unwrap_or_else(|| raw.clone())
+                    } else {
+                        raw
+                    };
+
+                    // Extract media URLs before stripping
+                    let urls: Vec<String> = preview_text
+                        .split_whitespace()
+                        .filter(|w| {
+                            (w.starts_with("http://") || w.starts_with("https://"))
+                                && (is_media_url(w)
+                                    || super::media::is_nostr_media_cdn(w)
+                                    || super::media::mime_type_from_url(w).is_some())
+                        })
+                        .map(|w| w.to_string())
+                        .collect();
+
+                    let cleaned: String = preview_text
+                        .split_whitespace()
+                        .filter(|w| !w.starts_with("http://") && !w.starts_with("https://"))
+                        .collect::<Vec<&str>>()
+                        .join(" ");
+                    let content = if cleaned.chars().count() > 120 {
+                        let truncated: String = cleaned.chars().take(120).collect();
+                        format!("{}...", truncated)
+                    } else {
+                        cleaned
+                    };
+                    (content, urls)
+                })).unwrap_or_default();
+
+                batch.push(StoredEventNotification {
+                    id: event.id.to_hex(),
+                    kind: event.kind.as_u16() as u32,
+                    pubkey: event.pubkey.to_hex(),
+                    content,
+                    layer: layer.to_string(),
+                    media_urls,
+                });
+            }
         }
         if result.wot_updated {
             wot_updates += 1;
         }
     }
 
+    // Emit all stored events as a single batch to reduce IPC overhead
+    if !batch.is_empty() {
+        if let Some(handle) = app_handle {
+            handle.emit("events:batch", &batch).ok();
+        }
+    }
+
+    info!("process_events: done — {} stored, {} wot updates", stored, wot_updates);
     (stored, wot_updates)
 }
 

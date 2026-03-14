@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use anyhow::Result;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -10,15 +11,23 @@ use crate::storage::db::Database;
 pub struct MediaDownloader {
     db: Arc<Database>,
     own_pubkey: String,
-    limit_bytes: u64,
+    tracked_limit_bytes: u64,
+    wot_limit_bytes: u64,
+    tracked_pubkeys: HashSet<String>,
 }
 
 impl MediaDownloader {
-    pub fn new(db: Arc<Database>, own_pubkey: String, storage_gb: f64) -> Self {
+    pub fn new(db: Arc<Database>, own_pubkey: String, tracked_media_gb: f64, wot_media_gb: f64) -> Self {
+        let tracked = db.get_tracked_pubkeys()
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<HashSet<String>>();
         Self {
             db,
             own_pubkey,
-            limit_bytes: (storage_gb * 1_073_741_824.0) as u64,
+            tracked_limit_bytes: (tracked_media_gb * 1_073_741_824.0) as u64,
+            wot_limit_bytes: (wot_media_gb * 1_073_741_824.0) as u64,
+            tracked_pubkeys: tracked,
         }
     }
 
@@ -41,12 +50,18 @@ impl MediaDownloader {
                 .unwrap_or_else(|| sha256_of_string(url));
 
             if self.db.media_exists(&hash) {
+                // Media already downloaded — but reassign to higher-priority pubkey if needed.
+                // Priority: own > tracked > wot. This ensures tracked/own profiles get credit
+                // for media that was first downloaded during a WoT sync pass.
+                self.db.media_reassign_if_higher_priority(
+                    &hash, pubkey, &self.own_pubkey, &self.tracked_pubkeys,
+                ).ok();
                 stats.skipped += 1;
                 continue;
             }
 
-            let is_own = pubkey == &self.own_pubkey;
-            match self.download_media(&http_client, url, &hash, pubkey, is_own).await {
+            let bypass_limit = pubkey == &self.own_pubkey || self.tracked_pubkeys.contains(pubkey);
+            match self.download_media(&http_client, url, &hash, pubkey, bypass_limit).await {
                 Ok(true) => stats.downloaded += 1,
                 Ok(false) => stats.skipped += 1,
                 Err(e) => {
@@ -56,8 +71,9 @@ impl MediaDownloader {
             }
         }
 
-        // Enforce storage limit
-        self.enforce_media_limit().await;
+        // Enforce storage limits per category
+        self.enforce_tracked_media_limit().await;
+        self.enforce_wot_media_limit().await;
 
         if stats.downloaded > 0 {
             info!(
@@ -76,7 +92,7 @@ impl MediaDownloader {
         url: &str,
         hash: &str,
         pubkey: &str,
-        is_own: bool,
+        bypass_limit: bool,
     ) -> Result<bool> {
         const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024; // 50 MB
 
@@ -99,9 +115,14 @@ impl MediaDownloader {
             if cl > MAX_FILE_SIZE {
                 return Ok(false);
             }
-            if !is_own {
-                let used = self.db.media_total_bytes().unwrap_or(0);
-                if used + cl > self.limit_bytes {
+            if !bypass_limit {
+                let used = self.db.media_others_bytes(&self.own_pubkey).unwrap_or(0);
+                if used + cl > self.wot_limit_bytes {
+                    return Ok(false);
+                }
+            } else if pubkey != &self.own_pubkey && self.tracked_pubkeys.contains(pubkey) {
+                let used = self.db.media_tracked_bytes(&self.own_pubkey).unwrap_or(0);
+                if used + cl > self.tracked_limit_bytes {
                     return Ok(false);
                 }
             }
@@ -136,9 +157,14 @@ impl MediaDownloader {
             return Ok(false);
         }
 
-        if !is_own {
-            let used = self.db.media_total_bytes().unwrap_or(0);
-            if used + size_bytes > self.limit_bytes {
+        if !bypass_limit {
+            let used = self.db.media_others_bytes(&self.own_pubkey).unwrap_or(0);
+            if used + size_bytes > self.wot_limit_bytes {
+                return Ok(false);
+            }
+        } else if pubkey != &self.own_pubkey && self.tracked_pubkeys.contains(pubkey) {
+            let used = self.db.media_tracked_bytes(&self.own_pubkey).unwrap_or(0);
+            if used + size_bytes > self.tracked_limit_bytes {
                 return Ok(false);
             }
         }
@@ -156,19 +182,54 @@ impl MediaDownloader {
         Ok(true)
     }
 
-    /// Enforce media storage limit — evict LRU items if over 95%.
-    async fn enforce_media_limit(&self) {
+    /// Enforce tracked media storage limit — evict LRU tracked items if over 95%.
+    async fn enforce_tracked_media_limit(&self) {
+        let used = match self.db.media_tracked_bytes(&self.own_pubkey) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+
+        if used < (self.tracked_limit_bytes as f64 * 0.95) as u64 {
+            return;
+        }
+
+        let target = (self.tracked_limit_bytes as f64 * 0.80) as u64;
+        info!("Media(tracked): over 95% ({}/{}), evicting to 80%", used, self.tracked_limit_bytes);
+
+        let candidates = self.db.media_list_lru_tracked(500, &self.own_pubkey).unwrap_or_default();
+        let mut evicted: Vec<String> = Vec::new();
+        let mut current = used;
+
+        for (hash, size) in candidates {
+            if current <= target { break; }
+            let path = media_file_path(&hash);
+            if let Err(e) = tokio::fs::remove_file(&path).await {
+                warn!("Media: evict failed {:?}: {}", path, e);
+            }
+            evicted.push(hash);
+            current = current.saturating_sub(size);
+        }
+
+        if !evicted.is_empty() {
+            let freed = used - current;
+            self.db.media_delete_records(&evicted).ok();
+            info!("Media(tracked): evicted {} items, freed {} bytes", evicted.len(), freed);
+        }
+    }
+
+    /// Enforce WoT media storage limit — evict LRU WoT items if over 95%.
+    async fn enforce_wot_media_limit(&self) {
         let used = match self.db.media_others_bytes(&self.own_pubkey) {
             Ok(b) => b,
             Err(_) => return,
         };
 
-        if used < (self.limit_bytes as f64 * 0.95) as u64 {
+        if used < (self.wot_limit_bytes as f64 * 0.95) as u64 {
             return;
         }
 
-        let target = (self.limit_bytes as f64 * 0.80) as u64;
-        info!("Media: over 95% ({}/{}), evicting to 80%", used, self.limit_bytes);
+        let target = (self.wot_limit_bytes as f64 * 0.80) as u64;
+        info!("Media(wot): over 95% ({}/{}), evicting to 80%", used, self.wot_limit_bytes);
 
         let candidates = self.db.media_list_lru_excluding_pubkey(500, &self.own_pubkey).unwrap_or_default();
         let mut evicted: Vec<String> = Vec::new();
@@ -187,7 +248,7 @@ impl MediaDownloader {
         if !evicted.is_empty() {
             let freed = used - current;
             self.db.media_delete_records(&evicted).ok();
-            info!("Media: evicted {} items, freed {} bytes", evicted.len(), freed);
+            info!("Media(wot): evicted {} items, freed {} bytes", evicted.len(), freed);
         }
     }
 }
@@ -300,31 +361,12 @@ pub fn extract_urls_from_tags(tags_json: &str) -> Vec<String> {
 /// Extract URLs from text content.
 pub fn extract_urls_from_text(text: &str) -> Vec<String> {
     let mut urls = Vec::new();
-    let bytes = text.as_bytes();
-    let mut i = 0;
 
-    while i < bytes.len() {
-        let remaining = &text[i..];
-        let start = if remaining.starts_with("https://") || remaining.starts_with("http://") {
-            Some(i)
-        } else {
-            None
-        };
-
-        if let Some(start) = start {
-            let mut end = start;
-            for &b in &bytes[start..] {
-                if matches!(b, b' ' | b'\n' | b'\r' | b'\t' | b'"' | b'\'' | b'<' | b'>' | b']' | b')') {
-                    break;
-                }
-                end += 1;
-            }
-            if end > start + 10 {
-                urls.push(text[start..end].to_string());
-            }
-            i = end;
-        } else {
-            i += 1;
+    // Split on whitespace and common delimiters to find URL tokens
+    for token in text.split(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '<' || c == '>' || c == ')' || c == ']') {
+        let trimmed = token.trim();
+        if (trimmed.starts_with("https://") || trimmed.starts_with("http://")) && trimmed.len() > 10 {
+            urls.push(trimmed.to_string());
         }
     }
 

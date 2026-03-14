@@ -53,6 +53,9 @@ export interface AppStatus {
   sync_status: string;
   sync_tier: number;
   sync_stats: SyncStats;
+  media_stored: number;
+  offline_mode: boolean;
+  sync_wot_notes_per_cycle: number;
   relayRunning?: boolean;
   relayPort?: number;
   eventsStored?: number;
@@ -68,6 +71,12 @@ export interface SyncStats {
   tier4_fetched: number;
   current_tier: number;
   current_layer: string;
+  pass_pubkeys_done: number;
+  pass_pubkeys_total: number;
+  pass_relays_done: number;
+  pass_relays_total: number;
+  follows_count: number;
+  current_phase: string;
 }
 
 export interface SyncProgress {
@@ -75,6 +84,15 @@ export interface SyncProgress {
   fetched: number;
   total: number;
   relay: string;
+}
+
+export interface StoredEventNotification {
+  id: string;
+  kind: number;
+  pubkey: string;
+  content: string;
+  layer: string;
+  media_urls: string[];
 }
 
 export interface RelayStatusInfo {
@@ -88,7 +106,9 @@ export interface FeedFilter {
   kinds?: number[];
   limit?: number;
   since?: number;
+  until?: number;
   wotOnly?: boolean;
+  author?: string;
 }
 
 export interface StorageStats {
@@ -121,7 +141,7 @@ export interface Settings {
   sync_wot_batch_size: number;
   sync_wot_events_per_batch: number;
   max_event_age_days: number;
-  sync_fof_content: boolean;
+  sync_wot_notes_per_cycle: number;
   relayPort?: number;
   maxStorageMb?: number;
   syncIntervalSecs?: number;
@@ -143,4 +163,4 @@ export interface Conversation {
   lastTimestamp: number;
 }
 
-export type Screen = "wizard" | "dashboard" | "feed" | "dms" | "wot" | "storage" | "settings" | "my-media";
+export type Screen = "wizard" | "dashboard" | "feed" | "dms" | "wot" | "storage" | "settings";

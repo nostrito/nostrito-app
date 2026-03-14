@@ -3,7 +3,7 @@ use rusqlite::Connection;
 use tracing::info;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Get the current schema version from the database.
 pub fn get_schema_version(conn: &Connection) -> u32 {
@@ -42,6 +42,14 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
 
     if current < 3 {
         migrate_v2_to_v3(conn)?;
+    }
+
+    if current < 4 {
+        migrate_v3_to_v4(conn)?;
+    }
+
+    if current < 5 {
+        migrate_v4_to_v5(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -305,6 +313,58 @@ fn migrate_v2_to_v3(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Migrate from v3 to v4:
+/// - Add priority column to media_queue
+/// - Add hop3 retention config
+fn migrate_v3_to_v4(conn: &Connection) -> Result<()> {
+    info!("Running migration v3 → v4...");
+
+    // Add priority column to media_queue
+    let has_priority: bool = conn
+        .prepare("SELECT priority FROM media_queue LIMIT 1")
+        .is_ok();
+    if !has_priority {
+        conn.execute_batch(
+            "ALTER TABLE media_queue ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_media_queue_priority ON media_queue(priority DESC, queued_at ASC);",
+    )?;
+
+    // Add hop3 retention config
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO retention_config (tier, min_events, time_window_secs) VALUES ('hop3', 3, 172800);",
+    )?;
+
+    info!("Migration v3 → v4 complete");
+    Ok(())
+}
+
+/// Migrate from v4 to v5:
+/// - Add bookmarked_media table for permanent media bookmarks
+fn migrate_v4_to_v5(conn: &Connection) -> Result<()> {
+    info!("Running migration v4 → v5...");
+
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS bookmarked_media (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT NOT NULL,
+            media_url TEXT NOT NULL,
+            event_json TEXT NOT NULL,
+            profile_json TEXT NOT NULL,
+            bookmarked_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+            UNIQUE(event_id, media_url)
+        );
+        CREATE INDEX IF NOT EXISTS idx_bookmarked_media_at ON bookmarked_media(bookmarked_at DESC);
+        "#,
+    )?;
+
+    info!("Migration v4 → v5 complete");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -479,11 +539,11 @@ mod tests {
             .unwrap();
         assert_eq!(relay_count, 1);
 
-        // Retention defaults bootstrapped
+        // Retention defaults bootstrapped (follows, fof, others + hop3 from v4)
         let ret_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM retention_config", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(ret_count, 3);
+        assert_eq!(ret_count, 4);
 
         // sync_state should be dropped
         let ss_count: i64 = conn

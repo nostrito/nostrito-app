@@ -1,17 +1,11 @@
-import React, { useEffect, useState } from "react";
+import React from "react";
 import { NavLink } from "react-router-dom";
-import { invoke } from "@tauri-apps/api/core";
-import { IconDashboard, IconFeed, IconMessageCircle, IconNetwork, IconDatabase, IconSettings, IconImage } from "./Icon";
-import type { ProfileInfo } from "../utils/profiles";
+import logoUrl from "../assets/logo.png";
+import { IconDashboard, IconFeed, IconMessageCircle, IconNetwork, IconDatabase, IconSettings } from "./Icon";
+import { useAppContext } from "../context/AppContext";
 
 export const Sidebar: React.FC = () => {
-  const [ownProfile, setOwnProfile] = useState<ProfileInfo | null>(null);
-
-  useEffect(() => {
-    invoke<ProfileInfo | null>("get_own_profile")
-      .then((p) => setOwnProfile(p))
-      .catch(() => {});
-  }, []);
+  const { ownProfile } = useAppContext();
 
   const navItems = [
     { to: "/", icon: <IconDashboard />, label: "Dashboard" },
@@ -19,12 +13,14 @@ export const Sidebar: React.FC = () => {
     { to: "/dms", icon: <IconMessageCircle />, label: "DMs" },
     { to: "/wot", icon: <IconNetwork />, label: "WoT" },
     { to: "/storage", icon: <IconDatabase />, label: "Storage" },
-    { to: "/my-media", icon: <IconImage />, label: "My Media" },
     { to: "/settings", icon: <IconSettings />, label: "Settings" },
   ];
 
   return (
     <aside className="app-sidebar-nav">
+      <div className="sidebar-logo">
+        <img src={logoUrl} alt="nostrito" style={{ width: 52, height: 52, borderRadius: 12, display: "block", margin: "0 auto 8px" }} />
+      </div>
       {navItems.map((item) => (
         <NavLink
           key={item.to}

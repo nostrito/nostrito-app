@@ -7,101 +7,32 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use super::policy::RelayPolicy;
-use super::types::MAX_CONNECTIONS;
+
 
 /// Tracks a relay connection's lifecycle.
 struct RelayConnection {
     last_used: Instant,
 }
 
-/// Manages a pool of relay connections with on-demand connect, idle disconnect,
+/// Manages relay connections with per-call Client instances, policy enforcement,
 /// and a global connection cap.
+///
+/// Each `subscribe_and_collect` creates a fresh `nostr_sdk::Client` because
+/// the underlying relay pool shuts itself down after subscriptions complete,
+/// making the Client unusable for subsequent calls.
 pub struct RelayPool {
-    client: Client,
-    connections: RwLock<HashMap<String, RelayConnection>>,
     policies: RwLock<HashMap<String, RelayPolicy>>,
-    max_connections: usize,
-    idle_timeout: Duration,
 }
 
 impl RelayPool {
     pub fn new() -> Self {
         Self {
-            client: Client::default(),
-            connections: RwLock::new(HashMap::new()),
             policies: RwLock::new(HashMap::new()),
-            max_connections: MAX_CONNECTIONS,
-            idle_timeout: Duration::from_secs(300), // 5 min
         }
-    }
-
-    /// Ensure a relay is connected. Connects on-demand if not already connected.
-    /// Evicts idle relays if at the connection cap.
-    pub async fn ensure_connected(&self, relay_url: &str) -> Result<()> {
-        {
-            let mut conns = self.connections.write().await;
-            if let Some(conn) = conns.get_mut(relay_url) {
-                conn.last_used = Instant::now();
-                return Ok(());
-            }
-
-            // Evict idle connections if at cap
-            if conns.len() >= self.max_connections {
-                self.evict_idle(&mut conns).await;
-            }
-
-            if conns.len() >= self.max_connections {
-                // Still at cap after eviction — remove least recently used
-                if let Some(lru_url) = conns
-                    .iter()
-                    .min_by_key(|(_, c)| c.last_used)
-                    .map(|(url, _)| url.clone())
-                {
-                    debug!("RelayPool: evicting LRU relay {}", lru_url);
-                    conns.remove(&lru_url);
-                    self.client.remove_relay(&lru_url).await?;
-                }
-            }
-        }
-
-        // Connect to new relay
-        match self.client.add_relay(relay_url).await {
-            Ok(_) => {
-                self.client.connect_relay(relay_url).await?;
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                let mut conns = self.connections.write().await;
-                conns.insert(
-                    relay_url.to_string(),
-                    RelayConnection {
-                        last_used: Instant::now(),
-                    },
-                );
-                debug!("RelayPool: connected to {}", relay_url);
-                Ok(())
-            }
-            Err(e) => {
-                let mut policies = self.policies.write().await;
-                let policy = policies
-                    .entry(relay_url.to_string())
-                    .or_insert_with(RelayPolicy::new);
-                policy.on_connection_failure();
-                Err(e.into())
-            }
-        }
-    }
-
-    /// Ensure multiple relays are connected.
-    pub async fn ensure_connected_many(&self, relay_urls: &[String]) -> Vec<String> {
-        let mut connected = Vec::new();
-        for url in relay_urls {
-            if self.ensure_connected(url).await.is_ok() {
-                connected.push(url.clone());
-            }
-        }
-        connected
     }
 
     /// Subscribe to filters and collect events with timeout, EOSE handling, and policy enforcement.
+    /// Creates a fresh Client per call to avoid stale connection state.
     pub async fn subscribe_and_collect(
         &self,
         relay_urls: &[String],
@@ -112,25 +43,57 @@ impl RelayPool {
             return Ok(Vec::new());
         }
 
-        // Ensure relays are connected
-        let connected = self.ensure_connected_many(relay_urls).await;
-        if connected.is_empty() {
-            return Ok(Vec::new());
-        }
-
         // Wait for policy slot on first relay
         {
             let mut policies = self.policies.write().await;
             let policy = policies
-                .entry(connected[0].clone())
+                .entry(relay_urls[0].clone())
                 .or_insert_with(RelayPolicy::new);
             policy.wait_for_slot().await;
         }
 
-        let expected_eose = connected.len();
-        let mut notifications = self.client.notifications();
+        // Create a fresh client for this subscription
+        let client = Client::default();
+        let mut connected = Vec::new();
 
-        let sub_id = self.client.subscribe(filters, None).await?.val;
+        for url in relay_urls {
+            debug!("RelayPool: connecting to {} ...", url);
+            let connect_start = Instant::now();
+            match client.add_relay(url.as_str()).await {
+                Ok(_) => {
+                    match client.connect_relay(url.as_str()).await {
+                        Ok(_) => {
+                            debug!("RelayPool: connected to {} in {:.1}s", url, connect_start.elapsed().as_secs_f32());
+                            connected.push(url.clone());
+                        }
+                        Err(e) => {
+                            warn!("RelayPool: connect to {} failed after {:.1}s: {}", url, connect_start.elapsed().as_secs_f32(), e);
+                            let mut policies = self.policies.write().await;
+                            let policy = policies.entry(url.clone()).or_insert_with(RelayPolicy::new);
+                            policy.on_connection_failure();
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("RelayPool: add relay {} failed: {}", url, e);
+                    let mut policies = self.policies.write().await;
+                    let policy = policies.entry(url.clone()).or_insert_with(RelayPolicy::new);
+                    policy.on_connection_failure();
+                }
+            }
+        }
+
+        if connected.is_empty() {
+            warn!("RelayPool: no relays connected out of {:?}", relay_urls);
+            return Ok(Vec::new());
+        }
+
+        let expected_eose = connected.len();
+        let mut notifications = client.notifications();
+
+        debug!("RelayPool: subscribing to {} relays (timeout={}s): {:?}", connected.len(), timeout_secs, connected);
+        let sub_start = Instant::now();
+        let sub_id = client.subscribe_to(connected.clone(), filters, None).await?.val;
         let mut events: Vec<Event> = Vec::new();
 
         let deadline = tokio::time::sleep(Duration::from_secs(timeout_secs));
@@ -172,7 +135,10 @@ impl RelayPool {
                                 _ => {}
                             }
                         }
-                        Ok(RelayPoolNotification::Shutdown) => break,
+                        Ok(RelayPoolNotification::Shutdown) => {
+                            warn!("RelayPool: internal pool shutdown during subscription");
+                            break;
+                        },
                         Err(_) => break,
                         _ => {}
                     }
@@ -184,7 +150,7 @@ impl RelayPool {
             }
         }
 
-        self.client.unsubscribe(sub_id).await;
+        client.unsubscribe(sub_id).await;
 
         // Update policies on success
         if got_eose || !events.is_empty() {
@@ -197,56 +163,29 @@ impl RelayPool {
             }
         }
 
-        // Touch connection timestamps
-        {
-            let mut conns = self.connections.write().await;
-            for url in &connected {
-                if let Some(conn) = conns.get_mut(url) {
-                    conn.last_used = Instant::now();
-                }
-            }
-        }
-
-        debug!(
-            "RelayPool: collected {} events (EOSE={}, {}/{} relays)",
+        info!(
+            "RelayPool: collected {} events in {:.1}s (EOSE={}, {}/{} relays)",
             events.len(),
+            sub_start.elapsed().as_secs_f32(),
             got_eose,
             eose_count,
             expected_eose
         );
 
+        // Clean disconnect
+        client.disconnect().await.ok();
+
         Ok(events)
-    }
-
-    /// Disconnect idle relays that haven't been used within the idle timeout.
-    async fn evict_idle(&self, conns: &mut HashMap<String, RelayConnection>) {
-        let now = Instant::now();
-        let to_evict: Vec<String> = conns
-            .iter()
-            .filter(|(_, c)| now.duration_since(c.last_used) > self.idle_timeout)
-            .map(|(url, _)| url.clone())
-            .collect();
-
-        for url in &to_evict {
-            conns.remove(url);
-            if let Err(e) = self.client.remove_relay(url.as_str()).await {
-                warn!("RelayPool: failed to remove idle relay {}: {}", url, e);
-            } else {
-                debug!("RelayPool: evicted idle relay {}", url);
-            }
-        }
     }
 
     /// Disconnect all relays and clean up.
     pub async fn shutdown(&self) {
-        self.client.disconnect().await.ok();
-        self.connections.write().await.clear();
         info!("RelayPool: shutdown complete");
     }
 
-    /// Get current connection count.
+    /// Get current connection count (always 0 — connections are per-call now).
     pub async fn connection_count(&self) -> usize {
-        self.connections.read().await.len()
+        0
     }
 }
 
@@ -262,8 +201,8 @@ mod tests {
 
     #[test]
     fn test_pool_construction() {
-        let pool = RelayPool::new();
-        assert_eq!(pool.max_connections, MAX_CONNECTIONS);
+        let _pool = RelayPool::new();
+        // Pool is now stateless per-call — just verify construction works
     }
 
     #[tokio::test]
