@@ -18,6 +18,20 @@ use wot::WotGraph;
 
 // ── Helpers ────────────────────────────────────────────────────────
 
+/// Show a native macOS error dialog and exit gracefully instead of panicking.
+fn fatal_exit(msg: &str) -> ! {
+    tracing::error!("[fatal] {}", msg);
+    let escaped = msg.replace('\\', "\\\\").replace('"', "\\\"");
+    let _ = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(format!(
+            "display dialog \"{}\" with title \"nostrito\" buttons {{\"OK\"}} default button \"OK\" with icon stop",
+            escaped
+        ))
+        .output();
+    std::process::exit(1);
+}
+
 /// Per-npub database path: `{data_dir}/{npub_prefix}.db`
 fn db_path_for_npub(data_dir: &std::path::Path, npub: &str) -> PathBuf {
     let short = if npub.len() > 16 { &npub[..16] } else { npub };
@@ -197,6 +211,16 @@ pub struct OwnershipStorageStats {
     pub db_size_bytes: u64,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StorageEstimateResponse {
+    pub follows_count: u32,
+    pub fof_estimate: u32,
+    pub events_per_day: f64,
+    pub bytes_per_day: f64,
+    pub projected_30d_bytes: f64,
+    pub current_db_size: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub npub: String,
@@ -337,6 +361,10 @@ async fn init_nostrito(
     storage_others_gb: Option<f64>,
     storage_tracked_media_gb: Option<f64>,
     storage_wot_media_gb: Option<f64>,
+    wot_retention_days: Option<u32>,
+    max_event_age_days: Option<u32>,
+    retention_overrides: Option<String>,
+    storage_preset: Option<String>,
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
@@ -394,6 +422,12 @@ async fn init_nostrito(
         if let Some(gb) = storage_wot_media_gb {
             config.storage_wot_media_gb = gb;
         }
+        if let Some(days) = wot_retention_days {
+            config.wot_event_retention_days = days;
+        }
+        if let Some(days) = max_event_age_days {
+            config.max_event_age_days = days;
+        }
     }
 
     // Persist to DB
@@ -414,6 +448,34 @@ async fn init_nostrito(
         let config = state.config.read().await;
         state.db().set_config("storage_tracked_media_gb", &config.storage_tracked_media_gb.to_string()).ok();
         state.db().set_config("storage_wot_media_gb", &config.storage_wot_media_gb.to_string()).ok();
+        state.db().set_config("wot_event_retention_days", &config.wot_event_retention_days.to_string()).ok();
+        state.db().set_config("max_event_age_days", &config.max_event_age_days.to_string()).ok();
+    }
+
+    // Persist storage preset key
+    if let Some(ref preset_key) = storage_preset {
+        state.db().set_config("storage_preset", preset_key).ok();
+    }
+
+    // Apply retention overrides (JSON string: {"follows":{"minEvents":50,"windowDays":30},...})
+    if let Some(ref overrides_json) = retention_overrides {
+        if let Ok(overrides) = serde_json::from_str::<serde_json::Value>(overrides_json) {
+            for (tier, cfg) in overrides.as_object().into_iter().flatten() {
+                if let (Some(min_events), Some(window_days)) = (
+                    cfg.get("minEvents").and_then(|v| v.as_u64()),
+                    cfg.get("windowDays").and_then(|v| v.as_u64()),
+                ) {
+                    let window_secs = window_days * 86400;
+                    state.db()
+                        .set_retention_config(tier, min_events as u32, window_secs)
+                        .ok();
+                    tracing::info!(
+                        "[init_nostrito] retention override: tier={} min_events={} window_days={}",
+                        tier, min_events, window_days
+                    );
+                }
+            }
+        }
     }
 
     // Load existing graph from DB
@@ -841,9 +903,14 @@ async fn get_feed(filter: FeedFilter, state: State<'_, AppState>) -> Result<Vec<
             })?
     };
 
-    tracing::info!("[cmd:get_feed] returning {} events", events.len());
+    tracing::info!("[cmd:get_feed] returning {} events (pre-filter)", events.len());
 
-    Ok(events
+    // Filter out events containing muted words or hashtags
+    let muted_words = state.db().get_muted_words().unwrap_or_default();
+    let muted_hashtags: std::collections::HashSet<String> = state.db().get_muted_hashtags()
+        .unwrap_or_default().into_iter().collect();
+
+    let results: Vec<NostrEvent> = events
         .into_iter()
         .map(|(id, pubkey, created_at, kind, tags_json, content, sig)| {
             let tags: Vec<Vec<String>> = serde_json::from_str(&tags_json).unwrap_or_default();
@@ -857,7 +924,28 @@ async fn get_feed(filter: FeedFilter, state: State<'_, AppState>) -> Result<Vec<
                 sig,
             }
         })
-        .collect())
+        .filter(|event| {
+            // Skip events containing muted words (case-insensitive)
+            let content_lower = event.content.to_lowercase();
+            for word in &muted_words {
+                if content_lower.contains(&word.to_lowercase()) {
+                    return false;
+                }
+            }
+            // Skip events with muted hashtags
+            for tag in &event.tags {
+                if tag.len() >= 2 && tag[0] == "t" {
+                    if muted_hashtags.contains(&tag[1].to_lowercase()) {
+                        return false;
+                    }
+                }
+            }
+            true
+        })
+        .collect();
+
+    tracing::info!("[cmd:get_feed] returning {} events", results.len());
+    Ok(results)
 }
 
 fn rows_to_events(rows: Vec<(String, String, i64, i64, String, String, String)>) -> Vec<NostrEvent> {
@@ -1042,8 +1130,42 @@ async fn fetch_global_feed(limit: Option<u32>, until: Option<u64>, kinds: Option
     // Users can explicitly save individual events via the save_event command.
     tracing::info!("[fetch_global_feed] {} events fetched (not persisted)", all_events.len());
 
+    // Filter out muted pubkeys and events
+    let muted_pubkeys: std::collections::HashSet<String> = state.db().get_muted_pubkeys()
+        .unwrap_or_default().into_iter().collect();
+    let muted_words = state.db().get_muted_words().unwrap_or_default();
+    let muted_hashtags: std::collections::HashSet<String> = state.db().get_muted_hashtags()
+        .unwrap_or_default().into_iter().collect();
+
     Ok(all_events
         .into_iter()
+        .filter(|event| {
+            // Skip muted pubkeys
+            if muted_pubkeys.contains(&event.pubkey.to_hex()) {
+                return false;
+            }
+            // Skip muted event IDs
+            if state.db().is_event_muted(&event.id.to_hex()).unwrap_or(false) {
+                return false;
+            }
+            // Skip events containing muted words (case-insensitive)
+            let content_lower = event.content.to_lowercase();
+            for word in &muted_words {
+                if content_lower.contains(&word.to_lowercase()) {
+                    return false;
+                }
+            }
+            // Skip events with muted hashtags
+            for tag in event.tags.iter() {
+                let tag_slice = tag.as_slice();
+                if tag_slice.len() >= 2 && tag_slice[0] == "t" {
+                    if muted_hashtags.contains(&tag_slice[1].to_lowercase()) {
+                        return false;
+                    }
+                }
+            }
+            true
+        })
         .map(|event| {
             let tags: Vec<Vec<String>> = event.tags.iter()
                 .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
@@ -1238,8 +1360,38 @@ async fn fetch_wot_articles(
     sorted.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     sorted.truncate(target);
 
+    // Filter out muted pubkeys, events, words, and hashtags
+    let muted_pubkeys: std::collections::HashSet<String> = state.db().get_muted_pubkeys()
+        .unwrap_or_default().into_iter().collect();
+    let muted_words = state.db().get_muted_words().unwrap_or_default();
+    let muted_hashtags: std::collections::HashSet<String> = state.db().get_muted_hashtags()
+        .unwrap_or_default().into_iter().collect();
+
     Ok(sorted
         .into_iter()
+        .filter(|event| {
+            if muted_pubkeys.contains(&event.pubkey.to_hex()) {
+                return false;
+            }
+            if state.db().is_event_muted(&event.id.to_hex()).unwrap_or(false) {
+                return false;
+            }
+            let content_lower = event.content.to_lowercase();
+            for word in &muted_words {
+                if content_lower.contains(&word.to_lowercase()) {
+                    return false;
+                }
+            }
+            for tag in event.tags.iter() {
+                let tag_slice = tag.as_slice();
+                if tag_slice.len() >= 2 && tag_slice[0] == "t" {
+                    if muted_hashtags.contains(&tag_slice[1].to_lowercase()) {
+                        return false;
+                    }
+                }
+            }
+            true
+        })
         .map(|event| {
             let tags: Vec<Vec<String>> = event.tags.iter()
                 .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
@@ -1657,8 +1809,13 @@ async fn search_global(query: String, limit: Option<u32>, state: State<'_, AppSt
 
     tracing::info!("[search_global] {} results from NIP-50 search", results.len());
 
+    // Filter out muted pubkeys
+    let muted_pubkeys: std::collections::HashSet<String> = state.db().get_muted_pubkeys()
+        .unwrap_or_default().into_iter().collect();
+
     Ok(results
         .into_iter()
+        .filter(|event| !muted_pubkeys.contains(&event.pubkey.to_hex()))
         .map(|event| {
             let tags: Vec<Vec<String>> = event.tags.iter()
                 .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
@@ -1706,52 +1863,10 @@ async fn get_ownership_storage_stats(state: State<'_, AppState>) -> Result<Owner
 
     let db = state.db();
 
-    // Reconcile media for tracked profiles: reassign misattributed media and
-    // queue any undownloaded media for profiles that have events but no cached media
-    let tracked_pks_for_reassign = db.get_tracked_pubkeys().unwrap_or_default();
-    for tpk in &tracked_pks_for_reassign {
-        if tpk != &own_pubkey {
-            if let Ok(n) = db.reassign_media_for_pubkey(tpk) {
-                if n > 0 {
-                    tracing::info!("[cmd:get_ownership_storage_stats] reassigned {} media for tracked {}...", n, &tpk[..tpk.len().min(12)]);
-                }
-            }
-            // Re-queue media for tracked profiles that have no cached media yet
-            let has_media = db.get_profile_media(tpk).map(|m| !m.is_empty()).unwrap_or(false);
-            if !has_media {
-                if let Ok(queued) = db.requeue_events_media(tpk) {
-                    if queued > 0 {
-                        tracing::info!("[cmd:get_ownership_storage_stats] queued {} media URLs for tracked {}...", queued, &tpk[..tpk.len().min(12)]);
-                    }
-                }
-            }
-        }
-    }
-
-    let own_events_count = db.own_event_count(&own_pubkey).map_err(|e| e.to_string())?;
-    let own_media_bytes = db.own_media_bytes(&own_pubkey).map_err(|e| e.to_string())?;
-    let tracked_events_count = db.tracked_event_count(&own_pubkey).map_err(|e| e.to_string())?;
-    let tracked_media_bytes = db.tracked_media_bytes(&own_pubkey).map_err(|e| e.to_string())?;
-    let wot_events_count = db.wot_event_count(&own_pubkey).map_err(|e| e.to_string())?;
-    let wot_media_bytes = db.wot_media_bytes(&own_pubkey).map_err(|e| e.to_string())?;
-    let total_events = db.event_count().map_err(|e| e.to_string())?;
-    let db_size_bytes = db.db_size_bytes().map_err(|e| e.to_string())?;
-
-    // Debug: show tracked pubkeys and whether they match any events
-    let tracked_pks = db.get_tracked_pubkeys().unwrap_or_default();
-    if !tracked_pks.is_empty() {
-        for tpk in &tracked_pks {
-            let is_own = tpk == &own_pubkey;
-            let event_sample = db.query_events(None, Some(&[tpk.clone()]), None, None, None, 1).unwrap_or_default();
-            tracing::info!(
-                "[cmd:get_ownership_storage_stats] tracked_pk={}... is_own={} has_events={} format={}",
-                &tpk[..tpk.len().min(16)], is_own, !event_sample.is_empty(),
-                if tpk.starts_with("npub") { "npub" } else { "hex" }
-            );
-        }
-    } else {
-        tracing::warn!("[cmd:get_ownership_storage_stats] tracked_profiles table is EMPTY");
-    }
+    // Use batch query (2 SQL calls instead of 7+)
+    let (own_events_count, tracked_events_count, wot_events_count, total_events,
+         own_media_bytes, tracked_media_bytes, wot_media_bytes, db_size_bytes) =
+        db.get_ownership_stats_batch(&own_pubkey).map_err(|e| e.to_string())?;
 
     tracing::info!(
         "[cmd:get_ownership_storage_stats] own={}/{}, tracked={}/{}, wot={}/{}",
@@ -1769,6 +1884,58 @@ async fn get_ownership_storage_stats(state: State<'_, AppState>) -> Result<Owner
         wot_media_bytes,
         total_events,
         db_size_bytes,
+    })
+}
+
+#[tauri::command]
+async fn prune_wot_data(state: State<'_, AppState>) -> Result<String, String> {
+    tracing::info!("[cmd:prune_wot_data] called");
+    let config = state.config.read().await;
+    let own_pubkey = config.hex_pubkey.clone().unwrap_or_default();
+    drop(config);
+
+    if own_pubkey.is_empty() {
+        return Err("Not initialized — no pubkey set".into());
+    }
+
+    let db = state.db();
+    let graph = &state.wot_graph;
+    let stats = sync::pruning::run_pruning(&db, graph, &own_pubkey)
+        .map_err(|e| format!("Pruning failed: {}", e))?;
+
+    let msg = format!(
+        "Pruned {} events (follows={}, fof={}, hop3={}, others={})",
+        stats.total(),
+        stats.follows_pruned,
+        stats.fof_pruned,
+        stats.hop3_pruned,
+        stats.others_pruned,
+    );
+    tracing::info!("[cmd:prune_wot_data] {}", msg);
+    Ok(msg)
+}
+
+#[tauri::command]
+async fn get_storage_estimate(state: State<'_, AppState>) -> Result<StorageEstimateResponse, String> {
+    let config = state.config.read().await;
+    let own_pubkey = config.hex_pubkey.clone().unwrap_or_default();
+    drop(config);
+
+    if own_pubkey.is_empty() {
+        return Err("Not initialized — no pubkey set".into());
+    }
+
+    let db = state.db();
+    let estimate = storage::estimation::estimate_storage(&db, &state.wot_graph, &own_pubkey)
+        .map_err(|e| format!("Estimation failed: {}", e))?;
+
+    Ok(StorageEstimateResponse {
+        follows_count: estimate.follows_count,
+        fof_estimate: estimate.fof_estimate,
+        events_per_day: estimate.events_per_day,
+        bytes_per_day: estimate.bytes_per_day,
+        projected_30d_bytes: estimate.projected_30d_bytes,
+        current_db_size: estimate.current_db_size,
     })
 }
 
@@ -3275,8 +3442,7 @@ pub fn run() {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("nostrito");
     if let Err(e) = std::fs::create_dir_all(&data_dir) {
-        tracing::error!("[init] Failed to create data directory {}: {}", data_dir.display(), e);
-        panic!("Failed to create data directory {}: {}", data_dir.display(), e);
+        fatal_exit(&format!("Failed to create data directory {}: {}", data_dir.display(), e));
     }
 
     // Open lobby DB to check for saved npub
@@ -3285,8 +3451,7 @@ pub fn run() {
     let lobby_db = match Database::open(&lobby_path) {
         Ok(db) => db,
         Err(e) => {
-            tracing::error!("[init] Failed to open lobby database {}: {}", lobby_path.display(), e);
-            panic!("Failed to open lobby database {}: {}", lobby_path.display(), e);
+            fatal_exit(&format!("Failed to open lobby database {}: {}", lobby_path.display(), e));
         }
     };
 
@@ -3300,18 +3465,15 @@ pub fn run() {
             tracing::info!("[init] Migrating lobby DB → per-user DB");
             drop(lobby_db);
             if let Err(e) = std::fs::copy(&lobby_path, &user_path) {
-                tracing::error!("[init] Failed to copy lobby DB to {}: {}", user_path.display(), e);
-                panic!("Failed to copy lobby DB: {}", e);
+                fatal_exit(&format!("Failed to copy lobby DB to {}: {}", user_path.display(), e));
             }
             Arc::new(Database::open(&user_path).unwrap_or_else(|e| {
-                tracing::error!("[init] Failed to open per-user database {}: {}", user_path.display(), e);
-                panic!("Failed to open per-user database: {}", e);
+                fatal_exit(&format!("Failed to open per-user database {}: {}", user_path.display(), e));
             }))
         } else {
             drop(lobby_db);
             Arc::new(Database::open(&user_path).unwrap_or_else(|e| {
-                tracing::error!("[init] Failed to open per-user database {}: {}", user_path.display(), e);
-                panic!("Failed to open per-user database: {}", e);
+                fatal_exit(&format!("Failed to open per-user database {}: {}", user_path.display(), e));
             }))
         }
     } else {
@@ -3476,40 +3638,45 @@ pub fn run() {
                     let hex: String = hex_pubkey.clone();
                     let port = cfg.relay_port;
                     let allowed = cfg.hex_pubkey.clone();
+                    let offline = cfg.offline_mode;
                     drop(cfg);
 
-                    tracing::info!("Auto-resuming sync for {}...", &hex[..8]);
+                    if offline {
+                        tracing::info!("[init] Offline mode active — skipping sync engine auto-resume for {}", &hex[..8]);
+                    } else {
+                        tracing::info!("Auto-resuming sync for {}...", &hex[..8]);
 
-                    let cfg2 = config.read().await;
-                    let tracked_media_gb = cfg2.storage_tracked_media_gb;
-                    let wot_media_gb = cfg2.storage_wot_media_gb;
-                    let max_age_days = cfg2.max_event_age_days;
-                    let sync_config = SyncConfig {
-                        lookback_days: cfg2.sync_lookback_days,
-                        batch_size: cfg2.sync_batch_size,
-                        events_per_batch: cfg2.sync_events_per_batch,
-                        batch_pause_secs: cfg2.sync_batch_pause_secs,
-                        relay_min_interval_secs: cfg2.sync_relay_min_interval_secs,
-                        wot_batch_size: cfg2.sync_wot_batch_size,
-                        wot_events_per_batch: cfg2.sync_wot_events_per_batch,
-                        cycle_interval_secs: cfg2.sync_interval_secs,
-                        wot_notes_per_cycle: cfg2.sync_wot_notes_per_cycle,
-                    };
-                    drop(cfg2);
-                    let cancel = start_sync_engine(
-                        wot_graph,
-                        db,
-                        relays,
-                        hex,
-                        sync_tier,
-                        sync_stats,
-                        app_handle.clone(),
-                        tracked_media_gb,
-                        wot_media_gb,
-                        sync_config,
-                        max_age_days,
-                    );
-                    *sync_cancel.write().await = Some(cancel);
+                        let cfg2 = config.read().await;
+                        let tracked_media_gb = cfg2.storage_tracked_media_gb;
+                        let wot_media_gb = cfg2.storage_wot_media_gb;
+                        let max_age_days = cfg2.max_event_age_days;
+                        let sync_config = SyncConfig {
+                            lookback_days: cfg2.sync_lookback_days,
+                            batch_size: cfg2.sync_batch_size,
+                            events_per_batch: cfg2.sync_events_per_batch,
+                            batch_pause_secs: cfg2.sync_batch_pause_secs,
+                            relay_min_interval_secs: cfg2.sync_relay_min_interval_secs,
+                            wot_batch_size: cfg2.sync_wot_batch_size,
+                            wot_events_per_batch: cfg2.sync_wot_events_per_batch,
+                            cycle_interval_secs: cfg2.sync_interval_secs,
+                            wot_notes_per_cycle: cfg2.sync_wot_notes_per_cycle,
+                        };
+                        drop(cfg2);
+                        let cancel = start_sync_engine(
+                            wot_graph,
+                            db,
+                            relays,
+                            hex,
+                            sync_tier,
+                            sync_stats,
+                            app_handle.clone(),
+                            tracked_media_gb,
+                            wot_media_gb,
+                            sync_config,
+                            max_age_days,
+                        );
+                        *sync_cancel.write().await = Some(cancel);
+                    }
 
                     // Auto-setup mkcert if certs don't exist
                     {
@@ -3591,6 +3758,8 @@ pub fn run() {
             search_global,
             get_storage_stats,
             get_ownership_storage_stats,
+            prune_wot_data,
+            get_storage_estimate,
             get_settings,
             save_settings,
             start_sync,
@@ -3642,7 +3811,6 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|e| {
-            tracing::error!("[init] Fatal error running nostrito: {}", e);
-            panic!("Fatal error running nostrito: {}", e);
+            fatal_exit(&format!("Fatal error running nostrito: {}", e));
         });
 }

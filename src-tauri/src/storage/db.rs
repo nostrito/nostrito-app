@@ -505,6 +505,10 @@ impl Database {
             param_values.push(Box::new(until as i64));
         }
 
+        // Exclude muted users and muted events
+        sql.push_str(" AND pubkey NOT IN (SELECT pubkey FROM muted_users)");
+        sql.push_str(" AND id NOT IN (SELECT event_id FROM muted_events)");
+
         sql.push_str(" ORDER BY created_at DESC");
 
         {
@@ -589,6 +593,10 @@ impl Database {
             sql.push_str(&format!(" AND created_at <= ?{}", idx));
             param_values.push(Box::new(until as i64));
         }
+
+        // Exclude muted users and muted events
+        sql.push_str(" AND pubkey NOT IN (SELECT pubkey FROM muted_users)");
+        sql.push_str(" AND id NOT IN (SELECT event_id FROM muted_events)");
 
         sql.push_str(" ORDER BY created_at DESC");
 
@@ -681,6 +689,10 @@ impl Database {
             param_values.push(Box::new(until as i64));
         }
 
+        // Exclude muted users and muted events
+        sql.push_str(" AND pubkey NOT IN (SELECT pubkey FROM muted_users)");
+        sql.push_str(" AND id NOT IN (SELECT event_id FROM muted_events)");
+
         sql.push_str(" ORDER BY created_at DESC");
         {
             let idx = param_values.len() + 1;
@@ -755,6 +767,10 @@ impl Database {
             sql.push_str(&format!(" AND pubkey = ?{}", idx));
             param_values.push(Box::new(author_pk.to_string()));
         }
+
+        // Exclude muted users and muted events
+        sql.push_str(" AND pubkey NOT IN (SELECT pubkey FROM muted_users)");
+        sql.push_str(" AND id NOT IN (SELECT event_id FROM muted_events)");
 
         sql.push_str(" ORDER BY created_at DESC");
 
@@ -1664,6 +1680,71 @@ impl Database {
         Ok(total as u64)
     }
 
+    /// Batch query: get all ownership storage stats in 2 SQL queries instead of 7+.
+    /// Returns (own_events, tracked_events, wot_events, total_events,
+    ///          own_media_bytes, tracked_media_bytes, wot_media_bytes, db_size_bytes).
+    pub fn get_ownership_stats_batch(&self, own_pubkey: &str) -> Result<(u64, u64, u64, u64, u64, u64, u64, u64)> {
+        let conn = self.conn.lock();
+
+        // Event counts in a single query
+        let (own_events, tracked_events, wot_events, total_events): (i64, i64, i64, i64) = conn.query_row(
+            "SELECT
+                SUM(CASE WHEN pubkey = ?1 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN pubkey != ?1 AND pubkey IN (SELECT pubkey FROM tracked_profiles) THEN 1 ELSE 0 END),
+                SUM(CASE WHEN pubkey != ?1 AND pubkey NOT IN (SELECT pubkey FROM tracked_profiles) THEN 1 ELSE 0 END),
+                COUNT(*)
+            FROM nostr_events",
+            params![own_pubkey],
+            |row| Ok((
+                row.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                row.get::<_, i64>(3)?,
+            )),
+        )?;
+
+        // Media bytes in a single query
+        let (own_media, tracked_media, wot_media): (i64, i64, i64) = conn.query_row(
+            "SELECT
+                COALESCE(SUM(CASE WHEN pubkey = ?1 THEN size_bytes ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN pubkey != ?1 AND pubkey IN (SELECT pubkey FROM tracked_profiles) THEN size_bytes ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN pubkey != ?1 AND pubkey NOT IN (SELECT pubkey FROM tracked_profiles) THEN size_bytes ELSE 0 END), 0)
+            FROM media_cache",
+            params![own_pubkey],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+
+        // DB size
+        let db_size: i64 = conn.query_row(
+            "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()",
+            [],
+            |row| row.get(0),
+        )?;
+
+        Ok((
+            own_events as u64,
+            tracked_events as u64,
+            wot_events as u64,
+            total_events as u64,
+            own_media as u64,
+            tracked_media as u64,
+            wot_media as u64,
+            db_size as u64,
+        ))
+    }
+
+    /// Get the number of events stored in the last 24 hours (for growth estimation).
+    pub fn events_last_24h(&self) -> Result<u64> {
+        let conn = self.conn.lock();
+        let cutoff = chrono::Utc::now().timestamp() - 86400;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM nostr_events WHERE stored_at > ?1",
+            params![cutoff],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
     /// Extract all media URLs referenced by a pubkey's events.
     fn extract_media_urls_for_pubkey(&self, pubkey: &str) -> Result<Vec<String>> {
         use crate::sync::media::{extract_urls_from_text, extract_urls_from_tags, is_nostr_media_cdn, mime_type_from_url};
@@ -1925,6 +2006,10 @@ impl Database {
             sql.push_str(&format!(" AND created_at < ?{}", idx));
             param_values.push(Box::new(until as i64));
         }
+
+        // Exclude muted users and muted events
+        sql.push_str(" AND pubkey NOT IN (SELECT pubkey FROM muted_users)");
+        sql.push_str(" AND id NOT IN (SELECT event_id FROM muted_events)");
 
         sql.push_str(" ORDER BY created_at DESC");
         {
@@ -2464,6 +2549,17 @@ impl Database {
     pub fn get_muted_words(&self) -> Result<Vec<String>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT word FROM muted_words")?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Get all muted pubkeys.
+    pub fn get_muted_pubkeys(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("SELECT pubkey FROM muted_users")?;
         let rows = stmt
             .query_map([], |row| row.get::<_, String>(0))?
             .filter_map(|r| r.ok())
