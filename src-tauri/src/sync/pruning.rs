@@ -141,6 +141,85 @@ impl PruningStats {
     }
 }
 
+/// Size-based pruning: if the DB exceeds `max_bytes`, aggressively prune
+/// starting from the lowest-priority tier (Others) and working upward.
+/// Never touches Follows, Tracked, or Own data.
+pub fn prune_to_size_limit(
+    db: &Arc<Database>,
+    graph: &Arc<WotGraph>,
+    own_pubkey: &str,
+    max_bytes: u64,
+) -> Result<u64> {
+    let current_size = db.db_size_bytes()?;
+    if current_size <= max_bytes {
+        return Ok(0);
+    }
+
+    info!(
+        "[size-prune] DB size {} exceeds limit {}, starting aggressive pruning",
+        current_size, max_bytes
+    );
+
+    let hop_map = get_all_hop_distances(graph, own_pubkey, 3);
+    let tracked = db.get_tracked_pubkeys()?;
+    let tracked_set: std::collections::HashSet<&str> =
+        tracked.iter().map(|s| s.as_str()).collect();
+
+    let mut total_deleted = 0u64;
+
+    // Tier priority: Others first, then Hop3, then FoF
+    let tiers_to_prune = [
+        ("others", None), // None = find_others
+        ("hop3", Some(3u8)),
+        ("fof", Some(2u8)),
+    ];
+
+    for (tier_name, hop_value) in &tiers_to_prune {
+        let pubkeys: Vec<String> = if let Some(hop) = hop_value {
+            hop_map.iter()
+                .filter(|(pk, h)| {
+                    **h == *hop
+                        && pk.as_ref() != own_pubkey
+                        && !tracked_set.contains(pk.as_ref())
+                })
+                .map(|(pk, _)| pk.to_string())
+                .collect()
+        } else {
+            find_others(db, own_pubkey, &hop_map, &tracked_set)?
+        };
+
+        if pubkeys.is_empty() {
+            continue;
+        }
+
+        // Use half the normal retention for aggressive pruning
+        if let Some((min_events, time_window_secs)) = db.get_retention_config(tier_name)? {
+            let aggressive_min = (min_events / 2).max(1);
+            let aggressive_window = time_window_secs / 2;
+            let cutoff = chrono::Utc::now().timestamp() - aggressive_window as i64;
+
+            for pubkey in &pubkeys {
+                match db.prune_pubkey_events(pubkey, cutoff, aggressive_min) {
+                    Ok(deleted) => total_deleted += deleted,
+                    Err(e) => debug!("Size-prune error for {}: {}", &pubkey[..8.min(pubkey.len())], e),
+                }
+            }
+        }
+
+        // Check if we're under the limit now
+        let new_size = db.db_size_bytes()?;
+        info!(
+            "[size-prune] After {} tier: deleted {} events, DB size now {}",
+            tier_name, total_deleted, new_size
+        );
+        if new_size <= max_bytes {
+            break;
+        }
+    }
+
+    Ok(total_deleted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

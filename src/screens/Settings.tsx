@@ -22,7 +22,12 @@ import {
   IconCheckCircle,
   IconUsers,
   IconWifiOff,
+  IconFeather,
+  IconArchive,
 } from "../components/Icon";
+import {
+  STORAGE_PRESETS,
+} from "../utils/storagePresets";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -159,6 +164,63 @@ const WOT_PRESETS = [
 /* ------------------------------------------------------------------ */
 /*  Component                                                          */
 /* ------------------------------------------------------------------ */
+
+const StorageEstimationPanel: React.FC = () => {
+  const [estimate, setEstimate] = useState<{
+    follows_count: number;
+    fof_estimate: number;
+    events_per_day: number;
+    bytes_per_day: number;
+    projected_30d_bytes: number;
+    current_db_size: number;
+  } | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  const fetchEstimate = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await invoke<typeof estimate>("get_storage_estimate");
+      setEstimate(data);
+    } catch (e) {
+      console.warn("[settings] storage estimate failed:", e);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const fmtBytes = (b: number) => {
+    if (b < 1024) return `${b} B`;
+    if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
+    if (b < 1024 * 1024 * 1024) return `${(b / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(b / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  };
+
+  return (
+    <div style={{ marginTop: 24, paddingTop: 16, borderTop: "1px solid var(--border)" }}>
+      <div style={{ fontSize: "0.84rem", fontWeight: 600, marginBottom: 8, color: "var(--accent-light)" }}>
+        Storage Estimation (DEV)
+      </div>
+      <button
+        className="btn btn-secondary"
+        style={{ fontSize: "0.78rem", padding: "6px 14px", marginBottom: 12 }}
+        disabled={loading}
+        onClick={fetchEstimate}
+      >
+        {loading ? "Loading..." : "Run Estimate"}
+      </button>
+      {estimate && (
+        <div style={{ fontSize: "0.78rem", color: "var(--text-dim)", fontFamily: "var(--mono)", lineHeight: 1.8 }}>
+          <div>Follows: {estimate.follows_count}</div>
+          <div>FoF (est): ~{estimate.fof_estimate.toLocaleString()}</div>
+          <div>Events/day: ~{estimate.events_per_day.toFixed(0)}</div>
+          <div>Growth/day: ~{fmtBytes(estimate.bytes_per_day)}</div>
+          <div>Projected 30d: ~{fmtBytes(estimate.projected_30d_bytes)}</div>
+          <div>Current DB: {fmtBytes(estimate.current_db_size)}</div>
+        </div>
+      )}
+    </div>
+  );
+};
 
 export const Settings: React.FC = () => {
 
@@ -445,6 +507,14 @@ export const Settings: React.FC = () => {
     setSyncWotDepth(p.wotDepth);
     setSyncWotNotes(p.wotNotes);
     setSyncInterval(p.interval);
+  }, []);
+
+  const applyStoragePreset = useCallback((presetKey: string) => {
+    const p = STORAGE_PRESETS[presetKey];
+    if (!p) return;
+    setTrackedMediaGb(p.trackedMediaGb);
+    setWotMediaGb(p.wotMediaGb);
+    setWotRetentionDays(p.wotRetentionDays);
   }, []);
 
   /* --- danger zone -------------------------------------------------- */
@@ -940,6 +1010,24 @@ export const Settings: React.FC = () => {
           <div className="settings-pane-title">Storage</div>
           <div className="settings-pane-desc">
             Control what gets stored, organized by ownership.
+          </div>
+
+          {/* Storage Presets */}
+          <div className="storage-category-section">
+            <div className="storage-category-header">
+              <span className="storage-category-title">Quick Presets</span>
+            </div>
+            <div className="sync-presets">
+              <button className="sync-preset-btn" onClick={() => applyStoragePreset("minimal")}>
+                <span className="icon"><IconFeather /></span> Minimal
+              </button>
+              <button className="sync-preset-btn" onClick={() => applyStoragePreset("balanced")}>
+                <span className="icon"><IconScale /></span> Balanced
+              </button>
+              <button className="sync-preset-btn" onClick={() => applyStoragePreset("archive")}>
+                <span className="icon"><IconArchive /></span> Archive
+              </button>
+            </div>
           </div>
 
           {/* Own Events Section */}
@@ -1517,6 +1605,11 @@ export const Settings: React.FC = () => {
               )}
             </div>
           </div>
+
+          {/* Storage Estimation (dev mode only) */}
+          {import.meta.env.DEV && (
+            <StorageEstimationPanel />
+          )}
 
           {/* Danger Zone */}
           <div className="danger-zone">

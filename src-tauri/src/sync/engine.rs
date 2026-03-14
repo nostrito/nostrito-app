@@ -6,7 +6,7 @@ use std::time::Duration;
 use tauri::Emitter;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::storage::db::Database;
 use crate::wot::WotGraph;
@@ -397,6 +397,31 @@ impl SyncEngine {
         if stats.total() > 0 {
             info!("Pruning: {} events deleted", stats.total());
         }
+
+        // Size-based safety net: read max_storage_mb from config, default to 2 GB
+        let max_bytes = self.db.get_config("max_storage_mb")
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(2048) * 1024 * 1024;
+
+        match pruning::prune_to_size_limit(&self.db, &self.graph, &self.hex_pubkey, max_bytes) {
+            Ok(deleted) if deleted > 0 => {
+                info!("[size-prune] Deleted {} additional events to stay under size limit", deleted);
+            }
+            Err(e) => {
+                warn!("[size-prune] failed: {}", e);
+            }
+            _ => {}
+        }
+
+        // Debug-mode storage estimation
+        if let Err(e) = crate::storage::estimation::estimate_storage(
+            &self.db, &self.graph, &self.hex_pubkey,
+        ) {
+            debug!("[storage-estimate] failed: {}", e);
+        }
+
         Ok(())
     }
 
