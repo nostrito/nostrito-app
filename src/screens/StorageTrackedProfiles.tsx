@@ -201,10 +201,10 @@ export const StorageTrackedProfiles: React.FC = () => {
       <div className="storage-detail-header">
         <Link to="/storage" className="storage-back-link">
           <svg className="icon-sm" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m15 18-6-6 6-6"/></svg>
-          Storage
+          storage
         </Link>
-        <h2 className="storage-detail-title">Tracked Profiles</h2>
-        <Badge text="TRACKED" className="ownership-card-badge" variant="tracked" />
+        <h2 className="storage-detail-title">tracked profiles</h2>
+        <Badge text="tracked" className="ownership-card-badge" variant="tracked" />
       </div>
 
       <div className="storage-detail-stats">
@@ -222,13 +222,13 @@ export const StorageTrackedProfiles: React.FC = () => {
         </div>
       </div>
 
-      <div className="storage-detail-note">Always kept &mdash; never pruned</div>
+      <div className="storage-detail-note">always kept &mdash; never pruned</div>
 
       {/* Tabs */}
       <div className="storage-detail-tabs">
-        <button className={`storage-detail-tab${tab === "overview" ? " active" : ""}`} onClick={() => setTab("overview")}>Overview</button>
-        <button className={`storage-detail-tab${tab === "notes" ? " active" : ""}`} onClick={() => setTab("notes")}>Notes</button>
-        <button className={`storage-detail-tab${tab === "media" ? " active" : ""}`} onClick={() => setTab("media")}>Media</button>
+        <button className={`storage-detail-tab${tab === "overview" ? " active" : ""}`} onClick={() => setTab("overview")}>overview</button>
+        <button className={`storage-detail-tab${tab === "notes" ? " active" : ""}`} onClick={() => setTab("notes")}>notes</button>
+        <button className={`storage-detail-tab${tab === "media" ? " active" : ""}`} onClick={() => setTab("media")}>media</button>
       </div>
 
       {/* Overview tab */}
@@ -236,15 +236,15 @@ export const StorageTrackedProfiles: React.FC = () => {
         <>
           {/* Profile list */}
           <div className="tracked-profiles-section">
-            <div className="kind-breakdown-title">Profiles</div>
+            <div className="kind-breakdown-title">profiles</div>
 
-            {loading && <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", padding: 16 }}>Loading...</div>}
+            {loading && <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", padding: 16 }}>loading...</div>}
 
             {!loading && profiles.length === 0 && (
               <EmptyState
                 icon={<svg className="icon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>}
-                message="No tracked profiles yet."
-                hint="Track profiles in Settings to keep their data safe from pruning."
+                message="no tracked profiles yet."
+                hint="track profiles in settings to keep their data safe from pruning."
               />
             )}
 
@@ -288,10 +288,10 @@ export const StorageTrackedProfiles: React.FC = () => {
                   {isExpanded && (
                     <div className="tracked-profile-media-panel">
                       {mediaLoadingProfile && (
-                        <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", padding: 12 }}>Loading media...</div>
+                        <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", padding: 12 }}>loading media...</div>
                       )}
                       {!mediaLoadingProfile && profileMedia.length === 0 && (
-                        <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", padding: 12 }}>No media files stored.</div>
+                        <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", padding: 12 }}>no media files stored.</div>
                       )}
                       {!mediaLoadingProfile && profileMedia.length > 0 && (
                         <div className="profile-media-grid">
@@ -348,7 +348,7 @@ export const StorageTrackedProfiles: React.FC = () => {
           {kindCounts && (
             <>
               <div className="kind-breakdown-separator" />
-              <KindBreakdownChart title="Event Breakdown (All Tracked)" kindCounts={kindCounts} />
+              <KindBreakdownChart title="event breakdown (all tracked)" kindCounts={kindCounts} />
             </>
           )}
         </>
@@ -358,13 +358,13 @@ export const StorageTrackedProfiles: React.FC = () => {
       {tab === "notes" && (
         <div className="storage-notes-list">
           {notesLoading && notes.length === 0 && (
-            <div style={{ fontSize: "0.85rem", color: "var(--text-muted)", padding: 24, textAlign: "center" }}>Loading notes...</div>
+            <div style={{ fontSize: "0.85rem", color: "var(--text-muted)", padding: 24, textAlign: "center" }}>loading notes...</div>
           )}
           {!notesLoading && notes.length === 0 && (
             <EmptyState
               icon={<svg className="icon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 20h9"/><path d="M16.376 3.622a1 1 0 0 1 3.002 3.002L7.368 18.635a2 2 0 0 1-.855.506l-2.872.838a.5.5 0 0 1-.62-.62l.838-2.872a2 2 0 0 1 .506-.854z"/></svg>}
-              message="No notes from tracked profiles yet."
-              hint="Notes from your tracked profiles will appear here as they sync."
+              message="no notes from tracked profiles yet."
+              hint="notes from your tracked profiles will appear here as they sync."
             />
           )}
           {notes.map(event => (
@@ -379,7 +379,7 @@ export const StorageTrackedProfiles: React.FC = () => {
           {notesHasMore && notes.length > 0 && (
             <div className="storage-load-more">
               <button className="storage-load-more-btn" onClick={loadMoreNotes} disabled={notesLoading}>
-                {notesLoading ? "Loading..." : "Load more"}
+                {notesLoading ? "loading..." : "load more"}
               </button>
             </div>
           )}
@@ -396,7 +396,7 @@ export const StorageTrackedProfiles: React.FC = () => {
                 className={`my-media-filter${mediaFilter === f ? " active" : ""}`}
                 onClick={() => setMediaFilter(f)}
               >
-                {f.charAt(0).toUpperCase() + f.slice(1)}
+                {f}
               </button>
             ))}
             <span className="my-media-stats" style={{ marginLeft: "auto" }}>
@@ -405,13 +405,13 @@ export const StorageTrackedProfiles: React.FC = () => {
           </div>
           <div className="storage-media-grid">
             {mediaLoading && (
-              <div style={{ gridColumn: "1 / -1", textAlign: "center", padding: 40, color: "var(--text-muted)", fontSize: "0.85rem" }}>Loading media...</div>
+              <div style={{ gridColumn: "1 / -1", textAlign: "center", padding: 40, color: "var(--text-muted)", fontSize: "0.85rem" }}>loading media...</div>
             )}
             {!mediaLoading && filteredMedia.length === 0 && (
               <EmptyState
                 icon={<svg className="icon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>}
-                message="No media cached yet."
-                hint="Media from tracked profiles will appear here as it downloads."
+                message="no media cached yet."
+                hint="media from tracked profiles will appear here as it downloads."
               />
             )}
             {!mediaLoading && filteredMedia.map((item, idx) => {

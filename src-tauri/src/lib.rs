@@ -2,6 +2,7 @@ mod relay;
 mod search;
 mod storage;
 mod sync;
+mod wallet;
 mod wot;
 
 use serde::{Deserialize, Serialize};
@@ -55,6 +56,7 @@ pub struct AppState {
     pub sync_stats: Arc<RwLock<SyncStats>>,
     pub relay_cancel: Arc<RwLock<Option<CancellationToken>>>,
     pub start_time: std::time::Instant,
+    pub wallet: wallet::SharedWalletState,
 }
 
 impl AppState {
@@ -87,6 +89,7 @@ pub struct AppConfig {
     pub storage_tracked_media_gb: f64,
     pub storage_wot_media_gb: f64,
     pub wot_event_retention_days: u32,
+    pub thread_retention_days: u32,
     // Sync tuning
     pub sync_lookback_days: u32,
     pub sync_batch_size: u32,
@@ -127,6 +130,7 @@ impl Default for AppConfig {
             storage_tracked_media_gb: 3.0,
             storage_wot_media_gb: 2.0,
             wot_event_retention_days: 30,
+            thread_retention_days: 30,
             sync_lookback_days: 30,
             sync_batch_size: 50,
             sync_events_per_batch: 50,
@@ -232,6 +236,7 @@ pub struct Settings {
     pub storage_tracked_media_gb: f64,
     pub storage_wot_media_gb: f64,
     pub wot_event_retention_days: u32,
+    pub thread_retention_days: u32,
     pub wot_max_depth: u32,
     pub sync_interval_secs: u32,
     pub outbound_relays: Vec<String>,
@@ -498,6 +503,7 @@ async fn init_nostrito(
             wot_events_per_batch: config.sync_wot_events_per_batch,
             cycle_interval_secs: config.sync_interval_secs,
             wot_notes_per_cycle: config.sync_wot_notes_per_cycle,
+            thread_retention_days: config.thread_retention_days,
         };
         let cancel = start_sync_engine(
             state.wot_graph.clone(),
@@ -649,6 +655,24 @@ async fn get_wot_distance(
 }
 
 #[tauri::command]
+async fn get_wot_hop_distances(
+    state: State<'_, AppState>,
+) -> Result<std::collections::HashMap<String, u8>, String> {
+    let config = state.config.read().await;
+    let hex_pubkey = config
+        .hex_pubkey
+        .clone()
+        .ok_or("Not initialized — no pubkey set")?;
+    drop(config);
+
+    let distances = wot::bfs::get_all_hop_distances(&state.wot_graph, &hex_pubkey, 3);
+    Ok(distances
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect())
+}
+
+#[tauri::command]
 async fn start_sync(
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -677,6 +701,7 @@ async fn start_sync(
         wot_events_per_batch: config.sync_wot_events_per_batch,
         cycle_interval_secs: config.sync_interval_secs,
         wot_notes_per_cycle: config.sync_wot_notes_per_cycle,
+        thread_retention_days: config.thread_retention_days,
     };
     let cancel = start_sync_engine(
         state.wot_graph.clone(),
@@ -754,6 +779,7 @@ async fn set_offline_mode(
                 wot_events_per_batch: config.sync_wot_events_per_batch,
                 cycle_interval_secs: config.sync_interval_secs,
                 wot_notes_per_cycle: config.sync_wot_notes_per_cycle,
+                thread_retention_days: config.thread_retention_days,
             };
             let cancel = start_sync_engine(
                 state.wot_graph.clone(),
@@ -812,6 +838,7 @@ async fn restart_sync(state: State<'_, AppState>, app_handle: tauri::AppHandle) 
         wot_events_per_batch: config.sync_wot_events_per_batch,
         cycle_interval_secs: config.sync_interval_secs,
         wot_notes_per_cycle: config.sync_wot_notes_per_cycle,
+        thread_retention_days: config.thread_retention_days,
     };
 
     let cancel = start_sync_engine(
@@ -1019,6 +1046,131 @@ async fn get_note_reactions(
         None,
         500,
     ).map_err(|e| format!("Failed to get reactions: {}", e))?;
+    Ok(rows_to_events(rows))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadData {
+    pub root: Option<NostrEvent>,
+    pub replies: Vec<NostrEvent>,
+    pub reactions: Vec<NostrEvent>,
+    pub zaps: Vec<NostrEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InteractionCounts {
+    pub replies: u32,
+    pub reposts: u32,
+    pub reactions: u32,
+    pub zaps: u32,
+}
+
+#[tauri::command]
+async fn get_thread_events(
+    root_id: String,
+    state: State<'_, AppState>,
+) -> Result<ThreadData, String> {
+    let (root, replies, reactions, zaps) = state.db().get_thread_events(&root_id)
+        .map_err(|e| format!("Failed to get thread events: {}", e))?;
+
+    Ok(ThreadData {
+        root: root.map(|(id, pubkey, created_at, kind, tags_json, content, sig)| {
+            let tags: Vec<Vec<String>> = serde_json::from_str(&tags_json).unwrap_or_default();
+            NostrEvent { id, pubkey, created_at: created_at as u64, kind: kind as u32, tags, content, sig }
+        }),
+        replies: rows_to_events(replies),
+        reactions: rows_to_events(reactions),
+        zaps: rows_to_events(zaps),
+    })
+}
+
+#[tauri::command]
+async fn get_interaction_counts(
+    event_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<std::collections::HashMap<String, InteractionCounts>, String> {
+    let raw = state.db().get_interaction_counts(&event_ids)
+        .map_err(|e| format!("Failed to get interaction counts: {}", e))?;
+
+    let result: std::collections::HashMap<String, InteractionCounts> = raw
+        .into_iter()
+        .map(|(id, (replies, reposts, reactions, zaps))| {
+            (id, InteractionCounts { replies, reposts, reactions, zaps })
+        })
+        .collect();
+
+    Ok(result)
+}
+
+#[tauri::command]
+async fn fetch_thread_from_relays(
+    root_id: String,
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<u32, String> {
+    use nostr_sdk::prelude::*;
+
+    let cfg = state.config.read().await;
+    let hex_pubkey = cfg.hex_pubkey.clone().unwrap_or_default();
+    let fallback_relays = cfg.outbound_relays.clone();
+    drop(cfg);
+
+    let relay_urls = resolve_sync_relays(&state.db(), &hex_pubkey, &fallback_relays);
+    if relay_urls.is_empty() {
+        return Err("No relays available".into());
+    }
+
+    let event_id = EventId::from_hex(&root_id)
+        .map_err(|e| format!("Invalid event ID: {}", e))?;
+
+    // Fetch the root event + all replies/reactions/zaps
+    let root_filter = Filter::new().id(event_id).limit(1);
+    let replies_filter = Filter::new().event(event_id).kinds(vec![Kind::TextNote]).limit(500);
+    let interactions_filter = Filter::new().event(event_id).kinds(vec![Kind::Reaction, Kind::from(9735)]).limit(500);
+
+    let pool = crate::sync::pool::RelayPool::new();
+    let events = pool.subscribe_and_collect(
+        &relay_urls,
+        vec![root_filter, replies_filter, interactions_filter],
+        15,
+    ).await.map_err(|e| format!("Relay fetch failed: {}", e))?;
+
+    if events.is_empty() {
+        return Ok(0);
+    }
+
+    let db = state.db();
+    let graph = Arc::clone(&state.wot_graph);
+    let (stored, _) = crate::sync::processing::process_events(
+        &events,
+        &db,
+        &graph,
+        &hex_pubkey,
+        crate::sync::types::EventSource::ThreadContext,
+        crate::sync::types::MEDIA_PRIORITY_OTHERS,
+        None,
+        "thread",
+    );
+
+    // Emit thread-updated event so frontend can refresh
+    app_handle.emit("thread-updated", &root_id).ok();
+
+    Ok(stored)
+}
+
+#[tauri::command]
+async fn get_note_zaps(
+    note_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<NostrEvent>, String> {
+    let own_pk = state.config.read().await.hex_pubkey.clone();
+    let rows = state.db().query_events_by_tag(
+        "e", &note_id,
+        Some(&[9735]),
+        own_pk.as_deref(),
+        None,
+        500,
+    ).map_err(|e| format!("Failed to get zaps: {}", e))?;
     Ok(rows_to_events(rows))
 }
 
@@ -1531,6 +1683,52 @@ async fn find_event_for_media(
             sig,
         }
     }))
+}
+
+#[tauri::command]
+async fn delete_media_files(
+    urls: Vec<String>,
+    app_handle: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<u32, String> {
+    if urls.is_empty() {
+        return Ok(0);
+    }
+    tracing::info!("[cmd:delete_media_files] deleting {} media file(s)", urls.len());
+    let db = state.db();
+    let lookup = db
+        .media_cache_lookup_by_urls(&urls)
+        .map_err(|e| format!("Failed to lookup media: {}", e))?;
+
+    let mut deleted = 0u32;
+    let mut hashes = Vec::new();
+    for (_url, (hash, _mime, _size, _ts)) in &lookup {
+        let path = sync::media::media_file_path(hash);
+        if path.exists() {
+            if let Err(e) = std::fs::remove_file(&path) {
+                tracing::warn!("[cmd:delete_media_files] failed to delete {}: {}", path.display(), e);
+            } else {
+                deleted += 1;
+            }
+        }
+        hashes.push(hash.clone());
+    }
+
+    if !hashes.is_empty() {
+        db.media_delete_records(&hashes)
+            .map_err(|e| format!("Failed to delete media records: {}", e))?;
+    }
+
+    // Mark URLs as deleted so they don't reappear in the gallery
+    db.media_mark_deleted(&urls)
+        .map_err(|e| format!("Failed to mark media as deleted: {}", e))?;
+
+    tracing::info!("[cmd:delete_media_files] deleted {} files, {} db records, marked {} urls", deleted, hashes.len(), urls.len());
+
+    // Notify frontend to refresh storage stats
+    let _ = app_handle.emit("media-deleted", deleted);
+
+    Ok(deleted)
 }
 
 #[tauri::command]
@@ -2310,6 +2508,7 @@ async fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
         storage_tracked_media_gb: config.storage_tracked_media_gb,
         storage_wot_media_gb: config.storage_wot_media_gb,
         wot_event_retention_days: config.wot_event_retention_days,
+        thread_retention_days: config.thread_retention_days,
         wot_max_depth: config.wot_max_depth,
         sync_interval_secs: config.sync_interval_secs,
         outbound_relays: config.outbound_relays.clone(),
@@ -2339,6 +2538,7 @@ async fn save_settings(settings: Settings, app_handle: tauri::AppHandle, state: 
     config.storage_tracked_media_gb = settings.storage_tracked_media_gb;
     config.storage_wot_media_gb = settings.storage_wot_media_gb;
     config.wot_event_retention_days = settings.wot_event_retention_days;
+    config.thread_retention_days = settings.thread_retention_days;
     config.wot_max_depth = settings.wot_max_depth;
     config.sync_interval_secs = settings.sync_interval_secs;
     // Only update relays if the new list has valid entries — never clear to empty
@@ -2398,6 +2598,7 @@ async fn save_settings(settings: Settings, app_handle: tauri::AppHandle, state: 
     db.set_config("storage_tracked_media_gb", &settings.storage_tracked_media_gb.to_string()).ok();
     db.set_config("storage_wot_media_gb", &settings.storage_wot_media_gb.to_string()).ok();
     db.set_config("wot_event_retention_days", &settings.wot_event_retention_days.to_string()).ok();
+    db.set_config("thread_retention_days", &settings.thread_retention_days.to_string()).ok();
 
     // If relays changed, clear user cursors so the next cycle does a full lookback
     if relays_changed {
@@ -2432,6 +2633,7 @@ async fn save_settings(settings: Settings, app_handle: tauri::AppHandle, state: 
             wot_events_per_batch: config.sync_wot_events_per_batch,
             cycle_interval_secs: config.sync_interval_secs,
             wot_notes_per_cycle: config.sync_wot_notes_per_cycle,
+            thread_retention_days: config.thread_retention_days,
         };
         let cancel = start_sync_engine(
             state.wot_graph.clone(),
@@ -2726,6 +2928,13 @@ async fn get_event_media_for_category(
     }
 
     // Batch lookup which URLs have local copies
+    let all_urls: Vec<String> = items.iter().map(|(u, _, _)| u.clone()).collect();
+
+    // Filter out URLs the user has explicitly deleted
+    let deleted_urls = db.media_get_deleted(&all_urls).map_err(|e| e.to_string())?;
+    if !deleted_urls.is_empty() {
+        items.retain(|(url, _, _)| !deleted_urls.contains(url));
+    }
     let all_urls: Vec<String> = items.iter().map(|(u, _, _)| u.clone()).collect();
     let cache_map = db.media_cache_lookup_by_urls(&all_urls).map_err(|e| e.to_string())?;
 
@@ -3398,6 +3607,257 @@ async fn decrypt_dm(content: String, sender_pubkey: String, state: State<'_, App
     Ok(decrypted)
 }
 
+// ── Wallet Keychain Helpers ───────────────────────────────────────────
+
+fn save_wallet_to_keychain(npub: &str, data: &str) -> Result<(), String> {
+    let entry = keyring::Entry::new("nostrito-wallet", npub)
+        .map_err(|e| format!("Keychain error: {}", e))?;
+    entry
+        .set_password(data)
+        .map_err(|e| format!("Failed to save wallet to keychain: {}", e))
+}
+
+fn load_wallet_from_keychain(npub: &str) -> Option<String> {
+    let entry = keyring::Entry::new("nostrito-wallet", npub).ok()?;
+    entry.get_password().ok()
+}
+
+fn delete_wallet_from_keychain(npub: &str) {
+    if let Ok(entry) = keyring::Entry::new("nostrito-wallet", npub) {
+        entry.delete_credential().ok();
+    }
+}
+
+// ── Wallet Tauri Commands ────────────────────────────────────────────
+
+#[tauri::command]
+async fn wallet_connect_lnbits(
+    url: String,
+    admin_key: String,
+    state: State<'_, AppState>,
+) -> Result<wallet::WalletInfo, String> {
+    let url = url.trim_end_matches('/').to_string();
+
+    // Test connection
+    let (alias, _balance) = wallet::lnbits::get_info(&url, &admin_key).await?;
+
+    // Save to keychain
+    let config = state.config.read().await;
+    if let Some(ref npub) = config.npub {
+        let data = serde_json::json!({
+            "type": "lnbits",
+            "url": url,
+            "admin_key": admin_key,
+        });
+        save_wallet_to_keychain(npub, &data.to_string())?;
+    }
+    drop(config);
+
+    // Save wallet type to DB config
+    let db = state.db();
+    db.set_config("wallet_type", "lnbits")
+        .map_err(|e| format!("DB error: {}", e))?;
+    db.set_config("wallet_lnbits_url", &url)
+        .map_err(|e| format!("DB error: {}", e))?;
+
+    // Store in app state
+    let mut wallet_guard = state.wallet.write().await;
+    *wallet_guard = Some(wallet::WalletState {
+        provider: wallet::WalletProvider::LNbits {
+            url: url.clone(),
+            admin_key: admin_key.clone(),
+        },
+        wallet_type: "lnbits".to_string(),
+        alias: Some(alias.clone()),
+    });
+
+    Ok(wallet::WalletInfo {
+        wallet_type: "lnbits".to_string(),
+        connected: true,
+        alias: Some(alias),
+    })
+}
+
+#[tauri::command]
+async fn wallet_connect_nwc(
+    nwc_uri: String,
+    state: State<'_, AppState>,
+) -> Result<wallet::WalletInfo, String> {
+    let (client, alias) = wallet::nwc_provider::connect(&nwc_uri).await?;
+
+    // Save to keychain
+    let config = state.config.read().await;
+    if let Some(ref npub) = config.npub {
+        let data = serde_json::json!({
+            "type": "nwc",
+            "nwc_uri": nwc_uri,
+        });
+        save_wallet_to_keychain(npub, &data.to_string())?;
+    }
+    drop(config);
+
+    // Save wallet type to DB config
+    let db = state.db();
+    db.set_config("wallet_type", "nwc")
+        .map_err(|e| format!("DB error: {}", e))?;
+
+    // Store in app state
+    let mut wallet_guard = state.wallet.write().await;
+    *wallet_guard = Some(wallet::WalletState {
+        provider: wallet::WalletProvider::Nwc { client },
+        wallet_type: "nwc".to_string(),
+        alias: alias.clone(),
+    });
+
+    Ok(wallet::WalletInfo {
+        wallet_type: "nwc".to_string(),
+        connected: true,
+        alias,
+    })
+}
+
+#[tauri::command]
+async fn wallet_disconnect(state: State<'_, AppState>) -> Result<(), String> {
+    // Shutdown provider
+    let mut wallet_guard = state.wallet.write().await;
+    if let Some(ws) = wallet_guard.take() {
+        if let wallet::WalletProvider::Nwc { client } = ws.provider {
+            let _ = client.shutdown().await;
+        }
+    }
+
+    // Clear keychain
+    let config = state.config.read().await;
+    if let Some(ref npub) = config.npub {
+        delete_wallet_from_keychain(npub);
+    }
+    drop(config);
+
+    // Clear DB config
+    let db = state.db();
+    db.set_config("wallet_type", "").ok();
+    db.set_config("wallet_lnbits_url", "").ok();
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn wallet_get_status(state: State<'_, AppState>) -> Result<Option<wallet::WalletInfo>, String> {
+    let wallet_guard = state.wallet.read().await;
+    Ok(wallet_guard.as_ref().map(|ws| wallet::WalletInfo {
+        wallet_type: ws.wallet_type.clone(),
+        connected: true,
+        alias: ws.alias.clone(),
+    }))
+}
+
+#[tauri::command]
+async fn wallet_get_balance(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let wallet_guard = state.wallet.read().await;
+    let ws = wallet_guard.as_ref().ok_or("No wallet connected")?;
+
+    let balance = match &ws.provider {
+        wallet::WalletProvider::LNbits { url, admin_key } => {
+            wallet::lnbits::get_balance(url, admin_key).await?
+        }
+        wallet::WalletProvider::Nwc { client } => {
+            wallet::nwc_provider::get_balance(client).await?
+        }
+    };
+
+    Ok(serde_json::json!({ "balance": balance }))
+}
+
+#[tauri::command]
+async fn wallet_pay_invoice(
+    bolt11: String,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let wallet_guard = state.wallet.read().await;
+    let ws = wallet_guard.as_ref().ok_or("No wallet connected")?;
+
+    let preimage = match &ws.provider {
+        wallet::WalletProvider::LNbits { url, admin_key } => {
+            wallet::lnbits::pay_invoice(url, admin_key, &bolt11).await?
+        }
+        wallet::WalletProvider::Nwc { client } => {
+            wallet::nwc_provider::pay_invoice(client, &bolt11).await?
+        }
+    };
+
+    Ok(serde_json::json!({ "preimage": preimage }))
+}
+
+#[tauri::command]
+async fn wallet_make_invoice(
+    amount: u64,
+    memo: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let wallet_guard = state.wallet.read().await;
+    let ws = wallet_guard.as_ref().ok_or("No wallet connected")?;
+
+    let (bolt11, payment_hash) = match &ws.provider {
+        wallet::WalletProvider::LNbits { url, admin_key } => {
+            wallet::lnbits::make_invoice(url, admin_key, amount, memo.as_deref()).await?
+        }
+        wallet::WalletProvider::Nwc { client } => {
+            wallet::nwc_provider::make_invoice(client, amount, memo.as_deref()).await?
+        }
+    };
+
+    Ok(serde_json::json!({ "bolt11": bolt11, "payment_hash": payment_hash }))
+}
+
+#[tauri::command]
+async fn wallet_list_transactions(
+    limit: u32,
+    offset: u32,
+    state: State<'_, AppState>,
+) -> Result<Vec<wallet::WalletTransaction>, String> {
+    let wallet_guard = state.wallet.read().await;
+    let ws = wallet_guard.as_ref().ok_or("No wallet connected")?;
+
+    let mut txs = match &ws.provider {
+        wallet::WalletProvider::LNbits { url, admin_key } => {
+            wallet::lnbits::list_transactions(url, admin_key, limit, offset).await?
+        }
+        wallet::WalletProvider::Nwc { client } => {
+            wallet::nwc_provider::list_transactions(client, limit, offset).await?
+        }
+    };
+
+    // Link transactions to zap events
+    let db = state.db();
+    if let Ok(zaps) = db.query_events_by_kind(9735, 500) {
+        for tx in &mut txs {
+            if tx.payment_hash.is_empty() {
+                continue;
+            }
+            for (event_id, tags_json) in &zaps {
+                if let Ok(tags) = serde_json::from_str::<Vec<Vec<String>>>(tags_json) {
+                    for tag in &tags {
+                        if tag.len() >= 2 && tag[0] == "bolt11" {
+                            if let Ok(decoded) = wallet::bolt11::decode(&tag[1]) {
+                                if decoded.payment_hash.as_deref() == Some(&tx.payment_hash) {
+                                    tx.linked_zap_event = Some(event_id.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(txs)
+}
+
+#[tauri::command]
+fn wallet_decode_bolt11(invoice: String) -> Result<wallet::DecodedInvoice, String> {
+    wallet::bolt11::decode(&invoice)
+}
+
 // ── App Entry ──────────────────────────────────────────────────────
 
 pub fn run() {
@@ -3546,6 +4006,7 @@ pub fn run() {
     if let Ok(Some(v)) = db.get_config("storage_tracked_media_gb") { if let Ok(n) = v.parse::<f64>() { config.storage_tracked_media_gb = n; } }
     if let Ok(Some(v)) = db.get_config("storage_wot_media_gb") { if let Ok(n) = v.parse::<f64>() { config.storage_wot_media_gb = n; } }
     if let Ok(Some(v)) = db.get_config("wot_event_retention_days") { if let Ok(n) = v.parse::<u32>() { config.wot_event_retention_days = n; } }
+    if let Ok(Some(v)) = db.get_config("thread_retention_days") { if let Ok(n) = v.parse::<u32>() { config.thread_retention_days = n; } }
 
     // Load additional settings that are now persisted by save_settings
     if let Ok(Some(v)) = db.get_config("relay_port") { if let Ok(n) = v.parse::<u16>() { config.relay_port = n; } }
@@ -3609,6 +4070,7 @@ pub fn run() {
         sync_stats: Arc::new(RwLock::new(SyncStats::default())),
         relay_cancel: Arc::new(RwLock::new(None)),
         start_time: std::time::Instant::now(),
+        wallet: wallet::new_shared_wallet_state(),
     };
 
     // Install rustls ring crypto provider before any TLS code runs
@@ -3626,6 +4088,59 @@ pub fn run() {
             let sync_stats = state.sync_stats.clone();
             let sync_cancel = state.sync_cancel.clone();
             let app_handle = app.handle().clone();
+
+            // Restore wallet connection from keychain
+            {
+                let wallet_state = state.wallet.clone();
+                let wallet_config = state.config.clone();
+                tauri::async_runtime::spawn(async move {
+                    let cfg = wallet_config.read().await;
+                    if let Some(ref npub) = cfg.npub {
+                        if let Some(data) = load_wallet_from_keychain(npub) {
+                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
+                                match parsed["type"].as_str() {
+                                    Some("lnbits") => {
+                                        let url = parsed["url"].as_str().unwrap_or("").to_string();
+                                        let admin_key = parsed["admin_key"].as_str().unwrap_or("").to_string();
+                                        if !url.is_empty() && !admin_key.is_empty() {
+                                            let alias = wallet::lnbits::get_info(&url, &admin_key)
+                                                .await
+                                                .ok()
+                                                .map(|(a, _)| a);
+                                            let mut guard = wallet_state.write().await;
+                                            *guard = Some(wallet::WalletState {
+                                                provider: wallet::WalletProvider::LNbits { url, admin_key },
+                                                wallet_type: "lnbits".to_string(),
+                                                alias,
+                                            });
+                                            tracing::info!("[wallet] Restored LNbits connection from keychain");
+                                        }
+                                    }
+                                    Some("nwc") => {
+                                        if let Some(uri) = parsed["nwc_uri"].as_str() {
+                                            match wallet::nwc_provider::connect(uri).await {
+                                                Ok((client, alias)) => {
+                                                    let mut guard = wallet_state.write().await;
+                                                    *guard = Some(wallet::WalletState {
+                                                        provider: wallet::WalletProvider::Nwc { client },
+                                                        wallet_type: "nwc".to_string(),
+                                                        alias,
+                                                    });
+                                                    tracing::info!("[wallet] Restored NWC connection from keychain");
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!("[wallet] Failed to restore NWC: {}", e);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                });
+            }
 
             // Auto-resume sync and relay if previously configured
             let relay_cancel_setup = state.relay_cancel.clone();
@@ -3660,6 +4175,7 @@ pub fn run() {
                             wot_events_per_batch: cfg2.sync_wot_events_per_batch,
                             cycle_interval_secs: cfg2.sync_interval_secs,
                             wot_notes_per_cycle: cfg2.sync_wot_notes_per_cycle,
+                            thread_retention_days: cfg2.thread_retention_days,
                         };
                         drop(cfg2);
                         let cancel = start_sync_engine(
@@ -3741,10 +4257,15 @@ pub fn run() {
             get_follows,
             get_profiles_batch,
             get_wot_distance,
+            get_wot_hop_distances,
             get_feed,
             get_event,
             get_note_replies,
             get_note_reactions,
+            get_note_zaps,
+            get_thread_events,
+            get_interaction_counts,
+            fetch_thread_from_relays,
             fetch_global_feed,
             fetch_wot_articles,
             save_event,
@@ -3753,6 +4274,7 @@ pub fn run() {
             is_media_bookmarked,
             get_bookmarked_media,
             find_event_for_media,
+            delete_media_files,
             fetch_events_by_ids,
             search_events,
             search_global,
@@ -3808,6 +4330,15 @@ pub fn run() {
             get_signing_mode,
             decrypt_dm,
             get_addressable_event,
+            wallet_connect_lnbits,
+            wallet_connect_nwc,
+            wallet_disconnect,
+            wallet_get_status,
+            wallet_get_balance,
+            wallet_pay_invoice,
+            wallet_make_invoice,
+            wallet_list_transactions,
+            wallet_decode_bolt11,
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|e| {

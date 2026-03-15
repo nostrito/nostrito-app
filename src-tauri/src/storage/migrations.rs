@@ -3,7 +3,7 @@ use rusqlite::Connection;
 use tracing::info;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// Get the current schema version from the database.
 pub fn get_schema_version(conn: &Connection) -> u32 {
@@ -50,6 +50,10 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
 
     if current < 5 {
         migrate_v4_to_v5(conn)?;
+    }
+
+    if current < 6 {
+        migrate_v5_to_v6(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -362,6 +366,25 @@ fn migrate_v4_to_v5(conn: &Connection) -> Result<()> {
     )?;
 
     info!("Migration v4 → v5 complete");
+    Ok(())
+}
+
+/// Migrate from v5 to v6:
+/// - Add user_threads table for tracking thread participation
+fn migrate_v5_to_v6(conn: &Connection) -> Result<()> {
+    info!("Running migration v5 → v6...");
+
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS user_threads (
+            root_event_id TEXT PRIMARY KEY,
+            participation TEXT NOT NULL DEFAULT 'author',
+            updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+        );
+        "#,
+    )?;
+
+    info!("Migration v5 → v6 complete");
     Ok(())
 }
 

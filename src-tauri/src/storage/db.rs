@@ -117,6 +117,11 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_media_lru ON media_cache(last_accessed);
             CREATE INDEX IF NOT EXISTS idx_media_pubkey ON media_cache(pubkey);
 
+            CREATE TABLE IF NOT EXISTS media_deleted (
+                url TEXT PRIMARY KEY,
+                deleted_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+            );
+
             CREATE TABLE IF NOT EXISTS media_queue (
                 url TEXT PRIMARY KEY,
                 pubkey TEXT NOT NULL,
@@ -411,6 +416,22 @@ impl Database {
         let conn = self.conn.lock();
         conn.execute("DELETE FROM app_config WHERE key = ?1", params![key])?;
         Ok(())
+    }
+
+    /// Query events by kind, returning (id, tags_json) pairs.
+    pub fn query_events_by_kind(&self, kind: u32, limit: u32) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, tags FROM nostr_events WHERE kind = ?1 ORDER BY created_at DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![kind, limit], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
     }
 
     /// Clear all sync_state rows (per-relay cursors)
@@ -1479,6 +1500,48 @@ impl Database {
         }
         debug!("[db] media_delete_records: deleted {} records", hashes.len());
         Ok(())
+    }
+
+    // ── Media deleted tracking ──────────────────────────────────
+
+    /// Record URLs as user-deleted so they don't reappear in the gallery.
+    pub fn media_mark_deleted(&self, urls: &[String]) -> Result<()> {
+        if urls.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock();
+        for url in urls {
+            conn.execute(
+                "INSERT OR IGNORE INTO media_deleted (url) VALUES (?1)",
+                params![url],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Return the set of deleted URLs from a list of candidates.
+    pub fn media_get_deleted(&self, urls: &[String]) -> Result<std::collections::HashSet<String>> {
+        if urls.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let conn = self.conn.lock();
+        let mut deleted = std::collections::HashSet::new();
+        for chunk in urls.chunks(200) {
+            let placeholders: Vec<String> = (0..chunk.len()).map(|i| format!("?{}", i + 1)).collect();
+            let sql = format!(
+                "SELECT url FROM media_deleted WHERE url IN ({})",
+                placeholders.join(",")
+            );
+            let params_refs: Vec<&dyn rusqlite::ToSql> = chunk.iter().map(|u| u as &dyn rusqlite::ToSql).collect();
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_refs.as_slice(), |row| row.get::<_, String>(0))?;
+            for row in rows {
+                if let Ok(url) = row {
+                    deleted.insert(url);
+                }
+            }
+        }
+        Ok(deleted)
     }
 
     // ── Media queue ─────────────────────────────────────────────
@@ -2814,6 +2877,153 @@ impl Database {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    // ── User Threads ────────────────────────────────────────────
+
+    /// Upsert a user thread participation record.
+    pub fn upsert_user_thread(&self, root_id: &str, participation: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO user_threads (root_event_id, participation, updated_at)
+             VALUES (?1, ?2, strftime('%s','now'))
+             ON CONFLICT(root_event_id) DO UPDATE SET
+                participation = CASE
+                    WHEN excluded.participation = 'author' THEN 'author'
+                    WHEN user_threads.participation = 'author' THEN 'author'
+                    ELSE excluded.participation
+                END,
+                updated_at = strftime('%s','now')",
+            params![root_id, participation],
+        )?;
+        Ok(())
+    }
+
+    /// Get user thread roots ordered by updated_at, oldest first (for rotation).
+    pub fn get_user_thread_roots(&self, limit: u32, max_age_secs: u64) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT root_event_id, participation FROM user_threads
+             WHERE updated_at >= (strftime('%s','now') - ?2)
+             ORDER BY updated_at ASC LIMIT ?1"
+        )?;
+        let rows = stmt.query_map(params![limit, max_age_secs], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?.filter_map(|r| r.ok()).collect();
+        Ok(rows)
+    }
+
+    // ── Interaction Counts ──────────────────────────────────────
+
+    /// Get interaction counts (replies, reposts, reactions, zaps) for a batch of event IDs.
+    /// Uses json_each to scan tags for e-tag references.
+    pub fn get_interaction_counts(&self, event_ids: &[String]) -> Result<HashMap<String, (u32, u32, u32, u32)>> {
+        if event_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let conn = self.conn.lock();
+
+        // Build parameterized query
+        let placeholders: Vec<String> = (1..=event_ids.len()).map(|i| format!("?{}", i)).collect();
+        let sql = format!(
+            "SELECT json_extract(j.value, '$[1]') as ref_id, e.kind, COUNT(*) as cnt
+             FROM nostr_events e, json_each(e.tags) j
+             WHERE json_extract(j.value, '$[0]') = 'e'
+               AND json_extract(j.value, '$[1]') IN ({})
+               AND e.kind IN (1, 6, 7, 9735)
+             GROUP BY ref_id, e.kind",
+            placeholders.join(",")
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> = event_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+
+        let mut result: HashMap<String, (u32, u32, u32, u32)> = HashMap::new();
+
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, u32>(2)?,
+            ))
+        })?;
+
+        for row in rows.flatten() {
+            let (ref_id, kind, count) = row;
+            let entry = result.entry(ref_id).or_insert((0, 0, 0, 0));
+            match kind {
+                1 => entry.0 += count,     // replies
+                6 => entry.1 += count,     // reposts
+                7 => entry.2 += count,     // reactions
+                9735 => entry.3 += count,  // zaps
+                _ => {}
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Get all thread events for a given root ID (the root itself + all events referencing it).
+    pub fn get_thread_events(&self, root_id: &str) -> Result<(
+        Option<(String, String, i64, i64, String, String, String)>,
+        Vec<(String, String, i64, i64, String, String, String)>,
+        Vec<(String, String, i64, i64, String, String, String)>,
+        Vec<(String, String, i64, i64, String, String, String)>,
+    )> {
+        let conn = self.conn.lock();
+
+        // Get the root event
+        let root = conn.query_row(
+            "SELECT id, pubkey, created_at, kind, tags, content, sig FROM nostr_events WHERE id = ?1",
+            params![root_id],
+            |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            )),
+        ).ok();
+
+        // Get all events that reference this root via e-tag
+        let mut stmt = conn.prepare(
+            "SELECT e.id, e.pubkey, e.created_at, e.kind, e.tags, e.content, e.sig
+             FROM nostr_events e, json_each(e.tags) j
+             WHERE json_extract(j.value, '$[0]') = 'e'
+               AND json_extract(j.value, '$[1]') = ?1
+             ORDER BY e.created_at ASC"
+        )?;
+
+        let all_refs: Vec<(String, String, i64, i64, String, String, String)> = stmt
+            .query_map(params![root_id], |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            )))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut replies = Vec::new();
+        let mut reactions = Vec::new();
+        let mut zaps = Vec::new();
+
+        for row in all_refs {
+            match row.3 {
+                1 | 30023 => replies.push(row),
+                7 => reactions.push(row),
+                9735 => zaps.push(row),
+                _ => replies.push(row),
+            }
+        }
+
+        Ok((root, replies, reactions, zaps))
     }
 }
 

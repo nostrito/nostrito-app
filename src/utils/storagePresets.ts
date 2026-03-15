@@ -75,8 +75,8 @@ export interface StorageEstimate {
 
 export const STORAGE_PRESETS: Record<string, StoragePreset> = {
   minimal: {
-    label: "Minimal",
-    description: "Your data + close follows only. Low disk usage.",
+    label: "minimal",
+    description: "your data + close follows only. low disk usage.",
     estimatedGb: { low: 1, typical: 2 },
     othersEventsGb: 1,
     trackedMediaGb: 1,
@@ -92,8 +92,8 @@ export const STORAGE_PRESETS: Record<string, StoragePreset> = {
     },
   },
   balanced: {
-    label: "Balanced",
-    description: "30 days of WoT data + media. Good for most users.",
+    label: "balanced",
+    description: "30 days of WoT data + media. good for most users.",
     estimatedGb: { low: 5, typical: 10 },
     othersEventsGb: 5,
     trackedMediaGb: 3,
@@ -109,8 +109,8 @@ export const STORAGE_PRESETS: Record<string, StoragePreset> = {
     },
   },
   archive: {
-    label: "Archive",
-    description: "Long retention, full media. For power users.",
+    label: "archive",
+    description: "long retention, full media. for power users.",
     estimatedGb: { low: 20, typical: 50 },
     othersEventsGb: 20,
     trackedMediaGb: 10,

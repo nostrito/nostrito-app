@@ -26,6 +26,7 @@ export const Dms: React.FC = () => {
   const [ownPubkey, setOwnPubkey] = useState("");
   const [selectedPartner, setSelectedPartner] = useState<string | null>(null);
   const [signingMode, setSigningMode] = useState<"nsec" | "read-only">("read-only");
+  const [displayCount, setDisplayCount] = useState(30);
 
   // Cache for decrypted message content: eventId -> plaintext
   const decryptedCache = useRef<Map<string, string>>(new Map());
@@ -201,20 +202,42 @@ export const Dms: React.FC = () => {
     decryptThread(conv.messages, selectedPartner);
   }, [selectedPartner, signingMode, conversations, decryptThread]);
 
-  // Auto-scroll thread to bottom
+  // Auto-scroll thread to bottom on conversation change
   const threadRef = useRef<HTMLDivElement>(null);
+  const prevPartnerRef = useRef<string | null>(null);
   useEffect(() => {
-    if (selectedPartner && threadRef.current) {
-      threadRef.current.scrollTop = threadRef.current.scrollHeight;
+    if (selectedPartner && threadRef.current && selectedPartner !== prevPartnerRef.current) {
+      // Reset display count and scroll to bottom on new conversation
+      setDisplayCount(30);
+      setTimeout(() => {
+        if (threadRef.current) threadRef.current.scrollTop = threadRef.current.scrollHeight;
+      }, 0);
     }
+    prevPartnerRef.current = selectedPartner;
   }, [selectedPartner, conversations]);
+
+  // Sentinel observer to load older messages on scroll-up
+  const sentinelRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!sentinelRef.current || !selectedPartner) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0].isIntersecting) {
+          setDisplayCount((prev) => prev + 30);
+        }
+      },
+      { threshold: 0.1 },
+    );
+    observer.observe(sentinelRef.current);
+    return () => observer.disconnect();
+  }, [selectedPartner]);
 
   // Loading state
   if (loading) {
     return (
       <div className="dms-page-inner">
         <div style={{ display: "flex", alignItems: "center", justifyContent: "center", padding: 48, color: "var(--text-muted)" }}>
-          Loading DMs...
+          loading DMs...
         </div>
       </div>
     );
@@ -225,7 +248,7 @@ export const Dms: React.FC = () => {
     return (
       <div className="dms-page-inner">
         <EmptyState
-          message="Set up your identity in Settings first."
+          message="set up your identity in settings first."
           icon={<span className="icon"><IconMessageCircle /></span>}
         />
       </div>
@@ -236,7 +259,7 @@ export const Dms: React.FC = () => {
     return (
       <div className="dms-page-inner">
         <EmptyState
-          message="Could not determine your pubkey."
+          message="could not determine your pubkey."
           icon={<span className="icon"><IconMessageCircle /></span>}
         />
       </div>
@@ -247,7 +270,7 @@ export const Dms: React.FC = () => {
     return (
       <div className="dms-page-inner">
         <EmptyState
-          message="Failed to load DMs."
+          message="failed to load DMs."
           icon={<span className="icon"><IconMessageCircle /></span>}
         />
       </div>
@@ -263,7 +286,7 @@ export const Dms: React.FC = () => {
   // Truncate preview text
   function previewText(conv: Conversation): React.ReactNode {
     if (signingMode !== "nsec") {
-      return <><span className="icon"><IconLock /></span> Encrypted</>;
+      return <><span className="icon"><IconLock /></span> encrypted</>;
     }
     const lastMsg = conv.messages[0];
     if (!lastMsg) return null;
@@ -283,7 +306,7 @@ export const Dms: React.FC = () => {
           return (
             <div className="dms-empty-panel">
               <span className="icon dms-empty-icon"><IconMessageCircle /></span>
-              <div className="dms-empty-title">No conversations yet</div>
+              <div className="dms-empty-title">no conversations yet</div>
               <div className="dms-empty-hint">DMs will appear here after the next sync cycle.</div>
             </div>
           );
@@ -291,9 +314,9 @@ export const Dms: React.FC = () => {
         return (
           <div className="dms-empty-panel">
             <span className="icon dms-empty-icon"><IconLock /></span>
-            <div className="dms-empty-title">Enable write mode to send messages</div>
-            <div className="dms-empty-hint">Add your nsec in Settings to decrypt and read your messages.</div>
-            <button className="dms-empty-cta" onClick={() => navigate("/settings")}>Go to Settings</button>
+            <div className="dms-empty-title">enable write mode to send messages</div>
+            <div className="dms-empty-hint">add your nsec in settings to decrypt and read your messages.</div>
+            <button className="dms-empty-cta" onClick={() => navigate("/settings")}>go to settings</button>
           </div>
         );
       }
@@ -303,17 +326,17 @@ export const Dms: React.FC = () => {
         return (
           <div className="dms-empty-panel">
             <span className="icon dms-empty-icon"><IconMessageCircle /></span>
-            <div className="dms-empty-title">Select a conversation</div>
-            <div className="dms-empty-hint">Choose a chat from the sidebar to view messages.</div>
+            <div className="dms-empty-title">select a conversation</div>
+            <div className="dms-empty-hint">choose a chat from the sidebar to view messages.</div>
           </div>
         );
       }
       return (
         <div className="dms-empty-panel">
           <span className="icon dms-empty-icon"><IconLock /></span>
-          <div className="dms-empty-title">Read-only mode</div>
-          <div className="dms-empty-hint">Add your nsec in Settings to decrypt and send messages.</div>
-          <button className="dms-empty-cta" onClick={() => navigate("/settings")}>Go to Settings</button>
+          <div className="dms-empty-title">read-only mode</div>
+          <div className="dms-empty-hint">add your nsec in settings to decrypt and send messages.</div>
+          <button className="dms-empty-cta" onClick={() => navigate("/settings")}>go to settings</button>
         </div>
       );
     }
@@ -323,6 +346,8 @@ export const Dms: React.FC = () => {
     const name = profileDisplayName(profile, selectedPartner!);
     const avatar = profile?.picture || "";
     const sorted = [...selectedConv.messages].sort((a, b) => a.created_at - b.created_at);
+    const visible = sorted.slice(Math.max(0, sorted.length - displayCount));
+    const hasMore = sorted.length > displayCount;
 
     return (
       <>
@@ -330,7 +355,7 @@ export const Dms: React.FC = () => {
           <div
             className="dms-thread-profile"
             onClick={() => navigate(`/profile/${selectedPartner}`)}
-            title="View profile"
+            title="view profile"
           >
             <Avatar
               picture={avatar || null}
@@ -340,34 +365,50 @@ export const Dms: React.FC = () => {
             />
             <span className="dms-thread-name">{name}</span>
           </div>
-          <span className="dms-thread-count">{selectedConv.messages.length} messages</span>
+          <span className="dms-thread-count">{selectedConv.messages.length} msgs</span>
         </div>
         {signingMode !== "nsec" && (
           <div className="dms-banner" style={{ margin: "0 16px 0" }}>
-            <span className="icon"><IconLock /></span> Messages are encrypted. Add your nsec in Settings to decrypt.
+            <span className="icon"><IconLock /></span> messages are encrypted. add your nsec in settings to decrypt.
           </div>
         )}
         <div className="dms-thread-messages" ref={threadRef}>
-          {sorted.map((msg) => {
-            const isSent = msg.pubkey === ownPubkey;
-            const timeStr = formatTimestamp(msg.created_at);
-            const decrypted = cache.get(msg.id);
+          <div className="dms-thread-messages-inner">
+            {hasMore && <div ref={sentinelRef} className="dms-scroll-sentinel" />}
+            {visible.map((msg) => {
+              const isSent = msg.pubkey === ownPubkey;
+              const timeStr = formatTimestamp(msg.created_at);
+              const decrypted = cache.get(msg.id);
 
-            return (
-              <div key={msg.id} className={`dms-msg ${isSent ? "dms-msg-sent" : "dms-msg-received"}`}>
-                <div className="dms-msg-bubble">
-                  <div className="dms-msg-content">
-                    {decrypted
-                      ? decrypted
-                      : <><span className="icon"><IconLock /></span> Encrypted message</>
-                    }
+              return (
+                <div key={msg.id} className={`dms-msg ${isSent ? "dms-msg-sent" : "dms-msg-received"}`}>
+                  <div className="dms-msg-bubble">
+                    <div className="dms-msg-content">
+                      {decrypted
+                        ? decrypted
+                        : <><span className="icon"><IconLock /></span> encrypted message</>
+                      }
+                    </div>
+                    <div className="dms-msg-time">{timeStr}</div>
                   </div>
-                  <div className="dms-msg-time">{timeStr}</div>
                 </div>
-              </div>
-            );
-          })}
+              );
+            })}
+          </div>
         </div>
+        {signingMode === "nsec" ? (
+          <div className="dms-input-bar">
+            <input type="text" placeholder="coming soon..." disabled />
+            <button disabled>send</button>
+          </div>
+        ) : (
+          <div className="dms-input-readonly">
+            <span className="icon"><IconLock /></span>
+            add your nsec in{" "}
+            <span className="dms-settings-link" onClick={() => navigate("/settings")}>settings</span>
+            {" "}to send messages
+          </div>
+        )}
       </>
     );
   }
@@ -379,11 +420,11 @@ export const Dms: React.FC = () => {
       <div className="dms-sidebar">
         <div className="dms-sidebar-header">
           <span className="icon"><IconMessageCircle /></span>
-          <span>Conversations</span>
+          <span>conversations</span>
           <span className="dms-sidebar-count">{conversations.length}</span>
         </div>
         {conversations.length === 0 ? (
-          <div className="dms-sidebar-empty">No conversations yet</div>
+          <div className="dms-sidebar-empty">no conversations yet</div>
         ) : (
           <div className="dms-conversation-list">
             {conversations.map((conv) => {

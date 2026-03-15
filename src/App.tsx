@@ -21,13 +21,15 @@ import { StorageOwnEvents } from "./screens/StorageOwnEvents";
 import { StorageTrackedProfiles } from "./screens/StorageTrackedProfiles";
 import { StorageWotProfiles } from "./screens/StorageWotProfiles";
 import { Gallery } from "./screens/Gallery";
+import { Wallet } from "./screens/Wallet";
 
 const SCREEN_LABELS: Record<string, string> = {
-  "/": "analytics",
-  "/feed": "feed",
+  "/": "feed",
+  "/analytics": "analytics",
   "/dms": "messages",
   "/gallery": "gallery",
   "/wot": "wot",
+  "/wallet": "wallet",
   "/storage": "storage",
   "/storage/own-events": "storage / own events",
   "/storage/tracked-profiles": "storage / tracked profiles",
@@ -41,7 +43,7 @@ const AppShell: React.FC = () => {
 
   const label = SCREEN_LABELS[location.pathname] || "nostrito";
   const relayUrl = appStatus?.relay_running ? `wss://localhost:${appStatus.relay_port}` : null;
-  const titleText = relayUrl && location.pathname === "/"
+  const titleText = relayUrl && location.pathname === "/analytics"
     ? `nostrito — ${relayUrl}`
     : `nostrito — ${label}`;
 
@@ -145,11 +147,12 @@ const AppRoutes: React.FC = () => {
     <Routes>
       <Route path="/wizard" element={isInitialized ? <Navigate to="/" replace /> : <Wizard />} />
       <Route element={isInitialized ? <AppShell /> : <Navigate to="/wizard" replace />}>
-        <Route path="/" element={<Dashboard />} />
-        <Route path="/feed" element={<Feed />} />
+        <Route path="/" element={<Feed />} />
+        <Route path="/analytics" element={<Dashboard />} />
         <Route path="/dms" element={<Dms />} />
         <Route path="/gallery" element={<Gallery />} />
         <Route path="/wot" element={<Wot />} />
+        <Route path="/wallet" element={<Wallet />} />
         <Route path="/storage" element={<Storage />} />
         <Route path="/storage/own-events" element={<StorageOwnEvents />} />
         <Route path="/storage/tracked-profiles" element={<StorageTrackedProfiles />} />

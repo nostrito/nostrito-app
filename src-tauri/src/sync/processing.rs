@@ -124,6 +124,38 @@ pub fn process_event(
         }
     }
 
+    // Track thread participation for user_threads table
+    if result.stored && matches!(kind, 1 | 6 | 7 | 30023) {
+        let root_tag = tags.iter().find(|t| {
+            t.len() >= 2 && t[0] == "e" && (
+                (t.len() >= 4 && t[3] == "root") ||
+                // If no markers, first e-tag is typically the root
+                tags.iter().filter(|tt| tt.len() >= 2 && tt[0] == "e").count() == 1
+            )
+        }).or_else(|| {
+            // Fallback: first e-tag as root
+            tags.iter().find(|t| t.len() >= 2 && t[0] == "e")
+        });
+
+        if let Some(root) = root_tag {
+            let root_id = &root[1];
+            let participation = if pubkey == own_pubkey {
+                "author"
+            } else if tags.iter().any(|t| t.len() >= 2 && t[0] == "p" && t[1] == own_pubkey) {
+                "mentioned"
+            } else if kind == 7 {
+                "reacted"
+            } else {
+                "replied"
+            };
+
+            // Only track if own pubkey is involved
+            if pubkey == own_pubkey || tags.iter().any(|t| t.len() >= 2 && t[0] == "p" && t[1] == own_pubkey) {
+                db.upsert_user_thread(root_id, participation).ok();
+            }
+        }
+    }
+
     // Queue media for newly stored content events
     if result.stored && matches!(kind, 1 | 6 | 30023) {
         result.media_urls_queued = queue_media_urls(db, &pubkey, &event.content.to_string(), &tags, media_priority);

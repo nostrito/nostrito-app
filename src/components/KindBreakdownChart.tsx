@@ -108,14 +108,14 @@ export interface MediaRow {
 }
 
 export const KIND_CATEGORIES: KindCategory[] = [
-  { label: "Notes",      icon: kindIcons.notes,     color: "var(--green)",        kinds: [1] },
-  { label: "Reposts",    icon: kindIcons.reposts,    color: "var(--blue)",         kinds: [6] },
-  { label: "Reactions",  icon: kindIcons.reactions,  color: "var(--red)",          kinds: [7] },
-  { label: "Profiles",   icon: kindIcons.profiles,   color: "var(--accent-light)", kinds: [0] },
-  { label: "Contacts",   icon: kindIcons.contacts,   color: "var(--purple)",       kinds: [3] },
-  { label: "Articles",   icon: kindIcons.articles,   color: "var(--orange)",       kinds: [30023] },
-  { label: "Zaps",       icon: kindIcons.zaps,       color: "var(--yellow)",       kinds: [9735] },
-  { label: "DMs",        icon: kindIcons.dms,        color: "var(--blue)",         kinds: [4, 1059] },
+  { label: "notes",      icon: kindIcons.notes,     color: "var(--green)",        kinds: [1] },
+  { label: "reposts",    icon: kindIcons.reposts,    color: "var(--blue)",         kinds: [6] },
+  { label: "reactions",  icon: kindIcons.reactions,  color: "var(--red)",          kinds: [7] },
+  { label: "profiles",   icon: kindIcons.profiles,   color: "var(--accent-light)", kinds: [0] },
+  { label: "contacts",   icon: kindIcons.contacts,   color: "var(--purple)",       kinds: [3] },
+  { label: "articles",   icon: kindIcons.articles,   color: "var(--orange)",       kinds: [30023] },
+  { label: "zaps",       icon: kindIcons.zaps,       color: "var(--yellow)",       kinds: [9735] },
+  { label: "dms",        icon: kindIcons.dms,        color: "var(--blue)",         kinds: [4, 1059] },
 ];
 
 export const MEDIA_COLORS = {
@@ -151,7 +151,7 @@ export function aggregateKindRows(counts: Record<string, number>): KindRow[] {
   let otherCount = 0;
   for (const v of remaining.values()) otherCount += v;
   if (otherCount > 0) {
-    rows.push({ label: "Other", icon: kindIcons.other, color: "var(--text-dim)", count: otherCount });
+    rows.push({ label: "other", icon: kindIcons.other, color: "var(--text-dim)", count: otherCount });
   }
 
   rows.sort((a, b) => b.count - a.count);
@@ -175,10 +175,10 @@ export interface MediaBreakdown {
 
 export function buildMediaRows(mb: MediaBreakdown): MediaRow[] {
   return [
-    { label: "Images", icon: kindIcons.images, color: MEDIA_COLORS.images, count: mb.image_count, bytes: mb.image_bytes },
-    { label: "Videos", icon: kindIcons.videos, color: MEDIA_COLORS.videos, count: mb.video_count, bytes: mb.video_bytes },
-    { label: "Audio",  icon: kindIcons.audio,  color: MEDIA_COLORS.audio,  count: mb.audio_count, bytes: mb.audio_bytes },
-    { label: "Other",  icon: kindIcons.other,  color: MEDIA_COLORS.other,  count: mb.other_count, bytes: mb.other_bytes },
+    { label: "images", icon: kindIcons.images, color: MEDIA_COLORS.images, count: mb.image_count, bytes: mb.image_bytes },
+    { label: "videos", icon: kindIcons.videos, color: MEDIA_COLORS.videos, count: mb.video_count, bytes: mb.video_bytes },
+    { label: "audio",  icon: kindIcons.audio,  color: MEDIA_COLORS.audio,  count: mb.audio_count, bytes: mb.audio_bytes },
+    { label: "other",  icon: kindIcons.other,  color: MEDIA_COLORS.other,  count: mb.other_count, bytes: mb.other_bytes },
   ].filter(r => r.count > 0).sort((a, b) => b.bytes - a.bytes);
 }
 
@@ -201,13 +201,13 @@ export const KindBreakdownChart: React.FC<KindBreakdownChartProps> = ({ title, k
       <div className="kind-breakdown-title">{title}</div>
 
       {!kindCounts && !error && (
-        <div style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>Loading...</div>
+        <div style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>loading...</div>
       )}
       {error && (
-        <div style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>Unable to load breakdown</div>
+        <div style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>unable to load breakdown</div>
       )}
       {kindRows && kindRows.length === 0 && (
-        <div style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>No events stored</div>
+        <div style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>no events stored</div>
       )}
 
       {kindRows && kindRows.length > 0 && (
@@ -304,7 +304,7 @@ export const MediaBreakdownChart: React.FC<MediaBreakdownChartProps> = ({ mediaB
 
   return (
     <div className="kind-breakdown-section">
-      <div className="kind-breakdown-title">Media Breakdown</div>
+      <div className="kind-breakdown-title">media breakdown</div>
       <div className="media-summary-stats">
         <span>{mediaBreakdown.total_count.toLocaleString()} files</span>
         <span>{formatBytes(mediaBreakdown.total_bytes)}</span>

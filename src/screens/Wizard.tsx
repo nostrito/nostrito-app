@@ -46,21 +46,21 @@ interface MediaTypes {
 /*  Constants                                                          */
 /* ------------------------------------------------------------------ */
 
-const STEP_LABELS = ["Identity", "Relays", "Storage"];
+const STEP_LABELS = ["identity", "relays", "storage"];
 
 const CLIENTS = [
-  { name: "Damus", icon: "D" },
-  { name: "Amethyst", icon: "A" },
-  { name: "Primal", icon: "P" },
-  { name: "Coracle", icon: "C" },
-  { name: "Snort", icon: "S" },
+  { name: "damus", icon: "D" },
+  { name: "amethyst", icon: "A" },
+  { name: "primal", icon: "P" },
+  { name: "coracle", icon: "C" },
+  { name: "snort", icon: "S" },
 ];
 
 const SIGNER_OPTIONS: { type: SignerType; icon: React.ReactNode; label: string }[] = [
-  { type: "nsec", icon: <span className="icon"><IconKey /></span>, label: "Paste nsec" },
-  { type: "bunker", icon: <span className="icon"><IconCastle /></span>, label: "NBunker / NIP-46" },
-  { type: "connect", icon: <span className="icon"><IconPlug /></span>, label: "Nostr Connect" },
-  { type: "new", icon: <span className="icon"><IconSparkles /></span>, label: "Create new account" },
+  { type: "nsec", icon: <span className="icon"><IconKey /></span>, label: "paste nsec" },
+  { type: "bunker", icon: <span className="icon"><IconCastle /></span>, label: "nbunker / NIP-46" },
+  { type: "connect", icon: <span className="icon"><IconPlug /></span>, label: "nostr connect" },
+  { type: "new", icon: <span className="icon"><IconSparkles /></span>, label: "create new account" },
 ];
 
 /* ------------------------------------------------------------------ */
@@ -162,12 +162,12 @@ export const Wizard: React.FC = () => {
   const handleNext = useCallback(async () => {
     if (step === 1) {
       if (identityMode === "readonly" && !isNpubValid(npub)) {
-        setNpubError("Enter a valid npub (starts with npub1, 63 characters)");
+        setNpubError("enter a valid npub (starts with npub1, 63 characters)");
         return;
       }
       if (identityMode === "full" && signerType === "nsec") {
         if (!nsecInput.trim().startsWith("nsec1")) {
-          setNsecError("Enter a valid nsec (starts with nsec1)");
+          setNsecError("enter a valid nsec (starts with nsec1)");
           return;
         }
         try {
@@ -258,7 +258,7 @@ export const Wizard: React.FC = () => {
       setStep(4);
     } catch (e) {
       console.error("[nostrito] Failed to initialize:", e);
-      setFinishError(`Failed to initialize: ${e}`);
+      setFinishError(`failed to initialize: ${e}`);
       setFinishing(false);
     }
   };
@@ -298,7 +298,7 @@ export const Wizard: React.FC = () => {
           <button className="dot-yellow tb-btn" onClick={handleMinimize} title="Minimize" />
           <button className="dot-green tb-btn" onClick={handleMaximize} title="Maximize" />
         </div>
-        <span className="wizard-titlebar-text">nostrito — Setup</span>
+        <span className="wizard-titlebar-text">nostrito — setup</span>
         <div style={{ width: 52 }} />
       </div>
 
@@ -308,10 +308,10 @@ export const Wizard: React.FC = () => {
           <div className="wiz-panel wiz-panel-ready">
             <div className="wiz-ready-content">
               <h3 className="wiz-title wiz-ready-title">
-                Your local relay is running <span className="icon"><IconParty /></span>
+                your local relay is running <span className="icon"><IconParty /></span>
               </h3>
               <p className="wiz-subtitle">
-                Add this address to your favorite Nostr clients to start using your WoT-filtered feed:
+                add this address to your favorite nostr clients to start using your WoT-filtered feed:
               </p>
 
               <div className="wiz-relay-url-box">
@@ -321,15 +321,15 @@ export const Wizard: React.FC = () => {
                   onClick={handleCopyRelay}
                   title="Copy to clipboard"
                 >
-                  <span className="icon"><IconClipboard /></span> Copy
+                  <span className="icon"><IconClipboard /></span> copy
                 </button>
               </div>
               <span className={`wiz-copy-feedback${copyFeedback ? " visible" : ""}`}>
-                {copyFeedback ? "Copied!" : ""}
+                {copyFeedback ? "copied!" : ""}
               </span>
 
               <div className="wiz-clients-section">
-                <p className="wiz-clients-label">Works with:</p>
+                <p className="wiz-clients-label">works with:</p>
                 <ul className="wiz-clients-list">
                   {CLIENTS.map((c) => (
                     <li key={c.name} className="wiz-client-item">
@@ -343,7 +343,7 @@ export const Wizard: React.FC = () => {
                 className="btn btn-primary wiz-open-btn"
                 onClick={() => navigate("/")}
               >
-                Open nostrito →
+                open nostrito →
               </button>
             </div>
           </div>
@@ -422,14 +422,14 @@ export const Wizard: React.FC = () => {
               style={{ visibility: step === 1 ? "hidden" : "visible" }}
               onClick={handleBack}
             >
-              ← Back
+              ← back
             </button>
             <button
               className={`btn btn-primary${!canGoNext() || finishing ? " disabled" : ""}`}
               disabled={!canGoNext() || finishing}
               onClick={handleNext}
             >
-              {finishing ? "Initializing..." : step === 3 ? "Finish →" : "Next →"}
+              {finishing ? "initializing..." : step === 3 ? "finish →" : "next →"}
             </button>
           </div>
         </div>
@@ -470,8 +470,8 @@ const StepIdentity: React.FC<StepIdentityProps> = ({
   npubInputRef,
 }) => (
   <>
-    <h3 className="wiz-title">Your identity</h3>
-    <p className="wiz-subtitle">Choose how to connect. You can always upgrade later.</p>
+    <h3 className="wiz-title">your identity</h3>
+    <p className="wiz-subtitle">choose how to connect. you can always upgrade later.</p>
 
     <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 20, width: "100%", maxWidth: 480 }}>
       <div
@@ -479,10 +479,10 @@ const StepIdentity: React.FC<StepIdentityProps> = ({
         onClick={() => onIdentityModeChange("readonly")}
       >
         <div className="wiz-identity-title">
-          <span className="icon"><IconBookOpen /></span> Read-only
+          <span className="icon"><IconBookOpen /></span> read-only
         </div>
         <div className="wiz-identity-desc">
-          Paste your npub. DMs disabled, everything else works.
+          paste your npub. DMs disabled, everything else works.
         </div>
       </div>
       <div
@@ -490,10 +490,10 @@ const StepIdentity: React.FC<StepIdentityProps> = ({
         onClick={() => onIdentityModeChange("full")}
       >
         <div className="wiz-identity-title">
-          <span className="icon"><IconKey /></span> Full access
+          <span className="icon"><IconKey /></span> full access
         </div>
         <div className="wiz-identity-desc">
-          Connect nsec, NBunker, or Nostr Connect. Unlocks DMs.
+          connect nsec, nbunker, or nostr connect. unlocks DMs.
         </div>
       </div>
     </div>
@@ -559,8 +559,8 @@ interface StepRelaysProps {
 
 const StepRelays: React.FC<StepRelaysProps> = ({ selectedRelays, onToggle }) => (
   <>
-    <h3 className="wiz-title">Where do you want to sync from?</h3>
-    <p className="wiz-subtitle">Pick by name. We handle the rest.</p>
+    <h3 className="wiz-title">where do you want to sync from?</h3>
+    <p className="wiz-subtitle">pick by name. we handle the rest.</p>
 
     <div className="relay-grid">
       {RELAYS.map((relay) => (
@@ -586,9 +586,9 @@ const PRESET_ICONS: Record<string, React.ReactNode> = {
 };
 
 const PRESET_DETAILS: Record<string, string[]> = {
-  minimal: ["Last 7 days for follows & WoT", "Tracked profiles: full history", "Images only, no WoT media"],
-  balanced: ["Last 30 days for follows, 7 days for WoT", "Tracked profiles: full history", "All media types, 2 GB WoT media"],
-  archive: ["Last year for follows, 90 days for WoT", "Tracked profiles: full history", "All media types, 10 GB WoT media"],
+  minimal: ["last 7 days for follows & WoT", "tracked profiles: full history", "images only, no WoT media"],
+  balanced: ["last 30 days for follows, 7 days for WoT", "tracked profiles: full history", "all media types, 2 GB WoT media"],
+  archive: ["last year for follows, 90 days for WoT", "tracked profiles: full history", "all media types, 10 GB WoT media"],
 };
 
 interface StepStorageProps {
@@ -626,16 +626,16 @@ const StepStorage: React.FC<StepStorageProps> = ({
 
   return (
     <>
-      <h3 className="wiz-title">Storage</h3>
-      <p className="wiz-subtitle">Choose how much to store. You can change this later in Settings.</p>
+      <h3 className="wiz-title">storage</h3>
+      <p className="wiz-subtitle">choose how much to store. you can change this later in settings.</p>
 
       {/* Your events & media — locked */}
       <div className="storage-section">
         <div className="storage-row locked">
           <div className="storage-row-info">
-            <span className="storage-row-label">Your events &amp; media</span>
+            <span className="storage-row-label">your events &amp; media</span>
             <span className="storage-row-meta">
-              <span className="icon"><IconLock /></span> Always stored. No exceptions.
+              <span className="icon"><IconLock /></span> always stored. no exceptions.
             </span>
           </div>
           <div className="storage-bar-wrap">
@@ -679,12 +679,12 @@ const StepStorage: React.FC<StepStorageProps> = ({
 
       {/* Estimation summary */}
       <div className="storage-estimate-summary">
-        With ~200 follows: ~{estimate.eventsPerDay.toLocaleString()} events/day, ~{estimate.growthGbPerMonth} GB/month
+        with ~200 follows: ~{estimate.eventsPerDay.toLocaleString()} events/day, ~{estimate.growthGbPerMonth} GB/month
       </div>
 
       {/* Custom mode toggle */}
       <div className="storage-custom-toggle" onClick={onCustomModeToggle}>
-        {customMode ? "Hide" : "Customize"} advanced settings
+        {customMode ? "hide" : "customize"} advanced settings
       </div>
 
       {/* Advanced sliders (shown when custom mode is on) */}
@@ -694,8 +694,8 @@ const StepStorage: React.FC<StepStorageProps> = ({
           <div className="storage-section">
             <div className="storage-row">
               <div className="storage-row-info">
-                <span className="storage-row-label">Others' events</span>
-                <span className="storage-row-meta">From your Web of Trust</span>
+                <span className="storage-row-label">others' events</span>
+                <span className="storage-row-meta">from your web of trust</span>
               </div>
               <Slider
                 variant="storage"
@@ -713,8 +713,8 @@ const StepStorage: React.FC<StepStorageProps> = ({
           <div className="storage-section">
             <div className="storage-row">
               <div className="storage-row-info">
-                <span className="storage-row-label">Tracked profiles media</span>
-                <span className="storage-row-meta">Media from profiles you track</span>
+                <span className="storage-row-label">tracked profiles media</span>
+                <span className="storage-row-meta">media from profiles you track</span>
               </div>
               <Slider
                 variant="storage"
@@ -733,7 +733,7 @@ const StepStorage: React.FC<StepStorageProps> = ({
             <div className="storage-row">
               <div className="storage-row-info">
                 <span className="storage-row-label">WoT media</span>
-                <span className="storage-row-meta">Images, videos, audio from your network</span>
+                <span className="storage-row-meta">images, videos, audio from your network</span>
               </div>
               <Slider
                 variant="storage"
@@ -750,19 +750,19 @@ const StepStorage: React.FC<StepStorageProps> = ({
                 className={`media-toggle${mediaTypes.images ? " active" : ""}`}
                 onClick={() => onToggleMediaType("images")}
               >
-                <span className="icon"><IconImage /></span> Images
+                <span className="icon"><IconImage /></span> images
               </div>
               <div
                 className={`media-toggle${mediaTypes.videos ? " active" : ""}`}
                 onClick={() => onToggleMediaType("videos")}
               >
-                <span className="icon"><IconVideo /></span> Videos
+                <span className="icon"><IconVideo /></span> videos
               </div>
               <div
                 className={`media-toggle${mediaTypes.audio ? " active" : ""}`}
                 onClick={() => onToggleMediaType("audio")}
               >
-                <span className="icon"><IconVolume /></span> Audio
+                <span className="icon"><IconVolume /></span> audio
               </div>
             </div>
           </div>

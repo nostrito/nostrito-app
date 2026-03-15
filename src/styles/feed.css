@@ -949,3 +949,82 @@
 .note-detail-replies {
   margin-top: 8px;
 }
+
+/* Thread tree indentation */
+.thread-reply {
+  position: relative;
+  transition: margin-left 0.15s ease;
+}
+.thread-reply .event-card {
+  border-left: 2px solid var(--border);
+  border-radius: 0 8px 8px 0;
+}
+.thread-reply-non-wot {
+  opacity: 0.5;
+}
+.thread-reply-non-wot .event-card {
+  border-left-color: var(--text-dim);
+}
+.thread-non-wot-label {
+  display: inline-block;
+  font-size: 0.68rem;
+  color: var(--text-dim);
+  background: rgba(255,255,255,0.04);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1px 8px;
+  margin-bottom: 2px;
+  letter-spacing: 0.03em;
+}
+.thread-show-non-wot {
+  display: block;
+  width: 100%;
+  background: none;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  padding: 10px;
+  color: var(--text-muted);
+  font-size: 0.82rem;
+  cursor: pointer;
+  margin-top: 8px;
+  text-align: center;
+  transition: border-color 0.15s, color 0.15s;
+}
+.thread-show-non-wot:hover {
+  border-color: var(--accent);
+  color: var(--accent-light);
+}
+
+/* Zap display */
+.note-detail-zaps {
+  margin-bottom: 24px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+}
+.note-detail-zap-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.note-detail-zap-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.82rem;
+}
+.note-detail-zap-avatar {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  object-fit: cover;
+  cursor: pointer;
+}
+.note-detail-zap-amount {
+  font-weight: 600;
+  color: var(--accent-light);
+}
+.note-detail-zap-time {
+  color: var(--text-dim);
+  font-size: 0.75rem;
+  margin-left: auto;
+}

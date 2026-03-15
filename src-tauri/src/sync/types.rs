@@ -68,6 +68,8 @@ pub struct SyncConfig {
     pub cycle_interval_secs: u32,
     /// How many notes to fetch from WoT peers each cycle (0 = disabled).
     pub wot_notes_per_cycle: u32,
+    /// How many days to keep re-fetching threads the user interacted with.
+    pub thread_retention_days: u32,
 }
 
 impl Default for SyncConfig {
@@ -86,6 +88,7 @@ impl Default for SyncConfig {
             // all of them would be slow and bandwidth-heavy. A small sample
             // each cycle gradually builds a picture of the broader network.
             wot_notes_per_cycle: 50,
+            thread_retention_days: 30,
         }
     }
 }

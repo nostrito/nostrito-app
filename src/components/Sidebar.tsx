@@ -1,18 +1,19 @@
 import React from "react";
 import { NavLink } from "react-router-dom";
 import logoUrl from "../assets/logo.png";
-import { IconDashboard, IconFeed, IconMessageCircle, IconImage, IconNetwork, IconDatabase, IconSettings } from "./Icon";
+import { IconDashboard, IconFeed, IconMessageCircle, IconImage, IconNetwork, IconWallet, IconDatabase, IconSettings } from "./Icon";
 import { useAppContext } from "../context/AppContext";
 
 export const Sidebar: React.FC = () => {
   const { ownProfile } = useAppContext();
 
   const navItems = [
-    { to: "/feed", icon: <IconFeed />, label: "feed" },
+    { to: "/", icon: <IconFeed />, label: "feed" },
     { to: "/dms", icon: <IconMessageCircle />, label: "messages" },
     { to: "/gallery", icon: <IconImage />, label: "gallery" },
     { to: "/wot", icon: <IconNetwork />, label: "wot" },
-    { to: "/", icon: <IconDashboard />, label: "analytics" },
+    { to: "/wallet", icon: <IconWallet />, label: "wallet" },
+    { to: "/analytics", icon: <IconDashboard />, label: "analytics" },
     { to: "/storage", icon: <IconDatabase />, label: "storage" },
     { to: "/settings", icon: <IconSettings />, label: "settings" },
   ];
@@ -40,10 +41,10 @@ export const Sidebar: React.FC = () => {
           ) : (
             <div className="own-profile-avatar" />
           )}
-          <span className="own-profile-name">{ownProfile.name || ownProfile.display_name || "Me"}</span>
+          <span className="own-profile-name">{ownProfile.name || ownProfile.display_name || "me"}</span>
         </NavLink>
       )}
-      <div className="sidebar-status"><span className="pulse-dot" /> Live · wss://localhost:4869</div>
+      <div className="sidebar-status"><span className="pulse-dot" /> live · wss://localhost:4869</div>
     </aside>
   );
 };

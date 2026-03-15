@@ -9,6 +9,7 @@ import { renderMediaHtml, stripMediaUrls, type MediaContext } from "../utils/med
 import { profileDisplayName, type ProfileInfo } from "../utils/profiles";
 import { extractMentionedPubkeys, replaceMentions, normalizeBareEntities } from "../utils/mentions";
 import { useProfileContext } from "../context/ProfileContext";
+import { useInteractionCounts } from "../hooks/useInteractionCounts";
 import type { NostrEvent } from "../types/nostr";
 
 export function parseRepostContent(event: NostrEvent): { content: string; pubkey: string; id: string | null; created_at: number | null } | null {
@@ -343,6 +344,7 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, ful
   const k = kindLabel(event.kind);
   const displayName = profileDisplayName(profile, event.pubkey);
   const { ensureProfiles, getProfile } = useProfileContext();
+  const counts = useInteractionCounts(event.id);
 
   // Extract and ensure profiles for mentioned pubkeys (+ original author for reposts)
   const mentionedPubkeys = useMemo(() => {
@@ -456,9 +458,9 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, ful
         )}
         {!compact && (
           <div className="ev-actions">
-            <button className="ev-action"><span className="icon"><IconMessageCircle /></span> 0</button>
-            <button className="ev-action"><span className="icon"><IconRepeat /></span> 0</button>
-            <button className="ev-action"><span className="icon"><IconZap /></span> 0</button>
+            <button className="ev-action"><span className="icon"><IconMessageCircle /></span>{counts?.replies ? ` ${counts.replies}` : ""}</button>
+            <button className="ev-action"><span className="icon"><IconRepeat /></span>{counts?.reposts ? ` ${counts.reposts}` : ""}</button>
+            <button className="ev-action"><span className="icon"><IconZap /></span>{counts?.zaps ? ` ${counts.zaps}` : ""}</button>
             {onSave && (
               <button
                 className={`ev-action${saved ? " ev-action-saved" : ""}`}

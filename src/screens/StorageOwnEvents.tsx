@@ -139,10 +139,10 @@ export const StorageOwnEvents: React.FC = () => {
       <div className="storage-detail-header">
         <Link to="/storage" className="storage-back-link">
           <svg className="icon-sm" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m15 18-6-6 6-6"/></svg>
-          Storage
+          storage
         </Link>
-        <h2 className="storage-detail-title">Own Events</h2>
-        <Badge text="YOU" className="ownership-card-badge" variant="own" />
+        <h2 className="storage-detail-title">own events</h2>
+        <Badge text="you" className="ownership-card-badge" variant="own" />
       </div>
 
       <div className="storage-detail-stats">
@@ -156,13 +156,13 @@ export const StorageOwnEvents: React.FC = () => {
         </div>
       </div>
 
-      <div className="storage-detail-note">Always kept &mdash; never pruned &middot; unlimited</div>
+      <div className="storage-detail-note">always kept &mdash; never pruned &middot; unlimited</div>
 
       {/* Tabs */}
       <div className="storage-detail-tabs">
-        <button className={`storage-detail-tab${tab === "overview" ? " active" : ""}`} onClick={() => setTab("overview")}>Overview</button>
-        <button className={`storage-detail-tab${tab === "notes" ? " active" : ""}`} onClick={() => setTab("notes")}>Notes</button>
-        <button className={`storage-detail-tab${tab === "media" ? " active" : ""}`} onClick={() => setTab("media")}>Media</button>
+        <button className={`storage-detail-tab${tab === "overview" ? " active" : ""}`} onClick={() => setTab("overview")}>overview</button>
+        <button className={`storage-detail-tab${tab === "notes" ? " active" : ""}`} onClick={() => setTab("notes")}>notes</button>
+        <button className={`storage-detail-tab${tab === "media" ? " active" : ""}`} onClick={() => setTab("media")}>media</button>
       </div>
 
       {/* Overview tab */}
@@ -175,7 +175,7 @@ export const StorageOwnEvents: React.FC = () => {
             </>
           )}
 
-          <KindBreakdownChart title="Event Breakdown" kindCounts={kindCounts} />
+          <KindBreakdownChart title="event breakdown" kindCounts={kindCounts} />
         </>
       )}
 
@@ -183,13 +183,13 @@ export const StorageOwnEvents: React.FC = () => {
       {tab === "notes" && (
         <div className="storage-notes-list">
           {notesLoading && notes.length === 0 && (
-            <div style={{ fontSize: "0.85rem", color: "var(--text-muted)", padding: 24, textAlign: "center" }}>Loading notes...</div>
+            <div style={{ fontSize: "0.85rem", color: "var(--text-muted)", padding: 24, textAlign: "center" }}>loading notes...</div>
           )}
           {!notesLoading && notes.length === 0 && (
             <EmptyState
               icon={<svg className="icon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 20h9"/><path d="M16.376 3.622a1 1 0 0 1 3.002 3.002L7.368 18.635a2 2 0 0 1-.855.506l-2.872.838a.5.5 0 0 1-.62-.62l.838-2.872a2 2 0 0 1 .506-.854z"/></svg>}
-              message="No notes stored yet."
-              hint="Your own notes will appear here as they sync from relays."
+              message="no notes stored yet."
+              hint="your own notes will appear here as they sync from relays."
             />
           )}
           {notes.map(event => (
@@ -204,7 +204,7 @@ export const StorageOwnEvents: React.FC = () => {
           {notesHasMore && notes.length > 0 && (
             <div className="storage-load-more">
               <button className="storage-load-more-btn" onClick={loadMoreNotes} disabled={notesLoading}>
-                {notesLoading ? "Loading..." : "Load more"}
+                {notesLoading ? "loading..." : "load more"}
               </button>
             </div>
           )}
@@ -221,7 +221,7 @@ export const StorageOwnEvents: React.FC = () => {
                 className={`my-media-filter${mediaFilter === f ? " active" : ""}`}
                 onClick={() => setMediaFilter(f)}
               >
-                {f.charAt(0).toUpperCase() + f.slice(1)}
+                {f}
               </button>
             ))}
             <span className="my-media-stats" style={{ marginLeft: "auto" }}>
@@ -230,13 +230,13 @@ export const StorageOwnEvents: React.FC = () => {
           </div>
           <div className="storage-media-grid">
             {mediaLoading && (
-              <div style={{ gridColumn: "1 / -1", textAlign: "center", padding: 40, color: "var(--text-muted)", fontSize: "0.85rem" }}>Loading media...</div>
+              <div style={{ gridColumn: "1 / -1", textAlign: "center", padding: 40, color: "var(--text-muted)", fontSize: "0.85rem" }}>loading media...</div>
             )}
             {!mediaLoading && filteredMedia.length === 0 && (
               <EmptyState
                 icon={<svg className="icon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>}
-                message="No media cached yet."
-                hint="Media from your posts will appear here as it downloads."
+                message="no media cached yet."
+                hint="media from your posts will appear here as it downloads."
               />
             )}
             {!mediaLoading && filteredMedia.map((item, idx) => {

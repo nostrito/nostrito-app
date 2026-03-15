@@ -36,6 +36,7 @@ pub struct ThreadContext {
     pool: Arc<RelayPool>,
     own_pubkey: String,
     app_handle: tauri::AppHandle,
+    thread_retention_days: u32,
 }
 
 impl ThreadContext {
@@ -45,8 +46,9 @@ impl ThreadContext {
         pool: Arc<RelayPool>,
         own_pubkey: String,
         app_handle: tauri::AppHandle,
+        thread_retention_days: u32,
     ) -> Self {
-        Self { db, graph, pool, own_pubkey, app_handle }
+        Self { db, graph, pool, own_pubkey, app_handle, thread_retention_days }
     }
 
     /// Run the thread context phase (2-pass maximum).
@@ -101,6 +103,53 @@ impl ThreadContext {
 
         stats.missing = missing.len() as u32;
         info!("Thread context: fetched {} of {} missing roots", stats.fetched, stats.missing);
+
+        // Stage 2: Fetch thread context (replies, reactions, zaps) for user-participated threads
+        let max_age_secs = self.thread_retention_days as u64 * 86400;
+        let thread_roots = self.db.get_user_thread_roots(50, max_age_secs).unwrap_or_default();
+        if !thread_roots.is_empty() {
+            info!("Thread context: enriching {} user-participated threads", thread_roots.len());
+            for (root_id, _participation) in &thread_roots {
+                if let Ok(root_event_id) = EventId::from_hex(root_id) {
+                    // Fetch replies to this thread
+                    let replies_filter = Filter::new()
+                        .event(root_event_id)
+                        .kinds(vec![Kind::TextNote])
+                        .limit(200);
+
+                    // Fetch reactions + zaps for this thread
+                    let interactions_filter = Filter::new()
+                        .event(root_event_id)
+                        .kinds(vec![Kind::Reaction, Kind::from(9735)])
+                        .limit(500);
+
+                    match self.pool.subscribe_and_collect(
+                        relay_urls,
+                        vec![replies_filter, interactions_filter],
+                        15,
+                    ).await {
+                        Ok(events) => {
+                            if !events.is_empty() {
+                                let (stored, _) = processing::process_events(
+                                    &events,
+                                    &self.db,
+                                    &self.graph,
+                                    &self.own_pubkey,
+                                    EventSource::ThreadContext,
+                                    super::types::MEDIA_PRIORITY_OTHERS,
+                                    Some(&self.app_handle),
+                                    "thread",
+                                );
+                                stats.fetched += stored;
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Thread context: failed to enrich thread {}: {}", &root_id[..12.min(root_id.len())], e);
+                        }
+                    }
+                }
+            }
+        }
 
         // Recursive: scan newly fetched events for their own e-tag references
         if stats.fetched > 0 {

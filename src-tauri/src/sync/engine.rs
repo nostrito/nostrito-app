@@ -8,6 +8,8 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use std::collections::HashSet;
+
 use crate::storage::db::Database;
 use crate::wot::WotGraph;
 
@@ -201,6 +203,39 @@ impl SyncEngine {
 
     // ── Phase Implementations ────────────────────────────────────
 
+    /// Build a comprehensive relay set for own-data queries by merging:
+    /// 1. User's configured relays
+    /// 2. NIP-65 read relays
+    /// 3. Well-known relays
+    fn build_comprehensive_relay_set(&self) -> Vec<String> {
+        let mut set: HashSet<String> = HashSet::new();
+
+        // User's configured relays
+        for r in &self.relay_urls {
+            set.insert(r.clone());
+        }
+
+        // NIP-65 read relays
+        if let Ok(nip65) = self.db.get_read_relays(&self.hex_pubkey) {
+            for (url, _) in nip65 {
+                set.insert(url);
+            }
+        }
+
+        // Well-known relays
+        for url in &[
+            "wss://relay.damus.io",
+            "wss://relay.primal.net",
+            "wss://nos.lol",
+            "wss://purplepag.es",
+            "wss://relay.nostr.band",
+        ] {
+            set.insert(url.to_string());
+        }
+
+        set.into_iter().collect()
+    }
+
     /// Phase 1: Fetch own profile, contact list, and all own events.
     async fn phase_own_data(&self) -> Result<()> {
         {
@@ -246,9 +281,39 @@ impl SyncEngine {
             .since(Timestamp::from(since as u64))
             .limit(500);
 
+        // Mentions of us (kind:1 notes with #p tag pointing to us)
+        let mentions_filter = Filter::new()
+            .pubkey(pk)
+            .kinds(vec![Kind::TextNote, Kind::Repost, Kind::LongFormTextNote])
+            .since(Timestamp::from(since as u64))
+            .limit(500);
+
+        // Reactions to our notes (kind:7 with #p tag = us)
+        let reactions_to_own_filter = Filter::new()
+            .pubkey(pk)
+            .kind(Kind::Reaction)
+            .since(Timestamp::from(since as u64))
+            .limit(500);
+
+        // Zaps to our notes (kind:9735 with #p tag = us)
+        let zaps_to_own_filter = Filter::new()
+            .pubkey(pk)
+            .kind(Kind::from(9735))
+            .since(Timestamp::from(since as u64))
+            .limit(200);
+
+        let comprehensive_relays = self.build_comprehensive_relay_set();
+
         let events = self.pool.subscribe_and_collect(
-            &self.relay_urls,
-            vec![meta_filter, events_filter, received_dms_filter],
+            &comprehensive_relays,
+            vec![
+                meta_filter,
+                events_filter,
+                received_dms_filter,
+                mentions_filter,
+                reactions_to_own_filter,
+                zaps_to_own_filter,
+            ],
             30,
         ).await?;
 
@@ -354,6 +419,7 @@ impl SyncEngine {
             Arc::clone(&self.pool),
             self.hex_pubkey.clone(),
             self.app_handle.clone(),
+            self.sync_config.thread_retention_days,
         );
 
         let stats = threads.run(&self.relay_urls).await?;

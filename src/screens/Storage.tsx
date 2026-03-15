@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { Link } from "react-router-dom";
 import { Badge } from "../components/Badge";
 import { Avatar } from "../components/Avatar";
@@ -114,11 +115,24 @@ export const Storage: React.FC = () => {
       .catch(() => {});
   }, []);
 
+  // Refresh stats when media is deleted from Gallery
+  useEffect(() => {
+    const unlisten = listen("media-deleted", () => {
+      invoke<OwnershipStorageStats>("get_ownership_storage_stats")
+        .then(setOwnershipStats)
+        .catch(() => {});
+      invoke<StorageStats>("get_storage_stats")
+        .then(setStorageStats)
+        .catch(() => {});
+    });
+    return () => { unlisten.then((f) => f()); };
+  }, []);
+
   /* --- derived values ----------------------------------------------- */
   const title = useMemo(() => {
-    if (ownershipError) return "Storage Usage \u2014 no data";
-    if (!ownershipStats) return "Storage Usage \u2014 calculating...";
-    return `Storage Usage \u2014 ${ownershipStats.total_events.toLocaleString()} events \u00B7 ${formatBytes(ownershipStats.db_size_bytes)}`;
+    if (ownershipError) return "storage usage \u2014 no data";
+    if (!ownershipStats) return "storage usage \u2014 calculating...";
+    return `storage usage \u2014 ${ownershipStats.total_events.toLocaleString()} events \u00B7 ${formatBytes(ownershipStats.db_size_bytes)}`;
   }, [ownershipStats, ownershipError]);
 
   const { ownPct, trackedPct, wotPct } = useMemo(() => {
@@ -140,7 +154,7 @@ export const Storage: React.FC = () => {
       storageStats.newest_event > 0
         ? new Date(storageStats.newest_event * 1000).toLocaleDateString()
         : "\u2014";
-    return `Event range: ${oldest} \u2192 ${newest}`;
+    return `event range: ${oldest} \u2192 ${newest}`;
   }, [storageStats]);
 
   /* --- render ------------------------------------------------------- */
@@ -166,15 +180,15 @@ export const Storage: React.FC = () => {
         <div className="storage-legend">
           <div className="storage-legend-item">
             <div className="storage-legend-dot" style={{ background: "var(--accent)" }} />
-            <span>Own Events</span>
+            <span>own events</span>
           </div>
           <div className="storage-legend-item">
             <div className="storage-legend-dot" style={{ background: "var(--purple)" }} />
-            <span>Tracked Profiles</span>
+            <span>tracked profiles</span>
           </div>
           <div className="storage-legend-item">
             <div className="storage-legend-dot" style={{ background: "var(--blue)" }} />
-            <span>WoT Profiles</span>
+            <span>wot profiles</span>
           </div>
         </div>
       </div>
@@ -193,9 +207,9 @@ export const Storage: React.FC = () => {
                   fallbackClassName="ownership-avatar-fallback"
                 />
               )}
-              <span className="ownership-card-label">Own Events</span>
+              <span className="ownership-card-label">own events</span>
             </div>
-            <Badge text="YOU" className="ownership-card-badge" variant="own" />
+            <Badge text="you" className="ownership-card-badge" variant="own" />
           </div>
           <div className="ownership-card-body">
             <div className="ownership-stat">
@@ -212,7 +226,7 @@ export const Storage: React.FC = () => {
             </div>
           </div>
           <div className="ownership-card-footer">
-            Always kept &mdash; never pruned &middot; &infin; unlimited
+            always kept &mdash; never pruned &middot; &infin; unlimited
           </div>
         </Link>
 
@@ -233,9 +247,9 @@ export const Storage: React.FC = () => {
                   ))}
                 </div>
               )}
-              <span className="ownership-card-label">Tracked Profiles</span>
+              <span className="ownership-card-label">tracked profiles</span>
             </div>
-            <Badge text="TRACKED" className="ownership-card-badge" variant="tracked" />
+            <Badge text="tracked" className="ownership-card-badge" variant="tracked" />
           </div>
           <div className="ownership-card-body">
             <div className="ownership-stat">
@@ -252,7 +266,7 @@ export const Storage: React.FC = () => {
             </div>
           </div>
           <div className="ownership-card-footer">
-            Always kept &mdash; never pruned
+            always kept &mdash; never pruned
           </div>
         </Link>
 
@@ -276,9 +290,9 @@ export const Storage: React.FC = () => {
                   })}
                 </div>
               )}
-              <span className="ownership-card-label">WoT Profiles</span>
+              <span className="ownership-card-label">wot profiles</span>
             </div>
-            <Badge text="WOT" className="ownership-card-badge" variant="wot" />
+            <Badge text="wot" className="ownership-card-badge" variant="wot" />
           </div>
           <div className="ownership-card-body">
             <div className="ownership-stat">
@@ -295,7 +309,7 @@ export const Storage: React.FC = () => {
             </div>
           </div>
           <div className="ownership-card-footer">
-            Subject to retention limits
+            subject to retention limits
           </div>
         </Link>
       </div>
@@ -310,7 +324,7 @@ export const Storage: React.FC = () => {
       {/* ---- Kind breakdown ---- */}
       <div className="kind-breakdown-separator" />
 
-      <KindBreakdownChart title="Event Breakdown" kindCounts={kindCounts} error={kindError} />
+      <KindBreakdownChart title="event breakdown" kindCounts={kindCounts} error={kindError} />
     </div>
   );
 };

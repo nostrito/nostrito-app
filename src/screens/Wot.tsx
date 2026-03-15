@@ -529,7 +529,7 @@ export const Wot: React.FC = () => {
       // Create root node
       nodesRef.current.set(wotStatus.root_pubkey, {
         pubkey: wotStatus.root_pubkey,
-        name: myProfile?.display_name || myProfile?.name || "You",
+        name: myProfile?.display_name || myProfile?.name || "you",
         picture: myProfile?.picture || undefined,
         x: CX,
         y: CY,
@@ -708,7 +708,7 @@ export const Wot: React.FC = () => {
               cursor: "pointer",
             }}
           >
-            {"\u21ba"} Reset
+            {"\u21ba"} reset
           </button>
         </div>
 
@@ -730,7 +730,7 @@ export const Wot: React.FC = () => {
           <div className="wot-sidebar">
             <div className="wot-node-info">
               {!selectedInfo && (
-                <div className="wot-node-info-placeholder">Click a node to explore</div>
+                <div className="wot-node-info-placeholder">click a node to explore</div>
               )}
               {selectedInfo && (
                 <>
@@ -744,36 +744,36 @@ export const Wot: React.FC = () => {
                     />
                   ) : (
                     <div className="wot-info-avatar-fallback">
-                      {(selectedInfo.name || selectedInfo.pubkey).charAt(0).toUpperCase()}
+                      {(selectedInfo.name || selectedInfo.pubkey).charAt(0)}
                     </div>
                   )}
                   <div className="wot-info-name">
                     {selectedInfo.name}
                     {selectedInfo.isYou && (
-                      <span className="wot-you-badge"> You</span>
+                      <span className="wot-you-badge"> you</span>
                     )}
                   </div>
                   <div className="wot-info-pubkey">
                     {selectedInfo.pubkey.slice(0, 12)}{"\u2026"}{selectedInfo.pubkey.slice(-6)}
                   </div>
                   <div className="wot-info-meta">
-                    Hop {selectedInfo.hop}
+                    hop {selectedInfo.hop}
                     {selectedInfo.followCount > 0 && ` \u00b7 ${selectedInfo.followCount} follows`}
                   </div>
                   {!selectedInfo.expanded && !selectedInfo.isYou && (
-                    <div className="wot-info-hint">Click node to expand follows</div>
+                    <div className="wot-info-hint">click node to expand follows</div>
                   )}
                   {selectedInfo.expanded && (
-                    <div className="wot-info-expanded">{"\u2713"} Expanded</div>
+                    <div className="wot-info-expanded">{"\u2713"} expanded</div>
                   )}
                   {selectedInfo.expanded && selectedInfo.followCount === 0 && !selectedInfo.isYou && (
                     <div className="wot-info-no-data">
                       <span style={{ fontSize: "1.2rem" }}>
                         <IconSearch />
                       </span>
-                      <span>Not synced yet</span>
+                      <span>not synced yet</span>
                       <span className="wot-info-no-data-hint">
-                        This account's follow list hasn't been discovered. It will appear after deeper WoT sync.
+                        this account's follow list hasn't been discovered. it will appear after deeper wot sync.
                       </span>
                     </div>
                   )}
@@ -791,7 +791,7 @@ export const Wot: React.FC = () => {
             >
               {globalStats && (
                 <>
-                  Total graph:<br />
+                  total graph:<br />
                   {globalStats.nodeCount.toLocaleString()} nodes {"\u00b7"}{" "}
                   {globalStats.edgeCount.toLocaleString()} edges
                 </>

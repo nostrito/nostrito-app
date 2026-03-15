@@ -43,6 +43,7 @@ interface Settings {
   storage_tracked_media_gb: number;
   storage_wot_media_gb: number;
   wot_event_retention_days: number;
+  thread_retention_days: number;
   wot_max_depth: number;
   sync_interval_secs: number;
   outbound_relays: string[];
@@ -146,11 +147,11 @@ const SYNC_PRESETS: Record<
 };
 
 const TABS: { id: TabId; label: string; Icon: React.FC }[] = [
-  { id: "identity", label: "Identity", Icon: IconKey },
-  { id: "relays", label: "Relays", Icon: IconRadio },
-  { id: "storage", label: "Storage", Icon: IconDatabase },
-  { id: "tracked", label: "Tracked Profiles", Icon: IconUsers },
-  { id: "advanced", label: "Advanced", Icon: IconSettingsIcon },
+  { id: "identity", label: "identity", Icon: IconKey },
+  { id: "relays", label: "relays", Icon: IconRadio },
+  { id: "storage", label: "storage", Icon: IconDatabase },
+  { id: "tracked", label: "tracked profiles", Icon: IconUsers },
+  { id: "advanced", label: "advanced", Icon: IconSettingsIcon },
 ];
 
 const WOT_PRESETS = [
@@ -159,6 +160,14 @@ const WOT_PRESETS = [
   { days: 30, label: "30d" },
   { days: 90, label: "90d" },
   { days: 365, label: "1yr" },
+];
+
+const THREAD_RETENTION_PRESETS = [
+  { days: 7, label: "1w" },
+  { days: 14, label: "2w" },
+  { days: 30, label: "30d" },
+  { days: 60, label: "60d" },
+  { days: 90, label: "90d" },
 ];
 
 /* ------------------------------------------------------------------ */
@@ -198,7 +207,7 @@ const StorageEstimationPanel: React.FC = () => {
   return (
     <div style={{ marginTop: 24, paddingTop: 16, borderTop: "1px solid var(--border)" }}>
       <div style={{ fontSize: "0.84rem", fontWeight: 600, marginBottom: 8, color: "var(--accent-light)" }}>
-        Storage Estimation (DEV)
+        storage estimation (dev)
       </div>
       <button
         className="btn btn-secondary"
@@ -206,16 +215,16 @@ const StorageEstimationPanel: React.FC = () => {
         disabled={loading}
         onClick={fetchEstimate}
       >
-        {loading ? "Loading..." : "Run Estimate"}
+        {loading ? "loading..." : "run estimate"}
       </button>
       {estimate && (
         <div style={{ fontSize: "0.78rem", color: "var(--text-dim)", fontFamily: "var(--mono)", lineHeight: 1.8 }}>
-          <div>Follows: {estimate.follows_count}</div>
-          <div>FoF (est): ~{estimate.fof_estimate.toLocaleString()}</div>
-          <div>Events/day: ~{estimate.events_per_day.toFixed(0)}</div>
-          <div>Growth/day: ~{fmtBytes(estimate.bytes_per_day)}</div>
-          <div>Projected 30d: ~{fmtBytes(estimate.projected_30d_bytes)}</div>
-          <div>Current DB: {fmtBytes(estimate.current_db_size)}</div>
+          <div>follows: {estimate.follows_count}</div>
+          <div>fof (est): ~{estimate.fof_estimate.toLocaleString()}</div>
+          <div>events/day: ~{estimate.events_per_day.toFixed(0)}</div>
+          <div>growth/day: ~{fmtBytes(estimate.bytes_per_day)}</div>
+          <div>projected 30d: ~{fmtBytes(estimate.projected_30d_bytes)}</div>
+          <div>current db: {fmtBytes(estimate.current_db_size)}</div>
         </div>
       )}
     </div>
@@ -239,6 +248,7 @@ export const Settings: React.FC = () => {
   /* --- storage ------------------------------------------------------ */
   const [trackedMediaGb, setTrackedMediaGb] = useState(3);
   const [wotRetentionDays, setWotRetentionDays] = useState(30);
+  const [threadRetentionDays, setThreadRetentionDays] = useState(30);
   const [wotMediaGb, setWotMediaGb] = useState(2);
   const [storageSaving, setStorageSaving] = useState(false);
   const [storageFeedback, setStorageFeedback] = useState<SaveFeedback | null>(null);
@@ -312,6 +322,7 @@ export const Settings: React.FC = () => {
       setTrackedMediaGb(Math.round(s.storage_tracked_media_gb));
       setWotMediaGb(Math.round(s.storage_wot_media_gb));
       setWotRetentionDays(s.wot_event_retention_days);
+      setThreadRetentionDays(s.thread_retention_days);
 
       // Advanced sync sliders
       setSyncLookback(s.sync_lookback_days);
@@ -386,7 +397,7 @@ export const Settings: React.FC = () => {
   const handleSaveRelays = useCallback(async () => {
     if (!settings) return;
     if (selectedRelays.size === 0) {
-      setRelayFeedback({ type: "error", message: "Select at least one relay" });
+      setRelayFeedback({ type: "error", message: "select at least one relay" });
       return;
     }
 
@@ -400,9 +411,9 @@ export const Settings: React.FC = () => {
       await invoke("save_settings", { settings: updated });
       setSettings(updated);
       await invoke("restart_sync");
-      setRelayFeedback({ type: "success", message: "Relays saved \u2014 sync restarted" });
+      setRelayFeedback({ type: "success", message: "relays saved \u2014 sync restarted" });
     } catch (e) {
-      setRelayFeedback({ type: "error", message: `Failed: ${e}` });
+      setRelayFeedback({ type: "error", message: `failed: ${e}` });
     } finally {
       setRelaySaving(false);
     }
@@ -420,19 +431,20 @@ export const Settings: React.FC = () => {
       storage_tracked_media_gb: trackedMediaGb,
       storage_wot_media_gb: wotMediaGb,
       wot_event_retention_days: wotRetentionDays,
+      thread_retention_days: threadRetentionDays,
       max_event_age_days: wotRetentionDays,
     };
 
     try {
       await invoke("save_settings", { settings: updated });
       setSettings(updated);
-      setStorageFeedback({ type: "success", message: "Storage settings saved" });
+      setStorageFeedback({ type: "success", message: "storage settings saved" });
     } catch (e) {
-      setStorageFeedback({ type: "error", message: `Failed: ${e}` });
+      setStorageFeedback({ type: "error", message: `failed: ${e}` });
     } finally {
       setStorageSaving(false);
     }
-  }, [settings, trackedMediaGb, wotMediaGb, wotRetentionDays]);
+  }, [settings, trackedMediaGb, wotMediaGb, wotRetentionDays, threadRetentionDays]);
 
   const handleSaveAdvanced = useCallback(async () => {
     if (!settings) return;
@@ -458,9 +470,9 @@ export const Settings: React.FC = () => {
       await invoke("save_settings", { settings: updated });
       setSettings(updated);
       await invoke("restart_sync");
-      setAdvancedFeedback({ type: "success", message: "Saved \u2014 sync restarted with new config" });
+      setAdvancedFeedback({ type: "success", message: "saved \u2014 sync restarted with new config" });
     } catch (e) {
-      setAdvancedFeedback({ type: "error", message: `Failed: ${e}` });
+      setAdvancedFeedback({ type: "error", message: `failed: ${e}` });
     } finally {
       setAdvancedSaving(false);
     }
@@ -490,7 +502,7 @@ export const Settings: React.FC = () => {
     setSyncWotNotes(50);
     setResetDefaultsFeedback({
       type: "success",
-      message: 'Defaults restored \u2014 click "Save & Restart Sync" to apply',
+      message: 'defaults restored \u2014 click "save & restart sync" to apply',
     });
   }, []);
 
@@ -574,9 +586,9 @@ export const Settings: React.FC = () => {
     setResetSyncBusy(true);
     try {
       await invoke("reset_sync_cursors");
-      setAdvancedFeedback({ type: "success", message: "Sync cursors cleared — resyncing from scratch" });
+      setAdvancedFeedback({ type: "success", message: "sync cursors cleared — resyncing from scratch" });
     } catch (e) {
-      setAdvancedFeedback({ type: "error", message: `Reset failed: ${e}` });
+      setAdvancedFeedback({ type: "error", message: `reset failed: ${e}` });
     } finally {
       setResetSyncBusy(false);
       setResetSyncConfirm(false);
@@ -619,10 +631,10 @@ export const Settings: React.FC = () => {
       setBrowserEnabled(true);
       setBrowserFeedback({
         type: "success",
-        message: `wss://localhost:${settings.relay_port} active \u2014 relay restarted with TLS`,
+        message: `wss://localhost:${settings.relay_port} active \u2014 relay restarted with tls`,
       });
     } catch (e) {
-      setBrowserFeedback({ type: "error", message: `Failed: ${e}` });
+      setBrowserFeedback({ type: "error", message: `failed: ${e}` });
     } finally {
       setBrowserBusy(false);
     }
@@ -728,12 +740,12 @@ export const Settings: React.FC = () => {
                     color: offlineMode ? "#fbbf24" : "var(--text)",
                   }}
                 >
-                  Offline Mode
+                  offline mode
                 </div>
                 <div style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginTop: 2 }}>
                   {offlineMode
-                    ? "All relay sync is paused. Working with local data only."
-                    : "Disable all outbound connections and work with downloaded data"}
+                    ? "all relay sync is paused. working with local data only."
+                    : "disable all outbound connections and work with downloaded data"}
                 </div>
               </div>
             </div>
@@ -753,23 +765,23 @@ export const Settings: React.FC = () => {
         {/*  Tab 1: Identity                                                 */}
         {/* ================================================================ */}
         <div className={`settings-pane${activeTab === "identity" ? " active" : ""}`} id="pane-identity">
-          <div className="settings-pane-title">Identity</div>
-          <div className="settings-pane-desc">Your Nostr identity.</div>
+          <div className="settings-pane-title">identity</div>
+          <div className="settings-pane-desc">your nostr identity.</div>
 
           <div className="settings-field">
             <div className="settings-field-info">
-              <span className="settings-field-label">Public Key</span>
-              <span className="settings-field-desc">Your npub used for WoT computation</span>
+              <span className="settings-field-label">public key</span>
+              <span className="settings-field-desc">your npub used for wot computation</span>
             </div>
           </div>
           <div className="settings-mono" id="settings-npub">
-            {settings ? settings.npub || "Not configured" : "Loading..."}
+            {settings ? settings.npub || "not configured" : "loading..."}
           </div>
 
           <div className="settings-field" style={{ borderBottom: "none", paddingBottom: 8 }}>
             <div className="settings-field-info">
-              <span className="settings-field-label">Signing Mode</span>
-              <span className="settings-field-desc">How events are signed</span>
+              <span className="settings-field-label">signing mode</span>
+              <span className="settings-field-desc">how events are signed</span>
             </div>
           </div>
           <div
@@ -790,12 +802,12 @@ export const Settings: React.FC = () => {
                   nsec (full access)
                 </div>
                 <div style={{ fontSize: "0.75rem", color: "var(--text-muted)", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                  <span>Key stored in system keychain</span>
+                  <span>key stored in system keychain</span>
                   <button
                     onClick={handleClearNsec}
                     style={{ background: "none", border: "none", color: "var(--danger)", cursor: "pointer", fontSize: "0.72rem", textDecoration: "underline" }}
                   >
-                    Remove
+                    remove
                   </button>
                 </div>
               </>
@@ -805,10 +817,10 @@ export const Settings: React.FC = () => {
                   <span className="icon">
                     <IconLock />
                   </span>{" "}
-                  Read-only mode
+                  read-only mode
                 </div>
                 <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
-                  DMs disabled. Connect a signer to unlock full access.
+                  dms disabled. connect a signer to unlock full access.
                 </div>
               </>
             )}
@@ -816,8 +828,8 @@ export const Settings: React.FC = () => {
 
           <div className="settings-field" style={{ borderBottom: "none", paddingBottom: 8 }}>
             <div className="settings-field-info">
-              <span className="settings-field-label">Connect Signer</span>
-              <span className="settings-field-desc">Upgrade to full access</span>
+              <span className="settings-field-label">connect signer</span>
+              <span className="settings-field-desc">upgrade to full access</span>
             </div>
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 24 }}>
@@ -839,9 +851,9 @@ export const Settings: React.FC = () => {
                 <span className="icon">
                   <IconKey />
                 </span>{" "}
-                Paste nsec
+                paste nsec
               </span>
-              <span style={{ fontSize: "0.72rem", color: "var(--text-muted)" }}>Full access</span>
+              <span style={{ fontSize: "0.72rem", color: "var(--text-muted)" }}>full access</span>
             </div>
             {nsecExpanded && (
               <div
@@ -880,13 +892,13 @@ export const Settings: React.FC = () => {
                     disabled={nsecSaving || !nsecInput.trim().startsWith("nsec1")}
                     style={{ fontSize: "0.8rem", padding: "6px 16px" }}
                   >
-                    {nsecSaving ? "Saving..." : "Save to Keychain"}
+                    {nsecSaving ? "saving..." : "save to keychain"}
                   </button>
                   <button
                     onClick={(e) => { e.stopPropagation(); setNsecExpanded(false); setNsecInput(""); setNsecFeedback(null); }}
                     style={{ background: "none", border: "none", color: "var(--text-muted)", cursor: "pointer", fontSize: "0.78rem" }}
                   >
-                    Cancel
+                    cancel
                   </button>
                 </div>
                 {nsecFeedback && (
@@ -919,9 +931,9 @@ export const Settings: React.FC = () => {
                 <span className="icon">
                   <IconCastle />
                 </span>{" "}
-                NBunker
+                nbunker
               </span>
-              <span style={{ fontSize: "0.72rem", color: "var(--text-muted)" }}>Remote signer</span>
+              <span style={{ fontSize: "0.72rem", color: "var(--text-muted)" }}>remote signer</span>
             </div>
             <div
               style={{
@@ -940,7 +952,7 @@ export const Settings: React.FC = () => {
                 <span className="icon">
                   <IconPlug />
                 </span>{" "}
-                Nostr Connect
+                nostr connect
               </span>
               <span style={{ fontSize: "0.72rem", color: "var(--text-muted)" }}>NIP-46</span>
             </div>
@@ -949,13 +961,13 @@ export const Settings: React.FC = () => {
           <div className="danger-zone">
             <div className="danger-zone-row">
               <div>
-                <div className="danger-zone-label">Change Account</div>
+                <div className="danger-zone-label">change account</div>
                 <div className="danger-zone-desc">
-                  Remove your npub and start over. Keeps your event data.
+                  remove your npub and start over. keeps your event data.
                 </div>
               </div>
               <button className="btn-danger" id="btn-change-account" onClick={handleChangeAccount}>
-                {changeAccountConfirm ? "Are you sure?" : "Change Account"}
+                {changeAccountConfirm ? "are you sure?" : "change account"}
               </button>
             </div>
           </div>
@@ -965,9 +977,9 @@ export const Settings: React.FC = () => {
         {/*  Tab 2: Relays                                                   */}
         {/* ================================================================ */}
         <div className={`settings-pane${activeTab === "relays" ? " active" : ""}`} id="pane-relays">
-          <div className="settings-pane-title">Relays</div>
+          <div className="settings-pane-title">relays</div>
           <div className="settings-pane-desc">
-            Pick which relays to sync from. Changes take effect after saving.
+            pick which relays to sync from. changes take effect after saving.
           </div>
 
           <div className="relay-grid" style={{ marginBottom: 16 }}>
@@ -987,7 +999,7 @@ export const Settings: React.FC = () => {
             disabled={relaySaving}
             onClick={handleSaveRelays}
           >
-            {relaySaving ? "Saving..." : "Save Relays"}
+            {relaySaving ? "saving..." : "save relays"}
           </button>
           {relayFeedback && (
             <div style={{ marginTop: 8, fontSize: "0.78rem", textAlign: "center" }}>
@@ -1007,25 +1019,25 @@ export const Settings: React.FC = () => {
         {/*  Tab 3: Storage                                                  */}
         {/* ================================================================ */}
         <div className={`settings-pane${activeTab === "storage" ? " active" : ""}`} id="pane-storage">
-          <div className="settings-pane-title">Storage</div>
+          <div className="settings-pane-title">storage</div>
           <div className="settings-pane-desc">
-            Control what gets stored, organized by ownership.
+            control what gets stored, organized by ownership.
           </div>
 
           {/* Storage Presets */}
           <div className="storage-category-section">
             <div className="storage-category-header">
-              <span className="storage-category-title">Quick Presets</span>
+              <span className="storage-category-title">quick presets</span>
             </div>
             <div className="sync-presets">
               <button className="sync-preset-btn" onClick={() => applyStoragePreset("minimal")}>
-                <span className="icon"><IconFeather /></span> Minimal
+                <span className="icon"><IconFeather /></span> minimal
               </button>
               <button className="sync-preset-btn" onClick={() => applyStoragePreset("balanced")}>
-                <span className="icon"><IconScale /></span> Balanced
+                <span className="icon"><IconScale /></span> balanced
               </button>
               <button className="sync-preset-btn" onClick={() => applyStoragePreset("archive")}>
-                <span className="icon"><IconArchive /></span> Archive
+                <span className="icon"><IconArchive /></span> archive
               </button>
             </div>
           </div>
@@ -1033,18 +1045,18 @@ export const Settings: React.FC = () => {
           {/* Own Events Section */}
           <div className="storage-category-section">
             <div className="storage-category-header">
-              <Badge text="YOU" className="storage-category-badge" variant="own" />
-              <span className="storage-category-title">Own Events</span>
+              <Badge text="you" className="storage-category-badge" variant="own" />
+              <span className="storage-category-title">own events</span>
             </div>
             <div className="storage-section">
               <div className="storage-row locked">
                 <div className="storage-row-info">
-                  <span className="storage-row-label">Event retention</span>
+                  <span className="storage-row-label">event retention</span>
                   <span className="storage-row-meta">
                     <span className="icon">
                       <IconLock />
                     </span>{" "}
-                    Own events are always kept
+                    own events are always kept
                   </span>
                 </div>
               </div>
@@ -1052,9 +1064,9 @@ export const Settings: React.FC = () => {
             <div className="storage-section">
               <div className="storage-row">
                 <div className="storage-row-info">
-                  <span className="storage-row-label">Own media limit</span>
+                  <span className="storage-row-label">own media limit</span>
                   <span className="storage-row-meta">
-                    Media from your own events &mdash; always kept, never evicted
+                    media from your own events &mdash; always kept, never evicted
                   </span>
                 </div>
                 <div className="storage-slider-wrap">
@@ -1062,7 +1074,7 @@ export const Settings: React.FC = () => {
                     className="storage-slider-value"
                     style={{ color: "var(--green)", fontWeight: 600 }}
                   >
-                    &infin; Unlimited
+                    &infin; unlimited
                   </span>
                 </div>
               </div>
@@ -1072,18 +1084,18 @@ export const Settings: React.FC = () => {
           {/* Tracked Profiles Section */}
           <div className="storage-category-section">
             <div className="storage-category-header">
-              <Badge text="TRACKED" className="storage-category-badge" variant="tracked" />
-              <span className="storage-category-title">Tracked Profiles</span>
+              <Badge text="tracked" className="storage-category-badge" variant="tracked" />
+              <span className="storage-category-title">tracked profiles</span>
             </div>
             <div className="storage-section">
               <div className="storage-row locked">
                 <div className="storage-row-info">
-                  <span className="storage-row-label">Event retention</span>
+                  <span className="storage-row-label">event retention</span>
                   <span className="storage-row-meta">
                     <span className="icon">
                       <IconLock />
                     </span>{" "}
-                    Tracked profiles events are always kept
+                    tracked profiles events are always kept
                   </span>
                 </div>
               </div>
@@ -1091,8 +1103,8 @@ export const Settings: React.FC = () => {
             <div className="storage-section">
               <div className="storage-row">
                 <div className="storage-row-info">
-                  <span className="storage-row-label">Tracked media limit</span>
-                  <span className="storage-row-meta">Media from tracked profiles</span>
+                  <span className="storage-row-label">tracked media limit</span>
+                  <span className="storage-row-meta">media from tracked profiles</span>
                 </div>
                 <Slider
                   variant="storage"
@@ -1110,15 +1122,15 @@ export const Settings: React.FC = () => {
           {/* WoT Profiles Section */}
           <div className="storage-category-section">
             <div className="storage-category-header">
-              <Badge text="WOT" className="storage-category-badge" variant="wot" />
-              <span className="storage-category-title">WoT Profiles</span>
+              <Badge text="wot" className="storage-category-badge" variant="wot" />
+              <span className="storage-category-title">wot profiles</span>
             </div>
             <div className="storage-section">
               <div className="storage-row">
                 <div className="storage-row-info">
-                  <span className="storage-row-label">Event retention</span>
+                  <span className="storage-row-label">event retention</span>
                   <span className="storage-row-meta">
-                    How long to keep WoT events before pruning
+                    how long to keep wot events before pruning
                   </span>
                 </div>
                 <Slider
@@ -1147,8 +1159,8 @@ export const Settings: React.FC = () => {
             <div className="storage-section">
               <div className="storage-row">
                 <div className="storage-row-info">
-                  <span className="storage-row-label">WoT media limit</span>
-                  <span className="storage-row-meta">Media from WoT profiles</span>
+                  <span className="storage-row-label">wot media limit</span>
+                  <span className="storage-row-meta">media from wot profiles</span>
                 </div>
                 <Slider
                   variant="storage"
@@ -1164,9 +1176,9 @@ export const Settings: React.FC = () => {
             <div className="storage-section" style={{ marginTop: 12 }}>
               <div className="storage-row">
                 <div className="storage-row-info">
-                  <span className="storage-row-label">WoT notes per cycle</span>
+                  <span className="storage-row-label">wot notes per cycle</span>
                   <span className="storage-row-meta">
-                    Random notes fetched from WoT peers each sync cycle (0 = disabled)
+                    random notes fetched from wot peers each sync cycle (0 = disabled)
                   </span>
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: 12, minWidth: 200 }}>
@@ -1188,9 +1200,9 @@ export const Settings: React.FC = () => {
             <div className="storage-section" style={{ marginTop: 12 }}>
               <div className="storage-row" style={{ alignItems: "center" }}>
                 <div className="storage-row-info">
-                  <span className="storage-row-label">Prune WoT data</span>
+                  <span className="storage-row-label">prune wot data</span>
                   <span className="storage-row-meta">
-                    Manually delete old events from WoT peers based on retention settings
+                    manually delete old events from wot peers based on retention settings
                   </span>
                 </div>
                 <button
@@ -1210,7 +1222,7 @@ export const Settings: React.FC = () => {
                     }
                   }}
                 >
-                  {pruning ? "Pruning..." : "Prune Now"}
+                  {pruning ? "pruning..." : "prune now"}
                 </button>
               </div>
               {pruneResult && (
@@ -1221,13 +1233,53 @@ export const Settings: React.FC = () => {
             </div>
           </div>
 
+          {/* Thread Follow-up Section */}
+          <div className="storage-category-section">
+            <div className="storage-category-header">
+              <span className="storage-category-title">thread follow-up</span>
+            </div>
+            <div className="storage-section">
+              <div className="storage-row">
+                <div className="storage-row-info">
+                  <span className="storage-row-label">thread follow-up window</span>
+                  <span className="storage-row-meta">
+                    how long to keep re-fetching replies and reactions for threads you've interacted with.
+                    after this period, the app stops syncing those threads to save bandwidth and relay resources.
+                    you'll still see cached data &mdash; the app just won't check for new activity.
+                  </span>
+                </div>
+                <Slider
+                  variant="storage"
+                  id="storage-thread-retention"
+                  min={7}
+                  max={90}
+                  value={threadRetentionDays}
+                  suffix=" days"
+                  onChange={setThreadRetentionDays}
+                />
+                <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                  {THREAD_RETENTION_PRESETS.map((preset) => (
+                    <button
+                      key={preset.days}
+                      className="btn btn-secondary wot-age-preset"
+                      style={{ fontSize: "0.75rem", padding: "4px 10px" }}
+                      onClick={() => setThreadRetentionDays(preset.days)}
+                    >
+                      {preset.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+
           <button
             className="btn btn-primary"
             style={{ marginTop: 16, width: "100%" }}
             disabled={storageSaving}
             onClick={handleSaveStorage}
           >
-            {storageSaving ? "Saving..." : "Save Storage Settings"}
+            {storageSaving ? "saving..." : "save storage settings"}
           </button>
           {storageFeedback && (
             <div style={{ marginTop: 8, fontSize: "0.78rem", textAlign: "center" }}>
@@ -1247,7 +1299,7 @@ export const Settings: React.FC = () => {
         {/*  Tab 4: Advanced                                                 */}
         {/* ================================================================ */}
         <div className={`settings-pane${activeTab === "advanced" ? " active" : ""}`} id="pane-advanced">
-          <div className="settings-pane-title">Advanced</div>
+          <div className="settings-pane-title">advanced</div>
           <div
             style={{
               background: "var(--bg)",
@@ -1258,7 +1310,7 @@ export const Settings: React.FC = () => {
             }}
           >
             <div style={{ fontSize: "0.84rem", color: "var(--text-dim)" }}>
-              These settings are for advanced users. The defaults work well for most people.
+              these settings are for advanced users. the defaults work well for most people.
             </div>
           </div>
 
@@ -1267,7 +1319,7 @@ export const Settings: React.FC = () => {
             style={{ width: "100%", marginBottom: 20 }}
             onClick={handleResetDefaults}
           >
-            Reset to Defaults
+            reset to defaults
           </button>
           {resetDefaultsFeedback && (
             <div
@@ -1303,26 +1355,26 @@ export const Settings: React.FC = () => {
                 marginBottom: 8,
               }}
             >
-              Sync Presets
+              sync presets
             </div>
             <div className="sync-presets">
               <button className="sync-preset-btn" onClick={() => applySyncPreset("light")}>
                 <span className="icon">
                   <IconTurtle />
                 </span>{" "}
-                Light
+                light
               </button>
               <button className="sync-preset-btn" onClick={() => applySyncPreset("balanced")}>
                 <span className="icon">
                   <IconScale />
                 </span>{" "}
-                Balanced
+                balanced
               </button>
               <button className="sync-preset-btn" onClick={() => applySyncPreset("power")}>
                 <span className="icon">
                   <IconRocket />
                 </span>{" "}
-                Power
+                power
               </button>
             </div>
           </div>
@@ -1330,8 +1382,8 @@ export const Settings: React.FC = () => {
           {/* Sync Sliders */}
           <div className="settings-field">
             <div className="settings-field-info">
-              <span className="settings-field-label">Lookback window</span>
-              <span className="settings-field-desc">How many days back to fetch</span>
+              <span className="settings-field-label">lookback window</span>
+              <span className="settings-field-desc">how many days back to fetch</span>
             </div>
             <Slider
               variant="sync"
@@ -1346,8 +1398,8 @@ export const Settings: React.FC = () => {
 
           <div className="settings-field">
             <div className="settings-field-info">
-              <span className="settings-field-label">Authors per batch</span>
-              <span className="settings-field-desc">How many authors per subscription request</span>
+              <span className="settings-field-label">authors per batch</span>
+              <span className="settings-field-desc">how many authors per subscription request</span>
             </div>
             <Slider
               variant="sync"
@@ -1361,8 +1413,8 @@ export const Settings: React.FC = () => {
 
           <div className="settings-field">
             <div className="settings-field-info">
-              <span className="settings-field-label">Events per request</span>
-              <span className="settings-field-desc">Max events per REQ</span>
+              <span className="settings-field-label">events per request</span>
+              <span className="settings-field-desc">max events per REQ</span>
             </div>
             <Slider
               variant="sync"
@@ -1377,9 +1429,9 @@ export const Settings: React.FC = () => {
 
           <div className="settings-field">
             <div className="settings-field-info">
-              <span className="settings-field-label">Pause between batches</span>
+              <span className="settings-field-label">pause between batches</span>
               <span className="settings-field-desc">
-                Seconds to wait between subscription batches
+                seconds to wait between subscription batches
               </span>
             </div>
             <Slider
@@ -1395,9 +1447,9 @@ export const Settings: React.FC = () => {
 
           <div className="settings-field">
             <div className="settings-field-info">
-              <span className="settings-field-label">Min relay interval</span>
+              <span className="settings-field-label">min relay interval</span>
               <span className="settings-field-desc">
-                Minimum seconds between requests to the same relay
+                minimum seconds between requests to the same relay
               </span>
             </div>
             <Slider
@@ -1413,8 +1465,8 @@ export const Settings: React.FC = () => {
 
           <div className="settings-field">
             <div className="settings-field-info">
-              <span className="settings-field-label">WoT authors per batch</span>
-              <span className="settings-field-desc">Authors per batch in WoT crawl</span>
+              <span className="settings-field-label">wot authors per batch</span>
+              <span className="settings-field-desc">authors per batch in wot crawl</span>
             </div>
             <Slider
               variant="sync"
@@ -1428,8 +1480,8 @@ export const Settings: React.FC = () => {
 
           <div className="settings-field">
             <div className="settings-field-info">
-              <span className="settings-field-label">WoT events per request</span>
-              <span className="settings-field-desc">Max events per REQ in WoT crawl</span>
+              <span className="settings-field-label">wot events per request</span>
+              <span className="settings-field-desc">max events per REQ in wot crawl</span>
             </div>
             <Slider
               variant="sync"
@@ -1443,8 +1495,8 @@ export const Settings: React.FC = () => {
 
           <div className="settings-field">
             <div className="settings-field-info">
-              <span className="settings-field-label">Sync cycle interval</span>
-              <span className="settings-field-desc">Minutes between full sync cycles</span>
+              <span className="settings-field-label">sync cycle interval</span>
+              <span className="settings-field-desc">minutes between full sync cycles</span>
             </div>
             <Slider
               variant="sync"
@@ -1459,9 +1511,9 @@ export const Settings: React.FC = () => {
 
           <div className="settings-field">
             <div className="settings-field-info">
-              <span className="settings-field-label">WoT max depth</span>
+              <span className="settings-field-label">wot max depth</span>
               <span className="settings-field-desc">
-                How many hops to compute in the trust graph
+                how many hops to compute in the trust graph
               </span>
             </div>
             <Slider
@@ -1480,7 +1532,7 @@ export const Settings: React.FC = () => {
             disabled={advancedSaving}
             onClick={handleSaveAdvanced}
           >
-            {advancedSaving ? "Saving..." : "Save & Restart Sync"}
+            {advancedSaving ? "saving..." : "save & restart sync"}
           </button>
           {advancedFeedback && (
             <div style={{ marginTop: 8, fontSize: "0.78rem", textAlign: "center" }}>
@@ -1501,15 +1553,15 @@ export const Settings: React.FC = () => {
             disabled={resetSyncBusy}
             onClick={handleResetSync}
           >
-            {resetSyncBusy ? "Resetting..." : resetSyncConfirm ? "Are you sure? Click again to confirm" : "Reset Sync From Scratch"}
+            {resetSyncBusy ? "resetting..." : resetSyncConfirm ? "are you sure? click again to confirm" : "reset sync from scratch"}
           </button>
 
           {/* Low-level config */}
           <div style={{ marginTop: 24, paddingTop: 16, borderTop: "1px solid var(--border)" }}>
             <div className="settings-field">
               <div className="settings-field-info">
-                <span className="settings-field-label">Relay port</span>
-                <span className="settings-field-desc">Local WebSocket relay port</span>
+                <span className="settings-field-label">relay port</span>
+                <span className="settings-field-desc">local websocket relay port</span>
               </div>
               <span
                 style={{
@@ -1524,8 +1576,8 @@ export const Settings: React.FC = () => {
 
             <div className="settings-field">
               <div className="settings-field-info">
-                <span className="settings-field-label">Auto-start</span>
-                <span className="settings-field-desc">Start nostrito on login</span>
+                <span className="settings-field-label">auto-start</span>
+                <span className="settings-field-desc">start nostrito on login</span>
               </div>
               <label className="toggle">
                 <input
@@ -1539,9 +1591,9 @@ export const Settings: React.FC = () => {
 
             <div className="settings-field" style={{ borderBottom: "none", paddingBottom: 8 }}>
               <div className="settings-field-info">
-                <span className="settings-field-label">Browser Integration</span>
+                <span className="settings-field-label">browser integration</span>
                 <span className="settings-field-desc">
-                  Enable wss:// for web Nostr clients (Coracle, Snort, Primal)
+                  enable wss:// for web nostr clients (coracle, snort, primal)
                 </span>
               </div>
             </div>
@@ -1558,22 +1610,22 @@ export const Settings: React.FC = () => {
                 <div>
                   <div style={{ fontSize: "0.85rem", color: "var(--text-dim)", marginBottom: 2 }}>
                     {browserEnabled === null ? (
-                      "Checking..."
+                      "checking..."
                     ) : browserEnabled ? (
                       <>
                         <span className="icon">
                           <IconCheckCircle />
                         </span>{" "}
-                        Enabled
+                        enabled
                       </>
                     ) : (
-                      "Not enabled"
+                      "not enabled"
                     )}
                   </div>
                   <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
                     {browserEnabled
                       ? `wss://localhost:${settings?.relay_port ?? ""} available for web clients`
-                      : "Web clients cannot connect without wss:// support"}
+                      : "web clients cannot connect without wss:// support"}
                   </div>
                 </div>
                 <button
@@ -1582,7 +1634,7 @@ export const Settings: React.FC = () => {
                   disabled={browserBusy}
                   onClick={handleEnableBrowser}
                 >
-                  {browserBusy ? "Setting up..." : browserEnabled ? "Regenerate" : "Enable"}
+                  {browserBusy ? "setting up..." : browserEnabled ? "regenerate" : "enable"}
                 </button>
               </div>
               {browserFeedback && (
@@ -1617,17 +1669,17 @@ export const Settings: React.FC = () => {
               <span className="icon">
                 <IconAlertTriangle />
               </span>{" "}
-              Danger Zone
+              danger zone
             </div>
             <div className="danger-zone-row">
               <div>
-                <div className="danger-zone-label">Reset App Data</div>
+                <div className="danger-zone-label">reset app data</div>
                 <div className="danger-zone-desc">
-                  Clears all events, WoT graph, and config. Returns to setup wizard.
+                  clears all events, wot graph, and config. returns to setup wizard.
                 </div>
               </div>
               <button className="btn-danger" onClick={handleResetApp}>
-                {resetAppConfirm ? "Are you sure?" : "Reset App Data"}
+                {resetAppConfirm ? "are you sure?" : "reset app data"}
               </button>
             </div>
           </div>
@@ -1637,9 +1689,9 @@ export const Settings: React.FC = () => {
         {/*  Tab 5: Tracked Profiles                                         */}
         {/* ================================================================ */}
         <div className={`settings-pane${activeTab === "tracked" ? " active" : ""}`} id="pane-tracked">
-          <div className="settings-pane-title">Tracked Profiles</div>
+          <div className="settings-pane-title">tracked profiles</div>
           <div className="settings-pane-desc">
-            These profiles are never pruned. Perfect for important follows.
+            these profiles are never pruned. perfect for important follows.
           </div>
 
           <div
@@ -1652,10 +1704,10 @@ export const Settings: React.FC = () => {
             }}
           >
             {trackedLoading ? (
-              "Loading..."
+              "loading..."
             ) : trackedProfiles.length === 0 ? (
               <div style={{ color: "var(--text-muted)", fontSize: "0.78rem", padding: "4px 0" }}>
-                No tracked profiles yet.
+                no tracked profiles yet.
               </div>
             ) : (
               trackedProfiles.map((p) => {
@@ -1724,7 +1776,7 @@ export const Settings: React.FC = () => {
                       }}
                       onClick={() => handleUntrackProfile(p.pubkey)}
                     >
-                      Untrack
+                      untrack
                     </button>
                   </div>
                 );
@@ -1757,7 +1809,7 @@ export const Settings: React.FC = () => {
               style={{ fontSize: "0.82rem", padding: "8px 16px" }}
               onClick={handleTrackProfile}
             >
-              Track
+              track
             </button>
           </div>
         </div>

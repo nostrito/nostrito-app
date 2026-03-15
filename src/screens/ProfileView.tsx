@@ -46,9 +46,9 @@ type ProfileTab = "notes" | "articles" | "media";
 /* ------------------------------------------------------------------ */
 
 const TAB_OPTIONS: { key: ProfileTab; label: string }[] = [
-  { key: "notes", label: "Notes" },
-  { key: "articles", label: "Articles" },
-  { key: "media", label: "Media" },
+  { key: "notes", label: "notes" },
+  { key: "articles", label: "articles" },
+  { key: "media", label: "media" },
 ];
 
 /* ------------------------------------------------------------------ */
@@ -449,7 +449,7 @@ export const ProfileView: React.FC = () => {
   if (!pubkey) {
     return (
       <div className="screen-page">
-        <EmptyState message="No profile pubkey specified." />
+        <EmptyState message="no profile pubkey specified." />
       </div>
     );
   }
@@ -464,12 +464,12 @@ export const ProfileView: React.FC = () => {
       <div className="profile-back-row">
         <button className="btn btn-secondary profile-back-btn" onClick={() => navigate(-1)}>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" width="16" height="16"><path d="M19 12H5"/><path d="m12 19-7-7 7-7"/></svg>
-          Back
+          back
         </button>
       </div>
 
       {profileLoading ? (
-        <div style={{ color: "var(--text-muted)", padding: 24 }}>Loading profile...</div>
+        <div style={{ color: "var(--text-muted)", padding: 24 }}>loading profile...</div>
       ) : (
         <>
           {/* Banner */}
@@ -497,19 +497,19 @@ export const ProfileView: React.FC = () => {
                   {followsMe && (
                     <span className="profile-badge profile-badge-follows">
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" width="12" height="12"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>
-                      Follows you
+                      follows you
                     </span>
                   )}
                   {isTracked && (
                     <span className="profile-badge profile-badge-tracked">
                       <span className="icon" style={{ width: 12, height: 12 }}><IconDatabase /></span>
-                      Tracked
+                      tracked
                     </span>
                   )}
                   {isMuted && (
                     <span className="profile-badge profile-badge-muted">
                       <span className="icon" style={{ width: 12, height: 12 }}><IconVolumeX /></span>
-                      Muted
+                      muted
                     </span>
                   )}
                 </div>
@@ -520,7 +520,7 @@ export const ProfileView: React.FC = () => {
                     <button
                       className="profile-menu-btn"
                       onClick={() => setMenuOpen(!menuOpen)}
-                      title="Profile actions"
+                      title="profile actions"
                     >
                       <IconMoreVertical />
                     </button>
@@ -529,23 +529,23 @@ export const ProfileView: React.FC = () => {
                       <div className="profile-menu-dropdown">
                         <button className="profile-menu-item" onClick={handleCopyNpub}>
                           <span className="icon"><IconCopy /></span>
-                          {copied ? "Copied!" : "Copy npub"}
+                          {copied ? "copied!" : "copy npub"}
                         </button>
                         <button className="profile-menu-item" onClick={handleShareNjump}>
                           <span className="icon"><IconShare /></span>
-                          Share via njump.me
+                          share via njump.me
                         </button>
                         <div className="profile-menu-divider" />
                         <button className="profile-menu-item" onClick={handleToggleTrack}>
                           <span className="icon"><IconDatabase /></span>
-                          {isTracked ? "Untrack profile" : "Track profile"}
+                          {isTracked ? "untrack profile" : "track profile"}
                         </button>
                         <button
                           className={`profile-menu-item${isMuted ? " profile-menu-item-danger" : ""}`}
                           onClick={handleToggleMute}
                         >
                           <span className="icon">{isMuted ? <IconVolume /> : <IconVolumeX />}</span>
-                          {isMuted ? "Unmute user" : "Mute user"}
+                          {isMuted ? "unmute user" : "mute user"}
                         </button>
                       </div>
                     )}
@@ -561,10 +561,10 @@ export const ProfileView: React.FC = () => {
               )}
               <div className="profile-hero-stats">
                 <span className="profile-stat profile-stat-clickable" onClick={() => { setListPopup("following"); setListSearch(""); }}>
-                  <strong>{followingCount}</strong> Following
+                  <strong>{followingCount}</strong> following
                 </span>
                 <span className="profile-stat profile-stat-clickable" onClick={() => { setListPopup("followers"); setListSearch(""); }}>
-                  <strong>{followerCount}</strong> Followers
+                  <strong>{followerCount}</strong> followers
                 </span>
               </div>
             </div>
@@ -618,12 +618,12 @@ export const ProfileView: React.FC = () => {
                 {activeTab === "notes" && (
                   <div className="profile-notes">
                     {notesLoading && notes.length === 0 && (
-                      <div style={{ color: "var(--text-muted)", padding: 16 }}>Loading notes...</div>
+                      <div style={{ color: "var(--text-muted)", padding: 16 }}>loading notes...</div>
                     )}
                     {!notesLoading && notes.length === 0 && (
                       <EmptyState
                         icon={<span className="icon"><IconFeed /></span>}
-                        message="No notes found for this profile."
+                        message="no notes found for this profile."
                       />
                     )}
                     {notes.map((note) => (
@@ -637,7 +637,7 @@ export const ProfileView: React.FC = () => {
                     ))}
                     {hasMoreNotes && notes.length > 0 && (
                       <div ref={notesSentinelRef} style={{ padding: 16, color: "var(--text-muted)" }}>
-                        {loadingMoreNotes ? "Loading more notes..." : ""}
+                        {loadingMoreNotes ? "loading more notes..." : ""}
                       </div>
                     )}
                   </div>
@@ -647,12 +647,12 @@ export const ProfileView: React.FC = () => {
                 {activeTab === "articles" && (
                   <div className="profile-articles">
                     {articlesLoading && articles.length === 0 && (
-                      <div style={{ color: "var(--text-muted)", padding: 16 }}>Loading articles...</div>
+                      <div style={{ color: "var(--text-muted)", padding: 16 }}>loading articles...</div>
                     )}
                     {!articlesLoading && articles.length === 0 && (
                       <EmptyState
                         icon={<span className="icon"><IconBookOpen /></span>}
-                        message="No articles found for this profile."
+                        message="no articles found for this profile."
                       />
                     )}
                     {articles.length > 0 && (
@@ -673,12 +673,12 @@ export const ProfileView: React.FC = () => {
                 {activeTab === "media" && (
                   <div className="profile-media">
                     {mediaLoading && media.length === 0 && (
-                      <div style={{ color: "var(--text-muted)", padding: 16 }}>Loading media...</div>
+                      <div style={{ color: "var(--text-muted)", padding: 16 }}>loading media...</div>
                     )}
                     {!mediaLoading && media.length === 0 && (
                       <EmptyState
                         icon={<span className="icon"><IconImage /></span>}
-                        message="No media found for this profile."
+                        message="no media found for this profile."
                       />
                     )}
                     <div className="profile-media-grid">
@@ -756,7 +756,7 @@ export const ProfileView: React.FC = () => {
         <div className="profile-list-overlay">
           <div className="profile-list-popup" ref={listPopupRef}>
             <div className="profile-list-header">
-              <h3>{listPopup === "following" ? "Following" : "Followers"}</h3>
+              <h3>{listPopup === "following" ? "following" : "followers"}</h3>
               <button
                 className="profile-list-close"
                 onClick={() => { setListPopup(null); setListSearch(""); }}
@@ -767,7 +767,7 @@ export const ProfileView: React.FC = () => {
             <div className="profile-list-search">
               <input
                 type="text"
-                placeholder="Search by name, nip05, pubkey..."
+                placeholder="search by name, nip05, pubkey..."
                 value={listSearch}
                 onChange={(e) => setListSearch(e.target.value)}
                 autoFocus
@@ -776,7 +776,7 @@ export const ProfileView: React.FC = () => {
             <div className="profile-list-items">
               {filteredListItems.length === 0 && (
                 <div className="profile-list-empty">
-                  {listSearch.trim() ? "No matches found" : listPopup === "following" ? "Not following anyone" : "No followers found"}
+                  {listSearch.trim() ? "no matches found" : listPopup === "following" ? "not following anyone" : "no followers found"}
                 </div>
               )}
               {filteredListItems.map((pk) => {
