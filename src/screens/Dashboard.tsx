@@ -35,10 +35,10 @@ const LAYER_IDS = ["0", "05", "1", "2"] as const;
 type LayerId = (typeof LAYER_IDS)[number];
 
 const LAYER_LABELS: Record<LayerId, string> = {
-  "0": "Layer 0 \u2014 Own Content",
-  "05": "Layer 0.5 \u2014 Tracked",
-  "1": "Layer 1 \u2014 Direct Follows",
-  "2": "Layer 2 \u2014 WoT Peers",
+  "0": "layer 0 \u2014 own content",
+  "05": "layer 0.5 \u2014 tracked",
+  "1": "layer 1 \u2014 direct follows",
+  "2": "layer 2 \u2014 wot peers",
 };
 
 const LAYER_TO_BACKEND: Record<LayerId, string> = {
@@ -70,12 +70,12 @@ function kindCssClass(kind: number): string {
 
 function layerLabel(layer: string): string {
   switch (layer) {
-    case "0": return "L0";
-    case "0.5": return "T";
-    case "1": return "L1";
-    case "2": return "L2";
-    case "3": return "L3";
-    case "thread": return "Th";
+    case "0": return "l0";
+    case "0.5": return "t";
+    case "1": return "l1";
+    case "2": return "l2";
+    case "3": return "l3";
+    case "thread": return "th";
     default: return "";
   }
 }
@@ -115,7 +115,7 @@ function getLayerBadge(layerId: LayerId, currentLayer: string, currentPhase: str
 
   // Show DISABLED for Layer 2 when WoT notes is 0
   if (layerId === "2" && wotNotes === 0) {
-    return { text: "OFF", className: "sync-tier-badge disabled" };
+    return { text: "off", className: "sync-tier-badge disabled" };
   }
 
   // During Thread Context or Media Download, all content layers are complete
@@ -124,7 +124,7 @@ function getLayerBadge(layerId: LayerId, currentLayer: string, currentPhase: str
   }
 
   if (currentLayer === backendLayer) {
-    return { text: "FAST", className: "sync-tier-badge fast" };
+    return { text: "fast", className: "sync-tier-badge fast" };
   }
   if (
     currentLayer !== "" &&
@@ -132,7 +132,7 @@ function getLayerBadge(layerId: LayerId, currentLayer: string, currentPhase: str
   ) {
     return { text: "\u2713", className: "sync-tier-badge done" };
   }
-  return { text: "IDLE", className: "sync-tier-badge idle" };
+  return { text: "idle", className: "sync-tier-badge idle" };
 }
 
 function getLayerDetail(
@@ -465,12 +465,12 @@ export const Dashboard: React.FC = () => {
               </span>
             ) : (
               <span className="status-badge offline">
-                &#9675; Offline
+                &#9675; offline
               </span>
             )
           ) : (
             <span className="status-badge offline">
-              &#9675; Offline
+              &#9675; offline
             </span>
           )}
         </div>
@@ -482,19 +482,19 @@ export const Dashboard: React.FC = () => {
           <div className="dash-stat-val">
             {status ? status.events_stored.toLocaleString() : "\u2014"}
           </div>
-          <div className="dash-stat-label">Events Synced</div>
+          <div className="dash-stat-label">events synced</div>
         </div>
         <div className="dash-stat">
           <div className="dash-stat-val">
             {status ? status.wot_nodes.toLocaleString() : "\u2014"}
           </div>
-          <div className="dash-stat-label" title="Total unique pubkeys discovered in the social graph (follows, follows-of-follows, and beyond). Only a small sample is synced each cycle.">WoT Peers</div>
+          <div className="dash-stat-label" title="Total unique pubkeys discovered in the social graph (follows, follows-of-follows, and beyond). Only a small sample is synced each cycle.">wot peers</div>
         </div>
         <div className="dash-stat">
           <div className="dash-stat-val">
             {status ? `${(status.media_stored / 1_073_741_824).toFixed(2)} GB` : "\u2014"}
           </div>
-          <div className="dash-stat-label">Media Stored</div>
+          <div className="dash-stat-label">media stored</div>
         </div>
         <div className="dash-stat">
           <div className="dash-stat-val">
@@ -506,19 +506,19 @@ export const Dashboard: React.FC = () => {
                   : "idle"
               : "\u2014"}
           </div>
-          <div className="dash-stat-label">Sync Rate</div>
+          <div className="dash-stat-label">sync rate</div>
         </div>
         <div className="dash-stat">
           <div className="dash-stat-val">
             {status ? formatUptime(uptime) : "\u2014"}
           </div>
-          <div className="dash-stat-label">Uptime</div>
+          <div className="dash-stat-label">uptime</div>
         </div>
       </div>
 
       {/* Activity chart */}
       <div className="dash-activity">
-        <div className="dash-activity-label">Last 24h activity</div>
+        <div className="dash-activity-label">last 24h activity</div>
         <div className="dash-activity-bars">
           {activityData.map((val, i) => {
             const pct = Math.max((val / activityMax) * 100, 4);
@@ -547,15 +547,15 @@ export const Dashboard: React.FC = () => {
             <span className="dash-live-title">
               {status?.offline_mode ? (
                 <span className="stream-status idle">
-                  <span className="stream-dot-idle"></span> Offline
+                  <span className="stream-dot-idle"></span> offline
                 </span>
               ) : isSyncing ? (
                 <span className="stream-status syncing">
-                  <span className="stream-dot"></span> Syncing
+                  <span className="stream-dot"></span> syncing
                 </span>
               ) : (
                 <span className="stream-status idle">
-                  <span className="stream-dot-idle"></span> Idle
+                  <span className="stream-dot-idle"></span> idle
                 </span>
               )}
             </span>
@@ -567,10 +567,10 @@ export const Dashboard: React.FC = () => {
             {liveStream.length === 0 ? (
               <div className="dash-live-empty">
                 {status?.offline_mode
-                  ? "Offline mode — sync disabled"
+                  ? "offline mode — sync disabled"
                   : isSyncing
-                    ? "Waiting for events..."
-                    : "Idle — waiting for next sync cycle"}
+                    ? "waiting for events..."
+                    : "idle — waiting for next sync cycle"}
               </div>
             ) : (
               liveStream.slice(0, 20).map((entry) => {
@@ -638,13 +638,13 @@ export const Dashboard: React.FC = () => {
 
         {/* Sync Engine sidebar */}
         <div className="dash-sidebar">
-          <div className="sync-engine-header">Sync Engine</div>
+          <div className="sync-engine-header">sync engine</div>
 
           {LAYER_IDS.map((lid) => {
             const wotNotes = status?.sync_wot_notes_per_cycle ?? 0;
             const badge = status
               ? getLayerBadge(lid, currentLayer, currentPhase, wotNotes)
-              : { text: "IDLE", className: "sync-tier-badge idle" };
+              : { text: "idle", className: "sync-tier-badge idle" };
             const detail = status
               ? getLayerDetail(lid, status.sync_stats, currentLayer, progressRelay, wotNotes)
               : "\u2014";
@@ -677,7 +677,7 @@ export const Dashboard: React.FC = () => {
             <div className="sync-tier">
               <div className="sync-tier-head">
                 <span className="sync-tier-label">{currentPhase}</span>
-                <span className="sync-tier-badge fast">ACTIVE</span>
+                <span className="sync-tier-badge fast">active</span>
               </div>
               <div className="sync-tier-detail">
                 {currentPhase === "Thread Context"
@@ -694,7 +694,7 @@ export const Dashboard: React.FC = () => {
           {/* Relays */}
           <div className="sync-tier">
             <div className="sync-tier-head">
-              <span className="sync-tier-label">Relays</span>
+              <span className="sync-tier-label">relays</span>
             </div>
             <div style={{ paddingTop: 4 }}>
               {relays.length === 0 ? (
@@ -705,7 +705,7 @@ export const Dashboard: React.FC = () => {
                     padding: "4px 0",
                   }}
                 >
-                  {relaysLoaded ? "No relays configured" : "Connecting..."}
+                  {relaysLoaded ? "no relays configured" : "connecting..."}
                 </div>
               ) : (
                 relays.map((r) => (

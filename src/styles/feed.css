@@ -358,6 +358,10 @@
   padding: 0 24px 48px;
 }
 
+.note-detail-original .article-reader {
+  padding-bottom: 0;
+}
+
 .reader-header {
   padding: 16px 0;
   border-bottom: 1px solid var(--border);
@@ -898,7 +902,7 @@
   font-size: 0.82rem;
   font-weight: 600;
   color: var(--text-muted);
-  text-transform: uppercase;
+
   letter-spacing: 0.04em;
   margin-bottom: 12px;
 }

@@ -20,17 +20,19 @@ import { NoteDetail } from "./screens/NoteDetail";
 import { StorageOwnEvents } from "./screens/StorageOwnEvents";
 import { StorageTrackedProfiles } from "./screens/StorageTrackedProfiles";
 import { StorageWotProfiles } from "./screens/StorageWotProfiles";
+import { Gallery } from "./screens/Gallery";
 
 const SCREEN_LABELS: Record<string, string> = {
-  "/": "Dashboard",
-  "/feed": "Feed",
-  "/dms": "DMs",
-  "/wot": "WoT",
-  "/storage": "Storage",
-  "/storage/own-events": "Storage / Own Events",
-  "/storage/tracked-profiles": "Storage / Tracked Profiles",
-  "/storage/wot-profiles": "Storage / WoT Profiles",
-  "/settings": "Settings",
+  "/": "analytics",
+  "/feed": "feed",
+  "/dms": "messages",
+  "/gallery": "gallery",
+  "/wot": "wot",
+  "/storage": "storage",
+  "/storage/own-events": "storage / own events",
+  "/storage/tracked-profiles": "storage / tracked profiles",
+  "/storage/wot-profiles": "storage / wot profiles",
+  "/settings": "settings",
 };
 
 const AppShell: React.FC = () => {
@@ -146,6 +148,7 @@ const AppRoutes: React.FC = () => {
         <Route path="/" element={<Dashboard />} />
         <Route path="/feed" element={<Feed />} />
         <Route path="/dms" element={<Dms />} />
+        <Route path="/gallery" element={<Gallery />} />
         <Route path="/wot" element={<Wot />} />
         <Route path="/storage" element={<Storage />} />
         <Route path="/storage/own-events" element={<StorageOwnEvents />} />

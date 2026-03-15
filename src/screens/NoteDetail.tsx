@@ -5,6 +5,10 @@ import { NoteCard } from "../components/NoteCard";
 import { Avatar } from "../components/Avatar";
 import { EmptyState } from "../components/EmptyState";
 import { useProfileContext } from "../context/ProfileContext";
+import { renderMarkdown } from "../utils/markdown";
+import { getArticleTitle, getArticleImage, getArticleTimestamp } from "../components/ArticleCard";
+import { formatDate } from "../utils/format";
+import { profileDisplayName } from "../utils/profiles";
 import type { NostrEvent } from "../types/nostr";
 
 export const NoteDetail: React.FC = () => {
@@ -135,11 +139,40 @@ export const NoteDetail: React.FC = () => {
         <>
           {/* Original note - full content */}
           <div className="note-detail-original">
-            <NoteCard
-              event={event}
-              profile={getProfile(event.pubkey)}
-              full
-            />
+            {event.kind === 30023 ? (
+              <div className="article-reader">
+                <article className="reader-article">
+                  {getArticleImage(event) && (
+                    <div className="reader-cover">
+                      <img src={getArticleImage(event)!} alt="" loading="lazy" />
+                    </div>
+                  )}
+                  <h1 className="reader-title">{getArticleTitle(event)}</h1>
+                  <div className="reader-meta">
+                    <div className="reader-author">
+                      <Avatar
+                        picture={getProfile(event.pubkey)?.picture}
+                        pubkey={event.pubkey}
+                        className="reader-author-avatar"
+                        fallbackClassName="reader-author-avatar reader-author-avatar-fallback"
+                        clickable
+                      />
+                      <span className="reader-author-name">
+                        {profileDisplayName(getProfile(event.pubkey), event.pubkey)}
+                      </span>
+                    </div>
+                    <span className="reader-date">{formatDate(getArticleTimestamp(event))}</span>
+                  </div>
+                  <div className="reader-content" dangerouslySetInnerHTML={{ __html: renderMarkdown(event.content) }} />
+                </article>
+              </div>
+            ) : (
+              <NoteCard
+                event={event}
+                profile={getProfile(event.pubkey)}
+                full
+              />
+            )}
           </div>
 
           {/* Reactions */}

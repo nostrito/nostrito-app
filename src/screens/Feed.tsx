@@ -77,7 +77,7 @@ const ArticleReader: React.FC<ArticleReaderProps> = ({ event, onBack }) => {
     <div className="article-reader">
       <div className="reader-header">
         <button className="reader-back-btn" onClick={onBack}>
-          &#x2190; Back to feed
+          &#x2190; back to feed
         </button>
       </div>
       <article className="reader-article">
@@ -626,7 +626,7 @@ export const Feed: React.FC = () => {
   }, [ensureProfiles]);
 
   const performSearch = useCallback(async (query: string) => {
-    setSearchStatus("Searching\u2026");
+    setSearchStatus("searching\u2026");
     setIsSearchMode(true);
     setSearchRelayAvailable(false);
     setSearchRelayLoading(false);
@@ -634,12 +634,12 @@ export const Feed: React.FC = () => {
     let sq = query;
 
     if (isNip05(query)) {
-      setSearchStatus(`Resolving ${query}\u2026`);
+      setSearchStatus(`resolving ${query}\u2026`);
       const resolved = await resolveNip05(query);
       if (resolved) {
         sq = resolved;
       } else {
-        setSearchStatus(`Could not resolve ${query}`);
+        setSearchStatus(`could not resolve ${query}`);
         setFeedEvents([]);
         return;
       }
@@ -661,7 +661,7 @@ export const Feed: React.FC = () => {
 
       if (localCount === 0) {
         // Nothing found locally → auto-search relays immediately
-        setSearchStatus(`No local results for "${query}" \u2014 searching relays\u2026`);
+        setSearchStatus(`no local results for "${query}" \u2014 searching relays\u2026`);
         searchRelaysForQuery(sq);
       } else {
         // Found locally → show results + offer relay search button
@@ -669,7 +669,7 @@ export const Feed: React.FC = () => {
         setSearchRelayAvailable(true);
       }
     } catch {
-      setSearchStatus("Search failed");
+      setSearchStatus("search failed");
       setFeedEvents([]);
     }
   }, [ensureProfiles, searchRelaysForQuery]);
@@ -801,10 +801,10 @@ export const Feed: React.FC = () => {
   const showNotesColumn = activeFilter !== "long-form";
 
   const filterTabs: { key: FilterTab; label: string }[] = [
-    { key: "all", label: "All" },
-    { key: "note", label: "Notes" },
-    { key: "long-form", label: "Long-form" },
-    { key: "repost", label: "Reposts" },
+    { key: "all", label: "all" },
+    { key: "note", label: "notes" },
+    { key: "long-form", label: "long-form" },
+    { key: "repost", label: "reposts" },
   ];
 
   return (
@@ -815,13 +815,13 @@ export const Feed: React.FC = () => {
             className={`feed-mode-btn${feedMode === "wot" ? " active" : ""}`}
             onClick={() => setFeedMode("wot")}
           >
-            WoT
+            wot
           </button>
           <button
             className={`feed-mode-btn${feedMode === "global" ? " active" : ""}`}
             onClick={() => setFeedMode("global")}
           >
-            Global
+            global
           </button>
         </div>
         <div className="feed-filters">
@@ -840,7 +840,7 @@ export const Feed: React.FC = () => {
           <input
             type="text"
             className="feed-search-input"
-            placeholder="Search notes, npub, name@domain\u2026"
+            placeholder="search notes, npub, name@domain\u2026"
             value={searchQuery}
             onChange={(e) => handleSearchInput(e.target.value)}
           />
@@ -861,7 +861,7 @@ export const Feed: React.FC = () => {
               onClick={() => searchRelaysForQuery(activeSearchQueryRef.current)}
             >
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" width="12" height="12"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
-              Search relays
+              search relays
             </button>
           )}
           {searchRelayLoading && (
@@ -894,31 +894,31 @@ export const Feed: React.FC = () => {
                     <circle cx="12" cy="12" r="10" /><path d="M2 12h20" /><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" />
                   </svg>
                 </div>
-                <h3 className="global-consent-title">Global Feed</h3>
+                <h3 className="global-consent-title">global feed</h3>
                 <p className="global-consent-text">
-                  This will fetch recent notes from public relays. These events are temporary and won't be saved to your local database unless you explicitly save them.
+                  this will fetch recent notes from public relays. these events are temporary and won't be saved to your local database unless you explicitly save them.
                 </p>
                 <button className="global-consent-btn" onClick={handleGlobalConsent}>
-                  Fetch Global Feed
+                  fetch global feed
                 </button>
               </div>
             )}
 
             {loading && !isSearchMode && (feedMode === "wot" || globalConsent) && (
               <div className="event-card" style={{ justifyContent: "center", color: "var(--text-muted)", padding: 32 }}>
-                Loading events...
+                loading events...
               </div>
             )}
 
             {!loading && feedEvents.length === 0 && !isSearchMode && (feedMode === "wot" || globalConsent) && (
               <div className="event-card" style={{ justifyContent: "center", color: "var(--text-muted)", padding: 32 }}>
-                No events yet
+                no events yet
               </div>
             )}
 
-            {isSearchMode && feedEvents.length === 0 && searchStatus && !searchStatus.includes("Searching") && !searchStatus.includes("Resolving") && !searchRelayLoading && !searchStatus.includes("searching relays") && (
+            {isSearchMode && feedEvents.length === 0 && searchStatus && !searchStatus.includes("searching") && !searchStatus.includes("resolving") && !searchRelayLoading && !searchStatus.includes("searching relays") && (
               <div className="event-card" style={{ justifyContent: "center", color: "var(--text-muted)", padding: 32 }}>
-                No events found
+                no events found
               </div>
             )}
 
@@ -946,20 +946,20 @@ export const Feed: React.FC = () => {
 
             {!loading && !isSearchMode && hasMore && filteredNotes.length > 0 && (feedMode === "wot" || globalConsent) && (
               <div className="feed-sentinel">
-                {loadingMore && <span className="feed-sentinel-text">Loading more...</span>}
+                {loadingMore && <span className="feed-sentinel-text">loading more...</span>}
               </div>
             )}
 
             {!isSearchMode && !hasMore && filteredNotes.length > 0 && feedMode === "wot" && !relayFetched && (
               <div className="feed-end feed-relay-prompt">
-                <span>No more local events.</span>
+                <span>no more local events.</span>
                 <button className="feed-relay-fetch-btn" onClick={fetchFromRelays} disabled={fetchingRelay}>
-                  {fetchingRelay ? "Fetching from relays..." : "Fetch from relays?"}
+                  {fetchingRelay ? "fetching from relays..." : "fetch from relays?"}
                 </button>
               </div>
             )}
             {!isSearchMode && !hasMore && filteredNotes.length > 0 && (feedMode !== "wot" || relayFetched) && (
-              <div className="feed-end">No more events to load</div>
+              <div className="feed-end">no more events to load</div>
             )}
           </div>
         )}
@@ -979,18 +979,18 @@ export const Feed: React.FC = () => {
               <div className="feed-sentinel">
                 {loadingMoreArticles && (
                   <span className="feed-sentinel-text">
-                    {articleStageRef.current === "relay-follows" ? "Fetching from follows\u2026" :
-                     articleStageRef.current === "relay-wot" ? "Fetching from network\u2026" :
-                     "Loading more\u2026"}
+                    {articleStageRef.current === "relay-follows" ? "fetching from follows\u2026" :
+                     articleStageRef.current === "relay-wot" ? "fetching from network\u2026" :
+                     "loading more\u2026"}
                   </span>
                 )}
               </div>
             )}
             {!hasMoreArticles && articles.length === 0 && (
-              <div className="feed-end" style={{ color: "var(--text-muted)", padding: 32 }}>No articles found</div>
+              <div className="feed-end" style={{ color: "var(--text-muted)", padding: 32 }}>no articles found</div>
             )}
             {!hasMoreArticles && articles.length > 0 && (
-              <div className="feed-end">No more articles</div>
+              <div className="feed-end">no more articles</div>
             )}
           </div>
         )}
@@ -1012,18 +1012,18 @@ export const Feed: React.FC = () => {
               <div className="feed-sentinel">
                 {loadingMoreArticles && (
                   <span className="feed-sentinel-text">
-                    {articleStageRef.current === "relay-follows" ? "Fetching from follows\u2026" :
-                     articleStageRef.current === "relay-wot" ? "Fetching from network\u2026" :
-                     "Loading more\u2026"}
+                    {articleStageRef.current === "relay-follows" ? "fetching from follows\u2026" :
+                     articleStageRef.current === "relay-wot" ? "fetching from network\u2026" :
+                     "loading more\u2026"}
                   </span>
                 )}
               </div>
             )}
             {!hasMoreArticles && articles.length === 0 && (
-              <div className="feed-end" style={{ color: "var(--text-muted)", padding: 32 }}>No long-form events yet</div>
+              <div className="feed-end" style={{ color: "var(--text-muted)", padding: 32 }}>no long-form events yet</div>
             )}
             {!hasMoreArticles && articles.length > 0 && (
-              <div className="feed-end">No more articles</div>
+              <div className="feed-end">no more articles</div>
             )}
           </div>
         )}

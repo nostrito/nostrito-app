@@ -19,16 +19,12 @@ function getPartner(event: NostrEvent, ownPk: string): string | null {
   return event.pubkey;
 }
 
-type DmsView =
-  | { kind: "list" }
-  | { kind: "thread"; partnerPubkey: string };
-
 export const Dms: React.FC = () => {
   const navigate = useNavigate();
   const [loading, setLoading] = useState(true);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [ownPubkey, setOwnPubkey] = useState("");
-  const [view, setView] = useState<DmsView>({ kind: "list" });
+  const [selectedPartner, setSelectedPartner] = useState<string | null>(null);
   const [signingMode, setSigningMode] = useState<"nsec" | "read-only">("read-only");
 
   // Cache for decrypted message content: eventId -> plaintext
@@ -59,8 +55,9 @@ export const Dms: React.FC = () => {
       }
 
       // Check signing mode
+      let mode: string = "read-only";
       try {
-        const mode = await invoke<string>("get_signing_mode");
+        mode = await invoke<string>("get_signing_mode");
         setSigningMode(mode as "nsec" | "read-only");
       } catch {
         setSigningMode("read-only");
@@ -126,10 +123,38 @@ export const Dms: React.FC = () => {
 
       setConversations(sorted);
       setLoading(false);
+
+      // Decrypt last message of each conversation for sidebar preview
+      if (mode === "nsec") {
+        decryptPreviews(sorted, pk);
+      }
     } catch (e) {
       console.error("[dms] Error loading DMs:", e);
       setEmptyReason("error");
       setLoading(false);
+    }
+
+    // Inner helper — uses closure over decryptedCache
+    async function decryptPreviews(convs: Conversation[], pk: string) {
+      const cache = decryptedCache.current;
+      let updated = false;
+      for (const conv of convs) {
+        const lastMsg = conv.messages[0]; // sorted desc, first = latest
+        if (!lastMsg || cache.has(lastMsg.id)) continue;
+        const senderPk = lastMsg.pubkey === pk ? conv.partnerPubkey : lastMsg.pubkey;
+        try {
+          const plaintext = await invoke<string>("decrypt_dm", {
+            content: lastMsg.content,
+            senderPubkey: senderPk,
+          });
+          cache.set(lastMsg.id, plaintext);
+          updated = true;
+        } catch {
+          cache.set(lastMsg.id, "[Decryption failed]");
+          updated = true;
+        }
+      }
+      if (updated) setDecryptTick((v) => v + 1);
     }
   }, []);
 
@@ -137,7 +162,7 @@ export const Dms: React.FC = () => {
     loadDms();
   }, [loadDms]);
 
-  // Decrypt messages for the current thread view
+  // Decrypt messages for the selected thread
   const decryptThread = useCallback(async (messages: NostrEvent[], partnerPubkey: string) => {
     const cache = decryptedCache.current;
     let updated = false;
@@ -145,7 +170,6 @@ export const Dms: React.FC = () => {
     for (const msg of messages) {
       if (cache.has(msg.id)) continue;
 
-      // The sender is the partner for received messages, or us for sent
       const senderPk = msg.pubkey === ownPubkey ? partnerPubkey : msg.pubkey;
 
       try {
@@ -167,15 +191,23 @@ export const Dms: React.FC = () => {
     }
   }, [ownPubkey]);
 
-  // Trigger decryption when entering a thread with nsec
+  // Trigger decryption when selecting a conversation with nsec
   useEffect(() => {
-    if (view.kind !== "thread" || signingMode !== "nsec") return;
+    if (!selectedPartner || signingMode !== "nsec") return;
 
-    const conv = conversations.find((c) => c.partnerPubkey === view.partnerPubkey);
+    const conv = conversations.find((c) => c.partnerPubkey === selectedPartner);
     if (!conv) return;
 
-    decryptThread(conv.messages, view.partnerPubkey);
-  }, [view, signingMode, conversations, decryptThread]);
+    decryptThread(conv.messages, selectedPartner);
+  }, [selectedPartner, signingMode, conversations, decryptThread]);
+
+  // Auto-scroll thread to bottom
+  const threadRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (selectedPartner && threadRef.current) {
+      threadRef.current.scrollTop = threadRef.current.scrollHeight;
+    }
+  }, [selectedPartner, conversations]);
 
   // Loading state
   if (loading) {
@@ -188,7 +220,7 @@ export const Dms: React.FC = () => {
     );
   }
 
-  // Empty states
+  // Full-page empty states (no identity, cannot determine pubkey, error)
   if (emptyReason === "no-identity") {
     return (
       <div className="dms-page-inner">
@@ -211,31 +243,6 @@ export const Dms: React.FC = () => {
     );
   }
 
-  if (emptyReason === "read-only") {
-    return (
-      <div className="dms-page-inner">
-        <EmptyState
-          message="You have DMs but your configuration is read-only."
-          icon={<span className="icon"><IconLock /></span>}
-          hint="Add your nsec in Settings to decrypt and read your messages."
-          cta={{ label: "Settings", onClick: () => navigate("/settings") }}
-        />
-      </div>
-    );
-  }
-
-  if (emptyReason === "no-dms") {
-    return (
-      <div className="dms-page-inner">
-        <EmptyState
-          message="No DMs found yet."
-          icon={<span className="icon"><IconMessageCircle /></span>}
-          hint="DMs will appear here after the next sync cycle."
-        />
-      </div>
-    );
-  }
-
   if (emptyReason === "error") {
     return (
       <div className="dms-page-inner">
@@ -247,31 +254,100 @@ export const Dms: React.FC = () => {
     );
   }
 
-  // Thread view
-  if (view.kind === "thread") {
-    const conv = conversations.find((c) => c.partnerPubkey === view.partnerPubkey);
-    if (!conv) return null;
+  // Selected conversation data
+  const selectedConv = selectedPartner
+    ? conversations.find((c) => c.partnerPubkey === selectedPartner) ?? null
+    : null;
+  const cache = decryptedCache.current;
 
-    const profile = getCachedProfile(view.partnerPubkey);
-    const name = profileDisplayName(profile, view.partnerPubkey);
-    const sorted = [...conv.messages].sort((a, b) => a.created_at - b.created_at);
-    const cache = decryptedCache.current;
+  // Truncate preview text
+  function previewText(conv: Conversation): React.ReactNode {
+    if (signingMode !== "nsec") {
+      return <><span className="icon"><IconLock /></span> Encrypted</>;
+    }
+    const lastMsg = conv.messages[0];
+    if (!lastMsg) return null;
+    const decrypted = cache.get(lastMsg.id);
+    if (!decrypted) return "...";
+    const maxLen = 40;
+    return decrypted.length > maxLen ? decrypted.slice(0, maxLen) + "\u2026" : decrypted;
+  }
+
+  // Render right panel
+  function renderChatPanel() {
+    // No conversation selected
+    if (!selectedConv) {
+      if (emptyReason === "no-dms" || conversations.length === 0) {
+        // No DMs at all
+        if (signingMode === "nsec") {
+          return (
+            <div className="dms-empty-panel">
+              <span className="icon dms-empty-icon"><IconMessageCircle /></span>
+              <div className="dms-empty-title">No conversations yet</div>
+              <div className="dms-empty-hint">DMs will appear here after the next sync cycle.</div>
+            </div>
+          );
+        }
+        return (
+          <div className="dms-empty-panel">
+            <span className="icon dms-empty-icon"><IconLock /></span>
+            <div className="dms-empty-title">Enable write mode to send messages</div>
+            <div className="dms-empty-hint">Add your nsec in Settings to decrypt and read your messages.</div>
+            <button className="dms-empty-cta" onClick={() => navigate("/settings")}>Go to Settings</button>
+          </div>
+        );
+      }
+
+      // Has conversations, none selected
+      if (signingMode === "nsec") {
+        return (
+          <div className="dms-empty-panel">
+            <span className="icon dms-empty-icon"><IconMessageCircle /></span>
+            <div className="dms-empty-title">Select a conversation</div>
+            <div className="dms-empty-hint">Choose a chat from the sidebar to view messages.</div>
+          </div>
+        );
+      }
+      return (
+        <div className="dms-empty-panel">
+          <span className="icon dms-empty-icon"><IconLock /></span>
+          <div className="dms-empty-title">Read-only mode</div>
+          <div className="dms-empty-hint">Add your nsec in Settings to decrypt and send messages.</div>
+          <button className="dms-empty-cta" onClick={() => navigate("/settings")}>Go to Settings</button>
+        </div>
+      );
+    }
+
+    // Conversation selected — render thread
+    const profile = getCachedProfile(selectedPartner!);
+    const name = profileDisplayName(profile, selectedPartner!);
+    const avatar = profile?.picture || "";
+    const sorted = [...selectedConv.messages].sort((a, b) => a.created_at - b.created_at);
 
     return (
-      <div className="dms-page-inner">
+      <>
         <div className="dms-thread-header">
-          <button className="dms-back-btn" onClick={() => setView({ kind: "list" })}>
-            &#x2190; Back
-          </button>
-          <span className="dms-thread-name">{name}</span>
-          <span className="dms-thread-count">{conv.messages.length} messages</span>
+          <div
+            className="dms-thread-profile"
+            onClick={() => navigate(`/profile/${selectedPartner}`)}
+            title="View profile"
+          >
+            <Avatar
+              picture={avatar || null}
+              pubkey={selectedPartner!}
+              className="dms-thread-avatar"
+              fallbackClassName="dms-thread-avatar-fallback"
+            />
+            <span className="dms-thread-name">{name}</span>
+          </div>
+          <span className="dms-thread-count">{selectedConv.messages.length} messages</span>
         </div>
         {signingMode !== "nsec" && (
-          <div className="dms-banner" style={{ marginBottom: 12 }}>
+          <div className="dms-banner" style={{ margin: "0 16px 0" }}>
             <span className="icon"><IconLock /></span> Messages are encrypted. Add your nsec in Settings to decrypt.
           </div>
         )}
-        <div className="dms-thread-messages">
+        <div className="dms-thread-messages" ref={threadRef}>
           {sorted.map((msg) => {
             const isSent = msg.pubkey === ownPubkey;
             const timeStr = formatTimestamp(msg.created_at);
@@ -292,62 +368,67 @@ export const Dms: React.FC = () => {
             );
           })}
         </div>
-      </div>
+      </>
     );
   }
 
-  // Conversation list view
-  const count = conversations.length;
-  const totalMsgs = conversations.reduce((sum, c) => sum + c.messages.length, 0);
-
+  // --- Split-pane layout ---
   return (
-    <div className="dms-page-inner">
-      <div className="dms-banner">
-        <span>
-          <span className="icon"><IconMessageCircle /></span>{" "}
-          {count} conversation{count !== 1 ? "s" : ""} &middot; {totalMsgs} messages
-          {signingMode !== "nsec" && " \u00B7 Add nsec in Settings to decrypt"}
-        </span>
-      </div>
-      <div className="dms-conversation-list">
-        {conversations.map((conv) => {
-          const profile = getCachedProfile(conv.partnerPubkey);
-          const name = profileDisplayName(profile, conv.partnerPubkey);
-          const avatar = profile?.picture || "";
-          const timeStr = formatTimestamp(conv.lastTimestamp);
-          const msgCount = conv.messages.length;
+    <div className="dms-container">
+      {/* Sidebar */}
+      <div className="dms-sidebar">
+        <div className="dms-sidebar-header">
+          <span className="icon"><IconMessageCircle /></span>
+          <span>Conversations</span>
+          <span className="dms-sidebar-count">{conversations.length}</span>
+        </div>
+        {conversations.length === 0 ? (
+          <div className="dms-sidebar-empty">No conversations yet</div>
+        ) : (
+          <div className="dms-conversation-list">
+            {conversations.map((conv) => {
+              const profile = getCachedProfile(conv.partnerPubkey);
+              const name = profileDisplayName(profile, conv.partnerPubkey);
+              const avatar = profile?.picture || "";
+              const timeStr = formatTimestamp(conv.lastTimestamp);
+              const msgCount = conv.messages.length;
+              const isActive = selectedPartner === conv.partnerPubkey;
 
-          return (
-            <div
-              key={conv.partnerPubkey}
-              className="dms-conv-item"
-              data-partner={conv.partnerPubkey}
-              onClick={() => setView({ kind: "thread", partnerPubkey: conv.partnerPubkey })}
-            >
-              <div className="dms-conv-avatar">
-                <Avatar
-                  picture={avatar || null}
-                  pubkey={conv.partnerPubkey}
-                  className="dms-conv-avatar-img"
-                  fallbackClassName="dms-conv-avatar-fallback"
-                />
-              </div>
-              <div className="dms-conv-info">
-                <div className="dms-conv-name">{name}</div>
-                <div className="dms-conv-preview">
-                  {signingMode === "nsec"
-                    ? <><span className="icon"><IconMessageCircle /></span> {msgCount} message{msgCount !== 1 ? "s" : ""}</>
-                    : <><span className="icon"><IconLock /></span> Encrypted</>
-                  }
+              return (
+                <div
+                  key={conv.partnerPubkey}
+                  className={`dms-conv-item${isActive ? " active" : ""}`}
+                  data-partner={conv.partnerPubkey}
+                  onClick={() => setSelectedPartner(conv.partnerPubkey)}
+                >
+                  <div className="dms-conv-avatar">
+                    <Avatar
+                      picture={avatar || null}
+                      pubkey={conv.partnerPubkey}
+                      className="dms-conv-avatar-img"
+                      fallbackClassName="dms-conv-avatar-fallback"
+                    />
+                  </div>
+                  <div className="dms-conv-info">
+                    <div className="dms-conv-name">{name}</div>
+                    <div className="dms-conv-preview">
+                      {previewText(conv)}
+                    </div>
+                  </div>
+                  <div className="dms-conv-meta">
+                    <div className="dms-conv-time">{timeStr}</div>
+                    <div className="dms-conv-count">{msgCount}</div>
+                  </div>
                 </div>
-              </div>
-              <div className="dms-conv-meta">
-                <div className="dms-conv-time">{timeStr}</div>
-                <div className="dms-conv-count">{msgCount}</div>
-              </div>
-            </div>
-          );
-        })}
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* Chat panel */}
+      <div className="dms-chat-panel">
+        {renderChatPanel()}
       </div>
     </div>
   );

@@ -1,19 +1,20 @@
 import React from "react";
 import { NavLink } from "react-router-dom";
 import logoUrl from "../assets/logo.png";
-import { IconDashboard, IconFeed, IconMessageCircle, IconNetwork, IconDatabase, IconSettings } from "./Icon";
+import { IconDashboard, IconFeed, IconMessageCircle, IconImage, IconNetwork, IconDatabase, IconSettings } from "./Icon";
 import { useAppContext } from "../context/AppContext";
 
 export const Sidebar: React.FC = () => {
   const { ownProfile } = useAppContext();
 
   const navItems = [
-    { to: "/", icon: <IconDashboard />, label: "Dashboard" },
-    { to: "/feed", icon: <IconFeed />, label: "Feed" },
-    { to: "/dms", icon: <IconMessageCircle />, label: "DMs" },
-    { to: "/wot", icon: <IconNetwork />, label: "WoT" },
-    { to: "/storage", icon: <IconDatabase />, label: "Storage" },
-    { to: "/settings", icon: <IconSettings />, label: "Settings" },
+    { to: "/feed", icon: <IconFeed />, label: "feed" },
+    { to: "/dms", icon: <IconMessageCircle />, label: "messages" },
+    { to: "/gallery", icon: <IconImage />, label: "gallery" },
+    { to: "/wot", icon: <IconNetwork />, label: "wot" },
+    { to: "/", icon: <IconDashboard />, label: "analytics" },
+    { to: "/storage", icon: <IconDatabase />, label: "storage" },
+    { to: "/settings", icon: <IconSettings />, label: "settings" },
   ];
 
   return (

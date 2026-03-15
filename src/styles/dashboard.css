@@ -26,7 +26,7 @@
   border-radius: 100px;
   font-size: 0.7rem;
   font-weight: 600;
-  text-transform: uppercase;
+
   letter-spacing: 0.5px;
   background: var(--green-dim);
   color: var(--green);
@@ -63,7 +63,7 @@
 .dash-stat-label {
   font-size: 0.68rem;
   color: var(--text-muted);
-  text-transform: uppercase;
+
   letter-spacing: 0.5px;
   margin-top: 2px;
 }
@@ -76,7 +76,7 @@
 .dash-activity-label {
   font-size: 0.68rem;
   color: var(--text-muted);
-  text-transform: uppercase;
+
   letter-spacing: 0.5px;
   margin-bottom: 8px;
 }
@@ -124,7 +124,7 @@
   font-size: 0.78rem;
   font-weight: 600;
   color: var(--text-dim);
-  text-transform: uppercase;
+
   letter-spacing: 0.5px;
 }
 .dash-live-count {
@@ -236,7 +236,7 @@
   font-weight: 700;
   font-family: var(--mono);
   flex-shrink: 0;
-  text-transform: uppercase;
+
   letter-spacing: 0.3px;
 }
 .live-layer-own { background: rgba(124,58,237,.12); color: #a78bfa; }
@@ -290,7 +290,7 @@
   padding: 14px 16px;
   font-size: 0.72rem;
   font-weight: 600;
-  text-transform: uppercase;
+
   letter-spacing: 0.5px;
   color: var(--text-muted);
   border-bottom: 1px solid var(--border);
@@ -320,7 +320,7 @@
   border-radius: 4px;
   font-size: 0.6rem;
   font-weight: 700;
-  text-transform: uppercase;
+
   letter-spacing: 0.3px;
 }
 .sync-tier-badge.fast {
@@ -518,7 +518,7 @@
   border-radius: 4px;
   font-size: 0.65rem;
   font-weight: 600;
-  text-transform: uppercase;
+
   letter-spacing: 0.5px;
   margin-left: 8px;
 }
