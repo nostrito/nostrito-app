@@ -1,21 +1,41 @@
-# ⚡ nostrito
+<p align="center">
+  <img src="https://raw.githubusercontent.com/nostrito/nostrito/main/public/assets/nostrito-white.svg" alt="nostrito" width="160" />
+</p>
 
-A personal Nostr mini-relay desktop app. nostrito runs a local WebSocket relay on your machine, stores your events in SQLite, builds a Web of Trust graph from your social connections, and syncs with the broader Nostr network — giving you full control over your data.
+<h1 align="center">nostrito-app</h1>
 
-## Stack
+<p align="center">
+  <strong>A personal Nostr mini-relay desktop app.</strong><br />
+  <em>Your relay. Your network. Your machine.</em>
+</p>
 
-- **Tauri 2** — Rust backend + web frontend in a native desktop shell
-- **Rust** — Relay server, WoT engine, sync engine, SQLite storage
-- **TypeScript** — Frontend UI (vanilla, no framework)
-- **SQLite** — Local event storage via rusqlite
-- **nostr-sdk** — Nostr protocol handling
-- **Vite** — Frontend dev server + bundler
+<p align="center">
+  <a href="https://nostrito.com">Website</a> ·
+  <a href="https://github.com/nostrito/.github">Organization</a>
+</p>
+
+---
+
+nostrito runs a local WebSocket relay on your machine, stores your events in SQLite, builds a Web of Trust graph from your social connections, and syncs with the broader Nostr network — giving you full control over your data.
 
 ## Architecture
 
-### Frontend (TypeScript)
+<p align="center">
+  <img src="https://raw.githubusercontent.com/nostrito/nostrito/main/public/assets/architecture-diagram.svg" alt="nostrito architecture" width="720" />
+</p>
 
-Screen-based routing with a sidebar navigation:
+## Stack
+
+| Layer | Technology |
+|-------|-----------|
+| **Shell** | Tauri 2 — Rust backend + web frontend in a native desktop app |
+| **Backend** | Rust — relay server, WoT engine, sync engine, SQLite storage |
+| **Frontend** | TypeScript — screen-based UI |
+| **Storage** | SQLite via rusqlite |
+| **Protocol** | nostr-sdk |
+| **Bundler** | Vite |
+
+## Frontend Screens
 
 | Screen | Description |
 |--------|-------------|
@@ -26,7 +46,7 @@ Screen-based routing with a sidebar navigation:
 | **Storage** | Database stats: size, event breakdown, time range |
 | **Settings** | Configure relay port, WoT depth, sync interval, outbound relays |
 
-### Backend (Rust)
+## Backend Modules
 
 | Module | Description |
 |--------|-------------|
@@ -49,7 +69,6 @@ npm run tauri build
 
 # Build macOS DMG installer
 npm run tauri build -- --bundles dmg
-# Output: src-tauri/target/release/bundle/dmg/nostrito_<version>_<arch>.dmg
 ```
 
 ### Prerequisites
