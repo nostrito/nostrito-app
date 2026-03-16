@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useNavigate } from "react-router-dom";
 import { IconZap, IconX, IconSearch } from "../components/Icon";
+import { useCanWrite } from "../context/SigningContext";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -57,11 +58,13 @@ function formatSats(sats: number): string {
 /* ------------------------------------------------------------------ */
 
 const WalletSetup: React.FC<{ onConnected: () => void }> = ({ onConnected }) => {
-  const [tab, setTab] = useState<"nwc" | "lnbits">("nwc");
+  const canWrite = useCanWrite();
+  const [tab, setTab] = useState<"create" | "nwc" | "lnbits">(canWrite ? "create" : "nwc");
   const [nwcUri, setNwcUri] = useState("");
   const [lnbitsUrl, setLnbitsUrl] = useState("");
   const [lnbitsKey, setLnbitsKey] = useState("");
   const [loading, setLoading] = useState(false);
+  const [provisioning, setProvisioning] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const connectNwc = async () => {
@@ -107,6 +110,14 @@ const WalletSetup: React.FC<{ onConnected: () => void }> = ({ onConnected }) => 
         </div>
 
         <div className="wallet-setup-tabs">
+          {canWrite && (
+            <button
+              className={`wallet-setup-tab${tab === "create" ? " active" : ""}`}
+              onClick={() => { setTab("create"); setError(null); }}
+            >
+              create wallet
+            </button>
+          )}
           <button
             className={`wallet-setup-tab${tab === "nwc" ? " active" : ""}`}
             onClick={() => { setTab("nwc"); setError(null); }}
@@ -120,6 +131,33 @@ const WalletSetup: React.FC<{ onConnected: () => void }> = ({ onConnected }) => 
             LNbits
           </button>
         </div>
+
+        {tab === "create" && canWrite && (
+          <div className="wallet-setup-form">
+            <p className="wallet-setup-hint">
+              auto-create a custodial lightning wallet at zaps.nostr-wot.com.
+              fast and easy — you can always switch to your own wallet later.
+            </p>
+            <button
+              className="wallet-setup-connect-btn"
+              disabled={provisioning}
+              onClick={async () => {
+                setProvisioning(true);
+                setError(null);
+                try {
+                  await invoke("wallet_provision");
+                  onConnected();
+                } catch (e: any) {
+                  setError(typeof e === "string" ? e : e?.message || "Provisioning failed");
+                } finally {
+                  setProvisioning(false);
+                }
+              }}
+            >
+              {provisioning ? "creating wallet..." : "create wallet"}
+            </button>
+          </div>
+        )}
 
         {tab === "nwc" && (
           <div className="wallet-setup-form">

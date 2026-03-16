@@ -8,11 +8,13 @@ import {
 } from "../components/Icon";
 import { Avatar } from "../components/Avatar";
 import { NoteCard } from "../components/NoteCard";
+import { ZapModal } from "../components/ZapModal";
 import { ArticleCard } from "../components/ArticleCard";
 import { EmptyState } from "../components/EmptyState";
 import { formatBytes, shortPubkey } from "../utils/format";
 import { profileDisplayName } from "../utils/profiles";
 import { initMediaViewer } from "../utils/media";
+import { invalidateInteractionCounts } from "../hooks/useInteractionCounts";
 import { useProfileContext, useProfile } from "../context/ProfileContext";
 import type { ProfileInfo } from "../utils/profiles";
 
@@ -84,6 +86,18 @@ export const ProfileView: React.FC = () => {
   const [menuOpen, setMenuOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
+
+  // Zap modal
+  const [zapTarget, setZapTarget] = useState<NostrEvent | null>(null);
+
+  const handleLike = useCallback(async (event: NostrEvent) => {
+    try {
+      await invoke("publish_reaction", { eventId: event.id, eventPubkey: event.pubkey });
+      invalidateInteractionCounts([event.id]);
+    } catch (err) {
+      console.warn("[profile] Failed to publish reaction:", err);
+    }
+  }, []);
 
   // Tab data
   const [notes, setNotes] = useState<NostrEvent[]>([]);
@@ -633,6 +647,8 @@ export const ProfileView: React.FC = () => {
                         profile={getProfile(note.pubkey) ?? profile ?? undefined}
                         compact
                         onClick={() => navigate(`/note/${note.id}`)}
+                        onZap={setZapTarget}
+                        onLike={handleLike}
                       />
                     ))}
                     {hasMoreNotes && notes.length > 0 && (
@@ -805,6 +821,15 @@ export const ProfileView: React.FC = () => {
             </div>
           </div>
         </div>
+      )}
+
+      {zapTarget && (
+        <ZapModal
+          eventId={zapTarget.id}
+          recipientPubkey={zapTarget.pubkey}
+          recipientLud16={getProfile(zapTarget.pubkey)?.lud16 ?? profile?.lud16 ?? null}
+          onClose={() => setZapTarget(null)}
+        />
       )}
     </div>
   );

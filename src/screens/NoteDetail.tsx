@@ -3,6 +3,7 @@ import { useParams, useNavigate } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { NoteCard } from "../components/NoteCard";
+import { ZapModal } from "../components/ZapModal";
 import { Avatar } from "../components/Avatar";
 import { EmptyState } from "../components/EmptyState";
 import { useProfileContext } from "../context/ProfileContext";
@@ -186,6 +187,16 @@ export const NoteDetail: React.FC = () => {
   const [fetchingRelays, setFetchingRelays] = useState(false);
   const [wotDistances, setWotDistances] = useState<Record<string, number>>({});
   const [showNonWot, setShowNonWot] = useState(false);
+  const [zapTarget, setZapTarget] = useState<NostrEvent | null>(null);
+
+  const handleLike = useCallback(async (event: NostrEvent) => {
+    try {
+      await invoke("publish_reaction", { eventId: event.id, eventPubkey: event.pubkey });
+      invalidateInteractionCounts([event.id]);
+    } catch (err) {
+      console.warn("[note-detail] Failed to publish reaction:", err);
+    }
+  }, []);
 
   // Determine root ID for thread fetching
   const rootId = useMemo(() => {
@@ -386,6 +397,8 @@ export const NoteDetail: React.FC = () => {
                 event={displayEvent}
                 profile={getProfile(displayEvent.pubkey)}
                 full
+                onZap={setZapTarget}
+                onLike={handleLike}
               />
             )}
           </div>
@@ -493,6 +506,14 @@ export const NoteDetail: React.FC = () => {
             )}
           </div>
         </>
+      )}
+      {zapTarget && (
+        <ZapModal
+          eventId={zapTarget.id}
+          recipientPubkey={zapTarget.pubkey}
+          recipientLud16={getProfile(zapTarget.pubkey)?.lud16 ?? null}
+          onClose={() => setZapTarget(null)}
+        />
       )}
     </div>
   );

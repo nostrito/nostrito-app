@@ -3,18 +3,22 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
-import { IconX } from "../components/Icon";
+import { IconX, IconHeart, IconMessageCircle, IconZap } from "../components/Icon";
 import { NoteCard, GroupedRepostCard, getRepostOriginalId, type GroupedRepost } from "../components/NoteCard";
+import { ZapModal } from "../components/ZapModal";
 import { ArticleCard, getArticleTitle, getArticleImage, getArticleTimestamp } from "../components/ArticleCard";
 import { Avatar } from "../components/Avatar";
 import { formatDate } from "../utils/format";
 import { renderMarkdown } from "../utils/markdown";
 import { initMediaViewer } from "../utils/media";
 import { useProfileContext } from "../context/ProfileContext";
+import { useCanWrite } from "../context/SigningContext";
 import { profileDisplayName } from "../utils/profiles";
+import { useInteractionCounts, invalidateInteractionCounts } from "../hooks/useInteractionCounts";
 import { useTauriEvent } from "../hooks/useTauriEvent";
 import { useInterval } from "../hooks/useInterval";
 import type { NostrEvent } from "../types/nostr";
+import type { ProfileInfo } from "../utils/profiles";
 
 /** Kinds that belong in the feed */
 const FEED_KINDS = [1, 6, 30023];
@@ -55,14 +59,78 @@ function isNip05(input: string): boolean {
   return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(input);
 }
 
+// -- Article sidebar --
+
+const ArticleSidebar: React.FC<{
+  event: NostrEvent;
+  profile?: ProfileInfo;
+  onSelectArticle: (event: NostrEvent) => void;
+  onLike: (event: NostrEvent) => void;
+  onZap: (event: NostrEvent) => void;
+}> = ({ event, profile, onSelectArticle, onLike, onZap }) => {
+  const [otherArticles, setOtherArticles] = useState<NostrEvent[]>([]);
+  const counts = useInteractionCounts(event.id);
+  const canWrite = useCanWrite();
+  const displayName = profileDisplayName(profile, event.pubkey);
+
+  useEffect(() => {
+    invoke<NostrEvent[]>("get_author_articles", {
+      pubkey: event.pubkey,
+      excludeEventId: event.id,
+      limit: 5,
+    }).then(setOtherArticles).catch(() => {});
+  }, [event.pubkey, event.id]);
+
+  return (
+    <>
+      <div className="sidebar-author-card">
+        <Avatar picture={profile?.picture} pubkey={event.pubkey} className="sidebar-author-avatar" clickable />
+        <div className="sidebar-author-name" data-pubkey={event.pubkey} style={{ cursor: "pointer" }}>{displayName}</div>
+        {profile?.about && <div className="sidebar-author-about">{profile.about.slice(0, 150)}{profile.about.length > 150 ? "\u2026" : ""}</div>}
+      </div>
+
+      <div className="sidebar-stats">
+        <span><span className="icon"><IconHeart /></span> {counts?.reactions || 0} likes</span>
+        <span><span className="icon"><IconMessageCircle /></span> {counts?.replies || 0} comments</span>
+        <span><span className="icon"><IconZap /></span> {counts?.zaps || 0} zaps</span>
+      </div>
+
+      {canWrite && (
+        <div className="sidebar-actions">
+          <button className="sidebar-like-btn" onClick={() => onLike(event)}>
+            <span className="icon"><IconHeart /></span> Like
+          </button>
+          <button className="sidebar-zap-btn" onClick={() => onZap(event)}>
+            <span className="icon"><IconZap /></span> Zap
+          </button>
+        </div>
+      )}
+
+      {otherArticles.length > 0 && (
+        <div className="sidebar-more-articles">
+          <h4>More by {displayName}</h4>
+          {otherArticles.map((a) => (
+            <div key={a.id} className="sidebar-article-link" onClick={() => onSelectArticle(a)}>
+              {getArticleTitle(a)}
+            </div>
+          ))}
+        </div>
+      )}
+    </>
+  );
+};
+
 // -- Article reader (inline, uses shared helpers) --
 
 interface ArticleReaderProps {
   event: NostrEvent;
   onBack: () => void;
+  onSelectArticle: (event: NostrEvent) => void;
+  onLike: (event: NostrEvent) => void;
+  onZap: (event: NostrEvent) => void;
 }
 
-const ArticleReader: React.FC<ArticleReaderProps> = ({ event, onBack }) => {
+const ArticleReader: React.FC<ArticleReaderProps> = ({ event, onBack, onSelectArticle, onLike, onZap }) => {
   const { getProfile, ensureProfiles } = useProfileContext();
   useEffect(() => { ensureProfiles([event.pubkey]); }, [event.pubkey, ensureProfiles]);
   const profile = getProfile(event.pubkey);
@@ -74,33 +142,44 @@ const ArticleReader: React.FC<ArticleReaderProps> = ({ event, onBack }) => {
   const renderedContent = renderMarkdown(event.content);
 
   return (
-    <div className="article-reader">
-      <div className="reader-header">
-        <button className="reader-back-btn" onClick={onBack}>
-          &#x2190; back to feed
-        </button>
-      </div>
-      <article className="reader-article">
-        {image && (
-          <div className="reader-cover">
-            <img src={image} alt="" loading="lazy" />
-          </div>
-        )}
-        <h1 className="reader-title">{title}</h1>
-        <div className="reader-meta">
-          <div className="reader-author">
-            <Avatar
-              picture={profile?.picture}
-              pubkey={event.pubkey}
-              className="reader-author-avatar"
-              fallbackClassName="reader-author-avatar reader-author-avatar-fallback"
-            />
-            <span className="reader-author-name">{displayName}</span>
-          </div>
-          <span className="reader-date">{formatDate(ts)}</span>
+    <div className="article-reader-layout">
+      <div className="article-reader">
+        <div className="reader-header">
+          <button className="reader-back-btn" onClick={onBack}>
+            &#x2190; back to feed
+          </button>
         </div>
-        <div className="reader-content" dangerouslySetInnerHTML={{ __html: renderedContent }} />
-      </article>
+        <article className="reader-article">
+          {image && (
+            <div className="reader-cover">
+              <img src={image} alt="" loading="lazy" />
+            </div>
+          )}
+          <h1 className="reader-title">{title}</h1>
+          <div className="reader-meta">
+            <div className="reader-author">
+              <Avatar
+                picture={profile?.picture}
+                pubkey={event.pubkey}
+                className="reader-author-avatar"
+                fallbackClassName="reader-author-avatar reader-author-avatar-fallback"
+              />
+              <span className="reader-author-name">{displayName}</span>
+            </div>
+            <span className="reader-date">{formatDate(ts)}</span>
+          </div>
+          <div className="reader-content" dangerouslySetInnerHTML={{ __html: renderedContent }} />
+        </article>
+      </div>
+      <aside className="article-sidebar">
+        <ArticleSidebar
+          event={event}
+          profile={profile}
+          onSelectArticle={onSelectArticle}
+          onLike={onLike}
+          onZap={onZap}
+        />
+      </aside>
     </div>
   );
 };
@@ -144,6 +223,17 @@ export const Feed: React.FC = () => {
   const [relayFetched, setRelayFetched] = useState(false);
 
   const { getProfile, ensureProfiles } = useProfileContext();
+
+  const [zapTarget, setZapTarget] = useState<NostrEvent | null>(null);
+
+  const handleLike = useCallback(async (event: NostrEvent) => {
+    try {
+      await invoke("publish_reaction", { eventId: event.id, eventPubkey: event.pubkey });
+      invalidateInteractionCounts([event.id]);
+    } catch (err) {
+      console.warn("[feed] Failed to publish reaction:", err);
+    }
+  }, []);
 
   const [groupedReposts, setGroupedReposts] = useState<Map<string, GroupedRepost>>(new Map());
   const fetchedOriginalIdsRef = useRef(new Set<string>());
@@ -775,6 +865,9 @@ export const Feed: React.FC = () => {
       <ArticleReader
         event={view.event}
         onBack={() => setView({ kind: "feed" })}
+        onSelectArticle={(ev) => setView({ kind: "article", event: ev })}
+        onLike={handleLike}
+        onZap={setZapTarget}
       />
     );
   }
@@ -941,6 +1034,8 @@ export const Feed: React.FC = () => {
                 onSave={feedMode === "global" ? saveEvent : undefined}
                 saved={savedEventIds.has(event.id)}
                 onClick={() => navigate(`/note/${event.id}`)}
+                onZap={setZapTarget}
+                onLike={handleLike}
               />
             ))}
 
@@ -1028,6 +1123,15 @@ export const Feed: React.FC = () => {
           </div>
         )}
       </div>
+
+      {zapTarget && (
+        <ZapModal
+          eventId={zapTarget.id}
+          recipientPubkey={zapTarget.pubkey}
+          recipientLud16={getProfile(zapTarget.pubkey)?.lud16 ?? null}
+          onClose={() => setZapTarget(null)}
+        />
+      )}
     </div>
   );
 };

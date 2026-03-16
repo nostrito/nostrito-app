@@ -523,3 +523,238 @@ pub mod bolt11 {
         result
     }
 }
+
+// ── Wallet Provisioning ─────────────────────────────────────────────
+
+pub mod provision {
+    use nostr_sdk::prelude::*;
+
+    const DEFAULT_PROVISION_URL: &str = "https://zaps.nostr-wot.com";
+
+    fn client() -> reqwest::Client {
+        reqwest::Client::new()
+    }
+
+    /// Auto-provision a wallet via challenge-response at the provisioning URL.
+    /// Returns (admin_key, wallet_id, instance_url).
+    pub async fn provision_wallet(
+        instance_url: Option<&str>,
+        nsec: &str,
+        hex_pubkey: &str,
+    ) -> Result<(String, String, String), String> {
+        let url = instance_url.unwrap_or(DEFAULT_PROVISION_URL).trim_end_matches('/');
+
+        // Step 1: GET challenge
+        let challenge_resp = client()
+            .get(format!("{}/api/provision/challenge", url))
+            .send()
+            .await
+            .map_err(|e| format!("Provision challenge request failed: {}", e))?;
+
+        if !challenge_resp.status().is_success() {
+            let body = challenge_resp.text().await.unwrap_or_default();
+            return Err(format!("Provision challenge error: {}", body));
+        }
+
+        let challenge_data: serde_json::Value = challenge_resp
+            .json()
+            .await
+            .map_err(|e| format!("Provision challenge parse error: {}", e))?;
+
+        let challenge = challenge_data["challenge"]
+            .as_str()
+            .ok_or("No challenge in response")?
+            .to_string();
+
+        // Step 2: Sign challenge as kind:27235 event (NIP-98)
+        let secret_key = SecretKey::from_bech32(nsec)
+            .map_err(|e| format!("Invalid nsec: {}", e))?;
+        let keys = Keys::new(secret_key);
+
+        let tags = vec![
+            Tag::custom(TagKind::Custom("challenge".into()), vec![challenge]),
+            Tag::custom(TagKind::Custom("u".into()), vec![url.to_string()]),
+            Tag::custom(TagKind::Custom("method".into()), vec!["POST".to_string()]),
+        ];
+        let event = EventBuilder::new(Kind::Custom(27235), "", tags)
+            .to_event(&keys)
+            .map_err(|e| format!("Failed to sign provision event: {}", e))?;
+
+        let event_json = serde_json::to_string(&event)
+            .map_err(|e| format!("Failed to serialize event: {}", e))?;
+
+        // Step 3: POST provision with signed event
+        let wallet_name = format!("Nostrito:{}", &hex_pubkey[..16.min(hex_pubkey.len())]);
+        let provision_resp = client()
+            .post(format!("{}/api/provision", url))
+            .json(&serde_json::json!({
+                "name": wallet_name,
+                "event": event_json,
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("Provision request failed: {}", e))?;
+
+        if !provision_resp.status().is_success() {
+            let body = provision_resp.text().await.unwrap_or_default();
+            return Err(format!("Provision error: {}", body));
+        }
+
+        let result: serde_json::Value = provision_resp
+            .json()
+            .await
+            .map_err(|e| format!("Provision parse error: {}", e))?;
+
+        let admin_key = result["adminkey"]
+            .as_str()
+            .ok_or("No adminkey in provision response")?
+            .to_string();
+        let wallet_id = result["id"]
+            .as_str()
+            .ok_or("No id in provision response")?
+            .to_string();
+
+        Ok((admin_key, wallet_id, url.to_string()))
+    }
+}
+
+// ── Zap Helpers (NIP-57 / LNURL) ───────────────────────────────────
+
+pub mod zap {
+    use nostr_sdk::prelude::*;
+    use serde::Deserialize;
+
+    #[derive(Debug, Clone)]
+    pub struct LnurlPayParams {
+        pub callback: String,
+        pub min_sendable: u64,
+        pub max_sendable: u64,
+        pub allows_nostr: bool,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct LnurlResponse {
+        callback: Option<String>,
+        min_sendable: Option<u64>,
+        max_sendable: Option<u64>,
+        allows_nostr: Option<bool>,
+    }
+
+    #[derive(Deserialize)]
+    struct InvoiceCallbackResponse {
+        pr: Option<String>,
+    }
+
+    fn client() -> reqwest::Client {
+        reqwest::Client::new()
+    }
+
+    /// Resolve a lightning address (user@domain) to LNURL pay parameters.
+    pub async fn resolve_lnurl(lud16: &str) -> Result<LnurlPayParams, String> {
+        let parts: Vec<&str> = lud16.split('@').collect();
+        if parts.len() != 2 {
+            return Err(format!("Invalid lightning address: {}", lud16));
+        }
+        let (user, domain) = (parts[0], parts[1]);
+        let url = format!("https://{}/.well-known/lnurlp/{}", domain, user);
+
+        let resp = client()
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("LNURL resolve failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("LNURL resolve error: HTTP {}", resp.status()));
+        }
+
+        let data: LnurlResponse = resp
+            .json()
+            .await
+            .map_err(|e| format!("LNURL parse error: {}", e))?;
+
+        Ok(LnurlPayParams {
+            callback: data.callback.ok_or("No callback in LNURL response")?,
+            min_sendable: data.min_sendable.unwrap_or(1000),
+            max_sendable: data.max_sendable.unwrap_or(100_000_000_000),
+            allows_nostr: data.allows_nostr.unwrap_or(false),
+        })
+    }
+
+    /// Build a NIP-57 kind:9734 zap request event and return it as a JSON string.
+    pub fn build_zap_request(
+        nsec: &str,
+        recipient_pubkey: &str,
+        event_id: &str,
+        amount_msats: u64,
+        content: &str,
+        relays: &[String],
+    ) -> Result<String, String> {
+        let secret_key = SecretKey::from_bech32(nsec)
+            .map_err(|e| format!("Invalid nsec: {}", e))?;
+        let keys = Keys::new(secret_key);
+
+        let recipient_pk = PublicKey::from_hex(recipient_pubkey)
+            .map_err(|e| format!("Invalid recipient pubkey: {}", e))?;
+        let event_id_parsed = EventId::from_hex(event_id)
+            .map_err(|e| format!("Invalid event id: {}", e))?;
+
+        let mut tags = vec![
+            Tag::public_key(recipient_pk),
+            Tag::event(event_id_parsed),
+            Tag::custom(
+                TagKind::Custom("amount".into()),
+                vec![amount_msats.to_string()],
+            ),
+        ];
+
+        // Add relays tag
+        if !relays.is_empty() {
+            let relay_values: Vec<String> = relays.to_vec();
+            tags.push(Tag::custom(
+                TagKind::Custom("relays".into()),
+                relay_values,
+            ));
+        }
+
+        let event = EventBuilder::new(Kind::ZapRequest, content, tags)
+            .to_event(&keys)
+            .map_err(|e| format!("Failed to sign zap request: {}", e))?;
+
+        serde_json::to_string(&event)
+            .map_err(|e| format!("Failed to serialize zap request: {}", e))
+    }
+
+    /// Fetch a BOLT11 invoice from the LNURL callback with the zap request.
+    pub async fn fetch_zap_invoice(
+        callback: &str,
+        amount_msats: u64,
+        zap_request_json: &str,
+    ) -> Result<String, String> {
+        let encoded_zap = urlencoding::encode(zap_request_json);
+        let separator = if callback.contains('?') { "&" } else { "?" };
+        let url = format!(
+            "{}{}amount={}&nostr={}",
+            callback, separator, amount_msats, encoded_zap
+        );
+
+        let resp = client()
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("LNURL callback failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("LNURL callback error: {}", body));
+        }
+
+        let data: InvoiceCallbackResponse = resp
+            .json()
+            .await
+            .map_err(|e| format!("LNURL callback parse error: {}", e))?;
+
+        data.pr.ok_or_else(|| "No invoice in LNURL callback response".to_string())
+    }
+}

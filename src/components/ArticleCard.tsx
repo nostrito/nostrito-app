@@ -1,8 +1,10 @@
 /** Shared article card for NIP-23 long-form content */
 import React from "react";
 import { Avatar } from "./Avatar";
+import { IconMessageCircle, IconRepeat, IconHeart, IconZap } from "./Icon";
 import { formatDate } from "../utils/format";
 import { profileDisplayName, type ProfileInfo } from "../utils/profiles";
+import { useInteractionCounts } from "../hooks/useInteractionCounts";
 import type { NostrEvent } from "../types/nostr";
 
 export function getTagValue(tags: string[][], name: string): string | null {
@@ -51,6 +53,7 @@ export const ArticleCard: React.FC<ArticleCardProps> = ({ event, profile, onClic
   const image = getArticleImage(event);
   const ts = getArticleTimestamp(event);
   const displayName = profileDisplayName(profile, event.pubkey);
+  const counts = useInteractionCounts(event.id);
 
   return (
     <div
@@ -97,6 +100,12 @@ export const ArticleCard: React.FC<ArticleCardProps> = ({ event, profile, onClic
             </span>
           </div>
           <span className="article-card-date">{formatDate(ts)}</span>
+        </div>
+        <div className="article-card-counts">
+          <span className="article-count"><span className="icon"><IconMessageCircle /></span> {counts?.replies || 0}</span>
+          <span className="article-count"><span className="icon"><IconRepeat /></span> {counts?.reposts || 0}</span>
+          <span className="article-count"><span className="icon"><IconHeart /></span> {counts?.reactions || 0}</span>
+          <span className="article-count"><span className="icon"><IconZap /></span> {counts?.zaps || 0}</span>
         </div>
       </div>
     </div>

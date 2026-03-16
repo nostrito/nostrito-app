@@ -3,6 +3,7 @@ import { BrowserRouter, Routes, Route, Outlet, Navigate, useNavigate, useLocatio
 import { listen } from "@tauri-apps/api/event";
 import { AppProvider, useAppContext } from "./context/AppContext";
 import { ProfileProvider } from "./context/ProfileContext";
+import { SigningProvider } from "./context/SigningContext";
 import { Titlebar } from "./components/Titlebar";
 import { Sidebar } from "./components/Sidebar";
 import { initMediaViewer } from "./utils/media";
@@ -167,10 +168,12 @@ const AppRoutes: React.FC = () => {
 
 export const App: React.FC = () => (
   <AppProvider>
-    <ProfileProvider>
-      <BrowserRouter>
-        <AppRoutes />
-      </BrowserRouter>
-    </ProfileProvider>
+    <SigningProvider>
+      <ProfileProvider>
+        <BrowserRouter>
+          <AppRoutes />
+        </BrowserRouter>
+      </ProfileProvider>
+    </SigningProvider>
   </AppProvider>
 );

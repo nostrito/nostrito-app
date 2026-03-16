@@ -1674,3 +1674,54 @@
   gap: 12px; padding: 24px; color: #34d399; font-weight: 600;
 }
 .wallet-send-success .icon svg { color: #34d399; }
+
+/* ── Zap Modal ─────────────────────────────────────────── */
+.zap-balance-row {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 0.88rem; font-weight: 600; color: var(--text-dim);
+  font-family: var(--mono);
+  padding: 4px 0 8px;
+}
+.zap-balance-row .icon svg { width: 16px; height: 16px; }
+.zap-preset-grid {
+  display: flex; gap: 6px; flex-wrap: wrap;
+}
+.zap-preset-btn {
+  flex: 1 1 auto; min-width: 52px;
+  padding: 8px 4px; border-radius: 8px;
+  border: 1px solid var(--border); background: var(--bg);
+  color: var(--text-dim); font-size: 0.84rem; font-weight: 600;
+  font-family: var(--mono); cursor: pointer;
+  transition: all 0.15s; text-align: center;
+}
+.zap-preset-btn:hover {
+  border-color: rgba(250,204,21,0.4); color: #facc15;
+}
+.zap-preset-btn.active {
+  background: rgba(250,204,21,0.12); border-color: #facc15;
+  color: #facc15;
+}
+.zap-custom-row {
+  display: flex; gap: 6px; align-items: center;
+}
+.zap-max-btn {
+  padding: 8px 14px; border-radius: 8px;
+  border: 1px solid var(--border); background: var(--bg);
+  color: var(--text-dim); font-size: 0.78rem; font-weight: 600;
+  cursor: pointer; transition: all 0.15s; flex-shrink: 0;
+}
+.zap-max-btn:hover {
+  border-color: var(--accent); color: var(--accent-light);
+}
+.zap-message-input {
+  margin-top: 4px;
+}
+.zap-insufficient {
+  font-size: 0.78rem; color: #ef4444; font-weight: 600;
+  padding: 2px 0;
+}
+.zap-success {
+  display: flex; flex-direction: column; align-items: center;
+  gap: 10px; padding: 24px; color: #34d399; font-weight: 600;
+}
+.zap-success .icon svg { width: 32px; height: 32px; color: #34d399; }

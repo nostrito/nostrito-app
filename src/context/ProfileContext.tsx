@@ -84,6 +84,22 @@ export const ProfileProvider: React.FC<{ children: React.ReactNode }> = ({ child
         }
       }
       setProfileVersion((v) => v + 1);
+
+      // Background relay fetch for profiles that came back empty
+      const emptyPks = missing.filter((pk) => {
+        const p = cacheRef.current.get(pk);
+        return p && !p.name && !p.display_name && !p.picture;
+      });
+      if (emptyPks.length > 0) {
+        invoke<ProfileInfo[]>("fetch_profiles_from_relay", { pubkeys: emptyPks })
+          .then((fetched) => {
+            for (const p of fetched) {
+              cacheRef.current.set(p.pubkey, p);
+            }
+            if (fetched.length > 0) setProfileVersion((v) => v + 1);
+          })
+          .catch(() => {});
+      }
     } catch (e) {
       console.warn("[ProfileProvider] batch fetch failed:", e);
     }

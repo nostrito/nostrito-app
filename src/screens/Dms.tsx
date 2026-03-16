@@ -8,7 +8,8 @@ import { IconMessageCircle, IconLock } from "../components/Icon";
 import { Avatar } from "../components/Avatar";
 import { EmptyState } from "../components/EmptyState";
 import { formatTimestamp } from "../utils/format";
-import { getCachedProfile, getProfiles, profileDisplayName } from "../utils/profiles";
+import { profileDisplayName } from "../utils/profiles";
+import { useProfileContext } from "../context/ProfileContext";
 import type { NostrEvent, Settings, Conversation } from "../types/nostr";
 
 function getPartner(event: NostrEvent, ownPk: string): string | null {
@@ -21,6 +22,8 @@ function getPartner(event: NostrEvent, ownPk: string): string | null {
 
 export const Dms: React.FC = () => {
   const navigate = useNavigate();
+  const { getProfile, ensureProfiles, profileVersion } = useProfileContext();
+  void profileVersion; // subscribe to profile cache updates
   const [loading, setLoading] = useState(true);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [ownPubkey, setOwnPubkey] = useState("");
@@ -120,7 +123,7 @@ export const Dms: React.FC = () => {
 
       // Fetch profiles for all partners
       const partnerKeys = sorted.map((c) => c.partnerPubkey);
-      await getProfiles(partnerKeys);
+      ensureProfiles(partnerKeys);
 
       setConversations(sorted);
       setLoading(false);
@@ -342,7 +345,7 @@ export const Dms: React.FC = () => {
     }
 
     // Conversation selected — render thread
-    const profile = getCachedProfile(selectedPartner!);
+    const profile = getProfile(selectedPartner!);
     const name = profileDisplayName(profile, selectedPartner!);
     const avatar = profile?.picture || "";
     const sorted = [...selectedConv.messages].sort((a, b) => a.created_at - b.created_at);
@@ -428,7 +431,7 @@ export const Dms: React.FC = () => {
         ) : (
           <div className="dms-conversation-list">
             {conversations.map((conv) => {
-              const profile = getCachedProfile(conv.partnerPubkey);
+              const profile = getProfile(conv.partnerPubkey);
               const name = profileDisplayName(profile, conv.partnerPubkey);
               const avatar = profile?.picture || "";
               const timeStr = formatTimestamp(conv.lastTimestamp);

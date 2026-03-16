@@ -171,9 +171,16 @@ pub fn process_event(
         }
     }
 
-    // Queue profile picture/banner from kind:0 metadata events
+    // Queue profile picture/banner from kind:0 metadata events (WoT hop 0-2 only)
     if result.stored && kind == 0 {
-        result.media_urls_queued = queue_profile_media(db, &pubkey, &event.content.to_string(), media_priority);
+        let should_download = if own_pubkey == pubkey {
+            true // Always download own media
+        } else {
+            is_within_hops(graph, own_pubkey, &pubkey, 2)
+        };
+        if should_download {
+            result.media_urls_queued = queue_profile_media(db, &pubkey, &event.content.to_string(), media_priority);
+        }
     }
 
     // Advance cursor for stored events
@@ -500,6 +507,44 @@ fn queue_media_urls(
 }
 
 /// Queue profile picture and banner from kind:0 metadata JSON content.
+/// Check if `target` pubkey is within `max_hops` of `root` in the WoT graph.
+/// Lightweight single-target BFS — avoids computing all hop distances.
+fn is_within_hops(graph: &WotGraph, root: &str, target: &str, max_hops: u8) -> bool {
+    let root_id = match graph.get_node_id(root) {
+        Some(id) => id,
+        None => return false,
+    };
+    let target_id = match graph.get_node_id(target) {
+        Some(id) => id,
+        None => return false,
+    };
+    if root_id == target_id {
+        return true;
+    }
+
+    graph.with_adjacency(|follows, _followers| {
+        use std::collections::{HashSet, VecDeque};
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+        visited.insert(root_id);
+        queue.push_back((root_id, 0u8));
+
+        while let Some((node, dist)) = queue.pop_front() {
+            if let Some(neighbors) = follows.get(node as usize) {
+                for &neighbor in neighbors {
+                    if neighbor == target_id {
+                        return true;
+                    }
+                    if dist + 1 < max_hops && visited.insert(neighbor) {
+                        queue.push_back((neighbor, dist + 1));
+                    }
+                }
+            }
+        }
+        false
+    })
+}
+
 fn queue_profile_media(
     db: &Database,
     pubkey: &str,

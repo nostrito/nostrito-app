@@ -3528,7 +3528,7 @@ fn nsec_to_npub(nsec: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn set_nsec(nsec: String, state: State<'_, AppState>) -> Result<(), String> {
+async fn set_nsec(nsec: String, app_handle: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     use nostr_sdk::prelude::*;
 
     let nsec_trimmed = nsec.trim();
@@ -3560,12 +3560,13 @@ async fn set_nsec(nsec: String, state: State<'_, AppState>) -> Result<(), String
         config.nsec = Some(nsec_trimmed.to_string());
     }
 
+    app_handle.emit("signing-mode-changed", "nsec").ok();
     tracing::info!("[cmd:set_nsec] nsec saved for {}...", &current_hex[..8]);
     Ok(())
 }
 
 #[tauri::command]
-async fn clear_nsec(state: State<'_, AppState>) -> Result<(), String> {
+async fn clear_nsec(app_handle: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let config = state.config.read().await;
     if let Some(ref npub) = config.npub {
         delete_nsec_from_keychain(npub);
@@ -3577,6 +3578,7 @@ async fn clear_nsec(state: State<'_, AppState>) -> Result<(), String> {
         config.nsec = None;
     }
 
+    app_handle.emit("signing-mode-changed", "read-only").ok();
     tracing::info!("[cmd:clear_nsec] nsec cleared");
     Ok(())
 }
@@ -3856,6 +3858,364 @@ async fn wallet_list_transactions(
 #[tauri::command]
 fn wallet_decode_bolt11(invoice: String) -> Result<wallet::DecodedInvoice, String> {
     wallet::bolt11::decode(&invoice)
+}
+
+#[tauri::command]
+async fn wallet_provision(state: State<'_, AppState>) -> Result<wallet::WalletInfo, String> {
+    let config = state.config.read().await;
+    let nsec = config.nsec.clone().ok_or("No nsec available — read-only mode")?;
+    let hex_pubkey = config.hex_pubkey.clone().ok_or("No pubkey set")?;
+    let npub = config.npub.clone().ok_or("No npub set")?;
+    drop(config);
+
+    // Auto-provision wallet
+    let (admin_key, _wallet_id, instance_url) =
+        wallet::provision::provision_wallet(None, &nsec, &hex_pubkey).await?;
+
+    // Connect using the same flow as wallet_connect_lnbits
+    let (alias, _balance) = wallet::lnbits::get_info(&instance_url, &admin_key).await?;
+
+    // Save to keychain
+    let data = serde_json::json!({
+        "type": "lnbits",
+        "url": instance_url,
+        "admin_key": admin_key,
+    });
+    save_wallet_to_keychain(&npub, &data.to_string())?;
+
+    // Save wallet type to DB config
+    let db = state.db();
+    db.set_config("wallet_type", "lnbits")
+        .map_err(|e| format!("DB error: {}", e))?;
+    db.set_config("wallet_lnbits_url", &instance_url)
+        .map_err(|e| format!("DB error: {}", e))?;
+
+    // Store in app state
+    let mut wallet_guard = state.wallet.write().await;
+    *wallet_guard = Some(wallet::WalletState {
+        provider: wallet::WalletProvider::LNbits {
+            url: instance_url,
+            admin_key,
+        },
+        wallet_type: "lnbits".to_string(),
+        alias: Some(alias.clone()),
+    });
+
+    Ok(wallet::WalletInfo {
+        wallet_type: "lnbits".to_string(),
+        connected: true,
+        alias: Some(alias),
+    })
+}
+
+// ── Reaction / Author Articles / Profile Relay Fetch ─────────────
+
+#[tauri::command]
+async fn publish_reaction(
+    event_id: String,
+    event_pubkey: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    use nostr_sdk::prelude::*;
+
+    let config = state.config.read().await;
+    let nsec = config.nsec.clone().ok_or("nsec required to react")?;
+    let relays = config.outbound_relays.clone();
+    drop(config);
+
+    let secret_key = SecretKey::from_bech32(&nsec)
+        .map_err(|e| format!("Invalid nsec: {}", e))?;
+    let keys = Keys::new(secret_key);
+
+    let tags = vec![
+        Tag::parse(&["e", &event_id]).map_err(|e| format!("bad e-tag: {}", e))?,
+        Tag::parse(&["p", &event_pubkey]).map_err(|e| format!("bad p-tag: {}", e))?,
+    ];
+    let signed = EventBuilder::new(Kind::Reaction, "+", tags)
+        .to_event(&keys)
+        .map_err(|e| format!("Failed to sign reaction: {}", e))?;
+
+    let reaction_id = signed.id.to_hex();
+
+    // Publish to outbound relays
+    let client = Client::default();
+    for url in &relays {
+        if let Ok(_) = client.add_relay(url.as_str()).await {
+            client.connect_relay(url.as_str()).await.ok();
+        }
+    }
+    client.send_event(signed.clone()).await
+        .map_err(|e| format!("Failed to publish reaction: {}", e))?;
+    client.disconnect().await.ok();
+
+    // Save locally so counts update immediately
+    let tags_json = serde_json::to_string(
+        &signed.tags.iter()
+            .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect::<Vec<String>>())
+            .collect::<Vec<Vec<String>>>()
+    ).unwrap_or_else(|_| "[]".to_string());
+
+    state.db().store_event(
+        &reaction_id,
+        &signed.pubkey.to_hex(),
+        signed.created_at.as_u64() as i64,
+        signed.kind.as_u16() as u32,
+        &tags_json,
+        &signed.content.to_string(),
+        &signed.sig.to_string(),
+    ).ok();
+
+    tracing::info!("[cmd:publish_reaction] published reaction {} for event {}", &reaction_id[..12.min(reaction_id.len())], &event_id[..12.min(event_id.len())]);
+    Ok(reaction_id)
+}
+
+#[tauri::command]
+async fn get_author_articles(
+    pubkey: String,
+    exclude_event_id: Option<String>,
+    limit: Option<u32>,
+    state: State<'_, AppState>,
+) -> Result<Vec<NostrEvent>, String> {
+    let db = state.db();
+    let kinds = [30023u32];
+    let authors = [pubkey.clone()];
+    let rows = db.query_events(None, Some(&authors), Some(&kinds), None, None, limit.unwrap_or(10))
+        .map_err(|e| format!("Failed to query articles: {}", e))?;
+
+    // Deduplicate by d-tag (keep newest)
+    let mut best: std::collections::HashMap<String, NostrEvent> = std::collections::HashMap::new();
+    for row in rows {
+        let tags: Vec<Vec<String>> = serde_json::from_str(&row.4).unwrap_or_default();
+        let d_tag = tags.iter()
+            .find(|t| t.len() >= 2 && t[0] == "d")
+            .map(|t| t[1].clone())
+            .unwrap_or_default();
+        let key = format!("{}:{}", pubkey, d_tag);
+        let ev = NostrEvent {
+            id: row.0,
+            pubkey: row.1,
+            created_at: row.2 as u64,
+            kind: row.3 as u32,
+            tags,
+            content: row.5,
+            sig: row.6,
+        };
+
+        // Skip excluded event
+        if let Some(ref excl) = exclude_event_id {
+            if &ev.id == excl { continue; }
+        }
+
+        let existing = best.get(&key);
+        if existing.is_none() || ev.created_at > existing.unwrap().created_at {
+            best.insert(key, ev);
+        }
+    }
+
+    let mut articles: Vec<NostrEvent> = best.into_values().collect();
+    articles.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    articles.truncate(limit.unwrap_or(10) as usize);
+    Ok(articles)
+}
+
+#[tauri::command]
+async fn fetch_profiles_from_relay(
+    pubkeys: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<ProfileInfo>, String> {
+    use nostr_sdk::prelude::*;
+
+    if pubkeys.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Filter to only pubkeys NOT already in DB (or with empty profiles)
+    let db = state.db();
+    let existing = db.get_profiles(&pubkeys).map_err(|e| e.to_string())?;
+    let existing_with_data: std::collections::HashSet<String> = existing.iter()
+        .filter(|p| p.name.is_some() || p.display_name.is_some() || p.picture.is_some())
+        .map(|p| p.pubkey.clone())
+        .collect();
+
+    let missing: Vec<String> = pubkeys.into_iter()
+        .filter(|pk| !existing_with_data.contains(pk))
+        .collect();
+
+    if missing.is_empty() {
+        return Ok(vec![]);
+    }
+
+    tracing::info!("[cmd:fetch_profiles_from_relay] fetching {} missing profiles from relays", missing.len());
+
+    let config = state.config.read().await;
+    let mut relay_urls = config.outbound_relays.clone();
+    drop(config);
+
+    // Add purplepag.es as a primary source for profile metadata
+    let purplepages = "wss://purplepag.es".to_string();
+    if !relay_urls.contains(&purplepages) {
+        relay_urls.insert(0, purplepages);
+    }
+
+    let authors: Vec<PublicKey> = missing.iter()
+        .filter_map(|pk| PublicKey::from_hex(pk).ok())
+        .collect();
+
+    if authors.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let filter = Filter::new()
+        .kinds(vec![Kind::Metadata])
+        .authors(authors);
+
+    let client = Client::default();
+    for url in &relay_urls[..relay_urls.len().min(3)] {
+        if let Ok(_) = client.add_relay(url.as_str()).await {
+            client.connect_relay(url.as_str()).await.ok();
+        }
+    }
+
+    let mut notifications = client.notifications();
+    let sub_id = match client.subscribe(vec![filter], None).await {
+        Ok(output) => output.val,
+        Err(e) => {
+            client.disconnect().await.ok();
+            return Err(format!("Subscribe failed: {}", e));
+        }
+    };
+
+    let mut fetched_events: Vec<Event> = Vec::new();
+    let deadline = tokio::time::sleep(std::time::Duration::from_secs(10));
+    tokio::pin!(deadline);
+
+    loop {
+        tokio::select! {
+            result = notifications.recv() => {
+                match result {
+                    Ok(RelayPoolNotification::Event { event, .. }) => {
+                        if event.kind == Kind::Metadata {
+                            fetched_events.push(*event);
+                        }
+                    }
+                    Ok(RelayPoolNotification::Message { message, .. }) => {
+                        if matches!(&message, RelayMessage::EndOfStoredEvents(_)) {
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            _ = &mut deadline => break,
+        }
+    }
+
+    client.unsubscribe(sub_id).await;
+    client.disconnect().await.ok();
+
+    // Store fetched metadata events
+    for event in &fetched_events {
+        let tags_json = serde_json::to_string(
+            &event.tags.iter()
+                .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect::<Vec<String>>())
+                .collect::<Vec<Vec<String>>>()
+        ).unwrap_or_else(|_| "[]".to_string());
+
+        db.store_event(
+            &event.id.to_hex(),
+            &event.pubkey.to_hex(),
+            event.created_at.as_u64() as i64,
+            event.kind.as_u16() as u32,
+            &tags_json,
+            &event.content.to_string(),
+            &event.sig.to_string(),
+        ).ok();
+    }
+
+    // Return newly cached profiles
+    let fetched_pks: Vec<String> = fetched_events.iter().map(|e| e.pubkey.to_hex()).collect();
+    if fetched_pks.is_empty() {
+        return Ok(vec![]);
+    }
+    db.get_profiles(&fetched_pks).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn send_zap(
+    recipient_pubkey: String,
+    event_id: String,
+    lud16: String,
+    amount_sats: u64,
+    comment: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let config = state.config.read().await;
+    let nsec = config.nsec.clone().ok_or("No nsec available — read-only mode")?;
+    let relays = config.outbound_relays.clone();
+    drop(config);
+
+    // Resolve LNURL
+    let params = wallet::zap::resolve_lnurl(&lud16).await?;
+
+    let amount_msats = amount_sats * 1000;
+    if amount_msats < params.min_sendable {
+        return Err(format!("Amount too low (min {} sats)", params.min_sendable / 1000));
+    }
+    if amount_msats > params.max_sendable {
+        return Err(format!("Amount too high (max {} sats)", params.max_sendable / 1000));
+    }
+
+    // Build zap request (kind:9734) if recipient supports nostr zaps
+    let zap_request_json = if params.allows_nostr {
+        Some(wallet::zap::build_zap_request(
+            &nsec,
+            &recipient_pubkey,
+            &event_id,
+            amount_msats,
+            comment.as_deref().unwrap_or(""),
+            &relays,
+        )?)
+    } else {
+        None
+    };
+
+    // Fetch invoice from LNURL callback
+    let bolt11 = if let Some(ref zap_json) = zap_request_json {
+        wallet::zap::fetch_zap_invoice(&params.callback, amount_msats, zap_json).await?
+    } else {
+        // No nostr zap support — just get a regular invoice
+        let separator = if params.callback.contains('?') { "&" } else { "?" };
+        let url = format!("{}{}amount={}", params.callback, separator, amount_msats);
+        let resp = reqwest::Client::new()
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("LNURL callback failed: {}", e))?;
+        let data: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("LNURL callback parse error: {}", e))?;
+        data["pr"]
+            .as_str()
+            .ok_or("No invoice in LNURL callback response")?
+            .to_string()
+    };
+
+    // Pay the invoice via connected wallet
+    let wallet_guard = state.wallet.read().await;
+    let ws = wallet_guard.as_ref().ok_or("No wallet connected")?;
+
+    let preimage = match &ws.provider {
+        wallet::WalletProvider::LNbits { url, admin_key } => {
+            wallet::lnbits::pay_invoice(url, admin_key, &bolt11).await?
+        }
+        wallet::WalletProvider::Nwc { client } => {
+            wallet::nwc_provider::pay_invoice(client, &bolt11).await?
+        }
+    };
+
+    Ok(serde_json::json!({ "preimage": preimage }))
 }
 
 // ── App Entry ──────────────────────────────────────────────────────
@@ -4339,6 +4699,11 @@ pub fn run() {
             wallet_make_invoice,
             wallet_list_transactions,
             wallet_decode_bolt11,
+            wallet_provision,
+            send_zap,
+            publish_reaction,
+            get_author_articles,
+            fetch_profiles_from_relay,
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|e| {

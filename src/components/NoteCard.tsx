@@ -1,7 +1,7 @@
 /** Shared note/repost card used in Feed and ProfileView */
 import React, { useMemo, useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { IconMessageCircle, IconRepeat, IconZap, IconBookmark } from "./Icon";
+import { IconMessageCircle, IconRepeat, IconZap, IconBookmark, IconHeart } from "./Icon";
 import { Avatar } from "./Avatar";
 import { timeAgo } from "../utils/format";
 import { kindLabel } from "../utils/ui";
@@ -9,6 +9,7 @@ import { renderMediaHtml, stripMediaUrls, type MediaContext } from "../utils/med
 import { profileDisplayName, type ProfileInfo } from "../utils/profiles";
 import { extractMentionedPubkeys, replaceMentions, normalizeBareEntities } from "../utils/mentions";
 import { useProfileContext } from "../context/ProfileContext";
+import { useCanWrite } from "../context/SigningContext";
 import { useInteractionCounts } from "../hooks/useInteractionCounts";
 import type { NostrEvent } from "../types/nostr";
 
@@ -162,6 +163,8 @@ interface NoteCardProps {
   onSave?: (event: NostrEvent) => void;
   saved?: boolean;
   onClick?: () => void;
+  onZap?: (event: NostrEvent) => void;
+  onLike?: (event: NostrEvent) => void;
 }
 
 /** Grouped repost: multiple people reposted the same original note */
@@ -285,8 +288,12 @@ const NoteCardInner: React.FC<{
   full?: boolean;
   onSave?: (event: NostrEvent) => void;
   saved?: boolean;
-}> = ({ event, profile, compact, full, onSave, saved }) => {
+  onLike?: (event: NostrEvent) => void;
+  onZap?: (event: NostrEvent) => void;
+}> = ({ event, profile, compact, full, onSave, saved, onLike, onZap }) => {
   const { ensureProfiles, getProfile } = useProfileContext();
+  const counts = useInteractionCounts(event.id);
+  const canWrite = useCanWrite();
   const displayName = profileDisplayName(profile, event.pubkey);
 
   const mentionedPubkeys = useMemo(() => {
@@ -321,9 +328,10 @@ const NoteCardInner: React.FC<{
         )}
         {!compact && (
           <div className="ev-actions">
-            <button className="ev-action"><span className="icon"><IconMessageCircle /></span> 0</button>
-            <button className="ev-action"><span className="icon"><IconRepeat /></span> {0}</button>
-            <button className="ev-action"><span className="icon"><IconZap /></span> 0</button>
+            <button className="ev-action"><span className="icon"><IconMessageCircle /></span>{counts?.replies ? ` ${counts.replies}` : ""}</button>
+            <button className="ev-action"><span className="icon"><IconRepeat /></span>{counts?.reposts ? ` ${counts.reposts}` : ""}</button>
+            <button className={`ev-action${counts?.reactions ? " ev-action-liked" : ""}${!canWrite ? " ev-action-disabled" : ""}`} onClick={canWrite ? (e) => { e.stopPropagation(); onLike?.(event); } : undefined} title={!canWrite ? "Add nsec in settings to react" : undefined}><span className="icon"><IconHeart /></span>{counts?.reactions ? ` ${counts.reactions}` : ""}</button>
+            <button className={`ev-action${!canWrite ? " ev-action-disabled" : ""}`} onClick={canWrite ? (e) => { e.stopPropagation(); onZap?.(event); } : undefined} title={!canWrite ? "Add nsec in settings to zap" : undefined}><span className="icon"><IconZap /></span>{counts?.zaps ? ` ${counts.zaps}` : ""}</button>
             {onSave && (
               <button
                 className={`ev-action${saved ? " ev-action-saved" : ""}`}
@@ -340,11 +348,12 @@ const NoteCardInner: React.FC<{
   );
 };
 
-export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, full, onSave, saved, onClick }) => {
+export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, full, onSave, saved, onClick, onZap, onLike }) => {
   const k = kindLabel(event.kind);
   const displayName = profileDisplayName(profile, event.pubkey);
   const { ensureProfiles, getProfile } = useProfileContext();
   const counts = useInteractionCounts(event.id);
+  const canWrite = useCanWrite();
 
   // Extract and ensure profiles for mentioned pubkeys (+ original author for reposts)
   const mentionedPubkeys = useMemo(() => {
@@ -407,9 +416,10 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, ful
             )}
             {!compact && (
               <div className="ev-actions">
-                <button className="ev-action"><span className="icon"><IconMessageCircle /></span> 0</button>
-                <button className="ev-action"><span className="icon"><IconRepeat /></span> 0</button>
-                <button className="ev-action"><span className="icon"><IconZap /></span> 0</button>
+                <button className="ev-action"><span className="icon"><IconMessageCircle /></span>{counts?.replies ? ` ${counts.replies}` : ""}</button>
+                <button className="ev-action"><span className="icon"><IconRepeat /></span>{counts?.reposts ? ` ${counts.reposts}` : ""}</button>
+                <button className={`ev-action${counts?.reactions ? " ev-action-liked" : ""}${!canWrite ? " ev-action-disabled" : ""}`} onClick={canWrite ? (e) => { e.stopPropagation(); onLike?.(event); } : undefined} title={!canWrite ? "Add nsec in settings to react" : undefined}><span className="icon"><IconHeart /></span>{counts?.reactions ? ` ${counts.reactions}` : ""}</button>
+                <button className={`ev-action${!canWrite ? " ev-action-disabled" : ""}`} onClick={canWrite ? (e) => { e.stopPropagation(); onZap?.(event); } : undefined} title={!canWrite ? "Add nsec in settings to zap" : undefined}><span className="icon"><IconZap /></span>{counts?.zaps ? ` ${counts.zaps}` : ""}</button>
                 {onSave && (
                   <button
                     className={`ev-action${saved ? " ev-action-saved" : ""}`}
@@ -460,7 +470,8 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, ful
           <div className="ev-actions">
             <button className="ev-action"><span className="icon"><IconMessageCircle /></span>{counts?.replies ? ` ${counts.replies}` : ""}</button>
             <button className="ev-action"><span className="icon"><IconRepeat /></span>{counts?.reposts ? ` ${counts.reposts}` : ""}</button>
-            <button className="ev-action"><span className="icon"><IconZap /></span>{counts?.zaps ? ` ${counts.zaps}` : ""}</button>
+            <button className={`ev-action${counts?.reactions ? " ev-action-liked" : ""}${!canWrite ? " ev-action-disabled" : ""}`} onClick={canWrite ? (e) => { e.stopPropagation(); onLike?.(event); } : undefined} title={!canWrite ? "Add nsec in settings to react" : undefined}><span className="icon"><IconHeart /></span>{counts?.reactions ? ` ${counts.reactions}` : ""}</button>
+            <button className={`ev-action${!canWrite ? " ev-action-disabled" : ""}`} onClick={canWrite ? (e) => { e.stopPropagation(); onZap?.(event); } : undefined} title={!canWrite ? "Add nsec in settings to zap" : undefined}><span className="icon"><IconZap /></span>{counts?.zaps ? ` ${counts.zaps}` : ""}</button>
             {onSave && (
               <button
                 className={`ev-action${saved ? " ev-action-saved" : ""}`}
