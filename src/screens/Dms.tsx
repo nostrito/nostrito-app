@@ -28,7 +28,7 @@ export const Dms: React.FC = () => {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [ownPubkey, setOwnPubkey] = useState("");
   const [selectedPartner, setSelectedPartner] = useState<string | null>(null);
-  const [signingMode, setSigningMode] = useState<"nsec" | "read-only">("read-only");
+  const [signingMode, setSigningMode] = useState<"nsec" | "bunker" | "connect" | "read-only">("read-only");
   const [displayCount, setDisplayCount] = useState(30);
 
   // Cache for decrypted message content: eventId -> plaintext
@@ -62,7 +62,7 @@ export const Dms: React.FC = () => {
       let mode: string = "read-only";
       try {
         mode = await invoke<string>("get_signing_mode");
-        setSigningMode(mode as "nsec" | "read-only");
+        setSigningMode(mode as "nsec" | "bunker" | "connect" | "read-only");
       } catch {
         setSigningMode("read-only");
       }
@@ -129,7 +129,7 @@ export const Dms: React.FC = () => {
       setLoading(false);
 
       // Decrypt last message of each conversation for sidebar preview
-      if (mode === "nsec") {
+      if (mode !== "read-only") {
         decryptPreviews(sorted, pk);
       }
     } catch (e) {
@@ -197,7 +197,7 @@ export const Dms: React.FC = () => {
 
   // Trigger decryption when selecting a conversation with nsec
   useEffect(() => {
-    if (!selectedPartner || signingMode !== "nsec") return;
+    if (!selectedPartner || signingMode === "read-only") return;
 
     const conv = conversations.find((c) => c.partnerPubkey === selectedPartner);
     if (!conv) return;
@@ -288,7 +288,7 @@ export const Dms: React.FC = () => {
 
   // Truncate preview text
   function previewText(conv: Conversation): React.ReactNode {
-    if (signingMode !== "nsec") {
+    if (signingMode === "read-only") {
       return <><span className="icon"><IconLock /></span> encrypted</>;
     }
     const lastMsg = conv.messages[0];
@@ -305,7 +305,7 @@ export const Dms: React.FC = () => {
     if (!selectedConv) {
       if (emptyReason === "no-dms" || conversations.length === 0) {
         // No DMs at all
-        if (signingMode === "nsec") {
+        if (signingMode !== "read-only") {
           return (
             <div className="dms-empty-panel">
               <span className="icon dms-empty-icon"><IconMessageCircle /></span>
@@ -318,14 +318,14 @@ export const Dms: React.FC = () => {
           <div className="dms-empty-panel">
             <span className="icon dms-empty-icon"><IconLock /></span>
             <div className="dms-empty-title">enable write mode to send messages</div>
-            <div className="dms-empty-hint">add your nsec in settings to decrypt and read your messages.</div>
+            <div className="dms-empty-hint">connect a signer in settings to decrypt and read your messages.</div>
             <button className="dms-empty-cta" onClick={() => navigate("/settings")}>go to settings</button>
           </div>
         );
       }
 
       // Has conversations, none selected
-      if (signingMode === "nsec") {
+      if (signingMode !== "read-only") {
         return (
           <div className="dms-empty-panel">
             <span className="icon dms-empty-icon"><IconMessageCircle /></span>
@@ -338,7 +338,7 @@ export const Dms: React.FC = () => {
         <div className="dms-empty-panel">
           <span className="icon dms-empty-icon"><IconLock /></span>
           <div className="dms-empty-title">read-only mode</div>
-          <div className="dms-empty-hint">add your nsec in settings to decrypt and send messages.</div>
+          <div className="dms-empty-hint">connect a signer in settings to decrypt and send messages.</div>
           <button className="dms-empty-cta" onClick={() => navigate("/settings")}>go to settings</button>
         </div>
       );
@@ -370,9 +370,9 @@ export const Dms: React.FC = () => {
           </div>
           <span className="dms-thread-count">{selectedConv.messages.length} msgs</span>
         </div>
-        {signingMode !== "nsec" && (
+        {signingMode === "read-only" && (
           <div className="dms-banner" style={{ margin: "0 16px 0" }}>
-            <span className="icon"><IconLock /></span> messages are encrypted. add your nsec in settings to decrypt.
+            <span className="icon"><IconLock /></span> messages are encrypted. connect a signer in settings to decrypt.
           </div>
         )}
         <div className="dms-thread-messages" ref={threadRef}>
@@ -399,7 +399,7 @@ export const Dms: React.FC = () => {
             })}
           </div>
         </div>
-        {signingMode === "nsec" ? (
+        {signingMode !== "read-only" ? (
           <div className="dms-input-bar">
             <input type="text" placeholder="coming soon..." disabled />
             <button disabled>send</button>
@@ -407,7 +407,7 @@ export const Dms: React.FC = () => {
         ) : (
           <div className="dms-input-readonly">
             <span className="icon"><IconLock /></span>
-            add your nsec in{" "}
+            connect a signer in{" "}
             <span className="dms-settings-link" onClick={() => navigate("/settings")}>settings</span>
             {" "}to send messages
           </div>
