@@ -1,9 +1,11 @@
 import React, { useState, useRef, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
+import { QRCodeSVG } from "qrcode.react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   IconCheck,
+  IconCheckCircle,
   IconBookOpen,
   IconKey,
   IconCastle,
@@ -97,6 +99,19 @@ export const Wizard: React.FC = () => {
   const [wotMediaGb, setWotMediaGb] = useState(2);
   const [mediaTypes, setMediaTypes] = useState<MediaTypes>({ images: true, videos: true, audio: true });
 
+  // NIP-46 bunker state
+  const [bunkerUri, setBunkerUri] = useState("");
+  const [bunkerError, setBunkerError] = useState("");
+  const [bunkerConnecting, setBunkerConnecting] = useState(false);
+  const [bunkerConnected, setBunkerConnected] = useState(false);
+
+  // NIP-46 Nostr Connect state
+  const [connectRelay, setConnectRelay] = useState("wss://relay.nsec.app");
+  const [connectUri, setConnectUri] = useState("");
+  const [connectWaiting, setConnectWaiting] = useState(false);
+  const [connectConnected, setConnectConnected] = useState(false);
+  const [connectError, setConnectError] = useState("");
+
   // Step 4 state (relay URL screen)
   const [relayPort, setRelayPort] = useState(4869);
   const [browserIntegration, setBrowserIntegration] = useState(false);
@@ -142,12 +157,59 @@ export const Wizard: React.FC = () => {
     setMediaTypes({ ...preset.mediaTypes });
   }, []);
 
+  /* --- NIP-46 handlers ---------------------------------------------- */
+  const handleConnectBunker = useCallback(async () => {
+    if (!bunkerUri.trim().startsWith("bunker://")) {
+      setBunkerError("URI must start with bunker://");
+      return;
+    }
+    setBunkerConnecting(true);
+    setBunkerError("");
+    try {
+      const derivedNpub = await invoke<string>("connect_bunker", { bunkerUri: bunkerUri.trim() });
+      setNpub(derivedNpub);
+      setBunkerConnected(true);
+    } catch (e: any) {
+      setBunkerError(String(e));
+    } finally {
+      setBunkerConnecting(false);
+    }
+  }, [bunkerUri]);
+
+  const handleGenerateConnectUri = useCallback(async () => {
+    setConnectError("");
+    try {
+      const result = await invoke<string>("generate_nostr_connect_uri", { relayUrl: connectRelay });
+      const parsed = JSON.parse(result);
+      setConnectUri(parsed.uri);
+
+      // Start waiting for remote signer connection
+      setConnectWaiting(true);
+      try {
+        const derivedNpub = await invoke<string>("await_nostr_connect", {
+          nostrConnectUri: parsed.uri,
+          appKeysNsec: parsed.app_keys_nsec,
+        });
+        setNpub(derivedNpub);
+        setConnectConnected(true);
+      } catch (e: any) {
+        setConnectError(`Connection failed: ${e}`);
+      } finally {
+        setConnectWaiting(false);
+      }
+    } catch (e: any) {
+      setConnectError(String(e));
+    }
+  }, [connectRelay]);
+
   /* --- navigation logic --------------------------------------------- */
   const canGoNext = (): boolean => {
     if (step === 1) {
       if (identityMode === "readonly") return isNpubValid(npub);
       if (identityMode === "full") {
         if (signerType === "nsec") return nsecInput.trim().startsWith("nsec1");
+        if (signerType === "bunker") return bunkerConnected;
+        if (signerType === "connect") return connectConnected;
         return signerType !== null;
       }
     }
@@ -388,6 +450,20 @@ export const Wizard: React.FC = () => {
                 signerType={signerType}
                 onSignerTypeChange={setSignerType}
                 npubInputRef={npubInputRef}
+                bunkerUri={bunkerUri}
+                onBunkerUriChange={(e) => { setBunkerUri(e.target.value); setBunkerError(""); }}
+                bunkerError={bunkerError}
+                bunkerConnecting={bunkerConnecting}
+                bunkerConnected={bunkerConnected}
+                onConnectBunker={handleConnectBunker}
+                connectRelay={connectRelay}
+                onConnectRelayChange={(e) => setConnectRelay(e.target.value)}
+                connectUri={connectUri}
+                connectWaiting={connectWaiting}
+                connectConnected={connectConnected}
+                connectError={connectError}
+                onGenerateConnectUri={handleGenerateConnectUri}
+                onCopyConnectUri={() => navigator.clipboard.writeText(connectUri)}
               />
             )}
             {step === 2 && (
@@ -454,6 +530,22 @@ interface StepIdentityProps {
   signerType: SignerType | null;
   onSignerTypeChange: (type: SignerType) => void;
   npubInputRef: React.RefObject<HTMLInputElement | null>;
+  // NIP-46 bunker
+  bunkerUri: string;
+  onBunkerUriChange: (e: React.ChangeEvent<HTMLInputElement>) => void;
+  bunkerError: string;
+  bunkerConnecting: boolean;
+  bunkerConnected: boolean;
+  onConnectBunker: () => void;
+  // NIP-46 Nostr Connect
+  connectRelay: string;
+  onConnectRelayChange: (e: React.ChangeEvent<HTMLInputElement>) => void;
+  connectUri: string;
+  connectWaiting: boolean;
+  connectConnected: boolean;
+  connectError: string;
+  onGenerateConnectUri: () => void;
+  onCopyConnectUri: () => void;
 }
 
 const StepIdentity: React.FC<StepIdentityProps> = ({
@@ -468,6 +560,20 @@ const StepIdentity: React.FC<StepIdentityProps> = ({
   signerType,
   onSignerTypeChange,
   npubInputRef,
+  bunkerUri,
+  onBunkerUriChange,
+  bunkerError,
+  bunkerConnecting,
+  bunkerConnected,
+  onConnectBunker,
+  connectRelay,
+  onConnectRelayChange,
+  connectUri,
+  connectWaiting,
+  connectConnected,
+  connectError,
+  onGenerateConnectUri,
+  onCopyConnectUri,
 }) => (
   <>
     <h3 className="wiz-title">your identity</h3>
@@ -541,6 +647,93 @@ const StepIdentity: React.FC<StepIdentityProps> = ({
               autoFocus
             />
             {nsecError && <p className="wiz-error">{nsecError}</p>}
+          </div>
+        )}
+        {signerType === "bunker" && (
+          <div style={{ marginTop: 8 }}>
+            <input
+              type="text"
+              className="wiz-input"
+              placeholder="bunker://..."
+              value={bunkerUri}
+              onChange={onBunkerUriChange}
+              spellCheck={false}
+              autoComplete="off"
+              autoFocus
+              disabled={bunkerConnecting || bunkerConnected}
+            />
+            {bunkerError && <p className="wiz-error">{bunkerError}</p>}
+            {bunkerConnected ? (
+              <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 8, color: "var(--accent)", fontSize: "0.82rem" }}>
+                <span className="icon"><IconCheckCircle /></span> Connected as {npub.slice(0, 20)}...
+              </div>
+            ) : (
+              <button
+                className={`btn btn-primary${bunkerConnecting || !bunkerUri.trim().startsWith("bunker://") ? " disabled" : ""}`}
+                disabled={bunkerConnecting || !bunkerUri.trim().startsWith("bunker://")}
+                onClick={onConnectBunker}
+                style={{ marginTop: 8 }}
+              >
+                {bunkerConnecting ? "Connecting..." : "Connect to Bunker"}
+              </button>
+            )}
+          </div>
+        )}
+        {signerType === "connect" && (
+          <div style={{ marginTop: 8 }}>
+            {!connectUri ? (
+              <>
+                <input
+                  type="text"
+                  className="wiz-input"
+                  placeholder="wss://relay.nsec.app"
+                  value={connectRelay}
+                  onChange={onConnectRelayChange}
+                  spellCheck={false}
+                  autoComplete="off"
+                  style={{ marginBottom: 8 }}
+                />
+                <button className="btn btn-primary" onClick={onGenerateConnectUri}>
+                  Generate Connect URI
+                </button>
+              </>
+            ) : connectConnected ? (
+              <div style={{ display: "flex", alignItems: "center", gap: 6, color: "var(--accent)", fontSize: "0.82rem" }}>
+                <span className="icon"><IconCheckCircle /></span> Connected as {npub.slice(0, 20)}...
+              </div>
+            ) : (
+              <div>
+                <p style={{ fontSize: "0.8rem", color: "var(--text-muted)", marginBottom: 12 }}>
+                  Scan with your signer app or copy the URI:
+                </p>
+                <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 12 }}>
+                  <div style={{
+                    padding: 12, background: "#fff", borderRadius: 12,
+                    display: "inline-flex",
+                  }}>
+                    <QRCodeSVG value={connectUri} size={180} level="M" />
+                  </div>
+                  <div style={{ display: "flex", gap: 8, alignItems: "center", width: "100%" }}>
+                    <code style={{
+                      fontSize: "0.68rem", flex: 1, overflow: "hidden", textOverflow: "ellipsis",
+                      whiteSpace: "nowrap", padding: "8px", background: "var(--bg-card)", borderRadius: 6,
+                      border: "1px solid var(--border)", color: "var(--text-dim)",
+                    }}>
+                      {connectUri}
+                    </code>
+                    <button className="btn btn-secondary" onClick={onCopyConnectUri} title="Copy" style={{ flexShrink: 0 }}>
+                      <span className="icon"><IconClipboard /></span>
+                    </button>
+                  </div>
+                </div>
+                {connectWaiting && (
+                  <p style={{ fontSize: "0.8rem", color: "var(--text-muted)", marginTop: 8, textAlign: "center" }}>
+                    Waiting for signer to connect...
+                  </p>
+                )}
+              </div>
+            )}
+            {connectError && <p className="wiz-error">{connectError}</p>}
           </div>
         )}
       </div>

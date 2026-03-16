@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { QRCodeSVG } from "qrcode.react";
 import { RELAYS, resolveRelayUrl, urlToAlias } from "../relays";
 import { getProfiles, profileDisplayName } from "../utils/profiles";
 import type { ProfileInfo } from "../utils/profiles";
@@ -293,6 +294,17 @@ export const Settings: React.FC = () => {
   const [nsecFeedback, setNsecFeedback] = useState<SaveFeedback | null>(null);
   const [signingMode, setSigningMode] = useState("read-only");
 
+  /* --- NIP-46 bunker / connect ------------------------------------- */
+  const [bunkerExpanded, setBunkerExpanded] = useState(false);
+  const [bunkerUri, setBunkerUri] = useState("");
+  const [bunkerConnecting, setBunkerConnecting] = useState(false);
+  const [bunkerFeedback, setBunkerFeedback] = useState<SaveFeedback | null>(null);
+  const [connectExpanded, setConnectExpanded] = useState(false);
+  const [connectRelay, setConnectRelay] = useState("wss://relay.nsec.app");
+  const [connectUri, setConnectUri] = useState("");
+  const [connectWaiting, setConnectWaiting] = useState(false);
+  const [connectFeedback, setConnectFeedback] = useState<SaveFeedback | null>(null);
+
   /* --- load settings on mount --------------------------------------- */
   useEffect(() => {
     loadSettings();
@@ -557,6 +569,61 @@ export const Settings: React.FC = () => {
     }
   }, []);
 
+  /* --- NIP-46 handlers ---------------------------------------------- */
+  const handleConnectBunkerSettings = useCallback(async () => {
+    if (!bunkerUri.trim().startsWith("bunker://")) return;
+    setBunkerConnecting(true);
+    setBunkerFeedback(null);
+    try {
+      await invoke<string>("connect_bunker", { bunkerUri: bunkerUri.trim() });
+      setSigningMode("bunker");
+      setBunkerExpanded(false);
+      setBunkerUri("");
+      setBunkerFeedback({ type: "success", message: "Connected to bunker" });
+    } catch (e: any) {
+      setBunkerFeedback({ type: "error", message: String(e) });
+    } finally {
+      setBunkerConnecting(false);
+    }
+  }, [bunkerUri]);
+
+  const handleGenerateConnectUriSettings = useCallback(async () => {
+    setConnectFeedback(null);
+    try {
+      const result = await invoke<string>("generate_nostr_connect_uri", { relayUrl: connectRelay });
+      const parsed = JSON.parse(result);
+      setConnectUri(parsed.uri);
+      setConnectWaiting(true);
+      try {
+        await invoke<string>("await_nostr_connect", {
+          nostrConnectUri: parsed.uri,
+          appKeysNsec: parsed.app_keys_nsec,
+        });
+        setSigningMode("connect");
+        setConnectExpanded(false);
+        setConnectUri("");
+        setConnectFeedback({ type: "success", message: "Connected via Nostr Connect" });
+      } catch (e: any) {
+        setConnectFeedback({ type: "error", message: `Connection failed: ${e}` });
+      } finally {
+        setConnectWaiting(false);
+      }
+    } catch (e: any) {
+      setConnectFeedback({ type: "error", message: String(e) });
+    }
+  }, [connectRelay]);
+
+  const handleDisconnectBunker = useCallback(async () => {
+    try {
+      await invoke("disconnect_bunker");
+      setSigningMode("read-only");
+      setBunkerFeedback({ type: "success", message: "Signer disconnected" });
+      setConnectFeedback(null);
+    } catch (e: any) {
+      setBunkerFeedback({ type: "error", message: String(e) });
+    }
+  }, []);
+
   const [changeAccountConfirm, setChangeAccountConfirm] = useState(false);
 
   const handleChangeAccount = useCallback(async () => {
@@ -811,6 +878,24 @@ export const Settings: React.FC = () => {
                   </button>
                 </div>
               </>
+            ) : signingMode === "bunker" || signingMode === "connect" ? (
+              <>
+                <div style={{ fontSize: "0.85rem", color: "var(--accent)", marginBottom: 2 }}>
+                  <span className="icon">
+                    {signingMode === "bunker" ? <IconCastle /> : <IconPlug />}
+                  </span>{" "}
+                  {signingMode === "bunker" ? "NBunker" : "Nostr Connect"} (full access)
+                </div>
+                <div style={{ fontSize: "0.75rem", color: "var(--text-muted)", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                  <span>remote signer connected</span>
+                  <button
+                    onClick={handleDisconnectBunker}
+                    style={{ background: "none", border: "none", color: "var(--danger)", cursor: "pointer", fontSize: "0.72rem", textDecoration: "underline" }}
+                  >
+                    disconnect
+                  </button>
+                </div>
+              </>
             ) : (
               <>
                 <div style={{ fontSize: "0.85rem", color: "var(--text-dim)", marginBottom: 2 }}>
@@ -915,14 +1000,15 @@ export const Settings: React.FC = () => {
               </div>
             )}
             <div
+              onClick={() => { setBunkerExpanded(!bunkerExpanded); setConnectExpanded(false); }}
               style={{
                 display: "flex",
                 alignItems: "center",
                 justifyContent: "space-between",
                 padding: "12px 16px",
                 background: "var(--bg)",
-                border: "1px solid var(--border)",
-                borderRadius: 10,
+                border: bunkerExpanded ? "1px solid var(--accent)" : "1px solid var(--border)",
+                borderRadius: bunkerExpanded ? "10px 10px 0 0" : 10,
                 cursor: "pointer",
                 transition: "border-color 0.2s",
               }}
@@ -935,15 +1021,69 @@ export const Settings: React.FC = () => {
               </span>
               <span style={{ fontSize: "0.72rem", color: "var(--text-muted)" }}>remote signer</span>
             </div>
+            {bunkerExpanded && (
+              <div
+                style={{
+                  padding: "12px 16px",
+                  background: "var(--bg)",
+                  border: "1px solid var(--accent)",
+                  borderTop: "none",
+                  borderRadius: "0 0 10px 10px",
+                  marginTop: -1,
+                }}
+              >
+                <input
+                  type="text"
+                  value={bunkerUri}
+                  onChange={(e) => setBunkerUri(e.target.value)}
+                  placeholder="bunker://..."
+                  style={{
+                    width: "100%",
+                    padding: "8px 12px",
+                    fontSize: "0.82rem",
+                    fontFamily: "monospace",
+                    background: "var(--bg-card)",
+                    border: "1px solid var(--border)",
+                    borderRadius: 6,
+                    color: "var(--text)",
+                    outline: "none",
+                    marginBottom: 8,
+                    boxSizing: "border-box",
+                  }}
+                />
+                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  <button
+                    className="btn btn-primary"
+                    onClick={(e) => { e.stopPropagation(); handleConnectBunkerSettings(); }}
+                    disabled={bunkerConnecting || !bunkerUri.trim().startsWith("bunker://")}
+                    style={{ fontSize: "0.8rem", padding: "6px 16px" }}
+                  >
+                    {bunkerConnecting ? "connecting..." : "connect"}
+                  </button>
+                  <button
+                    onClick={(e) => { e.stopPropagation(); setBunkerExpanded(false); setBunkerUri(""); setBunkerFeedback(null); }}
+                    style={{ background: "none", border: "none", color: "var(--text-muted)", cursor: "pointer", fontSize: "0.78rem" }}
+                  >
+                    cancel
+                  </button>
+                </div>
+                {bunkerFeedback && (
+                  <div style={{ marginTop: 8, fontSize: "0.78rem", color: bunkerFeedback.type === "success" ? "var(--accent)" : "var(--danger)" }}>
+                    {bunkerFeedback.message}
+                  </div>
+                )}
+              </div>
+            )}
             <div
+              onClick={() => { setConnectExpanded(!connectExpanded); setBunkerExpanded(false); }}
               style={{
                 display: "flex",
                 alignItems: "center",
                 justifyContent: "space-between",
                 padding: "12px 16px",
                 background: "var(--bg)",
-                border: "1px solid var(--border)",
-                borderRadius: 10,
+                border: connectExpanded ? "1px solid var(--accent)" : "1px solid var(--border)",
+                borderRadius: connectExpanded ? "10px 10px 0 0" : 10,
                 cursor: "pointer",
                 transition: "border-color 0.2s",
               }}
@@ -956,6 +1096,98 @@ export const Settings: React.FC = () => {
               </span>
               <span style={{ fontSize: "0.72rem", color: "var(--text-muted)" }}>NIP-46</span>
             </div>
+            {connectExpanded && (
+              <div
+                style={{
+                  padding: "12px 16px",
+                  background: "var(--bg)",
+                  border: "1px solid var(--accent)",
+                  borderTop: "none",
+                  borderRadius: "0 0 10px 10px",
+                  marginTop: -1,
+                }}
+              >
+                {!connectUri ? (
+                  <>
+                    <input
+                      type="text"
+                      value={connectRelay}
+                      onChange={(e) => setConnectRelay(e.target.value)}
+                      placeholder="wss://relay.nsec.app"
+                      style={{
+                        width: "100%",
+                        padding: "8px 12px",
+                        fontSize: "0.82rem",
+                        fontFamily: "monospace",
+                        background: "var(--bg-card)",
+                        border: "1px solid var(--border)",
+                        borderRadius: 6,
+                        color: "var(--text)",
+                        outline: "none",
+                        marginBottom: 8,
+                        boxSizing: "border-box",
+                      }}
+                    />
+                    <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                      <button
+                        className="btn btn-primary"
+                        onClick={(e) => { e.stopPropagation(); handleGenerateConnectUriSettings(); }}
+                        style={{ fontSize: "0.8rem", padding: "6px 16px" }}
+                      >
+                        generate URI
+                      </button>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); setConnectExpanded(false); setConnectFeedback(null); }}
+                        style={{ background: "none", border: "none", color: "var(--text-muted)", cursor: "pointer", fontSize: "0.78rem" }}
+                      >
+                        cancel
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <div>
+                    <p style={{ fontSize: "0.8rem", color: "var(--text-muted)", marginBottom: 10 }}>
+                      Scan with your signer app or copy the URI:
+                    </p>
+                    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 10 }}>
+                      <div style={{
+                        padding: 10, background: "#fff", borderRadius: 10,
+                        display: "inline-flex",
+                      }}>
+                        <QRCodeSVG value={connectUri} size={160} level="M" />
+                      </div>
+                      <div style={{ display: "flex", gap: 8, alignItems: "center", width: "100%" }}>
+                        <code style={{
+                          fontSize: "0.68rem", flex: 1, overflow: "hidden", textOverflow: "ellipsis",
+                          whiteSpace: "nowrap", padding: "8px", background: "var(--bg-card)", borderRadius: 6,
+                          border: "1px solid var(--border)", color: "var(--text-dim)",
+                        }}>
+                          {connectUri}
+                        </code>
+                        <button
+                          className="btn btn-secondary"
+                          onClick={(e) => { e.stopPropagation(); navigator.clipboard.writeText(connectUri); }}
+                          title="Copy"
+                          style={{ flexShrink: 0, fontSize: "0.78rem", padding: "6px 10px" }}
+                        >
+                          copy
+                        </button>
+                      </div>
+                    </div>
+                    {connectWaiting && (
+                      <p style={{ fontSize: "0.78rem", color: "var(--text-muted)", textAlign: "center" }}>
+                        Waiting for signer to connect...
+                      </p>
+                    )}
+                  </div>
+                )}
+                {connectFeedback && (
+                  <div style={{ marginTop: 8, fontSize: "0.78rem", color: connectFeedback.type === "success" ? "var(--accent)" : "var(--danger)" }}>
+                    {connectFeedback.message}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
 
           <div className="danger-zone">

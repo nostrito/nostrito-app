@@ -1,3 +1,4 @@
+mod nip46;
 mod relay;
 mod search;
 mod storage;
@@ -57,6 +58,7 @@ pub struct AppState {
     pub relay_cancel: Arc<RwLock<Option<CancellationToken>>>,
     pub start_time: std::time::Instant,
     pub wallet: wallet::SharedWalletState,
+    pub nip46_signer: Arc<RwLock<Option<crate::nip46::Nip46Client>>>,
 }
 
 impl AppState {
@@ -105,6 +107,8 @@ pub struct AppConfig {
     pub offline_mode: bool,
     /// Cached nsec (loaded from system keychain on startup)
     pub nsec: Option<String>,
+    /// Signing mode: "nsec", "bunker", "connect", or "read-only" (transient, not saved to DB)
+    pub signing_mode: String,
 }
 
 impl Default for AppConfig {
@@ -142,6 +146,7 @@ impl Default for AppConfig {
             sync_wot_notes_per_cycle: 50,
             offline_mode: false,
             nsec: None,
+            signing_mode: "read-only".to_string(),
         }
     }
 }
@@ -2274,11 +2279,22 @@ async fn change_account(
         cancel.cancel();
     }
 
-    // Clear nsec from keychain
+    // Clear nsec and bunker from keychain
     {
         let config = state.config.read().await;
         if let Some(ref npub) = config.npub {
             delete_nsec_from_keychain(npub);
+            delete_bunker_from_keychain(npub);
+        }
+    }
+
+    // Shutdown NIP-46 signer if active
+    {
+        let mut nip46 = state.nip46_signer.write().await;
+        if let Some(signer) = nip46.take() {
+            if let Err(e) = signer.shutdown().await {
+                tracing::warn!("[change_account] NIP-46 shutdown error: {}", e);
+            }
         }
     }
 
@@ -2308,6 +2324,7 @@ async fn change_account(
         config.npub = None;
         config.hex_pubkey = None;
         config.nsec = None;
+        config.signing_mode = "read-only".to_string();
     }
 
     // Emit event to frontend to show wizard
@@ -3518,6 +3535,39 @@ fn delete_nsec_from_keychain(npub: &str) {
     }
 }
 
+// ── NIP-46 Bunker Keychain Helpers ─────────────────────────────────
+
+fn save_bunker_to_keychain(npub: &str, bunker_uri: &str, app_keys_nsec: &str) -> Result<(), String> {
+    let uri_entry = keyring::Entry::new("nostrito-bunker-uri", npub)
+        .map_err(|e| format!("Keychain error: {}", e))?;
+    uri_entry.set_password(bunker_uri)
+        .map_err(|e| format!("Failed to save bunker URI to keychain: {}", e))?;
+
+    let keys_entry = keyring::Entry::new("nostrito-app-keys", npub)
+        .map_err(|e| format!("Keychain error: {}", e))?;
+    keys_entry.set_password(app_keys_nsec)
+        .map_err(|e| format!("Failed to save app keys to keychain: {}", e))?;
+
+    Ok(())
+}
+
+fn load_bunker_from_keychain(npub: &str) -> Option<(String, String)> {
+    let uri_entry = keyring::Entry::new("nostrito-bunker-uri", npub).ok()?;
+    let uri = uri_entry.get_password().ok()?;
+    let keys_entry = keyring::Entry::new("nostrito-app-keys", npub).ok()?;
+    let keys_nsec = keys_entry.get_password().ok()?;
+    Some((uri, keys_nsec))
+}
+
+fn delete_bunker_from_keychain(npub: &str) {
+    if let Ok(entry) = keyring::Entry::new("nostrito-bunker-uri", npub) {
+        entry.delete_credential().ok();
+    }
+    if let Ok(entry) = keyring::Entry::new("nostrito-app-keys", npub) {
+        entry.delete_credential().ok();
+    }
+}
+
 #[tauri::command]
 fn nsec_to_npub(nsec: String) -> Result<String, String> {
     use nostr_sdk::prelude::*;
@@ -3586,27 +3636,216 @@ async fn clear_nsec(app_handle: tauri::AppHandle, state: State<'_, AppState>) ->
 #[tauri::command]
 async fn get_signing_mode(state: State<'_, AppState>) -> Result<String, String> {
     let config = state.config.read().await;
-    Ok(if config.nsec.is_some() { "nsec".to_string() } else { "read-only".to_string() })
+    if config.nsec.is_some() {
+        return Ok("nsec".to_string());
+    }
+    let mode = config.signing_mode.clone();
+    drop(config);
+
+    if mode == "bunker" || mode == "connect" {
+        // Verify the signer is actually alive
+        let nip46 = state.nip46_signer.read().await;
+        if nip46.is_some() {
+            return Ok(mode);
+        }
+    }
+    Ok("read-only".to_string())
 }
 
 #[tauri::command]
 async fn decrypt_dm(content: String, sender_pubkey: String, state: State<'_, AppState>) -> Result<String, String> {
     use nostr_sdk::prelude::*;
 
-    let config = state.config.read().await;
-    let nsec_str = config.nsec.clone().ok_or("No nsec available — read-only mode")?;
-    drop(config);
-
-    let secret_key = SecretKey::from_bech32(&nsec_str)
-        .map_err(|e| format!("Invalid nsec: {}", e))?;
-
     let sender_pk = PublicKey::from_hex(&sender_pubkey)
         .map_err(|e| format!("Invalid sender pubkey: {}", e))?;
 
-    let decrypted = nip04::decrypt(&secret_key, &sender_pk, &content)
-        .map_err(|e| format!("Decryption failed: {}", e))?;
+    // Try local nsec first (fast path)
+    {
+        let config = state.config.read().await;
+        if let Some(ref nsec_str) = config.nsec {
+            let secret_key = SecretKey::from_bech32(nsec_str)
+                .map_err(|e| format!("Invalid nsec: {}", e))?;
+            let decrypted = nip04::decrypt(&secret_key, &sender_pk, &content)
+                .map_err(|e| format!("Decryption failed: {}", e))?;
+            return Ok(decrypted);
+        }
+    }
 
-    Ok(decrypted)
+    // Try NIP-46 remote signer (clone to release lock before await)
+    let signer_opt = {
+        let guard = state.nip46_signer.read().await;
+        guard.clone()
+    };
+    if let Some(signer) = signer_opt {
+        let decrypted = signer.nip04_decrypt(sender_pk, content)
+            .await
+            .map_err(|e| format!("Remote decryption failed: {}", e))?;
+        return Ok(decrypted);
+    }
+
+    Err("No signer available — read-only mode".into())
+}
+
+// ── NIP-46 Commands ────────────────────────────────────────────────
+
+#[tauri::command]
+async fn connect_bunker(
+    bunker_uri: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    use nostr_sdk::prelude::*;
+
+    tracing::info!("[cmd:connect_bunker] Parsing bunker URI...");
+
+    let uri = NostrConnectURI::parse(bunker_uri.trim())
+        .map_err(|e| format!("Invalid bunker URI: {}", e))?;
+
+    if !uri.is_bunker() {
+        return Err("Expected a bunker:// URI. For nostrconnect://, use the Nostr Connect flow.".into());
+    }
+
+    // Generate ephemeral app keys for NIP-46 communication
+    let app_keys = Keys::generate();
+    let app_keys_nsec = app_keys.secret_key().to_bech32()
+        .map_err(|e| format!("Failed to encode app keys: {}", e))?;
+
+    // Connect to bunker (sends connect request, waits for ack — up to 60s)
+    let signer = crate::nip46::Nip46Client::connect_bunker(&uri, app_keys, std::time::Duration::from_secs(60))
+        .await
+        .map_err(|e| format!("Bunker connection failed: {}", e))?;
+
+    // The signer_public_key IS the user's npub for bunker connections
+    let user_pk = signer.signer_public_key();
+    let npub = user_pk.to_bech32()
+        .map_err(|e| format!("Failed to encode npub: {}", e))?;
+
+    // Get bunker URI for reconnection (may differ from input if relays changed)
+    let reconnect_uri = signer.bunker_uri().await.to_string();
+
+    // Save to keychain for reconnection on restart
+    save_bunker_to_keychain(&npub, &reconnect_uri, &app_keys_nsec)?;
+
+    // Store signer in app state
+    {
+        let mut nip46 = state.nip46_signer.write().await;
+        *nip46 = Some(signer);
+    }
+
+    // Update config
+    {
+        let mut config = state.config.write().await;
+        config.signing_mode = "bunker".to_string();
+        // Clear nsec — bunker and nsec are mutually exclusive
+        config.nsec = None;
+    }
+
+    tracing::info!("[cmd:connect_bunker] Connected to bunker, npub={}", &npub[..npub.len().min(16)]);
+    Ok(npub)
+}
+
+#[tauri::command]
+async fn generate_nostr_connect_uri(
+    relay_url: String,
+) -> Result<String, String> {
+    use nostr_sdk::prelude::*;
+
+    let relay = nostr_sdk::prelude::Url::parse(&relay_url)
+        .map_err(|e| format!("Invalid relay URL: {}", e))?;
+
+    // Generate ephemeral app keys
+    let app_keys = Keys::generate();
+    let app_keys_nsec = app_keys.secret_key().to_bech32()
+        .map_err(|e| format!("Failed to encode app keys: {}", e))?;
+
+    let uri = NostrConnectURI::client(app_keys.public_key(), vec![relay], "Nostrito");
+    let uri_str = uri.to_string();
+
+    tracing::info!("[cmd:generate_nostr_connect_uri] Generated URI for relay {}", relay_url);
+
+    // Return both the URI and the app keys nsec (frontend needs both for the await step)
+    Ok(serde_json::json!({
+        "uri": uri_str,
+        "app_keys_nsec": app_keys_nsec
+    }).to_string())
+}
+
+#[tauri::command]
+async fn await_nostr_connect(
+    nostr_connect_uri: String,
+    app_keys_nsec: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    use nostr_sdk::prelude::*;
+
+    tracing::info!("[cmd:await_nostr_connect] Waiting for remote signer...");
+
+    let uri = NostrConnectURI::parse(&nostr_connect_uri)
+        .map_err(|e| format!("Invalid URI: {}", e))?;
+
+    let secret_key = SecretKey::from_bech32(&app_keys_nsec)
+        .map_err(|e| format!("Invalid app keys: {}", e))?;
+    let app_keys = Keys::new(secret_key);
+
+    // Connect via Nostr Connect (blocks until remote signer connects, up to 120s)
+    let signer = crate::nip46::Nip46Client::connect_nostrconnect(&uri, app_keys, std::time::Duration::from_secs(120))
+        .await
+        .map_err(|e| format!("Nostr Connect failed: {}", e))?;
+
+    let user_pk = signer.signer_public_key();
+    let npub = user_pk.to_bech32()
+        .map_err(|e| format!("Failed to encode npub: {}", e))?;
+
+    // Get bunker URI for reconnection
+    let reconnect_uri = signer.bunker_uri().await.to_string();
+
+    // Save to keychain
+    save_bunker_to_keychain(&npub, &reconnect_uri, &app_keys_nsec)?;
+
+    // Store signer
+    {
+        let mut nip46 = state.nip46_signer.write().await;
+        *nip46 = Some(signer);
+    }
+
+    // Update config
+    {
+        let mut config = state.config.write().await;
+        config.signing_mode = "connect".to_string();
+        config.nsec = None;
+    }
+
+    tracing::info!("[cmd:await_nostr_connect] Connected via Nostr Connect, npub={}", &npub[..npub.len().min(16)]);
+    Ok(npub)
+}
+
+#[tauri::command]
+async fn disconnect_bunker(state: State<'_, AppState>) -> Result<(), String> {
+    // Take signer from state and shut it down
+    {
+        let mut nip46 = state.nip46_signer.write().await;
+        if let Some(signer) = nip46.take() {
+            if let Err(e) = signer.shutdown().await {
+                tracing::warn!("[cmd:disconnect_bunker] Shutdown error (non-fatal): {}", e);
+            }
+        }
+    }
+
+    // Delete from keychain
+    {
+        let config = state.config.read().await;
+        if let Some(ref npub) = config.npub {
+            delete_bunker_from_keychain(npub);
+        }
+    }
+
+    // Update config
+    {
+        let mut config = state.config.write().await;
+        config.signing_mode = "read-only".to_string();
+    }
+
+    tracing::info!("[cmd:disconnect_bunker] Remote signer disconnected");
+    Ok(())
 }
 
 // ── Wallet Keychain Helpers ───────────────────────────────────────────
@@ -4380,6 +4619,7 @@ pub fn run() {
         if let Some(nsec) = load_nsec_from_keychain(npub) {
             tracing::info!("[init] Loaded nsec from keychain");
             config.nsec = Some(nsec);
+            config.signing_mode = "nsec".to_string();
         }
     }
 
@@ -4431,6 +4671,7 @@ pub fn run() {
         relay_cancel: Arc::new(RwLock::new(None)),
         start_time: std::time::Instant::now(),
         wallet: wallet::new_shared_wallet_state(),
+        nip46_signer: Arc::new(RwLock::new(None)),
     };
 
     // Install rustls ring crypto provider before any TLS code runs
@@ -4496,6 +4737,63 @@ pub fn run() {
                                     }
                                     _ => {}
                                 }
+                            }
+                        }
+                    }
+                });
+            }
+
+            // Reconnect NIP-46 bunker signer from keychain
+            {
+                let nip46_for_reconnect = state.nip46_signer.clone();
+                let config_for_reconnect = state.config.clone();
+
+                tauri::async_runtime::spawn(async move {
+                    let cfg = config_for_reconnect.read().await;
+                    if cfg.nsec.is_some() {
+                        return; // Using local nsec, no need for bunker
+                    }
+                    let npub = match cfg.npub.as_ref() {
+                        Some(n) => n.clone(),
+                        None => return,
+                    };
+                    drop(cfg);
+
+                    if let Some((bunker_uri_str, app_keys_nsec)) = load_bunker_from_keychain(&npub) {
+                        use nostr_sdk::prelude::*;
+                        tracing::info!("[init] Attempting NIP-46 bunker reconnection...");
+
+                        let parse_result = (|| -> Result<(NostrConnectURI, Keys), String> {
+                            let uri = NostrConnectURI::parse(&bunker_uri_str)
+                                .map_err(|e| format!("Invalid bunker URI: {}", e))?;
+                            let secret_key = SecretKey::from_bech32(&app_keys_nsec)
+                                .map_err(|e| format!("Invalid app keys: {}", e))?;
+                            Ok((uri, Keys::new(secret_key)))
+                        })();
+
+                        match parse_result {
+                            Ok((uri, app_keys)) => {
+                                // Reconnection always uses bunker:// flow (stored as bunker URI)
+                                match crate::nip46::Nip46Client::connect_bunker(&uri, app_keys, std::time::Duration::from_secs(30)).await {
+                                    Ok(signer) => {
+                                        let mode = if bunker_uri_str.starts_with("bunker://") { "bunker" } else { "connect" };
+                                        {
+                                            let mut nip46 = nip46_for_reconnect.write().await;
+                                            *nip46 = Some(signer);
+                                        }
+                                        {
+                                            let mut cfg = config_for_reconnect.write().await;
+                                            cfg.signing_mode = mode.to_string();
+                                        }
+                                        tracing::info!("[init] NIP-46 bunker reconnected (mode={})", mode);
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("[init] NIP-46 bunker reconnection failed: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("[init] Failed to parse stored bunker credentials: {}", e);
                             }
                         }
                     }
@@ -4689,6 +4987,10 @@ pub fn run() {
             clear_nsec,
             get_signing_mode,
             decrypt_dm,
+            connect_bunker,
+            generate_nostr_connect_uri,
+            await_nostr_connect,
+            disconnect_bunker,
             get_addressable_event,
             wallet_connect_lnbits,
             wallet_connect_nwc,
