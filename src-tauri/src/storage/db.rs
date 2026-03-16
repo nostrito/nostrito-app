@@ -867,6 +867,192 @@ impl Database {
         Ok(count as u64)
     }
 
+    /// NIP-45: Count events matching filters (same signature as query_events but returns count).
+    pub fn count_events(
+        &self,
+        ids: Option<&[String]>,
+        authors: Option<&[String]>,
+        kinds: Option<&[u32]>,
+        since: Option<u64>,
+        until: Option<u64>,
+    ) -> Result<u64> {
+        let conn = self.conn.lock();
+        let mut sql = String::from("SELECT COUNT(*) FROM nostr_events WHERE 1=1");
+        let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        if let Some(ids) = ids {
+            if !ids.is_empty() {
+                let placeholders: Vec<String> = ids.iter().enumerate().map(|(i, _)| format!("?{}", param_values.len() + i + 1)).collect();
+                sql.push_str(&format!(" AND id IN ({})", placeholders.join(",")));
+                for id in ids {
+                    param_values.push(Box::new(id.clone()));
+                }
+            }
+        }
+        if let Some(authors) = authors {
+            if !authors.is_empty() {
+                let placeholders: Vec<String> = (0..authors.len()).map(|i| format!("?{}", param_values.len() + i + 1)).collect();
+                sql.push_str(&format!(" AND pubkey IN ({})", placeholders.join(",")));
+                for a in authors {
+                    param_values.push(Box::new(a.clone()));
+                }
+            }
+        }
+        if let Some(kinds) = kinds {
+            if !kinds.is_empty() {
+                let placeholders: Vec<String> = (0..kinds.len()).map(|i| format!("?{}", param_values.len() + i + 1)).collect();
+                sql.push_str(&format!(" AND kind IN ({})", placeholders.join(",")));
+                for k in kinds {
+                    param_values.push(Box::new(*k as i64));
+                }
+            }
+        }
+        if let Some(since) = since {
+            let idx = param_values.len() + 1;
+            sql.push_str(&format!(" AND created_at >= ?{}", idx));
+            param_values.push(Box::new(since as i64));
+        }
+        if let Some(until) = until {
+            let idx = param_values.len() + 1;
+            sql.push_str(&format!(" AND created_at <= ?{}", idx));
+            param_values.push(Box::new(until as i64));
+        }
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> = param_values.iter().map(|p| p.as_ref()).collect();
+        let count: i64 = conn.prepare(&sql)?.query_row(params_refs.as_slice(), |row| row.get(0))?;
+        Ok(count as u64)
+    }
+
+    /// NIP-09: Delete events by IDs, only if they belong to the given pubkey.
+    pub fn delete_events_by_ids_and_pubkey(&self, ids: &[&str], pubkey: &str) -> Result<usize> {
+        let conn = self.conn.lock();
+        let mut deleted = 0;
+        for id in ids {
+            deleted += conn.execute(
+                "DELETE FROM nostr_events WHERE id = ?1 AND pubkey = ?2",
+                params![id, pubkey],
+            )?;
+        }
+        debug!("[db] delete_events: {} deleted for pubkey={}…", deleted, &pubkey[..pubkey.len().min(8)]);
+        Ok(deleted)
+    }
+
+    /// NIP-16: Store a replaceable event (kinds 0, 3, 10000-19999).
+    /// Replaces older event with same pubkey+kind.
+    pub fn store_replaceable_event(
+        &self,
+        id: &str,
+        pubkey: &str,
+        created_at: i64,
+        kind: u32,
+        tags_json: &str,
+        content: &str,
+        sig: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock();
+        let existing: Option<i64> = conn.query_row(
+            "SELECT created_at FROM nostr_events WHERE pubkey = ?1 AND kind = ?2",
+            params![pubkey, kind as i64],
+            |row| row.get(0),
+        ).ok();
+
+        if let Some(existing_ts) = existing {
+            if created_at <= existing_ts {
+                return Ok(false);
+            }
+            conn.execute(
+                "DELETE FROM nostr_events WHERE pubkey = ?1 AND kind = ?2",
+                params![pubkey, kind as i64],
+            )?;
+        }
+
+        let now = chrono::Utc::now().timestamp();
+        let result = conn.execute(
+            "INSERT OR IGNORE INTO nostr_events (id, pubkey, created_at, kind, tags, content, sig, stored_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![id, pubkey, created_at, kind as i64, tags_json, content, sig, now],
+        )?;
+        Ok(result > 0)
+    }
+
+    /// NIP-33: Store a parameterized replaceable event (kinds 30000-39999).
+    /// Replaces older event with same pubkey+kind+d-tag.
+    pub fn store_parameterized_replaceable_event(
+        &self,
+        id: &str,
+        pubkey: &str,
+        created_at: i64,
+        kind: u32,
+        tags_json: &str,
+        content: &str,
+        sig: &str,
+        d_tag: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock();
+        // Find existing events with same pubkey+kind, then check d-tag in memory
+        let mut stmt = conn.prepare(
+            "SELECT id, created_at, tags FROM nostr_events WHERE pubkey = ?1 AND kind = ?2",
+        )?;
+        let rows: Vec<(String, i64, String)> = stmt
+            .query_map(params![pubkey, kind as i64], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for (existing_id, existing_ts, existing_tags) in rows {
+            let parsed_tags: Vec<Vec<String>> = serde_json::from_str(&existing_tags).unwrap_or_default();
+            let existing_d = parsed_tags.iter()
+                .find(|t| t.len() >= 2 && t[0] == "d")
+                .map(|t| t[1].as_str())
+                .unwrap_or("");
+            if existing_d == d_tag {
+                if created_at <= existing_ts {
+                    return Ok(false);
+                }
+                conn.execute("DELETE FROM nostr_events WHERE id = ?1", params![existing_id])?;
+                break;
+            }
+        }
+
+        let now = chrono::Utc::now().timestamp();
+        let result = conn.execute(
+            "INSERT OR IGNORE INTO nostr_events (id, pubkey, created_at, kind, tags, content, sig, stored_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![id, pubkey, created_at, kind as i64, tags_json, content, sig, now],
+        )?;
+        Ok(result > 0)
+    }
+
+    /// NIP-40: Delete expired events.
+    pub fn delete_expired_events(&self) -> Result<usize> {
+        let conn = self.conn.lock();
+        let now = chrono::Utc::now().timestamp();
+        // Events with an expiration tag where the value is a past timestamp.
+        // Tags are stored as JSON arrays, so we look for ["expiration", "<timestamp>"].
+        let mut stmt = conn.prepare(
+            "SELECT id, tags FROM nostr_events",
+        )?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut deleted = 0;
+        for (id, tags_json) in rows {
+            let tags: Vec<Vec<String>> = serde_json::from_str(&tags_json).unwrap_or_default();
+            if let Some(exp_tag) = tags.iter().find(|t| t.len() >= 2 && t[0] == "expiration") {
+                if let Ok(exp_ts) = exp_tag[1].parse::<i64>() {
+                    if exp_ts <= now {
+                        deleted += conn.execute("DELETE FROM nostr_events WHERE id = ?1", params![id])?;
+                    }
+                }
+            }
+        }
+        if deleted > 0 {
+            debug!("[db] delete_expired_events: {} deleted", deleted);
+        }
+        Ok(deleted)
+    }
+
     /// Get database file size in bytes
     pub fn db_size_bytes(&self) -> Result<u64> {
         let conn = self.conn.lock();

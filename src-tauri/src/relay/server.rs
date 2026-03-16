@@ -16,7 +16,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
@@ -545,7 +545,7 @@ async fn write_nip11_response(
             "description": "Your personal Nostr relay. Running locally.",
             "pubkey": hex_pubkey,
             "contact": "",
-            "supported_nips": [1, 11],
+            "supported_nips": [1, 2, 9, 11, 16, 20, 33, 40, 45],
             "software": "nostrito",
             "version": "0.1.0"
         })
@@ -610,7 +610,14 @@ async fn write_nip11_response(
     <h2>Protocol</h2>
     <div class="nips">
       <span class="nip">NIP-01</span>
+      <span class="nip">NIP-02</span>
+      <span class="nip">NIP-09</span>
       <span class="nip">NIP-11</span>
+      <span class="nip">NIP-16</span>
+      <span class="nip">NIP-20</span>
+      <span class="nip">NIP-33</span>
+      <span class="nip">NIP-40</span>
+      <span class="nip">NIP-45</span>
     </div>
 
     <div class="cta">
@@ -662,6 +669,9 @@ async fn handle_connection(
 
     let subs_clone = subscriptions.clone();
 
+    // Channel to forward broadcast events back to the WebSocket sender
+    let (fwd_tx, mut fwd_rx) = mpsc::channel::<String>(256);
+
     // Task to forward broadcast events to matching subscriptions
     let forward_task = tokio::spawn(async move {
         loop {
@@ -671,9 +681,9 @@ async fn handle_connection(
                     for (sub_id, sub) in subs.iter() {
                         if sub.filters.iter().any(|f| f.matches_event(&event)) {
                             let msg = serde_json::json!(["EVENT", sub_id, event.to_json()]);
-                            // We can't send from here directly since ws_tx is in the other task.
-                            // For simplicity, we'll skip real-time broadcast for now and rely on REQ.
-                            let _ = msg; // suppress warning
+                            if fwd_tx.send(msg.to_string()).await.is_err() {
+                                return;
+                            }
                         }
                     }
                 }
@@ -689,6 +699,11 @@ async fn handle_connection(
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
+            Some(fwd_msg) = fwd_rx.recv() => {
+                if ws_tx.send(Message::Text(fwd_msg.into())).await.is_err() {
+                    break;
+                }
+            }
             msg = ws_rx.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
@@ -757,11 +772,30 @@ async fn handle_message(
         "EVENT" => handle_event(arr, db, allowed_pubkey, broadcast_tx).await,
         "REQ" => handle_req(arr, db, subscriptions).await,
         "CLOSE" => handle_close(arr, subscriptions).await,
+        "COUNT" => handle_count(arr, db).await,
         _ => {
             warn!("[relay] Unknown message type: {}", msg_type);
             vec![serde_json::json!(["NOTICE", format!("unknown message type: {}", msg_type)]).to_string()]
         }
     }
+}
+
+/// Check if a kind is replaceable (NIP-16): 0, 3, or 10000-19999
+fn is_replaceable_kind(kind: u32) -> bool {
+    kind == 0 || kind == 3 || (10000..20000).contains(&kind)
+}
+
+/// Check if a kind is parameterized replaceable (NIP-33): 30000-39999
+fn is_parameterized_replaceable_kind(kind: u32) -> bool {
+    (30000..40000).contains(&kind)
+}
+
+/// Extract the "d" tag value from event tags (for NIP-33)
+fn get_d_tag(tags: &[Vec<String>]) -> String {
+    tags.iter()
+        .find(|t| t.len() >= 2 && t[0] == "d")
+        .map(|t| t[1].clone())
+        .unwrap_or_default()
 }
 
 async fn handle_event(
@@ -792,22 +826,104 @@ async fn handle_event(
         }
     }
 
-    // Store event
-    let event_id = event.id.clone();
-    match store_event(db, &event) {
-        Ok(true) => {
-            info!("[relay] EVENT stored: id={}…", &event_id[..std::cmp::min(12, event_id.len())]);
-            // Broadcast to subscribers
-            broadcast_tx.send(event).ok();
-            vec![serde_json::json!(["OK", event_id, true, ""]).to_string()]
+    // NIP-40: Reject events that are already expired
+    if let Some(exp_tag) = event.tags.iter().find(|t| t.len() >= 2 && t[0] == "expiration") {
+        if let Ok(exp_ts) = exp_tag[1].parse::<i64>() {
+            let now = chrono::Utc::now().timestamp();
+            if exp_ts <= now {
+                info!("[relay] EVENT rejected: already expired");
+                return vec![serde_json::json!(["OK", event.id, false, "invalid: event has expired"]).to_string()];
+            }
         }
-        Ok(false) => {
-            debug!("[relay] EVENT duplicate: id={}…", &event_id[..std::cmp::min(12, event_id.len())]);
-            vec![serde_json::json!(["OK", event_id, true, "duplicate: already have this event"]).to_string()]
+    }
+
+    // NIP-09: Handle deletion events (kind 5)
+    if event.kind == 5 {
+        let event_id = event.id.clone();
+        let ids_to_delete: Vec<&str> = event.tags.iter()
+            .filter(|t| t.len() >= 2 && t[0] == "e")
+            .map(|t| t[1].as_str())
+            .collect();
+
+        if !ids_to_delete.is_empty() {
+            match db.delete_events_by_ids_and_pubkey(&ids_to_delete, &event.pubkey) {
+                Ok(n) => info!("[relay] NIP-09: deleted {} events", n),
+                Err(e) => error!("[relay] NIP-09 delete error: {}", e),
+            }
         }
-        Err(e) => {
-            error!("[relay] EVENT store error: {}", e);
-            vec![serde_json::json!(["OK", event_id, false, format!("error: {}", e)]).to_string()]
+
+        // Store the deletion event itself
+        match store_event(db, &event) {
+            Ok(_) => {
+                broadcast_tx.send(event).ok();
+                vec![serde_json::json!(["OK", event_id, true, ""]).to_string()]
+            }
+            Err(e) => {
+                vec![serde_json::json!(["OK", event_id, false, format!("error: {}", e)]).to_string()]
+            }
+        }
+    } else if is_replaceable_kind(event.kind) {
+        // NIP-16: Replaceable events — keep only the latest per pubkey+kind
+        let event_id = event.id.clone();
+        let tags_json = serde_json::to_string(&event.tags).unwrap_or_default();
+        match db.store_replaceable_event(
+            &event.id, &event.pubkey, event.created_at as i64,
+            event.kind, &tags_json, &event.content, &event.sig,
+        ) {
+            Ok(true) => {
+                info!("[relay] EVENT stored (replaceable): id={}…", &event_id[..std::cmp::min(12, event_id.len())]);
+                broadcast_tx.send(event).ok();
+                vec![serde_json::json!(["OK", event_id, true, ""]).to_string()]
+            }
+            Ok(false) => {
+                debug!("[relay] EVENT replaced/duplicate: id={}…", &event_id[..std::cmp::min(12, event_id.len())]);
+                vec![serde_json::json!(["OK", event_id, true, "duplicate: have newer event"]).to_string()]
+            }
+            Err(e) => {
+                error!("[relay] EVENT store error: {}", e);
+                vec![serde_json::json!(["OK", event_id, false, format!("error: {}", e)]).to_string()]
+            }
+        }
+    } else if is_parameterized_replaceable_kind(event.kind) {
+        // NIP-33: Parameterized replaceable events — keep only the latest per pubkey+kind+d-tag
+        let event_id = event.id.clone();
+        let d_tag = get_d_tag(&event.tags);
+        let tags_json = serde_json::to_string(&event.tags).unwrap_or_default();
+        match db.store_parameterized_replaceable_event(
+            &event.id, &event.pubkey, event.created_at as i64,
+            event.kind, &tags_json, &event.content, &event.sig, &d_tag,
+        ) {
+            Ok(true) => {
+                info!("[relay] EVENT stored (param-replaceable d={}): id={}…", d_tag, &event_id[..std::cmp::min(12, event_id.len())]);
+                broadcast_tx.send(event).ok();
+                vec![serde_json::json!(["OK", event_id, true, ""]).to_string()]
+            }
+            Ok(false) => {
+                debug!("[relay] EVENT replaced/duplicate: id={}…", &event_id[..std::cmp::min(12, event_id.len())]);
+                vec![serde_json::json!(["OK", event_id, true, "duplicate: have newer event"]).to_string()]
+            }
+            Err(e) => {
+                error!("[relay] EVENT store error: {}", e);
+                vec![serde_json::json!(["OK", event_id, false, format!("error: {}", e)]).to_string()]
+            }
+        }
+    } else {
+        // Regular event storage
+        let event_id = event.id.clone();
+        match store_event(db, &event) {
+            Ok(true) => {
+                info!("[relay] EVENT stored: id={}…", &event_id[..std::cmp::min(12, event_id.len())]);
+                broadcast_tx.send(event).ok();
+                vec![serde_json::json!(["OK", event_id, true, ""]).to_string()]
+            }
+            Ok(false) => {
+                debug!("[relay] EVENT duplicate: id={}…", &event_id[..std::cmp::min(12, event_id.len())]);
+                vec![serde_json::json!(["OK", event_id, true, "duplicate: already have this event"]).to_string()]
+            }
+            Err(e) => {
+                error!("[relay] EVENT store error: {}", e);
+                vec![serde_json::json!(["OK", event_id, false, format!("error: {}", e)]).to_string()]
+            }
         }
     }
 }
@@ -879,6 +995,44 @@ async fn handle_close(
     }
 
     vec![]
+}
+
+/// NIP-45: Handle COUNT message
+async fn handle_count(
+    arr: &[Value],
+    db: &Database,
+) -> Vec<String> {
+    if arr.len() < 3 {
+        return vec![serde_json::json!(["NOTICE", "COUNT requires subscription_id and at least one filter"]).to_string()];
+    }
+
+    let sub_id = match arr[1].as_str() {
+        Some(s) => s.to_string(),
+        None => {
+            return vec![serde_json::json!(["NOTICE", "subscription_id must be a string"]).to_string()];
+        }
+    };
+
+    let mut total: u64 = 0;
+    for filter_val in &arr[2..] {
+        if let Some(f) = RelayFilter::from_json(filter_val) {
+            match db.count_events(
+                f.ids.as_deref(),
+                f.authors.as_deref(),
+                f.kinds.as_deref(),
+                f.since,
+                f.until,
+            ) {
+                Ok(count) => total += count,
+                Err(e) => {
+                    error!("[relay] COUNT query error: {}", e);
+                }
+            }
+        }
+    }
+
+    info!("[relay] COUNT: sub_id={}, count={}", sub_id, total);
+    vec![serde_json::json!(["COUNT", sub_id, {"count": total}]).to_string()]
 }
 
 fn parse_event(val: &Value) -> Option<StoredEvent> {
