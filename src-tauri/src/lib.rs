@@ -34,6 +34,121 @@ fn fatal_exit(msg: &str) -> ! {
     std::process::exit(1);
 }
 
+/// Spawn a background task that receives events from the relay and:
+/// 1. Broadcasts them to all configured outbound relays
+/// 2. Shows a native macOS notification (via tauri-plugin-notification)
+fn spawn_outbound_broadcaster(
+    config: Arc<RwLock<AppConfig>>,
+    app_handle: tauri::AppHandle,
+) -> relay::OutboundEventSender {
+    use tauri_plugin_notification::NotificationExt;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    tokio::spawn(async move {
+        while let Some(event_json) = rx.recv().await {
+            let config = config.read().await;
+            let relays = config.outbound_relays.clone();
+            drop(config);
+
+            if relays.is_empty() {
+                tracing::warn!("[outbound] No outbound relays configured, skipping broadcast");
+                continue;
+            }
+
+            // Parse event JSON for notification details
+            let event_value: serde_json::Value = match serde_json::from_str(&event_json) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!("[outbound] Failed to parse event JSON: {}", e);
+                    continue;
+                }
+            };
+
+            let kind = event_value["kind"].as_u64().unwrap_or(0);
+            let event_id = event_value["id"].as_str().unwrap_or("unknown");
+            let short_id = &event_id[..event_id.len().min(12)];
+
+            // Send native macOS notification via Tauri
+            {
+                let notif_body = match kind {
+                    1 => {
+                        let content = event_value["content"].as_str().unwrap_or("");
+                        let preview = if content.len() > 80 {
+                            format!("{}...", &content[..80])
+                        } else {
+                            content.to_string()
+                        };
+                        format!("New note: {}", preview)
+                    }
+                    0 => "Profile metadata updated".to_string(),
+                    3 => "Contact list updated".to_string(),
+                    5 => "Deletion event published".to_string(),
+                    7 => "Reaction published".to_string(),
+                    _ => format!("New event (kind {})", kind),
+                };
+                if let Err(e) = app_handle.notification()
+                    .builder()
+                    .title("Nostrito")
+                    .body(&notif_body)
+                    .show()
+                {
+                    tracing::warn!("[outbound] Failed to show notification: {}", e);
+                }
+            }
+
+            // Broadcast to all outbound relays
+            let relay_count = relays.len();
+            tracing::info!("[outbound] Broadcasting event {}… (kind {}) to {} relays", short_id, kind, relay_count);
+
+            let event_json_clone = event_json.clone();
+            tokio::spawn(async move {
+                use nostr_sdk::prelude::*;
+
+                let event = match Event::from_json(&event_json_clone) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        tracing::error!("[outbound] Failed to reconstruct nostr event: {}", e);
+                        return;
+                    }
+                };
+
+                let client = Client::default();
+                let mut connected = 0u32;
+                for url in &relays {
+                    if let Ok(_) = client.add_relay(url.as_str()).await {
+                        if client.connect_relay(url.as_str()).await.is_ok() {
+                            connected += 1;
+                        }
+                    }
+                }
+
+                if connected == 0 {
+                    tracing::warn!("[outbound] Could not connect to any outbound relay");
+                    return;
+                }
+
+                match client.send_event(event).await {
+                    Ok(output) => {
+                        tracing::info!(
+                            "[outbound] Event broadcast complete: sent to {} relay(s), failed on {}",
+                            output.success.len(),
+                            output.failed.len()
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!("[outbound] Failed to broadcast event: {}", e);
+                    }
+                }
+
+                client.disconnect().await.ok();
+            });
+        }
+    });
+
+    tx
+}
+
 /// Per-npub database path: `{data_dir}/{npub_prefix}.db`
 fn db_path_for_npub(data_dir: &std::path::Path, npub: &str) -> PathBuf {
     let short = if npub.len() > 16 { &npub[..16] } else { npub };
@@ -552,6 +667,7 @@ async fn init_nostrito(
         let db_relay = state.db();
         let relay_cancel = CancellationToken::new();
         let relay_cancel_clone = relay_cancel.clone();
+        let outbound_tx = spawn_outbound_broadcaster(state.config.clone(), app_handle.clone());
 
         let cert_path = dirs::home_dir()
             .unwrap_or_default()
@@ -564,7 +680,7 @@ async fn init_nostrito(
             tracing::info!("[relay] Starting TLS relay on wss://127.0.0.1:{}", port);
             tokio::spawn(async move {
                 if let Err(e) =
-                    relay::run_relay_tls(port, cert_path, key_path, db_relay, allowed, relay_cancel_clone)
+                    relay::run_relay_tls(port, cert_path, key_path, db_relay, allowed, relay_cancel_clone, Some(outbound_tx))
                         .await
                 {
                     tracing::error!("TLS relay error: {}", e);
@@ -573,7 +689,7 @@ async fn init_nostrito(
         } else {
             tracing::info!("[relay] Starting plain relay on ws://127.0.0.1:{}", port);
             tokio::spawn(async move {
-                if let Err(e) = relay::run_relay(port, db_relay, allowed, relay_cancel_clone).await {
+                if let Err(e) = relay::run_relay(port, db_relay, allowed, relay_cancel_clone, Some(outbound_tx)).await {
                     tracing::error!("Relay server error: {}", e);
                 }
             });
@@ -2143,7 +2259,7 @@ async fn get_storage_estimate(state: State<'_, AppState>) -> Result<StorageEstim
 }
 
 #[tauri::command]
-async fn start_relay(state: State<'_, AppState>) -> Result<(), String> {
+async fn start_relay(app_handle: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     tracing::info!("[cmd:start_relay] called");
     let existing = state.relay_cancel.read().await;
     if existing.is_some() {
@@ -2160,6 +2276,7 @@ async fn start_relay(state: State<'_, AppState>) -> Result<(), String> {
     let db = state.db();
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
+    let outbound_tx = spawn_outbound_broadcaster(state.config.clone(), app_handle);
 
     let cert_path = dirs::home_dir()
         .unwrap_or_default()
@@ -2172,7 +2289,7 @@ async fn start_relay(state: State<'_, AppState>) -> Result<(), String> {
         tracing::info!("[relay] Starting TLS relay on wss://127.0.0.1:{}", port);
         tokio::spawn(async move {
             if let Err(e) =
-                relay::run_relay_tls(port, cert_path, key_path, db, allowed_pubkey, cancel_clone)
+                relay::run_relay_tls(port, cert_path, key_path, db, allowed_pubkey, cancel_clone, Some(outbound_tx))
                     .await
             {
                 tracing::error!("TLS relay error: {}", e);
@@ -2181,7 +2298,7 @@ async fn start_relay(state: State<'_, AppState>) -> Result<(), String> {
     } else {
         tracing::info!("[relay] Starting plain relay on ws://127.0.0.1:{}", port);
         tokio::spawn(async move {
-            if let Err(e) = relay::run_relay(port, db, allowed_pubkey, cancel_clone).await {
+            if let Err(e) = relay::run_relay(port, db, allowed_pubkey, cancel_clone, Some(outbound_tx)).await {
                 tracing::error!("Relay server error: {}", e);
             }
         });
@@ -4679,6 +4796,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(app_state)
         .setup(|app| {
             let state = app.state::<AppState>();
@@ -4871,6 +4989,7 @@ pub fn run() {
                     // Auto-start relay (TLS if certs available)
                     let relay_ct = CancellationToken::new();
                     let relay_ct_clone = relay_ct.clone();
+                    let outbound_tx = spawn_outbound_broadcaster(config.clone(), app_handle.clone());
 
                     let cert_path = dirs::home_dir()
                         .unwrap_or_default()
@@ -4883,7 +5002,7 @@ pub fn run() {
                         tracing::info!("[relay] Auto-starting TLS relay on wss://127.0.0.1:{}", port);
                         tokio::spawn(async move {
                             if let Err(e) = relay::run_relay_tls(
-                                port, cert_path, key_path, db_relay, allowed, relay_ct_clone,
+                                port, cert_path, key_path, db_relay, allowed, relay_ct_clone, Some(outbound_tx),
                             )
                             .await
                             {
@@ -4894,7 +5013,7 @@ pub fn run() {
                         tracing::info!("[relay] Auto-starting plain relay on ws://127.0.0.1:{}", port);
                         tokio::spawn(async move {
                             if let Err(e) =
-                                relay::run_relay(port, db_relay, allowed, relay_ct_clone).await
+                                relay::run_relay(port, db_relay, allowed, relay_ct_clone, Some(outbound_tx)).await
                             {
                                 tracing::error!("Relay auto-start error: {}", e);
                             }

@@ -5,7 +5,9 @@
 //! - Accepts EVENT, REQ, CLOSE messages
 //! - Sends EVENT, EOSE, NOTICE, OK responses
 //! - Serves relay information document over HTTP (NIP-11)
-//! - Optionally restricts writes to configured npub
+//! - Restricts writes to the owner npub **and** tracked profiles
+//! - Broadcasts newly-stored events to all configured outbound relays
+//! - Sends native macOS notifications on new events via tauri-plugin-notification
 
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
@@ -17,11 +19,39 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, RwLock};
+
+/// Channel for forwarding newly-stored events to outbound relays.
+pub type OutboundEventSender = mpsc::UnboundedSender<String>;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 
 use crate::storage::Database;
+
+/// Inline SVG path data for the Nostrito chili logo (simplified from logo.svg).
+const NOSTRITO_LOGO_PATH: &str = "m 220.8,428.3 c -6.8,-2.2 -8.2,-3.3 -9.4,-7.7 -0.6,-2.3 -2.0,-5.4 -3.2,-6.9 -2.0,-2.7 -2.0,-3.2 -0.8,-17.6 1.4,-16.5 0.4,-36.1 -2.6,-48.8 -1.9,-8.4 -1.5,-11.4 2.9,-18.0 3.6,-5.4 6.4,-12.1 5.4,-13.0 -0.3,-0.3 -2.4,0.3 -4.6,1.4 -2.2,1.1 -4.3,1.7 -4.6,1.4 -0.3,-0.3 -1.3,0.2 -2.1,1.3 -0.8,1.1 -1.5,1.4 -1.5,0.7 -0.1,-2.3 -2.0,-1.3 -3.6,2 -2.2,4.3 -2.1,4.2 -4.0,2.7 -1.4,-1.2 -1.8,-1.1 -3.1,0.6 -1.2,1.7 -1.6,1.7 -2.4,0.5 -0.5,-0.8 -1.0,-2.2 -1.0,-3.0 -0.1,-2.8 -2.0,1.2 -2.0,4.2 -0.0,3.3 -1.6,3.6 -2.6,0.6 -0.6,-2.0 -0.8,-2.0 -1.9,-0.5 -1.8,2.4 -2.5,2.1 -2.6,-1.1 -0.0,-1.5 -0.4,-3.6 -0.8,-4.7 -0.7,-1.8 -0.8,-1.8 -1.4,0.5 -0.6,2.3 -0.7,2.3 -2.0,0.6 -1.3,-1.7 -1.4,-1.6 -2.7,1.0 l -1.4,2.8 -1.0,-3.8 c -1.0,-3.7 -2.6,-5.1 -2.6,-2.2 0,0.8 -0.5,1.5 -1,1.5 -0.6,0 -1,-2.1 -1,-4.7 0,-4.6 -0.0,-4.6 -2,-2.8 -1.9,1.8 -2,1.7 -2,-0.3 0,-1.3 -0.5,-1.9 -1.3,-1.6 -0.8,0.3 -1.8,-0.6 -2.5,-2.2 -0.7,-1.5 -1.5,-2.4 -1.8,-2.1 -1.3,1.3 -3.9,-2.9 -3.5,-5.5 0.2,-1.6 -0.1,-2.8 -0.7,-2.8 -0.6,0 -1.1,-0.7 -1.1,-1.6 0,-0.9 -0.5,-1.3 -1.2,-0.8 -0.8,0.5 -1.0,-0.3 -0.6,-2.9 0.5,-3.4 0.4,-3.6 -1.3,-2.6 -2.4,1.3 -2.4,0.7 -0.2,-2.8 1.9,-2.9 2.3,-2.9 -3.4,-0.6 -1.4,0.6 -1.4,0.3 0.3,-2.2 3.5,-5.0 3.5,-5.3 1.1,-4.7 l -2.3,0.6 2.4,-2.6 2.4,-2.6 h -2.3 -2.3 l 2.4,-2.6 2.4,-2.6 -2.8,0.7 c -3.3,0.8 -3.6,-0.6 -0.5,-2.7 2.1,-1.5 2.1,-1.6 0.3,-1.6 -1.9,-0.1 -1.9,-0.1 0,-1.5 1.8,-1.4 1.7,-1.5 -1.6,-1.6 l -3.5,-0.1 4.2,-2.1 c 4.6,-2.3 5.2,-3.3 2.5,-4.1 -1.5,-0.4 -1.4,-0.6 0.5,-1.2 1.2,-0.4 2.2,-1.3 2.2,-2.1 0,-0.8 0.7,-1.4 1.5,-1.4 2.3,0 1.8,-1.7 -0.8,-2.4 l -2.2,-0.7 2.5,-1.0 c 3.3,-1.4 3.5,-1.6 2.1,-3.4 -1.1,-1.3 -0.9,-1.5 1.0,-1.5 1.6,0 2.1,-0.4 1.7,-1.5 -0.4,-0.9 -0.0,-1.5 0.9,-1.5 1.8,0 1.9,-1.6 0.2,-2.3 -0.7,-0.3 -0.0,-0.5 1.5,-0.6 1.8,-0.1 2.6,-0.5 2.2,-1.4 -0.3,-0.8 0.9,-2.1 3.0,-3.2 1.9,-1.0 3.5,-2.3 3.5,-2.7 0,-0.4 0.8,-0.8 1.9,-0.8 1.0,0 2.1,-0.9 2.4,-2 0.4,-1.4 1.4,-2 3.2,-2 1.7,0 2.5,-0.5 2.3,-1.2 -0.5,-1.4 1.0,-3.1 3.5,-4.0 1.0,-0.4 1.8,-1.1 1.8,-1.7 0,-0.6 0.9,-1.0 2,-1.0 1.1,0 2,-0.5 2,-1 0,-0.6 -0.5,-1 -1,-1 -0.6,0 -1,-0.5 -1,-1 0,-0.6 1.8,-1 4.1,-1 3.4,0 4.0,-0.3 3.5,-1.6 -0.3,-0.9 -0.1,-2.2 0.5,-3 0.6,-0.8 0.7,-1.4 0.3,-1.4 -0.5,-0.0 0.3,-0.6 1.8,-1.4 1.5,-0.8 3.9,-1.1 5.4,-0.9 2.5,0.5 2.7,0.3 2.0,-1.8 -0.7,-2.1 -0.5,-2.2 2.4,-1.7 1.7,0.3 3.1,0.3 3.1,-0.1 0.0,-1.5 5.2,-3.2 7.1,-2.2 2.6,1.4 2.9,1.2 2.9,-1.1 0,-2.1 0.0,-2.1 4.8,-0.2 1.0,0.4 1.1,-0.2 0.6,-2.3 -0.7,-2.7 -0.6,-2.8 1.0,-1.4 1.6,1.3 1.9,1.3 2.7,-0.3 0.7,-1.3 1.4,-1.5 2.9,-0.7 1.4,0.7 1.9,0.7 1.9,-0.1 0,-0.7 0.8,-0.8 2.2,-0.4 1.7,0.5 2.0,0.4 1.5,-0.9 -0.8,-2.0 1.1,-2.1 3.8,-0.1 1.5,1.1 2.1,1.2 2.7,0.3 0.6,-0.9 1.2,-0.8 2.6,0.5 2.3,2.1 3.4,2.2 2.6,0.2 -0.7,-1.9 0.1,-1.9 3.2,0.1 1.5,1.0 2.5,1.2 2.5,0.5 0,-1.7 1.4,-1.3 4.1,1.0 l 2.4,2.1 0.3,-2.6 c 0.4,-3.1 1.7,-3.3 3.2,-0.6 1.4,2.6 8.1,5.5 9.1,3.9 0.5,-0.8 1.4,-0.5 2.8,1.0 1.2,1.2 2.6,2.1 3.2,2.1 0.6,0 3.4,2.2 6.2,4.8 4.9,4.5 13.8,11.2 15.1,11.2 1.3,0 0.2,-2.9 -6.5,-17.3 -5.4,-11.6 -8.2,-16.5 -12.1,-20.7 -2.8,-3.0 -6.3,-7.1 -7.7,-9 -1.4,-1.9 -3.6,-4.5 -4.9,-5.7 -1.2,-1.2 -2.3,-3.2 -2.3,-4.3 0,-1.2 -0.4,-1.8 -1.1,-1.4 -0.7,0.4 -0.8,-0.5 -0.4,-3.0 0.6,-3.1 0.4,-3.5 -1.0,-3.0 -1.4,0.5 -1.5,0.2 -0.6,-2.1 1.3,-3.5 1.3,-3.6 -0.5,-2.9 -1.8,0.7 -2.0,-0.7 -0.2,-2.6 1.0,-1.1 1.0,-1.4 -0.0,-1.8 -1.0,-0.4 -1.0,-0.8 -0.1,-1.9 0.7,-0.8 0.9,-1.7 0.6,-2.1 -0.3,-0.3 -0.1,-1.3 0.5,-2.1 0.9,-1.1 0.9,-1.6 -0.2,-2.3 -1.1,-0.7 -0.9,-1.5 1.5,-3.9 1.7,-1.8 2.4,-3.0 1.6,-3.0 -0.9,0 -0.6,-0.8 0.8,-2.3 1.2,-1.3 1.9,-2.6 1.6,-2.9 -0.3,-0.3 0.3,-1.1 1.5,-1.7 1.1,-0.6 1.8,-1.7 1.5,-2.5 -0.4,-0.9 0.5,-1.6 2.6,-2.1 2.1,-0.5 3.0,-1.1 2.6,-2.1 -0.4,-1.0 0.2,-1.4 1.9,-1.4 1.4,0 2.5,-0.5 2.5,-1.1 0,-0.6 0.9,-0.8 2.0,-0.4 1.3,0.4 2.2,0.1 2.6,-0.8 0.3,-0.8 1.9,-1.5 3.7,-1.5 1.8,-0.0 5.2,-0.1 7.6,-0.2 2.4,-0.1 4.8,0.3 5.4,0.9 0.6,0.6 1.9,0.6 3.4,0.1 1.5,-0.6 2.4,-0.5 2.4,0.1 0,0.5 1.2,1.0 2.6,1.0 1.9,0 2.5,0.4 2.0,1.6 -0.4,1.1 0.3,1.9 2.2,2.5 2.6,0.9 10.9,10.7 14.3,16.9 1.0,1.8 1.3,5.8 1.2,13.5 l -0.2,11.0 5.8,6.1 c 6.1,6.4 8.5,11.9 5.9,13.7 -0.8,0.5 -6.9,0.6 -13.9,0.3 -12.9,-0.7 -14.9,-0.3 -19.1,3.3 -2.3,2.0 -1.4,3.6 7.6,13.7 11.4,12.8 14.7,17.3 16.1,22.0 0.7,2.4 2.0,5.8 3.0,7.5 0.9,1.8 1.4,3.8 1.2,4.5 -0.3,0.7 0.0,1.8 0.6,2.4 0.8,0.8 0.8,1.1 -0.1,1.1 -0.8,0 -1.0,0.7 -0.6,2 0.4,1.2 0.2,2 -0.6,2 -0.8,0 -0.9,0.4 -0.2,1.2 0.5,0.7 0.8,2.8 0.5,4.8 -0.3,1.9 -0.6,6.1 -0.6,9.2 -0.1,3.2 -0.5,5.8 -1.0,5.8 -0.5,0 -0.6,0.9 -0.3,2 0.3,1.2 0.0,2 -0.7,2 -0.8,0 -1.1,1.1 -0.8,3 0.3,1.8 -0.0,3 -0.7,3 -0.6,0 -1.1,0.7 -1.1,1.5 0,0.9 -0.6,1.2 -1.5,0.9 -1.0,-0.4 -2.1,0.6 -3.2,2.7 -2.3,4.3 -6.3,8.1 -7.9,7.5 -0.7,-0.3 -1.5,0.2 -1.8,1.1 -0.3,0.9 -0.9,1.3 -1.2,1.0 -0.3,-0.3 -2.3,0.0 -4.4,0.8 -3.3,1.1 -4.1,1.1 -5.9,-0.1 -1.2,-0.9 -2.1,-1.0 -2.1,-0.4 0,2.1 -1.9,1.0 -2.7,-1.6 -0.9,-2.6 -0.9,-2.6 -4.1,3 -1.8,3.1 -3.7,5.7 -4.3,5.7 -0.6,0 -0.8,0.4 -0.5,0.9 0.6,0.9 -7.7,9.1 -9.2,9.1 -0.5,0 -1.4,1.7 -2.0,3.8 -0.6,2.1 -3.5,7.8 -6.3,12.8 -2.8,5.0 -5.8,11.0 -6.7,13.4 -1.5,4.4 -1.5,5.5 1.4,24.9 0.6,4.3 15.4,33.7 19.8,39.5 1.9,2.5 4.4,6.4 5.5,8.6 2.8,5.5 5.8,7.2 14.1,8.1 3.9,0.4 7.8,1.4 8.7,2.3 0.9,0.8 3.4,2.0 5.4,2.7 4.8,1.5 8.8,4.7 8.8,7.0 0,1.3 -0.6,1.7 -2.2,1.4 -1.2,-0.2 -3.3,-0.0 -4.5,0.4 -1.3,0.5 -5.0,0.6 -8.4,0.3 -4.5,-0.4 -6.2,-0.2 -6.6,0.7 -0.3,0.7 -1.0,1.0 -1.6,0.6 -0.6,-0.4 -4.3,-0.7 -8.1,-0.8 -8.2,-0.1 -11.2,-1.4 -13.1,-6.0 -0.8,-1.8 -2.9,-4.4 -4.7,-5.6 -4.2,-2.9 -4.5,-3.4 -5.8,-9.3 -2.7,-12.7 -15.1,-38.0 -24.4,-49.9 -5.9,-7.5 -6.5,-10.9 -3.8,-21.3 1.2,-4.5 2.1,-11.2 2.1,-14.9 v -6.7 l -2.8,0.7 c -3.9,0.9 -11.5,8.8 -14.6,14.9 -1.8,3.5 -2.7,7.2 -3.0,11.7 -0.2,4.1 -1.4,9.2 -3.2,13.5 -2.7,6.6 -2.8,7.7 -2.8,23.9 -0.0,15.4 0.2,17.6 2.4,24.0 2.9,8.5 5.2,10.0 17.1,12.1 6.9,1.2 8.8,2.0 11.6,4.7 2.8,2.7 6.2,7.6 6.2,9.0 0,1.0 -16.2,-0.2 -20.9,-1.7 -3.0,-0.9 -6.6,-1.6 -8.0,-1.6 -2.4,0 -2.6,0.3 -2.2,3.5 0.5,3.9 0.4,3.9 -5.4,2.0 z";
+
+fn format_bytes_display(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+fn format_count_display(n: u64) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else if n < 1_000_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    }
+}
 
 /// Subscription state for a single client connection
 struct Subscription {
@@ -219,6 +249,7 @@ pub async fn run_relay(
     db: Arc<Database>,
     allowed_pubkey: Option<String>,
     cancel: tokio_util::sync::CancellationToken,
+    outbound_tx: Option<OutboundEventSender>,
 ) -> Result<()> {
     let addr = format!("127.0.0.1:{}", port);
     let listener = TcpListener::bind(&addr).await?;
@@ -240,6 +271,7 @@ pub async fn run_relay(
                         let tx = broadcast_tx.clone();
                         let rx = broadcast_tx.subscribe();
                         let cancel = cancel.clone();
+                        let outbound = outbound_tx.clone();
                         tokio::spawn(async move {
                             // Peek at raw bytes to detect WebSocket upgrade vs plain HTTP
                             let mut header_buf = vec![0u8; 2048];
@@ -250,14 +282,14 @@ pub async fn run_relay(
                                         || header_str.contains("upgrade: websocket")
                                         || header_str.contains("Upgrade: WebSocket");
                                     if is_ws {
-                                        if let Err(e) = handle_connection(stream, addr, db, allowed, tx, rx, cancel).await {
+                                        if let Err(e) = handle_connection(stream, addr, db, allowed, tx, rx, cancel, outbound).await {
                                             debug!("Connection {} closed: {}", addr, e);
                                         }
                                     } else {
                                         // NIP-11: serve HTTP info page
                                         let accept_nostr = header_str.contains("application/nostr+json");
                                         let hex_pubkey = allowed.unwrap_or_default();
-                                        if let Err(e) = serve_http(stream, port, &hex_pubkey, accept_nostr).await {
+                                        if let Err(e) = serve_http(stream, port, &hex_pubkey, accept_nostr, &db).await {
                                             debug!("HTTP response to {} failed: {}", addr, e);
                                         }
                                     }
@@ -311,6 +343,7 @@ pub async fn run_relay_tls(
     db: Arc<Database>,
     allowed_pubkey: Option<String>,
     cancel: tokio_util::sync::CancellationToken,
+    outbound_tx: Option<OutboundEventSender>,
 ) -> Result<()> {
     let tls_config = load_tls_config(&cert_pem, &key_pem)?;
     let tls_acceptor = TlsAcceptor::from(tls_config);
@@ -336,6 +369,7 @@ pub async fn run_relay_tls(
                         let rx = broadcast_tx.subscribe();
                         let cancel = cancel.clone();
                         let acceptor = tls_acceptor.clone();
+                        let outbound = outbound_tx.clone();
                         tokio::spawn(async move {
                             match acceptor.accept(stream).await {
                                 Ok(mut tls_stream) => {
@@ -368,6 +402,7 @@ pub async fn run_relay_tls(
                                                             handle_tls_connection(
                                                                 ws_stream, addr, db,
                                                                 allowed, tx, rx, cancel,
+                                                                outbound,
                                                             )
                                                             .await
                                                         {
@@ -396,6 +431,7 @@ pub async fn run_relay_tls(
                                                     &hex_pubkey,
                                                     accept_nostr,
                                                     true,
+                                                    &db,
                                                 )
                                                 .await
                                                 {
@@ -440,6 +476,7 @@ async fn handle_tls_connection<S>(
     broadcast_tx: EventBroadcast,
     mut broadcast_rx: broadcast::Receiver<StoredEvent>,
     cancel: tokio_util::sync::CancellationToken,
+    outbound_tx: Option<OutboundEventSender>,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
@@ -483,6 +520,7 @@ where
                             &subscriptions,
                             &allowed_pubkey,
                             &broadcast_tx,
+                            &outbound_tx,
                         ).await;
                         for resp in responses {
                             if ws_tx.send(Message::Text(resp.into())).await.is_err() {
@@ -515,6 +553,7 @@ async fn serve_http(
     port: u16,
     hex_pubkey: &str,
     accept_nostr_json: bool,
+    db: &Arc<Database>,
 ) -> Result<()> {
     // Drain the request from the socket (we already peeked, now consume it)
     let mut drain = vec![0u8; 4096];
@@ -524,7 +563,7 @@ async fn serve_http(
     )
     .await;
 
-    write_nip11_response(&mut stream, port, hex_pubkey, accept_nostr_json, false).await
+    write_nip11_response(&mut stream, port, hex_pubkey, accept_nostr_json, false, db).await
 }
 
 /// Write a NIP-11 HTTP response (JSON or HTML) to any async stream.
@@ -535,6 +574,7 @@ async fn write_nip11_response(
     hex_pubkey: &str,
     accept_nostr_json: bool,
     use_tls: bool,
+    db: &Arc<Database>,
 ) -> Result<()> {
     let ws_scheme = if use_tls { "wss" } else { "ws" };
 
@@ -571,65 +611,114 @@ async fn write_nip11_response(
             hex_pubkey.to_string()
         };
 
+        // Query relay stats from the database
+        let event_count = db.event_count().unwrap_or(0);
+        let db_size = db.db_size_bytes().unwrap_or(0);
+        let recent_events = db.events_last_24h().unwrap_or(0);
+
+        let event_count_display = format_count_display(event_count);
+        let db_size_display = format_bytes_display(db_size);
+        let recent_display = format_count_display(recent_events);
+
         let body = format!(
             r#"<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>nostrito — Your Personal Relay</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>nostrito relay</title>
   <style>
     *{{box-sizing:border-box;margin:0;padding:0}}
-    body{{background:#0a0a0a;color:#e8e8f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center}}
-    .card{{max-width:480px;width:100%;padding:40px;background:#111113;border:1px solid #1e1e24;border-radius:12px}}
-    .logo{{font-size:28px;font-weight:800;color:#fff;margin-bottom:4px}}
-    .logo span{{color:#7c3aed}}
-    .badge{{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#34d399;margin-bottom:28px}}
-    .badge::before{{content:'';width:8px;height:8px;border-radius:50%;background:#34d399;display:inline-block}}
-    h2{{font-size:13px;color:#888;text-transform:uppercase;letter-spacing:.5px;margin:20px 0 8px}}
-    .row{{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #1e1e24;font-size:13px}}
-    .row .label{{color:#888}}
-    .row .value{{color:#e8e8f0;font-weight:500;max-width:60%;text-align:right;word-break:break-all}}
-    .nips{{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}}
-    .nip{{padding:3px 10px;background:rgba(124,58,237,.15);color:#a78bfa;border-radius:20px;font-size:12px;font-weight:600}}
-    .cta{{margin-top:28px;padding:14px;background:rgba(124,58,237,.1);border:1px solid rgba(124,58,237,.3);border-radius:8px;font-size:13px;color:#a78bfa;text-align:center}}
-    .cta a{{color:#7c3aed}}
+    body{{background:#0a0a0a;color:#e8e8f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}}
+    .container{{max-width:520px;width:100%}}
+    .header{{text-align:center;margin-bottom:32px}}
+    .logo-icon{{width:80px;height:auto;margin:0 auto 16px}}
+    .logo-icon svg{{width:100%;height:100%}}
+    .logo-icon path{{fill:#7c3aed}}
+    .logo-text{{font-size:32px;font-weight:800;color:#fff}}
+    .logo-text span{{color:#7c3aed}}
+    .subtitle{{color:#888;font-size:14px;margin-top:4px}}
+    .status{{display:inline-flex;align-items:center;gap:8px;padding:8px 16px;background:rgba(52,211,153,.1);border:1px solid rgba(52,211,153,.2);border-radius:24px;font-size:13px;color:#34d399;margin-top:16px}}
+    .dot{{width:8px;height:8px;border-radius:50%;background:#34d399;display:inline-block;animation:pulse 2s infinite}}
+    @keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:.5}}}}
+    .stats{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:20px}}
+    .stat{{background:#111113;border:1px solid #1e1e24;border-radius:12px;padding:16px;text-align:center}}
+    .stat-val{{font-size:24px;font-weight:700;color:#fff}}
+    .stat-lbl{{font-size:11px;color:#888;text-transform:uppercase;letter-spacing:.5px;margin-top:4px}}
+    .card{{background:#111113;border:1px solid #1e1e24;border-radius:12px;padding:24px;margin-bottom:16px}}
+    .card-title{{font-size:12px;color:#888;text-transform:uppercase;letter-spacing:.5px;margin-bottom:16px}}
+    .row{{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #1e1e24;font-size:13px}}
+    .row:last-child{{border-bottom:none}}
+    .label{{color:#888}}
+    .value{{color:#e8e8f0;font-weight:500;max-width:60%;text-align:right;word-break:break-all}}
+    .nips{{display:flex;flex-wrap:wrap;gap:6px}}
+    .nip{{padding:4px 12px;background:rgba(124,58,237,.12);color:#a78bfa;border-radius:20px;font-size:12px;font-weight:600}}
+    .connect{{background:#111113;border:1px solid #1e1e24;border-radius:12px;padding:20px;text-align:center;font-size:13px;color:#888}}
+    .connect code{{display:block;background:rgba(124,58,237,.1);border:1px solid rgba(124,58,237,.2);border-radius:8px;padding:10px;margin:12px 0;font-family:'JetBrains Mono',monospace;font-size:13px;color:#a78bfa;word-break:break-all}}
+    .connect a{{color:#7c3aed;text-decoration:none}}
+    .connect a:hover{{text-decoration:underline}}
     .mono{{font-family:'JetBrains Mono',monospace;font-size:11px}}
   </style>
 </head>
 <body>
-  <div class="card">
-    <div class="logo">🌶️ nos<span>trito</span></div>
-    <div class="badge">Live — {ws_scheme}://localhost:{port}</div>
-
-    <h2>Relay Info</h2>
-    <div class="row"><span class="label">Name</span><span class="value">nostrito relay</span></div>
-    <div class="row"><span class="label">Description</span><span class="value">Your personal Nostr relay, running locally.</span></div>
-    <div class="row"><span class="label">Pubkey</span><span class="value mono">{pubkey_display}</span></div>
-    <div class="row"><span class="label">Port</span><span class="value">{port}</span></div>
-
-    <h2>Protocol</h2>
-    <div class="nips">
-      <span class="nip">NIP-01</span>
-      <span class="nip">NIP-02</span>
-      <span class="nip">NIP-09</span>
-      <span class="nip">NIP-11</span>
-      <span class="nip">NIP-16</span>
-      <span class="nip">NIP-20</span>
-      <span class="nip">NIP-33</span>
-      <span class="nip">NIP-40</span>
-      <span class="nip">NIP-45</span>
+  <div class="container">
+    <div class="header">
+      <div class="logo-icon">
+        <svg viewBox="0 0 201.4 318.7" xmlns="http://www.w3.org/2000/svg">
+          <g transform="translate(-137.9,-110.75)"><path d="{logo_path}"/></g>
+        </svg>
+      </div>
+      <div class="logo-text">nos<span>trito</span></div>
+      <div class="subtitle">Your Personal Nostr Relay</div>
+      <div class="status"><span class="dot"></span> Live &mdash; {ws_scheme}://localhost:{port}</div>
     </div>
 
-    <div class="cta">
-      Connect with <strong>{ws_scheme}://localhost:{port}</strong> in Damus, Amethyst, or any Nostr client.<br><br>
-      <a href="https://nostrito.com">Learn more about nostrito →</a>
+    <div class="stats">
+      <div class="stat"><div class="stat-val">{event_count}</div><div class="stat-lbl">Events</div></div>
+      <div class="stat"><div class="stat-val">{db_size}</div><div class="stat-lbl">Storage</div></div>
+      <div class="stat"><div class="stat-val">{recent_events}</div><div class="stat-lbl">Last 24h</div></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Relay Info</div>
+      <div class="row"><span class="label">Name</span><span class="value">nostrito relay</span></div>
+      <div class="row"><span class="label">Description</span><span class="value">Your personal Nostr relay, running locally.</span></div>
+      <div class="row"><span class="label">Pubkey</span><span class="value mono">{pubkey_display}</span></div>
+      <div class="row"><span class="label">Port</span><span class="value">{port}</span></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Supported NIPs</div>
+      <div class="nips">
+        <span class="nip">NIP-01</span>
+        <span class="nip">NIP-02</span>
+        <span class="nip">NIP-09</span>
+        <span class="nip">NIP-11</span>
+        <span class="nip">NIP-16</span>
+        <span class="nip">NIP-20</span>
+        <span class="nip">NIP-33</span>
+        <span class="nip">NIP-40</span>
+        <span class="nip">NIP-45</span>
+      </div>
+    </div>
+
+    <div class="connect">
+      Connect with any Nostr client
+      <code>{ws_scheme}://localhost:{port}</code>
+      Works with Damus, Amethyst, Primal, and more.
+      <br><br>
+      <a href="https://nostrito.com">nostrito.com &rarr;</a>
     </div>
   </div>
 </body>
 </html>"#,
+            logo_path = NOSTRITO_LOGO_PATH,
             ws_scheme = ws_scheme,
             port = port,
             pubkey_display = pubkey_display,
+            event_count = event_count_display,
+            db_size = db_size_display,
+            recent_events = recent_display,
         );
 
         let response = format!(
@@ -659,6 +748,7 @@ async fn handle_connection(
     broadcast_tx: EventBroadcast,
     mut broadcast_rx: broadcast::Receiver<StoredEvent>,
     cancel: tokio_util::sync::CancellationToken,
+    outbound_tx: Option<OutboundEventSender>,
 ) -> Result<()> {
     let ws_stream = tokio_tungstenite::accept_async(stream).await?;
     info!("[relay] New connection from {}", addr);
@@ -713,6 +803,7 @@ async fn handle_connection(
                             &subscriptions,
                             &allowed_pubkey,
                             &broadcast_tx,
+                            &outbound_tx,
                         ).await;
                         for resp in responses {
                             if ws_tx.send(Message::Text(resp.into())).await.is_err() {
@@ -745,6 +836,7 @@ async fn handle_message(
     subscriptions: &RwLock<HashMap<String, Subscription>>,
     allowed_pubkey: &Option<String>,
     broadcast_tx: &EventBroadcast,
+    outbound_tx: &Option<OutboundEventSender>,
 ) -> Vec<String> {
     let parsed: Value = match serde_json::from_str(text) {
         Ok(v) => v,
@@ -769,7 +861,7 @@ async fn handle_message(
 
     debug!("[relay] Message type={}", msg_type);
     match msg_type {
-        "EVENT" => handle_event(arr, db, allowed_pubkey, broadcast_tx).await,
+        "EVENT" => handle_event(arr, db, allowed_pubkey, broadcast_tx, outbound_tx).await,
         "REQ" => handle_req(arr, db, subscriptions).await,
         "CLOSE" => handle_close(arr, subscriptions).await,
         "COUNT" => handle_count(arr, db).await,
@@ -803,6 +895,7 @@ async fn handle_event(
     db: &Database,
     allowed_pubkey: &Option<String>,
     broadcast_tx: &EventBroadcast,
+    outbound_tx: &Option<OutboundEventSender>,
 ) -> Vec<String> {
     if arr.len() < 2 {
         return vec![serde_json::json!(["NOTICE", "EVENT requires an event object"]).to_string()];
@@ -818,11 +911,15 @@ async fn handle_event(
 
     info!("[relay] EVENT received: id={}… kind={} pubkey={}…", &event.id[..std::cmp::min(12, event.id.len())], event.kind, &event.pubkey[..std::cmp::min(8, event.pubkey.len())]);
 
-    // Check write permission
+    // Check write permission: allow owner pubkey + tracked profiles
     if let Some(ref allowed) = allowed_pubkey {
         if event.pubkey != *allowed {
-            warn!("[relay] EVENT rejected: pubkey not allowed");
-            return vec![serde_json::json!(["OK", event.id, false, "restricted: write not allowed"]).to_string()];
+            let is_tracked = db.is_tracked(&event.pubkey).unwrap_or(false);
+            if !is_tracked {
+                warn!("[relay] EVENT rejected: pubkey not allowed (not owner or tracked)");
+                return vec![serde_json::json!(["OK", event.id, false, "restricted: write not allowed"]).to_string()];
+            }
+            info!("[relay] EVENT accepted from tracked profile: pubkey={}…", &event.pubkey[..std::cmp::min(8, event.pubkey.len())]);
         }
     }
 
@@ -855,7 +952,11 @@ async fn handle_event(
         // Store the deletion event itself
         match store_event(db, &event) {
             Ok(_) => {
+                let outbound_json = event.to_json().to_string();
                 broadcast_tx.send(event).ok();
+                if let Some(ref tx) = outbound_tx {
+                    tx.send(outbound_json).ok();
+                }
                 vec![serde_json::json!(["OK", event_id, true, ""]).to_string()]
             }
             Err(e) => {
@@ -872,7 +973,11 @@ async fn handle_event(
         ) {
             Ok(true) => {
                 info!("[relay] EVENT stored (replaceable): id={}…", &event_id[..std::cmp::min(12, event_id.len())]);
+                let outbound_json = event.to_json().to_string();
                 broadcast_tx.send(event).ok();
+                if let Some(ref tx) = outbound_tx {
+                    tx.send(outbound_json).ok();
+                }
                 vec![serde_json::json!(["OK", event_id, true, ""]).to_string()]
             }
             Ok(false) => {
@@ -895,7 +1000,11 @@ async fn handle_event(
         ) {
             Ok(true) => {
                 info!("[relay] EVENT stored (param-replaceable d={}): id={}…", d_tag, &event_id[..std::cmp::min(12, event_id.len())]);
+                let outbound_json = event.to_json().to_string();
                 broadcast_tx.send(event).ok();
+                if let Some(ref tx) = outbound_tx {
+                    tx.send(outbound_json).ok();
+                }
                 vec![serde_json::json!(["OK", event_id, true, ""]).to_string()]
             }
             Ok(false) => {
@@ -913,7 +1022,11 @@ async fn handle_event(
         match store_event(db, &event) {
             Ok(true) => {
                 info!("[relay] EVENT stored: id={}…", &event_id[..std::cmp::min(12, event_id.len())]);
+                let outbound_json = event.to_json().to_string();
                 broadcast_tx.send(event).ok();
+                if let Some(ref tx) = outbound_tx {
+                    tx.send(outbound_json).ok();
+                }
                 vec![serde_json::json!(["OK", event_id, true, ""]).to_string()]
             }
             Ok(false) => {
