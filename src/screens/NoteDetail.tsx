@@ -185,6 +185,7 @@ export const NoteDetail: React.FC = () => {
   const [threadData, setThreadData] = useState<ThreadData | null>(null);
   const [loading, setLoading] = useState(true);
   const [fetchingRelays, setFetchingRelays] = useState(false);
+  const [relayFetchDone, setRelayFetchDone] = useState(false);
   const [wotDistances, setWotDistances] = useState<Record<string, number>>({});
   const [showNonWot, setShowNonWot] = useState(false);
   const [zapTarget, setZapTarget] = useState<NostrEvent | null>(null);
@@ -211,9 +212,10 @@ export const NoteDetail: React.FC = () => {
     setLoading(true);
     setThreadData(null);
     setShowNonWot(false);
+    setRelayFetchDone(false);
 
     const load = async () => {
-      // Load the main event
+      // Load the main event — show it immediately
       let mainEvent: NostrEvent | null = null;
       try {
         mainEvent = await invoke<NostrEvent | null>("get_event", { id: noteId });
@@ -222,39 +224,40 @@ export const NoteDetail: React.FC = () => {
       } catch (e) {
         console.error("[note-detail] Failed to load event:", e);
       }
+      setLoading(false);
 
       // Determine root for thread fetch
       const effectiveRootId = mainEvent ? (findRootTag(mainEvent) ?? mainEvent.id) : noteId;
 
-      // Load thread data
-      try {
-        const data = await invoke<ThreadData>("get_thread_events", { rootId: effectiveRootId });
-        setThreadData(data);
+      // Load thread data + WoT distances in parallel (non-blocking)
+      const threadPromise = invoke<ThreadData>("get_thread_events", { rootId: effectiveRootId })
+        .then((data) => {
+          setThreadData(data);
+          const pubkeys = new Set<string>();
+          if (data.root) pubkeys.add(data.root.pubkey);
+          for (const r of data.replies) pubkeys.add(r.pubkey);
+          for (const r of data.reactions) pubkeys.add(r.pubkey);
+          for (const z of data.zaps) pubkeys.add(z.pubkey);
+          if (pubkeys.size > 0) ensureProfiles(Array.from(pubkeys));
+        })
+        .catch((e) => console.error("[note-detail] Failed to load thread:", e));
 
-        // Ensure profiles for all participants
-        const pubkeys = new Set<string>();
-        if (data.root) pubkeys.add(data.root.pubkey);
-        for (const r of data.replies) pubkeys.add(r.pubkey);
-        for (const r of data.reactions) pubkeys.add(r.pubkey);
-        for (const z of data.zaps) pubkeys.add(z.pubkey);
-        if (pubkeys.size > 0) ensureProfiles(Array.from(pubkeys));
-      } catch (e) {
-        console.error("[note-detail] Failed to load thread:", e);
-      }
+      const wotPromise = invoke<Record<string, number>>("get_wot_hop_distances", { maxHops: 3 })
+        .then((distances) => setWotDistances(distances))
+        .catch((e) => console.error("[note-detail] Failed to load WoT distances:", e));
 
-      // Load WoT distances for thread participants
-      try {
-        const distances = await invoke<Record<string, number>>("get_wot_hop_distances", { maxHops: 3 });
-        setWotDistances(distances);
-      } catch (e) {
-        console.error("[note-detail] Failed to load WoT distances:", e);
-      }
+      await Promise.all([threadPromise, wotPromise]);
 
-      setLoading(false);
-
-      // Trigger background relay fetch for completeness
+      // Trigger background relay fetch for replies/interactions
       if (effectiveRootId) {
-        invoke("fetch_thread_from_relays", { rootId: effectiveRootId }).catch(() => {});
+        invoke("fetch_thread_from_relays", {
+          rootId: effectiveRootId,
+          skipRoot: mainEvent !== null,
+        })
+          .catch(() => {})
+          .finally(() => setRelayFetchDone(true));
+      } else {
+        setRelayFetchDone(true);
       }
     };
 
@@ -286,8 +289,12 @@ export const NoteDetail: React.FC = () => {
   const fetchFromRelays = useCallback(async () => {
     if (!rootId || fetchingRelays) return;
     setFetchingRelays(true);
+    setRelayFetchDone(false);
     try {
-      const count = await invoke<number>("fetch_thread_from_relays", { rootId });
+      const count = await invoke<number>("fetch_thread_from_relays", {
+        rootId,
+        skipRoot: false,
+      });
       if (count > 0) {
         const data = await invoke<ThreadData>("get_thread_events", { rootId });
         setThreadData(data);
@@ -297,6 +304,7 @@ export const NoteDetail: React.FC = () => {
       console.error("[note-detail] Relay fetch failed:", e);
     } finally {
       setFetchingRelays(false);
+      setRelayFetchDone(true);
     }
   }, [rootId, fetchingRelays]);
 
@@ -404,6 +412,12 @@ export const NoteDetail: React.FC = () => {
           </div>
 
           {/* Reactions */}
+          {!threadData && (
+            <div className="note-detail-reactions">
+              <div className="note-detail-section-title">reactions</div>
+              <div style={{ color: "var(--text-muted)", padding: "8px 0 0", fontSize: "0.85rem" }}>loading...</div>
+            </div>
+          )}
           {threadData && threadData.reactions.length === 0 && (
             <div className="note-detail-reactions">
               <div className="note-detail-section-title">reactions</div>
@@ -476,10 +490,21 @@ export const NoteDetail: React.FC = () => {
           {/* Threaded Replies */}
           <div className="note-detail-replies">
             <div className="note-detail-section-title">
-              replies ({threadData?.replies.length ?? 0})
+              replies {threadData ? `(${threadData.replies.length})` : ""}
             </div>
 
-            {threadData && threadData.replies.length === 0 && (
+            {!threadData && (
+              <div style={{ color: "var(--text-muted)", padding: "8px 0", fontSize: "0.85rem" }}>
+                loading...
+              </div>
+            )}
+            {threadData && threadData.replies.length === 0 && !relayFetchDone && (
+              <div style={{ color: "var(--text-muted)", padding: "8px 0", fontSize: "0.85rem" }}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" width="14" height="14" style={{ marginRight: 6, verticalAlign: "middle" }}><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+                checking relays for replies...
+              </div>
+            )}
+            {threadData && threadData.replies.length === 0 && relayFetchDone && (
               <div style={{ color: "var(--text-muted)", padding: "8px 0", fontSize: "0.85rem" }}>
                 no replies found for this note.
               </div>

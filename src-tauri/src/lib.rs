@@ -677,13 +677,26 @@ async fn init_nostrito(
             .join(".nostrito/certs/localhost-key.pem");
 
         if cert_path.exists() && key_path.exists() {
+            // Start TLS relay (wss://) on the configured port
+            let tls_cancel = relay_cancel_clone.clone();
+            let tls_db = db_relay.clone();
+            let tls_allowed = allowed.clone();
+            let tls_outbound = outbound_tx.clone();
             tracing::info!("[relay] Starting TLS relay on wss://127.0.0.1:{}", port);
             tokio::spawn(async move {
                 if let Err(e) =
-                    relay::run_relay_tls(port, cert_path, key_path, db_relay, allowed, relay_cancel_clone, Some(outbound_tx))
+                    relay::run_relay_tls(port, cert_path, key_path, tls_db, tls_allowed, tls_cancel, Some(tls_outbound))
                         .await
                 {
                     tracing::error!("TLS relay error: {}", e);
+                }
+            });
+            // Also start plain relay (ws://) on port+1 for browser compatibility
+            let plain_port = port + 1;
+            tracing::info!("[relay] Starting plain relay on ws://127.0.0.1:{} (browser fallback)", plain_port);
+            tokio::spawn(async move {
+                if let Err(e) = relay::run_relay(plain_port, db_relay, allowed, relay_cancel_clone, Some(outbound_tx)).await {
+                    tracing::error!("Plain relay error: {}", e);
                 }
             });
         } else {
@@ -1226,6 +1239,7 @@ async fn get_interaction_counts(
 #[tauri::command]
 async fn fetch_thread_from_relays(
     root_id: String,
+    skip_root: bool,
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<u32, String> {
@@ -1244,15 +1258,19 @@ async fn fetch_thread_from_relays(
     let event_id = EventId::from_hex(&root_id)
         .map_err(|e| format!("Invalid event ID: {}", e))?;
 
-    // Fetch the root event + all replies/reactions/zaps
-    let root_filter = Filter::new().id(event_id).limit(1);
-    let replies_filter = Filter::new().event(event_id).kinds(vec![Kind::TextNote]).limit(500);
-    let interactions_filter = Filter::new().event(event_id).kinds(vec![Kind::Reaction, Kind::from(9735)]).limit(500);
+    // Fetch replies/reactions/zaps (and optionally the root event)
+    let mut filters = vec![
+        Filter::new().event(event_id).kinds(vec![Kind::TextNote]).limit(500),
+        Filter::new().event(event_id).kinds(vec![Kind::Reaction, Kind::from(9735)]).limit(500),
+    ];
+    if !skip_root {
+        filters.insert(0, Filter::new().id(event_id).limit(1));
+    }
 
     let pool = crate::sync::pool::RelayPool::new();
     let events = pool.subscribe_and_collect(
         &relay_urls,
-        vec![root_filter, replies_filter, interactions_filter],
+        filters,
         15,
     ).await.map_err(|e| format!("Relay fetch failed: {}", e))?;
 
@@ -2286,13 +2304,24 @@ async fn start_relay(app_handle: tauri::AppHandle, state: State<'_, AppState>) -
         .join(".nostrito/certs/localhost-key.pem");
 
     if cert_path.exists() && key_path.exists() {
+        let tls_cancel = cancel_clone.clone();
+        let tls_db = db.clone();
+        let tls_allowed = allowed_pubkey.clone();
+        let tls_outbound = outbound_tx.clone();
         tracing::info!("[relay] Starting TLS relay on wss://127.0.0.1:{}", port);
         tokio::spawn(async move {
             if let Err(e) =
-                relay::run_relay_tls(port, cert_path, key_path, db, allowed_pubkey, cancel_clone, Some(outbound_tx))
+                relay::run_relay_tls(port, cert_path, key_path, tls_db, tls_allowed, tls_cancel, Some(tls_outbound))
                     .await
             {
                 tracing::error!("TLS relay error: {}", e);
+            }
+        });
+        let plain_port = port + 1;
+        tracing::info!("[relay] Starting plain relay on ws://127.0.0.1:{} (browser fallback)", plain_port);
+        tokio::spawn(async move {
+            if let Err(e) = relay::run_relay(plain_port, db, allowed_pubkey, cancel_clone, Some(outbound_tx)).await {
+                tracing::error!("Plain relay error: {}", e);
             }
         });
     } else {
@@ -4999,14 +5028,27 @@ pub fn run() {
                         .join(".nostrito/certs/localhost-key.pem");
 
                     if cert_path.exists() && key_path.exists() {
+                        let tls_cancel = relay_ct_clone.clone();
+                        let tls_db = db_relay.clone();
+                        let tls_allowed = allowed.clone();
+                        let tls_outbound = outbound_tx.clone();
                         tracing::info!("[relay] Auto-starting TLS relay on wss://127.0.0.1:{}", port);
                         tokio::spawn(async move {
                             if let Err(e) = relay::run_relay_tls(
-                                port, cert_path, key_path, db_relay, allowed, relay_ct_clone, Some(outbound_tx),
+                                port, cert_path, key_path, tls_db, tls_allowed, tls_cancel, Some(tls_outbound),
                             )
                             .await
                             {
                                 tracing::error!("TLS relay auto-start error: {}", e);
+                            }
+                        });
+                        let plain_port = port + 1;
+                        tracing::info!("[relay] Auto-starting plain relay on ws://127.0.0.1:{} (browser fallback)", plain_port);
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                relay::run_relay(plain_port, db_relay, allowed, relay_ct_clone, Some(outbound_tx)).await
+                            {
+                                tracing::error!("Plain relay auto-start error: {}", e);
                             }
                         });
                     } else {

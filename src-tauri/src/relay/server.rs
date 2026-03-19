@@ -281,15 +281,16 @@ pub async fn run_relay(
                                     let is_ws = header_str.contains("Upgrade: websocket")
                                         || header_str.contains("upgrade: websocket")
                                         || header_str.contains("Upgrade: WebSocket");
+                                    let is_options = header_str.starts_with("OPTIONS ");
                                     if is_ws {
                                         if let Err(e) = handle_connection(stream, addr, db, allowed, tx, rx, cancel, outbound).await {
                                             debug!("Connection {} closed: {}", addr, e);
                                         }
                                     } else {
-                                        // NIP-11: serve HTTP info page
+                                        // NIP-11 info page or CORS preflight
                                         let accept_nostr = header_str.contains("application/nostr+json");
                                         let hex_pubkey = allowed.unwrap_or_default();
-                                        if let Err(e) = serve_http(stream, port, &hex_pubkey, accept_nostr, &db).await {
+                                        if let Err(e) = serve_http(stream, port, &hex_pubkey, accept_nostr, is_options, &db).await {
                                             debug!("HTTP response to {} failed: {}", addr, e);
                                         }
                                     }
@@ -418,6 +419,11 @@ pub async fn run_relay_tls(
                                                             addr, e
                                                         );
                                                     }
+                                                }
+                                            } else if header_str.starts_with("OPTIONS ") {
+                                                // CORS preflight for Private Network Access
+                                                if let Err(e) = write_cors_preflight(&mut tls_stream).await {
+                                                    debug!("TLS CORS preflight to {} failed: {}", addr, e);
                                                 }
                                             } else {
                                                 // NIP-11: serve HTTP info page over TLS
@@ -553,6 +559,7 @@ async fn serve_http(
     port: u16,
     hex_pubkey: &str,
     accept_nostr_json: bool,
+    is_options_preflight: bool,
     db: &Arc<Database>,
 ) -> Result<()> {
     // Drain the request from the socket (we already peeked, now consume it)
@@ -563,7 +570,37 @@ async fn serve_http(
     )
     .await;
 
+    if is_options_preflight {
+        return write_cors_preflight(&mut stream).await;
+    }
+
     write_nip11_response(&mut stream, port, hex_pubkey, accept_nostr_json, false, db).await
+}
+
+/// CORS headers needed for Private Network Access (Chrome) and cross-origin WebSocket.
+const CORS_HEADERS: &str = "\
+Access-Control-Allow-Origin: *\r\n\
+Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+Access-Control-Allow-Headers: Content-Type, Accept, Authorization\r\n\
+Access-Control-Allow-Private-Network: true\r\n\
+Access-Control-Max-Age: 86400";
+
+/// Respond to an OPTIONS preflight request (required by Chrome Private Network Access).
+async fn write_cors_preflight(
+    stream: &mut (impl AsyncWriteExt + Unpin),
+) -> Result<()> {
+    let response = format!(
+        "HTTP/1.1 204 No Content\r\n\
+         {}\r\n\
+         Content-Length: 0\r\n\
+         Connection: close\r\n\
+         \r\n",
+        CORS_HEADERS
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.shutdown().await?;
+    debug!("[relay] Responded to CORS preflight");
+    Ok(())
 }
 
 /// Write a NIP-11 HTTP response (JSON or HTML) to any async stream.
@@ -594,11 +631,12 @@ async fn write_nip11_response(
         let response = format!(
             "HTTP/1.1 200 OK\r\n\
              Content-Type: application/nostr+json\r\n\
-             Access-Control-Allow-Origin: *\r\n\
+             {}\r\n\
              Content-Length: {}\r\n\
              Connection: close\r\n\
              \r\n\
              {}",
+            CORS_HEADERS,
             body.len(),
             body
         );
@@ -724,11 +762,12 @@ async fn write_nip11_response(
         let response = format!(
             "HTTP/1.1 200 OK\r\n\
              Content-Type: text/html; charset=utf-8\r\n\
-             Access-Control-Allow-Origin: *\r\n\
+             {}\r\n\
              Content-Length: {}\r\n\
              Connection: close\r\n\
              \r\n\
              {}",
+            CORS_HEADERS,
             body.len(),
             body
         );
