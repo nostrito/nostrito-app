@@ -6,7 +6,8 @@ import { IconChili } from "../components/Icon";
 import { Avatar } from "../components/Avatar";
 import { useTauriEvent } from "../hooks/useTauriEvent";
 import { useInterval } from "../hooks/useInterval";
-import { getProfiles, invalidateProfileCache, profileDisplayName, type ProfileInfo } from "../utils/profiles";
+import { profileDisplayName } from "../utils/profiles";
+import { useProfileContext } from "../context/ProfileContext";
 import type {
   AppStatus,
   SyncProgress,
@@ -203,7 +204,6 @@ function getLayerDetail(
 /* ------------------------------------------------------------------ */
 
 let cachedLiveStream: LiveEntry[] = [];
-let cachedProfileMap: Map<string, ProfileInfo> = new Map();
 
 /* ------------------------------------------------------------------ */
 /*  Component                                                          */
@@ -211,6 +211,7 @@ let cachedProfileMap: Map<string, ProfileInfo> = new Map();
 
 export const Dashboard: React.FC = () => {
   const navigate = useNavigate();
+  const { getProfile, ensureProfiles } = useProfileContext();
   /* --- state -------------------------------------------------------- */
   const [status, setStatus] = useState<AppStatus | null>(null);
   const [uptime, setUptime] = useState<number>(0);
@@ -219,10 +220,7 @@ export const Dashboard: React.FC = () => {
   const [relaysLoaded, setRelaysLoaded] = useState(false);
   /* --- live event stream state (initialized from cache) ------------- */
   const [liveStream, setLiveStream] = useState<LiveEntry[]>(cachedLiveStream);
-  const [liveProfileMap, setLiveProfileMap] = useState<Map<string, ProfileInfo>>(cachedProfileMap);
   const liveStreamRef = useRef<LiveEntry[]>(cachedLiveStream);
-  const pendingProfilesRef = useRef<Set<string>>(new Set());
-  const profileFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   /* --- Tauri event listeners ---------------------------------------- */
   const syncProgress = useTauriEvent<SyncProgress>("sync:progress");
@@ -231,29 +229,6 @@ export const Dashboard: React.FC = () => {
   /* --- live event stream listener ------------------------------------ */
   useEffect(() => {
     let unlisten: (() => void) | null = null;
-
-    const queueProfileFetch = (pubkey: string) => {
-      if (!pendingProfilesRef.current.has(pubkey)) {
-        pendingProfilesRef.current.add(pubkey);
-        if (!profileFlushTimerRef.current) {
-          profileFlushTimerRef.current = setTimeout(() => {
-            const pks = [...pendingProfilesRef.current];
-            pendingProfilesRef.current.clear();
-            profileFlushTimerRef.current = null;
-            getProfiles(pks).then((profiles) => {
-              setLiveProfileMap((prev) => {
-                const next = new Map(prev);
-                for (const [pk, info] of profiles) {
-                  next.set(pk, info);
-                }
-                cachedProfileMap = next;
-                return next;
-              });
-            });
-          }, 200);
-        }
-      }
-    };
 
     listen<StoredEventNotification[]>("events:batch", (event) => {
       const entries: LiveEntry[] = event.payload.map((n) => ({
@@ -266,9 +241,9 @@ export const Dashboard: React.FC = () => {
         media_urls: n.media_urls || [],
       }));
 
-      for (const entry of entries) {
-        queueProfileFetch(entry.pubkey);
-      }
+      const pubkeys = [...new Set(entries.map((e) => e.pubkey))];
+      ensureProfiles(pubkeys);
+
       liveStreamRef.current = [...entries, ...liveStreamRef.current].slice(0, LIVE_STREAM_MAX);
       cachedLiveStream = liveStreamRef.current;
       setLiveStream(liveStreamRef.current);
@@ -276,9 +251,8 @@ export const Dashboard: React.FC = () => {
 
     return () => {
       if (unlisten) unlisten();
-      if (profileFlushTimerRef.current) clearTimeout(profileFlushTimerRef.current);
     };
-  }, []);
+  }, [ensureProfiles]);
 
   /* --- seed stream from DB on mount so dashboard isn't empty --------- */
   const seededRef = useRef(false);
@@ -314,10 +288,7 @@ export const Dashboard: React.FC = () => {
 
         if (entries.length > 0) {
           const pubkeys = [...new Set(entries.map((e) => e.pubkey))];
-          const profiles = await getProfiles(pubkeys);
-          const profileMap = new Map(profiles);
-          cachedProfileMap = profileMap;
-          setLiveProfileMap(profileMap);
+          ensureProfiles(pubkeys);
           // Merge: keep any live events that arrived while we were fetching,
           // append seed entries behind them (deduped)
           const liveIds = new Set(liveStreamRef.current.map((e) => e.id));
@@ -331,36 +302,7 @@ export const Dashboard: React.FC = () => {
         }
       })
       .catch(() => {});
-  }, []);
-
-  /* --- profile retry for missing pictures ----------------------------- */
-  useEffect(() => {
-    const timer = setInterval(() => {
-      const visible = liveStreamRef.current.slice(0, 20);
-      const missing = visible
-        .map((e) => e.pubkey)
-        .filter((pk) => {
-          const p = liveProfileMap.get(pk);
-          return !p || !p.picture;
-        });
-      if (missing.length > 0) {
-        const unique = [...new Set(missing)];
-        // Invalidate cache so getProfiles re-queries the DB
-        unique.forEach((pk) => invalidateProfileCache(pk));
-        getProfiles(unique).then((profiles) => {
-          setLiveProfileMap((prev) => {
-            const next = new Map(prev);
-            for (const [pk, info] of profiles) {
-              next.set(pk, info);
-            }
-            cachedProfileMap = next;
-            return next;
-          });
-        });
-      }
-    }, 5000);
-    return () => clearInterval(timer);
-  }, [liveProfileMap]);
+  }, [ensureProfiles]);
 
   /* --- data loaders ------------------------------------------------- */
   const loadStats = useCallback(async () => {
@@ -574,7 +516,7 @@ export const Dashboard: React.FC = () => {
               </div>
             ) : (
               liveStream.slice(0, 20).map((entry) => {
-                const profile = liveProfileMap.get(entry.pubkey);
+                const profile = getProfile(entry.pubkey);
                 const name = profileDisplayName(profile, entry.pubkey);
                 const kind = kindLabel(entry.kind);
                 const kindCls = kindCssClass(entry.kind);
@@ -595,6 +537,7 @@ export const Dashboard: React.FC = () => {
                     >
                       <Avatar
                         picture={profile?.picture}
+                        pictureLocal={profile?.picture_local}
                         pubkey={entry.pubkey}
                         className="live-avatar"
                         fallbackClassName="live-avatar-fallback"

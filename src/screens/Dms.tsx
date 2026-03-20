@@ -348,6 +348,7 @@ export const Dms: React.FC = () => {
     const profile = getProfile(selectedPartner!);
     const name = profileDisplayName(profile, selectedPartner!);
     const avatar = profile?.picture || "";
+    const avatarLocal = profile?.picture_local || null;
     const sorted = [...selectedConv.messages].sort((a, b) => a.created_at - b.created_at);
     const visible = sorted.slice(Math.max(0, sorted.length - displayCount));
     const hasMore = sorted.length > displayCount;
@@ -362,6 +363,7 @@ export const Dms: React.FC = () => {
           >
             <Avatar
               picture={avatar || null}
+              pictureLocal={avatarLocal}
               pubkey={selectedPartner!}
               className="dms-thread-avatar"
               fallbackClassName="dms-thread-avatar-fallback"
@@ -448,6 +450,7 @@ export const Dms: React.FC = () => {
                   <div className="dms-conv-avatar">
                     <Avatar
                       picture={avatar || null}
+                      pictureLocal={profile?.picture_local || null}
                       pubkey={conv.partnerPubkey}
                       className="dms-conv-avatar-img"
                       fallbackClassName="dms-conv-avatar-fallback"

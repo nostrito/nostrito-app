@@ -498,6 +498,7 @@ export const ProfileView: React.FC = () => {
           <div className="profile-hero-info">
             <Avatar
               picture={profile?.picture ?? null}
+              pictureLocal={profile?.picture_local ?? null}
               pubkey={pubkey}
               className="profile-hero-avatar"
               fallbackClassName="profile-hero-avatar-fallback"
@@ -805,6 +806,7 @@ export const ProfileView: React.FC = () => {
                   >
                     <Avatar
                       picture={fp?.picture ?? null}
+                      pictureLocal={fp?.picture_local ?? null}
                       pubkey={pk}
                       className="profile-follow-avatar"
                       fallbackClassName="profile-follow-avatar-fallback"

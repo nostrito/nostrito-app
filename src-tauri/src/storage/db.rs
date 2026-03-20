@@ -15,6 +15,7 @@ pub struct ProfileInfo {
     pub name: Option<String>,
     pub display_name: Option<String>,
     pub picture: Option<String>,
+    pub picture_local: Option<String>,
     pub nip05: Option<String>,
     pub about: Option<String>,
     pub banner: Option<String>,
@@ -1129,53 +1130,83 @@ impl Database {
 
     /// Get profile info (kind:0 metadata) for given pubkeys.
     /// Parses the JSON content of the most recent kind:0 event per pubkey.
+    /// Resolves profile picture URLs to local cached paths when available.
     pub fn get_profiles(&self, pubkeys: &[String]) -> Result<Vec<ProfileInfo>> {
         if pubkeys.is_empty() {
             return Ok(vec![]);
         }
 
-        let conn = self.conn.lock();
         let mut profiles = Vec::new();
 
-        // Process in chunks to avoid SQLite variable limits
-        for chunk in pubkeys.chunks(500) {
-            let placeholders: Vec<String> = (0..chunk.len())
-                .map(|i| format!("?{}", i + 1))
-                .collect();
-            let sql = format!(
-                "SELECT pubkey, content FROM nostr_events \
-                 WHERE kind = 0 AND pubkey IN ({}) \
-                 ORDER BY created_at DESC",
-                placeholders.join(",")
-            );
+        {
+            let conn = self.conn.lock();
 
-            let mut stmt = conn.prepare(&sql)?;
-            let params_vec: Vec<&dyn rusqlite::ToSql> =
-                chunk.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+            // Process in chunks to avoid SQLite variable limits
+            for chunk in pubkeys.chunks(500) {
+                let placeholders: Vec<String> = (0..chunk.len())
+                    .map(|i| format!("?{}", i + 1))
+                    .collect();
+                let sql = format!(
+                    "SELECT pubkey, content FROM nostr_events \
+                     WHERE kind = 0 AND pubkey IN ({}) \
+                     ORDER BY created_at DESC",
+                    placeholders.join(",")
+                );
 
-            let rows = stmt.query_map(params_vec.as_slice(), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?;
+                let mut stmt = conn.prepare(&sql)?;
+                let params_vec: Vec<&dyn rusqlite::ToSql> =
+                    chunk.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
 
-            let mut seen = std::collections::HashSet::new();
-            for row in rows {
-                if let Ok((pubkey, content)) = row {
-                    // Only take the first (most recent) per pubkey
-                    if !seen.insert(pubkey.clone()) {
-                        continue;
+                let rows = stmt.query_map(params_vec.as_slice(), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+
+                let mut seen = std::collections::HashSet::new();
+                for row in rows {
+                    if let Ok((pubkey, content)) = row {
+                        // Only take the first (most recent) per pubkey
+                        if !seen.insert(pubkey.clone()) {
+                            continue;
+                        }
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
+                            profiles.push(ProfileInfo {
+                                pubkey,
+                                name: parsed.get("name").and_then(|v| v.as_str()).map(String::from),
+                                display_name: parsed.get("display_name").and_then(|v| v.as_str()).map(String::from),
+                                picture: parsed.get("picture").and_then(|v| v.as_str()).map(String::from),
+                                picture_local: None,
+                                nip05: parsed.get("nip05").and_then(|v| v.as_str()).map(String::from),
+                                about: parsed.get("about").and_then(|v| v.as_str()).map(String::from),
+                                banner: parsed.get("banner").and_then(|v| v.as_str()).map(String::from),
+                                website: parsed.get("website").and_then(|v| v.as_str()).map(String::from),
+                                lud16: parsed.get("lud16").and_then(|v| v.as_str()).map(String::from),
+                            });
+                        }
                     }
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
-                        profiles.push(ProfileInfo {
-                            pubkey,
-                            name: parsed.get("name").and_then(|v| v.as_str()).map(String::from),
-                            display_name: parsed.get("display_name").and_then(|v| v.as_str()).map(String::from),
-                            picture: parsed.get("picture").and_then(|v| v.as_str()).map(String::from),
-                            nip05: parsed.get("nip05").and_then(|v| v.as_str()).map(String::from),
-                            about: parsed.get("about").and_then(|v| v.as_str()).map(String::from),
-                            banner: parsed.get("banner").and_then(|v| v.as_str()).map(String::from),
-                            website: parsed.get("website").and_then(|v| v.as_str()).map(String::from),
-                            lud16: parsed.get("lud16").and_then(|v| v.as_str()).map(String::from),
-                        });
+                }
+            }
+        } // conn lock dropped here
+
+        // Resolve local media paths for profile pictures
+        let picture_urls: Vec<String> = profiles.iter()
+            .filter_map(|p| p.picture.clone())
+            .collect();
+
+        if !picture_urls.is_empty() {
+            if let Ok(cache_map) = self.media_cache_lookup_by_urls(&picture_urls) {
+                let home = dirs::home_dir().unwrap_or_default();
+                for profile in &mut profiles {
+                    if let Some(ref pic_url) = profile.picture {
+                        if let Some((hash, _mime, _size, _dl)) = cache_map.get(pic_url) {
+                            let local_path = home.join(".nostrito/media")
+                                .join(&hash[..2.min(hash.len())])
+                                .join(hash)
+                                .to_string_lossy()
+                                .to_string();
+                            if std::path::Path::new(&local_path).exists() {
+                                profile.picture_local = Some(local_path);
+                            }
+                        }
                     }
                 }
             }

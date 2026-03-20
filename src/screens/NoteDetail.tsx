@@ -386,6 +386,7 @@ export const NoteDetail: React.FC = () => {
                     <div className="reader-author">
                       <Avatar
                         picture={getProfile(displayEvent.pubkey)?.picture}
+                        pictureLocal={getProfile(displayEvent.pubkey)?.picture_local}
                         pubkey={displayEvent.pubkey}
                         className="reader-author-avatar"
                         fallbackClassName="reader-author-avatar reader-author-avatar-fallback"
@@ -443,6 +444,7 @@ export const NoteDetail: React.FC = () => {
                     <Avatar
                       key={r.id}
                       picture={rProfile?.picture ?? null}
+                      pictureLocal={rProfile?.picture_local ?? null}
                       pubkey={r.pubkey}
                       className="note-detail-reactor-avatar"
                       clickable
@@ -471,6 +473,7 @@ export const NoteDetail: React.FC = () => {
                     <div key={zap.id} className="note-detail-zap-item">
                       <Avatar
                         picture={zapProfile?.picture ?? null}
+                        pictureLocal={zapProfile?.picture_local ?? null}
                         pubkey={zap.pubkey}
                         className="note-detail-zap-avatar"
                         clickable

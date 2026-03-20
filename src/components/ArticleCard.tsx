@@ -86,6 +86,7 @@ export const ArticleCard: React.FC<ArticleCardProps> = ({ event, profile, onClic
           <div className="article-card-author">
             <Avatar
               picture={profile?.picture}
+              pictureLocal={profile?.picture_local}
               pubkey={event.pubkey}
               className="article-card-avatar"
               fallbackClassName="article-card-avatar article-card-avatar-fallback"

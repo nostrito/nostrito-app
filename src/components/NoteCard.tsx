@@ -314,7 +314,7 @@ const NoteCardInner: React.FC<{
 
   return (
     <div className="repost-original">
-      <Avatar picture={profile?.picture} pubkey={event.pubkey} className="ev-avatar" clickable />
+      <Avatar picture={profile?.picture} pictureLocal={profile?.picture_local} pubkey={event.pubkey} className="ev-avatar" clickable />
       <div className="ev-content">
         <div className="ev-meta">
           <span className="ev-npub" data-pubkey={event.pubkey} style={{ cursor: "pointer" }}>
@@ -402,7 +402,7 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, ful
           </span>
         </div>
         <div className="repost-original">
-          <Avatar picture={originalProfile?.picture} pubkey={original.pubkey} className="ev-avatar" clickable />
+          <Avatar picture={originalProfile?.picture} pictureLocal={originalProfile?.picture_local} pubkey={original.pubkey} className="ev-avatar" clickable />
           <div className="ev-content">
             <div className="ev-meta">
               <span className="ev-npub" data-pubkey={original.pubkey} style={{ cursor: "pointer" }}>
@@ -452,7 +452,7 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, ful
 
   return (
     <div className="event-card" data-kind={k.tag} onClick={handleClick} style={onClick ? { cursor: "pointer" } : undefined}>
-      <Avatar picture={profile?.picture} pubkey={event.pubkey} className="ev-avatar" clickable />
+      <Avatar picture={profile?.picture} pictureLocal={profile?.picture_local} pubkey={event.pubkey} className="ev-avatar" clickable />
       <div className="ev-content">
         <div className="ev-meta">
           <span className="ev-npub" data-pubkey={event.pubkey} style={{ cursor: "pointer" }}>

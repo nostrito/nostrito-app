@@ -2,8 +2,8 @@ import React, { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { QRCodeSVG } from "qrcode.react";
 import { RELAYS, resolveRelayUrl, urlToAlias } from "../relays";
-import { getProfiles, profileDisplayName } from "../utils/profiles";
-import type { ProfileInfo } from "../utils/profiles";
+import { profileDisplayName } from "../utils/profiles";
+import { useProfileContext } from "../context/ProfileContext";
 import { RelayCard } from "../components/RelayCard";
 import { Slider } from "../components/Slider";
 import { Badge } from "../components/Badge";
@@ -233,6 +233,7 @@ const StorageEstimationPanel: React.FC = () => {
 };
 
 export const Settings: React.FC = () => {
+  const { getProfile, ensureProfiles } = useProfileContext();
 
   /* --- core state --------------------------------------------------- */
   const [activeTab, setActiveTab] = useState<TabId>("identity");
@@ -279,7 +280,6 @@ export const Settings: React.FC = () => {
 
   /* --- tracked profiles --------------------------------------------- */
   const [trackedProfiles, setTrackedProfiles] = useState<TrackedProfile[]>([]);
-  const [trackedProfileMap, setTrackedProfileMap] = useState<Map<string, ProfileInfo>>(new Map());
   const [trackedLoading, setTrackedLoading] = useState(true);
   const [trackInput, setTrackInput] = useState("");
 
@@ -380,17 +380,14 @@ export const Settings: React.FC = () => {
       setTrackedProfiles(tracked);
       if (tracked.length > 0) {
         const pubkeys = tracked.map((p) => p.pubkey);
-        const profileMap = await getProfiles(pubkeys);
-        setTrackedProfileMap(new Map(profileMap));
-      } else {
-        setTrackedProfileMap(new Map());
+        ensureProfiles(pubkeys);
       }
     } catch (e) {
       console.error("[settings] get_tracked_profiles failed:", e);
     } finally {
       setTrackedLoading(false);
     }
-  }, []);
+  }, [ensureProfiles]);
 
   /* --- relay toggle ------------------------------------------------- */
   const toggleRelay = useCallback((id: string) => {
@@ -1943,7 +1940,7 @@ export const Settings: React.FC = () => {
               </div>
             ) : (
               trackedProfiles.map((p) => {
-                const profile = trackedProfileMap.get(p.pubkey);
+                const profile = getProfile(p.pubkey);
                 const hasName = !!(profile?.name || profile?.display_name);
                 const displayName = profileDisplayName(profile, p.pubkey);
                 const short = shortPubkey(p.pubkey);
@@ -1961,6 +1958,7 @@ export const Settings: React.FC = () => {
                   >
                     <Avatar
                       picture={profile?.picture}
+                      pictureLocal={profile?.picture_local}
                       pubkey={p.pubkey}
                       className="tracked-profile-avatar"
                     />

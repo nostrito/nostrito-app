@@ -20,7 +20,8 @@ use wot::WotGraph;
 
 // ── Helpers ────────────────────────────────────────────────────────
 
-/// Show a native macOS error dialog and exit gracefully instead of panicking.
+/// Show an error and exit gracefully instead of panicking.
+#[cfg(desktop)]
 fn fatal_exit(msg: &str) -> ! {
     tracing::error!("[fatal] {}", msg);
     let escaped = msg.replace('\\', "\\\\").replace('"', "\\\"");
@@ -31,6 +32,12 @@ fn fatal_exit(msg: &str) -> ! {
             escaped
         ))
         .output();
+    std::process::exit(1);
+}
+
+#[cfg(mobile)]
+fn fatal_exit(msg: &str) -> ! {
+    tracing::error!("[fatal] {}", msg);
     std::process::exit(1);
 }
 
@@ -641,7 +648,8 @@ async fn init_nostrito(
         *state.sync_cancel.write().await = Some(cancel);
     }
 
-    // Auto-setup mkcert if certs don't exist (first launch)
+    // Auto-setup mkcert (desktop only — needs OS trust store)
+    #[cfg(desktop)]
     {
         let cert_path = dirs::home_dir()
             .unwrap_or_default()
@@ -657,7 +665,7 @@ async fn init_nostrito(
         }
     }
 
-    // Auto-start relay (TLS if certs available)
+    // Auto-start relay (TLS on desktop if certs available, plain WS everywhere)
     {
         let config = state.config.read().await;
         let port = config.relay_port;
@@ -677,7 +685,6 @@ async fn init_nostrito(
             .join(".nostrito/certs/localhost-key.pem");
 
         if cert_path.exists() && key_path.exists() {
-            // Start TLS relay (wss://) on the configured port
             let tls_cancel = relay_cancel_clone.clone();
             let tls_db = db_relay.clone();
             let tls_allowed = allowed.clone();
@@ -691,7 +698,6 @@ async fn init_nostrito(
                     tracing::error!("TLS relay error: {}", e);
                 }
             });
-            // Also start plain relay (ws://) on port+1 for browser compatibility
             let plain_port = port + 1;
             tracing::info!("[relay] Starting plain relay on ws://127.0.0.1:{} (browser fallback)", plain_port);
             tokio::spawn(async move {
@@ -737,9 +743,10 @@ async fn get_profiles_batch(pubkeys: Vec<String>, state: State<'_, AppState>) ->
                 "name": p.name,
                 "display_name": p.display_name,
                 "picture": p.picture,
+                "picture_local": p.picture_local,
             })
         } else {
-            serde_json::json!({ "pubkey": pk, "name": null, "display_name": null, "picture": null })
+            serde_json::json!({ "pubkey": pk, "name": null, "display_name": null, "picture": null, "picture_local": null })
         }
     }).collect();
     Ok(result)
@@ -1759,6 +1766,7 @@ async fn bookmark_media(
         name: None,
         display_name: None,
         picture: None,
+        picture_local: None,
         nip05: None,
         about: None,
         banner: None,
@@ -2501,6 +2509,7 @@ pub struct TrackedProfileDetail {
     pub name: Option<String>,
     pub display_name: Option<String>,
     pub picture: Option<String>,
+    pub picture_local: Option<String>,
     pub event_count: u64,
     pub media_bytes: u64,
     pub media_count: u64,
@@ -2914,6 +2923,7 @@ async fn get_tracked_profiles_detail(state: State<'_, AppState>) -> Result<Vec<T
             name: info.and_then(|p| p.name.clone()),
             display_name: info.and_then(|p| p.display_name.clone()),
             picture: info.and_then(|p| p.picture.clone()),
+            picture_local: info.and_then(|p| p.picture_local.clone()),
             event_count,
             media_bytes,
             media_count,
@@ -3221,6 +3231,7 @@ async fn get_own_profile(state: State<'_, AppState>) -> Result<Option<ProfileInf
 // ── Browser Integration (mkcert TLS) ───────────────────────────────
 
 /// Core mkcert setup logic — synchronous, reusable by both auto-setup and manual command.
+#[cfg(desktop)]
 fn run_mkcert_setup(app: &tauri::AppHandle) -> Result<String, String> {
     use std::process::Command;
 
@@ -3299,16 +3310,18 @@ fn run_mkcert_setup(app: &tauri::AppHandle) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn setup_browser_integration(app: tauri::AppHandle) -> Result<String, String> {
-    let app_clone = app.clone();
-    let result = tokio::task::spawn_blocking(move || run_mkcert_setup(&app_clone))
-        .await
-        .map_err(|e| format!("Task failed: {}", e))??;
-
-    // Signal frontend to restart relay with TLS
-    app.emit("relay:restart_required", ()).ok();
-
-    Ok(result)
+async fn setup_browser_integration(#[allow(unused)] app: tauri::AppHandle) -> Result<String, String> {
+    #[cfg(desktop)]
+    {
+        let app_clone = app.clone();
+        let result = tokio::task::spawn_blocking(move || run_mkcert_setup(&app_clone))
+            .await
+            .map_err(|e| format!("Task failed: {}", e))??;
+        app.emit("relay:restart_required", ()).ok();
+        return Ok(result);
+    }
+    #[cfg(mobile)]
+    Err("Browser integration is not available on mobile".to_string())
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -3657,32 +3670,105 @@ async fn get_profile_with_refresh(
 
 #[tauri::command]
 async fn check_browser_integration() -> Result<bool, String> {
-    let cert_path = dirs::home_dir()
-        .ok_or("no home")?
-        .join(".nostrito/certs/localhost.pem");
-    Ok(cert_path.exists())
+    #[cfg(desktop)]
+    {
+        let cert_path = dirs::home_dir()
+            .ok_or("no home")?
+            .join(".nostrito/certs/localhost.pem");
+        return Ok(cert_path.exists());
+    }
+    #[cfg(mobile)]
+    Ok(false)
+}
+
+// ── Mobile secret storage (file-based, app-private sandbox) ─────────
+
+#[cfg(mobile)]
+mod mobile_secrets {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    fn secrets_path() -> PathBuf {
+        dirs::data_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("nostrito")
+            .join(".secrets.json")
+    }
+
+    fn load_all() -> HashMap<String, String> {
+        std::fs::read_to_string(secrets_path())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn save_all(secrets: &HashMap<String, String>) {
+        let path = secrets_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        if let Ok(json) = serde_json::to_string(secrets) {
+            std::fs::write(&path, json).ok();
+        }
+    }
+
+    pub fn set(service: &str, key: &str, value: &str) -> Result<(), String> {
+        let mut m = load_all();
+        m.insert(format!("{}:{}", service, key), value.to_string());
+        save_all(&m);
+        Ok(())
+    }
+
+    pub fn get(service: &str, key: &str) -> Option<String> {
+        load_all().get(&format!("{}:{}", service, key)).cloned()
+    }
+
+    pub fn delete(service: &str, key: &str) {
+        let mut m = load_all();
+        m.remove(&format!("{}:{}", service, key));
+        save_all(&m);
+    }
 }
 
 // ── nsec Keychain Helpers ────────────────────────────────────────────
 
+#[cfg(desktop)]
 fn save_nsec_to_keychain(npub: &str, nsec: &str) -> Result<(), String> {
     let entry = keyring::Entry::new("nostrito", npub).map_err(|e| format!("Keychain error: {}", e))?;
     entry.set_password(nsec).map_err(|e| format!("Failed to save to keychain: {}", e))
 }
 
+#[cfg(mobile)]
+fn save_nsec_to_keychain(npub: &str, nsec: &str) -> Result<(), String> {
+    mobile_secrets::set("nostrito", npub, nsec)
+}
+
+#[cfg(desktop)]
 fn load_nsec_from_keychain(npub: &str) -> Option<String> {
     let entry = keyring::Entry::new("nostrito", npub).ok()?;
     entry.get_password().ok()
 }
 
+#[cfg(mobile)]
+fn load_nsec_from_keychain(npub: &str) -> Option<String> {
+    mobile_secrets::get("nostrito", npub)
+}
+
+#[cfg(desktop)]
 fn delete_nsec_from_keychain(npub: &str) {
     if let Ok(entry) = keyring::Entry::new("nostrito", npub) {
         entry.delete_credential().ok();
     }
 }
 
+#[cfg(mobile)]
+fn delete_nsec_from_keychain(npub: &str) {
+    mobile_secrets::delete("nostrito", npub);
+}
+
 // ── NIP-46 Bunker Keychain Helpers ─────────────────────────────────
 
+#[cfg(desktop)]
 fn save_bunker_to_keychain(npub: &str, bunker_uri: &str, app_keys_nsec: &str) -> Result<(), String> {
     let uri_entry = keyring::Entry::new("nostrito-bunker-uri", npub)
         .map_err(|e| format!("Keychain error: {}", e))?;
@@ -3697,6 +3783,13 @@ fn save_bunker_to_keychain(npub: &str, bunker_uri: &str, app_keys_nsec: &str) ->
     Ok(())
 }
 
+#[cfg(mobile)]
+fn save_bunker_to_keychain(npub: &str, bunker_uri: &str, app_keys_nsec: &str) -> Result<(), String> {
+    mobile_secrets::set("nostrito-bunker-uri", npub, bunker_uri)?;
+    mobile_secrets::set("nostrito-app-keys", npub, app_keys_nsec)
+}
+
+#[cfg(desktop)]
 fn load_bunker_from_keychain(npub: &str) -> Option<(String, String)> {
     let uri_entry = keyring::Entry::new("nostrito-bunker-uri", npub).ok()?;
     let uri = uri_entry.get_password().ok()?;
@@ -3705,6 +3798,14 @@ fn load_bunker_from_keychain(npub: &str) -> Option<(String, String)> {
     Some((uri, keys_nsec))
 }
 
+#[cfg(mobile)]
+fn load_bunker_from_keychain(npub: &str) -> Option<(String, String)> {
+    let uri = mobile_secrets::get("nostrito-bunker-uri", npub)?;
+    let keys_nsec = mobile_secrets::get("nostrito-app-keys", npub)?;
+    Some((uri, keys_nsec))
+}
+
+#[cfg(desktop)]
 fn delete_bunker_from_keychain(npub: &str) {
     if let Ok(entry) = keyring::Entry::new("nostrito-bunker-uri", npub) {
         entry.delete_credential().ok();
@@ -3712,6 +3813,12 @@ fn delete_bunker_from_keychain(npub: &str) {
     if let Ok(entry) = keyring::Entry::new("nostrito-app-keys", npub) {
         entry.delete_credential().ok();
     }
+}
+
+#[cfg(mobile)]
+fn delete_bunker_from_keychain(npub: &str) {
+    mobile_secrets::delete("nostrito-bunker-uri", npub);
+    mobile_secrets::delete("nostrito-app-keys", npub);
 }
 
 #[tauri::command]
@@ -3996,6 +4103,7 @@ async fn disconnect_bunker(state: State<'_, AppState>) -> Result<(), String> {
 
 // ── Wallet Keychain Helpers ───────────────────────────────────────────
 
+#[cfg(desktop)]
 fn save_wallet_to_keychain(npub: &str, data: &str) -> Result<(), String> {
     let entry = keyring::Entry::new("nostrito-wallet", npub)
         .map_err(|e| format!("Keychain error: {}", e))?;
@@ -4004,15 +4112,32 @@ fn save_wallet_to_keychain(npub: &str, data: &str) -> Result<(), String> {
         .map_err(|e| format!("Failed to save wallet to keychain: {}", e))
 }
 
+#[cfg(mobile)]
+fn save_wallet_to_keychain(npub: &str, data: &str) -> Result<(), String> {
+    mobile_secrets::set("nostrito-wallet", npub, data)
+}
+
+#[cfg(desktop)]
 fn load_wallet_from_keychain(npub: &str) -> Option<String> {
     let entry = keyring::Entry::new("nostrito-wallet", npub).ok()?;
     entry.get_password().ok()
 }
 
+#[cfg(mobile)]
+fn load_wallet_from_keychain(npub: &str) -> Option<String> {
+    mobile_secrets::get("nostrito-wallet", npub)
+}
+
+#[cfg(desktop)]
 fn delete_wallet_from_keychain(npub: &str) {
     if let Ok(entry) = keyring::Entry::new("nostrito-wallet", npub) {
         entry.delete_credential().ok();
     }
+}
+
+#[cfg(mobile)]
+fn delete_wallet_from_keychain(npub: &str) {
+    mobile_secrets::delete("nostrito-wallet", npub);
 }
 
 // ── Wallet Tauri Commands ────────────────────────────────────────────
@@ -4605,45 +4730,73 @@ async fn send_zap(
 
 // ── App Entry ──────────────────────────────────────────────────────
 
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Set up dual logging: console (INFO+) and rotating file (~/.nostrito/nostrito.log, max ~10MB)
+    // Set up dual logging: console (INFO+) and rotating file (nostrito.log)
     {
         use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
         let log_dir = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
+            .or_else(|| dirs::data_dir())
+            .or_else(|| std::env::var("HOME").ok().map(PathBuf::from))
+            .or_else(|| {
+                let p = PathBuf::from("/data/data/lat.nostrito/files");
+                if p.exists() || std::fs::create_dir_all(&p).is_ok() { Some(p) } else { None }
+            })
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
             .join(".nostrito");
-        std::fs::create_dir_all(&log_dir).ok();
-
-        // Rotating file appender: daily rotation, keep up to 3 files (~10MB effective cap)
-        let file_appender = tracing_appender::rolling::daily(&log_dir, "nostrito.log");
-        let (file_writer, _guard) = tracing_appender::non_blocking(file_appender);
-        // Leak the guard so it lives for the entire process lifetime
-        std::mem::forget(_guard);
 
         let env_filter = EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| EnvFilter::new("info,nostrito_lib=info,nostrito_lib::sync=debug"));
 
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(
-                fmt::layer()
-                    .with_target(true)
-                    .with_ansi(true),
-            )
-            .with(
-                fmt::layer()
-                    .with_target(true)
-                    .with_ansi(false)
-                    .with_writer(file_writer),
-            )
-            .init();
+        // Try to set up file logging; skip if directory can't be created (e.g. sandboxed mobile)
+        if std::fs::create_dir_all(&log_dir).is_ok() {
+            let file_appender = tracing_appender::rolling::daily(&log_dir, "nostrito.log");
+            let (file_writer, _guard) = tracing_appender::non_blocking(file_appender);
+            std::mem::forget(_guard);
+
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(
+                    fmt::layer()
+                        .with_target(true)
+                        .with_ansi(true),
+                )
+                .with(
+                    fmt::layer()
+                        .with_target(true)
+                        .with_ansi(false)
+                        .with_writer(file_writer),
+                )
+                .init();
+        } else {
+            // Console-only logging (mobile fallback)
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(
+                    fmt::layer()
+                        .with_target(true)
+                        .with_ansi(false),
+                )
+                .init();
+        }
     }
 
     tracing::info!("[init] Starting nostrito");
 
     // Determine data directory
     let data_dir = dirs::data_dir()
+        .or_else(|| dirs::home_dir())
+        .or_else(|| std::env::var("HOME").ok().map(PathBuf::from))
+        .or_else(|| {
+            // Android fallback: app-private internal storage
+            let android_path = PathBuf::from("/data/data/lat.nostrito/files");
+            if android_path.exists() || std::fs::create_dir_all(&android_path).is_ok() {
+                Some(android_path)
+            } else {
+                None
+            }
+        })
         .unwrap_or_else(|| PathBuf::from("."))
         .join("nostrito");
     if let Err(e) = std::fs::create_dir_all(&data_dir) {
@@ -4999,7 +5152,8 @@ pub fn run() {
                         *sync_cancel.write().await = Some(cancel);
                     }
 
-                    // Auto-setup mkcert if certs don't exist
+                    // Auto-setup mkcert (desktop only — needs OS trust store)
+                    #[cfg(desktop)]
                     {
                         let cert_check = dirs::home_dir()
                             .unwrap_or_default()
@@ -5015,7 +5169,7 @@ pub fn run() {
                         }
                     }
 
-                    // Auto-start relay (TLS if certs available)
+                    // Auto-start relay (TLS on desktop if certs available, plain WS everywhere)
                     let relay_ct = CancellationToken::new();
                     let relay_ct_clone = relay_ct.clone();
                     let outbound_tx = spawn_outbound_broadcaster(config.clone(), app_handle.clone());
@@ -5063,7 +5217,7 @@ pub fn run() {
                     }
                     *relay_cancel_setup.write().await = Some(relay_ct);
 
-                    tracing::info!("Sync and relay auto-resumed successfully");
+                    tracing::info!("Sync auto-resumed successfully");
                 }
             });
 

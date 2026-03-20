@@ -84,7 +84,7 @@ const ArticleSidebar: React.FC<{
   return (
     <>
       <div className="sidebar-author-card">
-        <Avatar picture={profile?.picture} pubkey={event.pubkey} className="sidebar-author-avatar" clickable />
+        <Avatar picture={profile?.picture} pictureLocal={profile?.picture_local} pubkey={event.pubkey} className="sidebar-author-avatar" clickable />
         <div className="sidebar-author-name" data-pubkey={event.pubkey} style={{ cursor: "pointer" }}>{displayName}</div>
         {profile?.about && <div className="sidebar-author-about">{profile.about.slice(0, 150)}{profile.about.length > 150 ? "\u2026" : ""}</div>}
       </div>
@@ -160,6 +160,7 @@ const ArticleReader: React.FC<ArticleReaderProps> = ({ event, onBack, onSelectAr
             <div className="reader-author">
               <Avatar
                 picture={profile?.picture}
+                pictureLocal={profile?.picture_local}
                 pubkey={event.pubkey}
                 className="reader-author-avatar"
                 fallbackClassName="reader-author-avatar reader-author-avatar-fallback"
@@ -183,6 +184,11 @@ const ArticleReader: React.FC<ArticleReaderProps> = ({ event, onBack, onSelectAr
     </div>
   );
 };
+
+// -- Module-level feed cache (survives component remounts) --
+let cachedFeedEvents: NostrEvent[] = [];
+let cachedFeedMode: string | null = null;
+let cachedRenderedIds: Set<string> = new Set();
 
 // -- Main Feed component --
 
@@ -208,8 +214,9 @@ export const Feed: React.FC = () => {
   const [activeFilter, setActiveFilter] = useState<FilterTab>("all");
   const [searchQuery, setSearchQuery] = useState("");
   const [searchStatus, setSearchStatus] = useState<string | null>(null);
-  const [feedEvents, setFeedEvents] = useState<NostrEvent[]>([]);
-  const [loading, setLoading] = useState(true);
+  const hasCachedFeed = cachedFeedMode === feedMode && cachedFeedEvents.length > 0;
+  const [feedEvents, setFeedEvents] = useState<NostrEvent[]>(hasCachedFeed ? cachedFeedEvents : []);
+  const [loading, setLoading] = useState(!hasCachedFeed);
   const [isSearchMode, setIsSearchMode] = useState(false);
   const [globalConsent, setGlobalConsent] = useState(false);
   const [savedEventIds, setSavedEventIds] = useState<Set<string>>(new Set());
@@ -238,7 +245,7 @@ export const Feed: React.FC = () => {
   const [groupedReposts, setGroupedReposts] = useState<Map<string, GroupedRepost>>(new Map());
   const fetchedOriginalIdsRef = useRef(new Set<string>());
 
-  const renderedEventIdsRef = useRef(new Set<string>());
+  const renderedEventIdsRef = useRef(hasCachedFeed ? new Set(cachedRenderedIds) : new Set<string>());
   const feedLoadingRef = useRef(false);
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const oldestNoteTimestamp = useRef<number | null>(null);
@@ -302,7 +309,11 @@ export const Feed: React.FC = () => {
       setFeedEvents((prev) => {
         const existingIds = new Set(prev.map((e) => e.id));
         const toAdd = newEvents.filter((e) => !existingIds.has(e.id));
-        return deduplicateArticles([...toAdd, ...prev]);
+        const merged = deduplicateArticles([...toAdd, ...prev]);
+        cachedFeedEvents = merged;
+        cachedFeedMode = feedMode;
+        cachedRenderedIds = new Set(renderedEventIdsRef.current);
+        return merged;
       });
 
       setLoading(false);
@@ -486,7 +497,10 @@ export const Feed: React.FC = () => {
       setFeedEvents((prev) => {
         const existingIds = new Set(prev.map((e) => e.id));
         const toAdd = newEvents.filter((e) => !existingIds.has(e.id));
-        return [...prev, ...toAdd];
+        const merged = [...prev, ...toAdd];
+        cachedFeedEvents = merged;
+        cachedRenderedIds = new Set(renderedEventIdsRef.current);
+        return merged;
       });
     } catch (err) {
       console.warn("[feed] Failed to load more events:", err);

@@ -556,6 +556,7 @@ export const Gallery: React.FC = () => {
                   >
                     <Avatar
                       picture={profile?.picture}
+                      pictureLocal={profile?.picture_local}
                       pubkey={person.pubkey}
                       className="gallery-person-avatar"
                       clickable={false}

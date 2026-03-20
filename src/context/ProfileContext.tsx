@@ -75,6 +75,7 @@ export const ProfileProvider: React.FC<{ children: React.ReactNode }> = ({ child
             name: null,
             display_name: null,
             picture: null,
+            picture_local: null,
             nip05: null,
             about: null,
             banner: null,
