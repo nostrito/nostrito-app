@@ -50,7 +50,7 @@ export const SigningProvider: React.FC<{ children: React.ReactNode }> = ({ child
     return () => { unlisten.then((fn) => fn()); };
   }, []);
 
-  const canWrite = signingMode === "nsec";
+  const canWrite = signingMode === "nsec" || signingMode === "bunker" || signingMode === "connect";
 
   return (
     <SigningContext.Provider value={{ canWrite, signingMode, refresh }}>

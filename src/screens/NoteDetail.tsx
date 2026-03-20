@@ -4,6 +4,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { NoteCard } from "../components/NoteCard";
 import { ZapModal } from "../components/ZapModal";
+import { ComposeModal } from "../components/ComposeModal";
+import { IconMessageCircle } from "../components/Icon";
+import { useCanWrite } from "../context/SigningContext";
 import { Avatar } from "../components/Avatar";
 import { EmptyState } from "../components/EmptyState";
 import { useProfileContext } from "../context/ProfileContext";
@@ -189,6 +192,8 @@ export const NoteDetail: React.FC = () => {
   const [wotDistances, setWotDistances] = useState<Record<string, number>>({});
   const [showNonWot, setShowNonWot] = useState(false);
   const [zapTarget, setZapTarget] = useState<NostrEvent | null>(null);
+  const [showReplyModal, setShowReplyModal] = useState(false);
+  const canWrite = useCanWrite();
 
   const handleLike = useCallback(async (event: NostrEvent) => {
     try {
@@ -412,6 +417,14 @@ export const NoteDetail: React.FC = () => {
             )}
           </div>
 
+          {canWrite && displayEvent && (
+            <div className="note-detail-reply-row">
+              <button className="note-detail-reply-btn" onClick={() => setShowReplyModal(true)}>
+                <span className="icon"><IconMessageCircle /></span> reply to this note
+              </button>
+            </div>
+          )}
+
           {/* Reactions */}
           {!threadData && (
             <div className="note-detail-reactions">
@@ -541,6 +554,27 @@ export const NoteDetail: React.FC = () => {
           recipientPubkey={zapTarget.pubkey}
           recipientLud16={getProfile(zapTarget.pubkey)?.lud16 ?? null}
           onClose={() => setZapTarget(null)}
+        />
+      )}
+      {showReplyModal && displayEvent && (
+        <ComposeModal
+          replyTo={displayEvent}
+          replyToProfile={getProfile(displayEvent.pubkey)}
+          onClose={() => {
+            setShowReplyModal(false);
+            if (rootId) {
+              invoke<ThreadData>("get_thread_events", { rootId })
+                .then((data) => {
+                  setThreadData(data);
+                  invalidateInteractionCounts();
+                  const pubkeys = new Set<string>();
+                  if (data.root) pubkeys.add(data.root.pubkey);
+                  for (const r of data.replies) pubkeys.add(r.pubkey);
+                  if (pubkeys.size > 0) ensureProfiles(Array.from(pubkeys));
+                })
+                .catch(() => {});
+            }
+          }}
         />
       )}
     </div>

@@ -4418,7 +4418,64 @@ async fn wallet_provision(state: State<'_, AppState>) -> Result<wallet::WalletIn
     })
 }
 
-// ── Reaction / Author Articles / Profile Relay Fetch ─────────────
+// ── Signing helper / Reaction / Author Articles / Profile Relay Fetch ─────────────
+
+async fn sign_build_publish_store(
+    builder: nostr_sdk::prelude::EventBuilder,
+    state: &State<'_, AppState>,
+) -> Result<nostr_sdk::prelude::Event, String> {
+    use nostr_sdk::prelude::*;
+
+    let config = state.config.read().await;
+    let nsec = config.nsec.clone();
+    let relays = config.outbound_relays.clone();
+    let hex_pubkey = config.hex_pubkey.clone();
+    drop(config);
+
+    let signed = if let Some(nsec_str) = nsec {
+        let secret_key = SecretKey::from_bech32(&nsec_str)
+            .map_err(|e| format!("Invalid nsec: {}", e))?;
+        let keys = Keys::new(secret_key);
+        builder.to_event(&keys)
+            .map_err(|e| format!("Failed to sign event: {}", e))?
+    } else {
+        let pubkey_hex = hex_pubkey.ok_or("No signing key configured")?;
+        let pubkey = PublicKey::from_hex(&pubkey_hex)
+            .map_err(|e| format!("Invalid hex pubkey: {}", e))?;
+        let unsigned = builder.to_unsigned_event(pubkey);
+        let signer_guard = state.nip46_signer.read().await;
+        let signer = signer_guard.as_ref().ok_or("NIP-46 signer not connected")?;
+        signer.sign_event(unsigned).await?
+    };
+
+    let client = Client::default();
+    for url in &relays {
+        if let Ok(_) = client.add_relay(url.as_str()).await {
+            client.connect_relay(url.as_str()).await.ok();
+        }
+    }
+    client.send_event(signed.clone()).await
+        .map_err(|e| format!("Failed to publish event: {}", e))?;
+    client.disconnect().await.ok();
+
+    let tags_json = serde_json::to_string(
+        &signed.tags.iter()
+            .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect::<Vec<String>>())
+            .collect::<Vec<Vec<String>>>()
+    ).unwrap_or_else(|_| "[]".to_string());
+
+    state.db().store_event(
+        &signed.id.to_hex(),
+        &signed.pubkey.to_hex(),
+        signed.created_at.as_u64() as i64,
+        signed.kind.as_u16() as u32,
+        &tags_json,
+        &signed.content.to_string(),
+        &signed.sig.to_string(),
+    ).ok();
+
+    Ok(signed)
+}
 
 #[tauri::command]
 async fn publish_reaction(
@@ -4428,55 +4485,110 @@ async fn publish_reaction(
 ) -> Result<String, String> {
     use nostr_sdk::prelude::*;
 
-    let config = state.config.read().await;
-    let nsec = config.nsec.clone().ok_or("nsec required to react")?;
-    let relays = config.outbound_relays.clone();
-    drop(config);
-
-    let secret_key = SecretKey::from_bech32(&nsec)
-        .map_err(|e| format!("Invalid nsec: {}", e))?;
-    let keys = Keys::new(secret_key);
-
     let tags = vec![
         Tag::parse(&["e", &event_id]).map_err(|e| format!("bad e-tag: {}", e))?,
         Tag::parse(&["p", &event_pubkey]).map_err(|e| format!("bad p-tag: {}", e))?,
     ];
-    let signed = EventBuilder::new(Kind::Reaction, "+", tags)
-        .to_event(&keys)
-        .map_err(|e| format!("Failed to sign reaction: {}", e))?;
-
+    let builder = EventBuilder::new(Kind::Reaction, "+", tags);
+    let signed = sign_build_publish_store(builder, &state).await?;
     let reaction_id = signed.id.to_hex();
-
-    // Publish to outbound relays
-    let client = Client::default();
-    for url in &relays {
-        if let Ok(_) = client.add_relay(url.as_str()).await {
-            client.connect_relay(url.as_str()).await.ok();
-        }
-    }
-    client.send_event(signed.clone()).await
-        .map_err(|e| format!("Failed to publish reaction: {}", e))?;
-    client.disconnect().await.ok();
-
-    // Save locally so counts update immediately
-    let tags_json = serde_json::to_string(
-        &signed.tags.iter()
-            .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect::<Vec<String>>())
-            .collect::<Vec<Vec<String>>>()
-    ).unwrap_or_else(|_| "[]".to_string());
-
-    state.db().store_event(
-        &reaction_id,
-        &signed.pubkey.to_hex(),
-        signed.created_at.as_u64() as i64,
-        signed.kind.as_u16() as u32,
-        &tags_json,
-        &signed.content.to_string(),
-        &signed.sig.to_string(),
-    ).ok();
-
     tracing::info!("[cmd:publish_reaction] published reaction {} for event {}", &reaction_id[..12.min(reaction_id.len())], &event_id[..12.min(event_id.len())]);
     Ok(reaction_id)
+}
+
+#[tauri::command]
+async fn publish_note(
+    content: String,
+    reply_to: Option<String>,
+    reply_to_pubkey: Option<String>,
+    root_id: Option<String>,
+    root_pubkey: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    use nostr_sdk::prelude::*;
+
+    if content.trim().is_empty() {
+        return Err("Note content cannot be empty".to_string());
+    }
+
+    let mut tags: Vec<Tag> = Vec::new();
+
+    if let Some(ref reply_id) = reply_to {
+        if let Some(ref rid) = root_id {
+            tags.push(Tag::parse(&["e", rid, "", "root"]).map_err(|e| format!("bad root e-tag: {}", e))?);
+            tags.push(Tag::parse(&["e", reply_id, "", "reply"]).map_err(|e| format!("bad reply e-tag: {}", e))?);
+        } else {
+            tags.push(Tag::parse(&["e", reply_id, "", "root"]).map_err(|e| format!("bad e-tag: {}", e))?);
+        }
+        if let Some(ref rp) = root_pubkey {
+            tags.push(Tag::parse(&["p", rp]).map_err(|e| format!("bad p-tag: {}", e))?);
+        }
+        if let Some(ref rp) = reply_to_pubkey {
+            if root_pubkey.as_deref() != Some(rp.as_str()) {
+                tags.push(Tag::parse(&["p", rp]).map_err(|e| format!("bad p-tag: {}", e))?);
+            }
+        }
+    }
+
+    let builder = EventBuilder::new(Kind::TextNote, &content, tags);
+    let signed = sign_build_publish_store(builder, &state).await?;
+    let note_id = signed.id.to_hex();
+    tracing::info!("[cmd:publish_note] published note {}", &note_id[..12.min(note_id.len())]);
+    Ok(note_id)
+}
+
+#[tauri::command]
+async fn publish_article(
+    title: String,
+    content: String,
+    summary: Option<String>,
+    d_tag: Option<String>,
+    image: Option<String>,
+    hashtags: Option<Vec<String>>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    use nostr_sdk::prelude::*;
+
+    if title.trim().is_empty() || content.trim().is_empty() {
+        return Err("Title and content are required".to_string());
+    }
+
+    let slug = d_tag.unwrap_or_else(|| {
+        title.to_lowercase()
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '-' })
+            .collect::<String>()
+            .trim_matches('-')
+            .to_string()
+    });
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let mut tags: Vec<Tag> = vec![
+        Tag::parse(&["d", &slug]).unwrap(),
+        Tag::parse(&["title", &title]).unwrap(),
+        Tag::parse(&["published_at", &now.to_string()]).unwrap(),
+    ];
+    if let Some(ref s) = summary {
+        tags.push(Tag::parse(&["summary", s]).unwrap());
+    }
+    if let Some(ref img) = image {
+        tags.push(Tag::parse(&["image", img]).unwrap());
+    }
+    if let Some(ref ht) = hashtags {
+        for t in ht {
+            tags.push(Tag::parse(&["t", t]).unwrap());
+        }
+    }
+
+    let builder = EventBuilder::new(Kind::from(30023), &content, tags);
+    let signed = sign_build_publish_store(builder, &state).await?;
+    let article_id = signed.id.to_hex();
+    tracing::info!("[cmd:publish_article] published article '{}' ({})", &title, &article_id[..12.min(article_id.len())]);
+    Ok(article_id)
 }
 
 #[tauri::command]
@@ -5319,6 +5431,8 @@ pub fn run() {
             wallet_provision,
             send_zap,
             publish_reaction,
+            publish_note,
+            publish_article,
             get_author_articles,
             fetch_profiles_from_relay,
         ])
