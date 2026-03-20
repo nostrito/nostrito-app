@@ -15,6 +15,12 @@ src-tauri/target/
 .DS_Store
 Thumbs.db
 
+# Cargo local config
+src-tauri/.cargo/
+
+# Android/Kotlin build cache
+src-tauri/gen/android/buildSrc/.kotlin/
+
 # Environment
 .env
 .env.local

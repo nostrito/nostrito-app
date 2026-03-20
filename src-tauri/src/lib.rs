@@ -1305,6 +1305,208 @@ async fn fetch_thread_from_relays(
 }
 
 #[tauri::command]
+async fn fetch_profile_content_from_relays(
+    pubkey: String,
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<u32, String> {
+    use nostr_sdk::prelude::*;
+
+    let cfg = state.config.read().await;
+    let hex_pubkey = cfg.hex_pubkey.clone().unwrap_or_default();
+    let fallback_relays = cfg.outbound_relays.clone();
+    drop(cfg);
+
+    let relay_urls = resolve_sync_relays(&state.db(), &hex_pubkey, &fallback_relays);
+    if relay_urls.is_empty() {
+        return Err("No relays available".into());
+    }
+
+    let pk = PublicKey::from_hex(&pubkey)
+        .map_err(|e| format!("Invalid pubkey: {}", e))?;
+
+    // Recent notes, reposts, articles by this author
+    let notes_filter = Filter::new()
+        .authors(vec![pk])
+        .kinds(vec![Kind::TextNote, Kind::Repost, Kind::LongFormTextNote])
+        .limit(100);
+
+    // Metadata + contact list + relay list
+    let meta_filter = Filter::new()
+        .authors(vec![pk])
+        .kinds(vec![Kind::Metadata, Kind::ContactList, Kind::from(10002)])
+        .limit(5);
+
+    // Followers: kind:3 events that tag this pubkey in a "p" tag
+    let followers_filter = Filter::new()
+        .kind(Kind::ContactList)
+        .custom_tag(SingleLetterTag::lowercase(Alphabet::P), vec![pubkey.clone()])
+        .limit(500);
+
+    let pool = crate::sync::pool::RelayPool::new();
+    let events = pool.subscribe_and_collect(
+        &relay_urls,
+        vec![notes_filter, meta_filter, followers_filter],
+        15,
+    ).await.map_err(|e| format!("Relay fetch failed: {}", e))?;
+
+    if events.is_empty() {
+        app_handle.emit("profile-content-updated", &pubkey).ok();
+        return Ok(0);
+    }
+
+    let db = state.db();
+    let graph = Arc::clone(&state.wot_graph);
+    let (stored, _) = crate::sync::processing::process_events(
+        &events,
+        &db,
+        &graph,
+        &hex_pubkey,
+        crate::sync::types::EventSource::Sync,
+        crate::sync::types::MEDIA_PRIORITY_OTHERS,
+        None,
+        "profile-fetch",
+    );
+
+    // Update profile fetched_at timestamp
+    let now = chrono::Utc::now().timestamp();
+    db.set_profile_fetched_at(&pubkey, now).ok();
+
+    // Emit event so frontend can refresh
+    app_handle.emit("profile-content-updated", &pubkey).ok();
+
+    tracing::info!(
+        "[cmd:fetch_profile_content] pubkey={}… stored {} events from {} relay events",
+        &pubkey[..pubkey.len().min(12)],
+        stored,
+        events.len()
+    );
+
+    Ok(stored)
+}
+
+#[tauri::command]
+async fn fetch_note_context_from_relays(
+    note_id: String,
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<u32, String> {
+    use nostr_sdk::prelude::*;
+
+    let cfg = state.config.read().await;
+    let hex_pubkey = cfg.hex_pubkey.clone().unwrap_or_default();
+    let fallback_relays = cfg.outbound_relays.clone();
+    drop(cfg);
+
+    let relay_urls = resolve_sync_relays(&state.db(), &hex_pubkey, &fallback_relays);
+    if relay_urls.is_empty() {
+        return Err("No relays available".into());
+    }
+
+    let event_id = EventId::from_hex(&note_id)
+        .map_err(|e| format!("Invalid event ID: {}", e))?;
+
+    // Fetch the event itself + replies + reactions + zaps
+    let filters = vec![
+        Filter::new().id(event_id).limit(1),
+        Filter::new().event(event_id).kinds(vec![Kind::TextNote]).limit(500),
+        Filter::new().event(event_id).kinds(vec![Kind::Reaction, Kind::from(9735)]).limit(500),
+    ];
+
+    let pool = crate::sync::pool::RelayPool::new();
+    let events = pool.subscribe_and_collect(
+        &relay_urls,
+        filters,
+        15,
+    ).await.map_err(|e| format!("Relay fetch failed: {}", e))?;
+
+    if events.is_empty() {
+        return Ok(0);
+    }
+
+    let db = state.db();
+    let graph = Arc::clone(&state.wot_graph);
+    let (stored, _) = crate::sync::processing::process_events(
+        &events,
+        &db,
+        &graph,
+        &hex_pubkey,
+        crate::sync::types::EventSource::ThreadContext,
+        crate::sync::types::MEDIA_PRIORITY_OTHERS,
+        None,
+        "note-context",
+    );
+
+    // Emit thread-updated so frontend can refresh
+    app_handle.emit("thread-updated", &note_id).ok();
+
+    tracing::info!(
+        "[cmd:fetch_note_context] note={}… stored {} events",
+        &note_id[..note_id.len().min(12)],
+        stored
+    );
+
+    Ok(stored)
+}
+
+#[tauri::command]
+async fn fetch_addressable_event_from_relays(
+    kind: u16,
+    pubkey: String,
+    d_tag: String,
+    state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    use nostr_sdk::prelude::*;
+
+    let cfg = state.config.read().await;
+    let hex_pubkey = cfg.hex_pubkey.clone().unwrap_or_default();
+    let fallback_relays = cfg.outbound_relays.clone();
+    drop(cfg);
+
+    let relay_urls = resolve_sync_relays(&state.db(), &hex_pubkey, &fallback_relays);
+    if relay_urls.is_empty() {
+        return Err("No relays available".into());
+    }
+
+    let pk = PublicKey::from_hex(&pubkey)
+        .map_err(|e| format!("Invalid pubkey: {}", e))?;
+
+    let filter = Filter::new()
+        .kind(Kind::from(kind))
+        .authors(vec![pk])
+        .custom_tag(SingleLetterTag::lowercase(Alphabet::D), vec![d_tag])
+        .limit(1);
+
+    let pool = crate::sync::pool::RelayPool::new();
+    let events = pool.subscribe_and_collect(
+        &relay_urls,
+        vec![filter],
+        10,
+    ).await.map_err(|e| format!("Relay fetch failed: {}", e))?;
+
+    if events.is_empty() {
+        return Ok(None);
+    }
+
+    let event_id = events[0].id.to_hex();
+
+    let db = state.db();
+    let graph = Arc::clone(&state.wot_graph);
+    crate::sync::processing::process_events(
+        &events,
+        &db,
+        &graph,
+        &hex_pubkey,
+        crate::sync::types::EventSource::Search,
+        crate::sync::types::MEDIA_PRIORITY_OTHERS,
+        None,
+        "naddr-fetch",
+    );
+
+    Ok(Some(event_id))
+}
+
+#[tauri::command]
 async fn get_note_zaps(
     note_id: String,
     state: State<'_, AppState>,
@@ -5321,6 +5523,9 @@ pub fn run() {
             publish_reaction,
             get_author_articles,
             fetch_profiles_from_relay,
+            fetch_profile_content_from_relays,
+            fetch_note_context_from_relays,
+            fetch_addressable_event_from_relays,
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|e| {

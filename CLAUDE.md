@@ -16,4 +16,4 @@
   relays via Tauri commands — they do NOT go through the relay WebSocket path
 
 ## Git Workflow
-- Never use git worktrees. Always commit directly to the working branch.
+- Use feature branches for larger changes.
