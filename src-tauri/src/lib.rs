@@ -1334,7 +1334,7 @@ async fn fetch_profile_content_from_relays(
     // Metadata + contact list + relay list
     let meta_filter = Filter::new()
         .authors(vec![pk])
-        .kinds(vec![Kind::Metadata, Kind::ContactList, Kind::from(10002)])
+        .kinds(vec![Kind::Metadata, Kind::ContactList, Kind::from(10002u16)])
         .limit(5);
 
     // Followers: kind:3 events that tag this pubkey in a "p" tag
@@ -1410,7 +1410,7 @@ async fn fetch_note_context_from_relays(
     let filters = vec![
         Filter::new().id(event_id).limit(1),
         Filter::new().event(event_id).kinds(vec![Kind::TextNote]).limit(500),
-        Filter::new().event(event_id).kinds(vec![Kind::Reaction, Kind::from(9735)]).limit(500),
+        Filter::new().event(event_id).kinds(vec![Kind::Reaction, Kind::from(9735u16)]).limit(500),
     ];
 
     let pool = crate::sync::pool::RelayPool::new();
@@ -4146,6 +4146,7 @@ async fn decrypt_dm(content: String, sender_pubkey: String, state: State<'_, App
 #[tauri::command]
 async fn connect_bunker(
     bunker_uri: String,
+    app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     use nostr_sdk::prelude::*;
@@ -4194,6 +4195,7 @@ async fn connect_bunker(
         config.nsec = None;
     }
 
+    app_handle.emit("signing-mode-changed", "bunker").ok();
     tracing::info!("[cmd:connect_bunker] Connected to bunker, npub={}", &npub[..npub.len().min(16)]);
     Ok(npub)
 }
@@ -4228,6 +4230,7 @@ async fn generate_nostr_connect_uri(
 async fn await_nostr_connect(
     nostr_connect_uri: String,
     app_keys_nsec: String,
+    app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     use nostr_sdk::prelude::*;
@@ -4269,12 +4272,13 @@ async fn await_nostr_connect(
         config.nsec = None;
     }
 
+    app_handle.emit("signing-mode-changed", "connect").ok();
     tracing::info!("[cmd:await_nostr_connect] Connected via Nostr Connect, npub={}", &npub[..npub.len().min(16)]);
     Ok(npub)
 }
 
 #[tauri::command]
-async fn disconnect_bunker(state: State<'_, AppState>) -> Result<(), String> {
+async fn disconnect_bunker(app_handle: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     // Take signer from state and shut it down
     {
         let mut nip46 = state.nip46_signer.write().await;
@@ -4299,6 +4303,7 @@ async fn disconnect_bunker(state: State<'_, AppState>) -> Result<(), String> {
         config.signing_mode = "read-only".to_string();
     }
 
+    app_handle.emit("signing-mode-changed", "read-only").ok();
     tracing::info!("[cmd:disconnect_bunker] Remote signer disconnected");
     Ok(())
 }
@@ -4620,7 +4625,123 @@ async fn wallet_provision(state: State<'_, AppState>) -> Result<wallet::WalletIn
     })
 }
 
-// ── Reaction / Author Articles / Profile Relay Fetch ─────────────
+// ── Signing helper / Reaction / Author Articles / Profile Relay Fetch ─────────────
+
+async fn sign_build_publish_store(
+    builder: nostr_sdk::prelude::EventBuilder,
+    state: &State<'_, AppState>,
+) -> Result<nostr_sdk::prelude::Event, String> {
+    use nostr_sdk::prelude::*;
+
+    let config = state.config.read().await;
+    let nsec = config.nsec.clone();
+    let relays = config.outbound_relays.clone();
+    let hex_pubkey = config.hex_pubkey.clone();
+    let signing_mode = config.signing_mode.clone();
+    drop(config);
+
+    tracing::info!("[publish] signing_mode={}, has_nsec={}, has_pubkey={}, outbound_relays={}",
+        signing_mode, nsec.is_some(), hex_pubkey.is_some(), relays.len());
+
+    // Use signing_mode to decide path, NOT nsec.is_some() — nsec may linger
+    // in keychain even after switching to bunker/connect.
+    let use_nsec = signing_mode == "nsec" && nsec.is_some();
+
+    let signed = if use_nsec {
+        let nsec_str = nsec.unwrap();
+        tracing::info!("[publish] signing with local nsec");
+        let secret_key = SecretKey::from_bech32(&nsec_str)
+            .map_err(|e| format!("Invalid nsec: {}", e))?;
+        let keys = Keys::new(secret_key);
+        let event = builder.to_event(&keys)
+            .map_err(|e| format!("Failed to sign event: {}", e))?;
+        tracing::info!("[publish] signed locally: kind={}, id={}", event.kind.as_u16(), &event.id.to_hex()[..12]);
+        event
+    } else {
+        let pubkey_hex = hex_pubkey.ok_or("No signing key configured (no nsec, no pubkey)")?;
+        tracing::info!("[publish] using NIP-46 remote signing (mode={}) for pubkey={}...",
+            signing_mode, &pubkey_hex[..12.min(pubkey_hex.len())]);
+
+        let pubkey = PublicKey::from_hex(&pubkey_hex)
+            .map_err(|e| format!("Invalid hex pubkey: {}", e))?;
+        let unsigned = builder.to_unsigned_event(pubkey);
+        tracing::info!("[publish] built unsigned event: kind={}, content_len={}", unsigned.kind.as_u16(), unsigned.content.len());
+
+        let signer_guard = state.nip46_signer.read().await;
+        let signer = match signer_guard.as_ref() {
+            Some(s) => {
+                tracing::info!("[publish] NIP-46 signer found, sending sign_event request...");
+                s
+            }
+            None => {
+                tracing::error!("[publish] NIP-46 signer is None! signing_mode={}", signing_mode);
+                return Err("NIP-46 signer not connected. Reconnect your bunker in settings.".to_string());
+            }
+        };
+
+        match signer.sign_event(unsigned).await {
+            Ok(event) => {
+                tracing::info!("[publish] NIP-46 signed successfully: kind={}, id={}", event.kind.as_u16(), &event.id.to_hex()[..12]);
+                event
+            }
+            Err(e) => {
+                tracing::error!("[publish] NIP-46 sign_event failed: {}", e);
+                return Err(format!("Remote signer failed: {}", e));
+            }
+        }
+    };
+
+    // Publish to outbound relays
+    tracing::info!("[publish] publishing to {} outbound relays...", relays.len());
+    let client = Client::default();
+    let mut connected_count = 0u32;
+    for url in &relays {
+        match client.add_relay(url.as_str()).await {
+            Ok(_) => {
+                client.connect_relay(url.as_str()).await.ok();
+                connected_count += 1;
+            }
+            Err(e) => {
+                tracing::warn!("[publish] failed to add relay {}: {}", url, e);
+            }
+        }
+    }
+    tracing::info!("[publish] connected to {}/{} relays", connected_count, relays.len());
+
+    match client.send_event(signed.clone()).await {
+        Ok(output) => {
+            tracing::info!("[publish] broadcast complete: event {} sent", &signed.id.to_hex()[..12]);
+            let _ = output; // SendEventOutput
+        }
+        Err(e) => {
+            tracing::error!("[publish] broadcast failed: {}", e);
+            return Err(format!("Failed to publish event: {}", e));
+        }
+    }
+    client.disconnect().await.ok();
+
+    // Store locally
+    let tags_json = serde_json::to_string(
+        &signed.tags.iter()
+            .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect::<Vec<String>>())
+            .collect::<Vec<Vec<String>>>()
+    ).unwrap_or_else(|_| "[]".to_string());
+
+    match state.db().store_event(
+        &signed.id.to_hex(),
+        &signed.pubkey.to_hex(),
+        signed.created_at.as_u64() as i64,
+        signed.kind.as_u16() as u32,
+        &tags_json,
+        &signed.content.to_string(),
+        &signed.sig.to_string(),
+    ) {
+        Ok(stored) => tracing::info!("[publish] stored locally: new={}", stored),
+        Err(e) => tracing::warn!("[publish] local store failed (non-fatal): {}", e),
+    }
+
+    Ok(signed)
+}
 
 #[tauri::command]
 async fn publish_reaction(
@@ -4630,55 +4751,110 @@ async fn publish_reaction(
 ) -> Result<String, String> {
     use nostr_sdk::prelude::*;
 
-    let config = state.config.read().await;
-    let nsec = config.nsec.clone().ok_or("nsec required to react")?;
-    let relays = config.outbound_relays.clone();
-    drop(config);
-
-    let secret_key = SecretKey::from_bech32(&nsec)
-        .map_err(|e| format!("Invalid nsec: {}", e))?;
-    let keys = Keys::new(secret_key);
-
     let tags = vec![
         Tag::parse(&["e", &event_id]).map_err(|e| format!("bad e-tag: {}", e))?,
         Tag::parse(&["p", &event_pubkey]).map_err(|e| format!("bad p-tag: {}", e))?,
     ];
-    let signed = EventBuilder::new(Kind::Reaction, "+", tags)
-        .to_event(&keys)
-        .map_err(|e| format!("Failed to sign reaction: {}", e))?;
-
+    let builder = EventBuilder::new(Kind::Reaction, "+", tags);
+    let signed = sign_build_publish_store(builder, &state).await?;
     let reaction_id = signed.id.to_hex();
-
-    // Publish to outbound relays
-    let client = Client::default();
-    for url in &relays {
-        if let Ok(_) = client.add_relay(url.as_str()).await {
-            client.connect_relay(url.as_str()).await.ok();
-        }
-    }
-    client.send_event(signed.clone()).await
-        .map_err(|e| format!("Failed to publish reaction: {}", e))?;
-    client.disconnect().await.ok();
-
-    // Save locally so counts update immediately
-    let tags_json = serde_json::to_string(
-        &signed.tags.iter()
-            .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect::<Vec<String>>())
-            .collect::<Vec<Vec<String>>>()
-    ).unwrap_or_else(|_| "[]".to_string());
-
-    state.db().store_event(
-        &reaction_id,
-        &signed.pubkey.to_hex(),
-        signed.created_at.as_u64() as i64,
-        signed.kind.as_u16() as u32,
-        &tags_json,
-        &signed.content.to_string(),
-        &signed.sig.to_string(),
-    ).ok();
-
     tracing::info!("[cmd:publish_reaction] published reaction {} for event {}", &reaction_id[..12.min(reaction_id.len())], &event_id[..12.min(event_id.len())]);
     Ok(reaction_id)
+}
+
+#[tauri::command]
+async fn publish_note(
+    content: String,
+    reply_to: Option<String>,
+    reply_to_pubkey: Option<String>,
+    root_id: Option<String>,
+    root_pubkey: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    use nostr_sdk::prelude::*;
+
+    if content.trim().is_empty() {
+        return Err("Note content cannot be empty".to_string());
+    }
+
+    let mut tags: Vec<Tag> = Vec::new();
+
+    if let Some(ref reply_id) = reply_to {
+        if let Some(ref rid) = root_id {
+            tags.push(Tag::parse(&["e", rid, "", "root"]).map_err(|e| format!("bad root e-tag: {}", e))?);
+            tags.push(Tag::parse(&["e", reply_id, "", "reply"]).map_err(|e| format!("bad reply e-tag: {}", e))?);
+        } else {
+            tags.push(Tag::parse(&["e", reply_id, "", "root"]).map_err(|e| format!("bad e-tag: {}", e))?);
+        }
+        if let Some(ref rp) = root_pubkey {
+            tags.push(Tag::parse(&["p", rp]).map_err(|e| format!("bad p-tag: {}", e))?);
+        }
+        if let Some(ref rp) = reply_to_pubkey {
+            if root_pubkey.as_deref() != Some(rp.as_str()) {
+                tags.push(Tag::parse(&["p", rp]).map_err(|e| format!("bad p-tag: {}", e))?);
+            }
+        }
+    }
+
+    let builder = EventBuilder::new(Kind::TextNote, &content, tags);
+    let signed = sign_build_publish_store(builder, &state).await?;
+    let note_id = signed.id.to_hex();
+    tracing::info!("[cmd:publish_note] published note {}", &note_id[..12.min(note_id.len())]);
+    Ok(note_id)
+}
+
+#[tauri::command]
+async fn publish_article(
+    title: String,
+    content: String,
+    summary: Option<String>,
+    d_tag: Option<String>,
+    image: Option<String>,
+    hashtags: Option<Vec<String>>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    use nostr_sdk::prelude::*;
+
+    if title.trim().is_empty() || content.trim().is_empty() {
+        return Err("Title and content are required".to_string());
+    }
+
+    let slug = d_tag.unwrap_or_else(|| {
+        title.to_lowercase()
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '-' })
+            .collect::<String>()
+            .trim_matches('-')
+            .to_string()
+    });
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let mut tags: Vec<Tag> = vec![
+        Tag::parse(&["d", &slug]).unwrap(),
+        Tag::parse(&["title", &title]).unwrap(),
+        Tag::parse(&["published_at", &now.to_string()]).unwrap(),
+    ];
+    if let Some(ref s) = summary {
+        tags.push(Tag::parse(&["summary", s]).unwrap());
+    }
+    if let Some(ref img) = image {
+        tags.push(Tag::parse(&["image", img]).unwrap());
+    }
+    if let Some(ref ht) = hashtags {
+        for t in ht {
+            tags.push(Tag::parse(&["t", t]).unwrap());
+        }
+    }
+
+    let builder = EventBuilder::new(Kind::from(30023), &content, tags);
+    let signed = sign_build_publish_store(builder, &state).await?;
+    let article_id = signed.id.to_hex();
+    tracing::info!("[cmd:publish_article] published article '{}' ({})", &title, &article_id[..12.min(article_id.len())]);
+    Ok(article_id)
 }
 
 #[tauri::command]
@@ -5521,6 +5697,8 @@ pub fn run() {
             wallet_provision,
             send_zap,
             publish_reaction,
+            publish_note,
+            publish_article,
             get_author_articles,
             fetch_profiles_from_relay,
             fetch_profile_content_from_relays,

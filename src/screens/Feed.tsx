@@ -3,9 +3,10 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
-import { IconX, IconHeart, IconMessageCircle, IconZap } from "../components/Icon";
+import { IconX, IconHeart, IconMessageCircle, IconZap, IconPenSquare } from "../components/Icon";
 import { NoteCard, GroupedRepostCard, getRepostOriginalId, type GroupedRepost } from "../components/NoteCard";
 import { ZapModal } from "../components/ZapModal";
+import { ComposeModal } from "../components/ComposeModal";
 import { ArticleCard, getArticleTitle, getArticleImage, getArticleTimestamp } from "../components/ArticleCard";
 import { Avatar } from "../components/Avatar";
 import { formatDate } from "../utils/format";
@@ -232,6 +233,9 @@ export const Feed: React.FC = () => {
   const { getProfile, ensureProfiles } = useProfileContext();
 
   const [zapTarget, setZapTarget] = useState<NostrEvent | null>(null);
+  const [showCompose, setShowCompose] = useState(false);
+  const [replyTarget, setReplyTarget] = useState<NostrEvent | null>(null);
+  const canWrite = useCanWrite();
 
   const handleLike = useCallback(async (event: NostrEvent) => {
     try {
@@ -957,6 +961,11 @@ export const Feed: React.FC = () => {
             </button>
           )}
         </div>
+        {canWrite && (
+          <button className="feed-compose-btn" onClick={() => setShowCompose(true)}>
+            <span className="icon"><IconPenSquare /></span>
+          </button>
+        )}
       </div>
 
       {searchStatus && (
@@ -1050,6 +1059,7 @@ export const Feed: React.FC = () => {
                 onClick={() => navigate(`/note/${event.id}`)}
                 onZap={setZapTarget}
                 onLike={handleLike}
+                onReply={setReplyTarget}
               />
             ))}
 
@@ -1144,6 +1154,16 @@ export const Feed: React.FC = () => {
           recipientPubkey={zapTarget.pubkey}
           recipientLud16={getProfile(zapTarget.pubkey)?.lud16 ?? null}
           onClose={() => setZapTarget(null)}
+        />
+      )}
+      {showCompose && (
+        <ComposeModal onClose={() => setShowCompose(false)} />
+      )}
+      {replyTarget && (
+        <ComposeModal
+          replyTo={replyTarget}
+          replyToProfile={getProfile(replyTarget.pubkey)}
+          onClose={() => setReplyTarget(null)}
         />
       )}
     </div>
