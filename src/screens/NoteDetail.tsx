@@ -15,6 +15,7 @@ import { getArticleTitle, getArticleImage, getArticleTimestamp } from "../compon
 import { formatDate, timeAgo } from "../utils/format";
 import { profileDisplayName } from "../utils/profiles";
 import { invalidateInteractionCounts } from "../hooks/useInteractionCounts";
+import { useOnDemandFetch } from "../hooks/useOnDemandFetch";
 import type { NostrEvent } from "../types/nostr";
 
 // ── Types ───────────────────────────────────────────────────────
@@ -183,6 +184,7 @@ export const NoteDetail: React.FC = () => {
   const { noteId } = useParams<{ noteId: string }>();
   const navigate = useNavigate();
   const { ensureProfiles, getProfile } = useProfileContext();
+  const { fetchIfStale } = useOnDemandFetch();
 
   const [event, setEvent] = useState<NostrEvent | null>(null);
   const [threadData, setThreadData] = useState<ThreadData | null>(null);
@@ -229,6 +231,21 @@ export const NoteDetail: React.FC = () => {
       } catch (e) {
         console.error("[note-detail] Failed to load event:", e);
       }
+
+      // If event not in local DB, fetch from relays
+      if (!mainEvent) {
+        try {
+          await invoke("fetch_note_context_from_relays", { noteId });
+          mainEvent = await invoke<NostrEvent | null>("get_event", { id: noteId });
+          if (mainEvent) {
+            setEvent(mainEvent);
+            ensureProfiles([mainEvent.pubkey]);
+          }
+        } catch (e) {
+          console.error("[note-detail] Relay fetch for missing event failed:", e);
+        }
+      }
+
       setLoading(false);
 
       // Determine root for thread fetch
@@ -253,21 +270,24 @@ export const NoteDetail: React.FC = () => {
 
       await Promise.all([threadPromise, wotPromise]);
 
-      // Trigger background relay fetch for replies/interactions
+      // Trigger background relay fetch for replies/interactions (rate-limited)
       if (effectiveRootId) {
-        invoke("fetch_thread_from_relays", {
-          rootId: effectiveRootId,
-          skipRoot: mainEvent !== null,
-        })
-          .catch(() => {})
-          .finally(() => setRelayFetchDone(true));
+        let fetchFired = false;
+        fetchIfStale(`thread:${effectiveRootId}`, () => {
+          fetchFired = true;
+          return invoke("fetch_thread_from_relays", {
+            rootId: effectiveRootId,
+            skipRoot: mainEvent !== null,
+          }).then(() => {}).finally(() => setRelayFetchDone(true));
+        }, 30);
+        if (!fetchFired) setRelayFetchDone(true);
       } else {
         setRelayFetchDone(true);
       }
     };
 
     load();
-  }, [noteId, ensureProfiles]);
+  }, [noteId, ensureProfiles, fetchIfStale]);
 
   // Listen for thread-updated events from relay fetch
   useEffect(() => {

@@ -107,13 +107,21 @@ const AppRoutes: React.FC = () => {
         try {
           const data = JSON.parse(naddrEl.dataset.naddr || "{}");
           const { invoke } = await import("@tauri-apps/api/core");
-          const ev = await invoke<{ id: string } | null>("get_addressable_event", {
+          let ev = await invoke<{ id: string } | null>("get_addressable_event", {
             kind: data.kind,
             pubkey: data.pubkey,
             dTag: data.dTag,
           });
           if (ev) {
             navigate(`/note/${ev.id}`);
+          } else {
+            // Not in local DB — fetch from relays
+            const evId = await invoke<string | null>("fetch_addressable_event_from_relays", {
+              kind: data.kind,
+              pubkey: data.pubkey,
+              dTag: data.dTag,
+            });
+            if (evId) navigate(`/note/${evId}`);
           }
         } catch (err) {
           console.error("[naddr] Failed to resolve addressable event:", err);

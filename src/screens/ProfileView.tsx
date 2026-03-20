@@ -15,7 +15,9 @@ import { formatBytes, shortPubkey } from "../utils/format";
 import { profileDisplayName } from "../utils/profiles";
 import { initMediaViewer } from "../utils/media";
 import { invalidateInteractionCounts } from "../hooks/useInteractionCounts";
+import { useOnDemandFetch } from "../hooks/useOnDemandFetch";
 import { useProfileContext, useProfile } from "../context/ProfileContext";
+import { listen } from "@tauri-apps/api/event";
 import type { ProfileInfo } from "../utils/profiles";
 
 /* ------------------------------------------------------------------ */
@@ -115,6 +117,7 @@ export const ProfileView: React.FC = () => {
 
   /* --- profile context for batch operations ------------------------- */
   const { ensureProfiles, getProfile } = useProfileContext();
+  const { fetchIfStale } = useOnDemandFetch();
 
   /* --- init media viewer -------------------------------------------- */
   useEffect(() => {
@@ -238,10 +241,15 @@ export const ProfileView: React.FC = () => {
       }
 
       setProfileLoading(false);
+
+      // Trigger background relay fetch for fresh content
+      fetchIfStale(`profile:${pubkey}`, () =>
+        invoke("fetch_profile_content_from_relays", { pubkey })
+      );
     };
 
     load();
-  }, [pubkey, ensureProfiles]);
+  }, [pubkey, ensureProfiles, fetchIfStale]);
 
   /* --- load notes --------------------------------------------------- */
   const loadNotes = useCallback(async () => {
@@ -343,6 +351,27 @@ export const ProfileView: React.FC = () => {
       loadNotes();
     }
   }, [pubkey, profileLoading]);
+
+  /* --- listen for relay content updates ------------------------------ */
+  useEffect(() => {
+    if (!pubkey) return;
+    const unlisten = listen<string>("profile-content-updated", async (ev) => {
+      if (ev.payload !== pubkey) return;
+      try {
+        const followList = await invoke<string[]>("get_follows", { pubkey });
+        setFollows(followList);
+        setFollowingCount(followList.length);
+      } catch (_) {}
+      try {
+        const followerList = await invoke<string[]>("get_followers", { pubkey });
+        setFollowers(followerList);
+        setFollowerCount(followerList.length);
+      } catch (_) {}
+      // Reload notes to pick up any new content from relays
+      loadNotes();
+    });
+    return () => { unlisten.then((fn) => fn()); };
+  }, [pubkey, loadNotes]);
 
   /* --- IntersectionObserver for notes pagination -------------------- */
   useEffect(() => {
