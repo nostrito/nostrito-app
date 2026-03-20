@@ -13,7 +13,7 @@ crate-type = ["lib", "cdylib", "staticlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["macos-private-api", "tray-icon", "devtools", "protocol-asset"] }
+tauri = { version = "2", features = ["tray-icon", "macos-private-api", "protocol-asset"] }
 tauri-plugin-shell = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -37,12 +37,19 @@ dirs = "5"
 tokio-util = { version = "0.7", features = ["rt"] }
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
-keyring = "3"
+# keyring is desktop-only (see target section below)
 tokio-rustls = { version = "0.26", features = ["ring"] }
 rustls-pemfile = "2"
 bech32 = "0.11"
 urlencoding = "2"
 tauri-plugin-notification = "2"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+keyring = "3"
+
+[features]
+desktop = ["tauri/macos-private-api", "tauri/tray-icon", "tauri/devtools"]
+mobile = []
 
 [dev-dependencies]
 tempfile = "3"
