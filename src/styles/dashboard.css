@@ -523,6 +523,7 @@
   margin-left: 8px;
 }
 .ev-kind-note { background: rgba(124,58,237,0.1); color: var(--accent-light); }
+.ev-kind-reply { background: rgba(251,191,36,0.1); color: var(--yellow, #fbbf24); }
 .ev-kind-long { background: rgba(96,165,250,0.1); color: var(--blue); }
 .ev-kind-repost { background: rgba(52,211,153,0.1); color: var(--green); }
 
