@@ -4,7 +4,7 @@ import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import {
   IconCheck, IconImage, IconBookOpen, IconFeed, IconZap,
   IconMoreVertical, IconCopy, IconShare, IconVolumeX, IconVolume,
-  IconExternalLink, IconDatabase,
+  IconExternalLink, IconDatabase, IconMessageCircle,
 } from "../components/Icon";
 import { Avatar } from "../components/Avatar";
 import { NoteCard } from "../components/NoteCard";
@@ -557,6 +557,18 @@ export const ProfileView: React.FC = () => {
                     </span>
                   )}
                 </div>
+
+                {/* Send message button */}
+                {!isOwn && (
+                  <button
+                    className="profile-dm-btn"
+                    onClick={() => navigate("/dms", { state: { partner: pubkey } })}
+                    title="send message"
+                  >
+                    <span className="icon"><IconMessageCircle /></span>
+                    message
+                  </button>
+                )}
 
                 {/* Three-dots menu */}
                 {!isOwn && (

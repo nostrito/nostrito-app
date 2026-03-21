@@ -17,12 +17,22 @@ use nostr_sdk::pool::{
 };
 use nostr_sdk::RelayOptions;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Nip46Encryption {
+    Nip44,
+    Nip04,
+}
+
 #[derive(Debug)]
 pub struct Nip46Client {
     app_keys: Keys,
     signer_public_key: PublicKey,
     pool: RelayPool,
     timeout: Duration,
+    /// Original secret from bunker URI, needed for reconnection
+    secret: Option<String>,
+    /// Which encryption the signer uses (detected during handshake)
+    encryption: Nip46Encryption,
 }
 
 impl Clone for Nip46Client {
@@ -32,37 +42,51 @@ impl Clone for Nip46Client {
             signer_public_key: self.signer_public_key,
             pool: self.pool.clone(),
             timeout: self.timeout,
+            secret: self.secret.clone(),
+            encryption: self.encryption,
         }
     }
 }
 
 /// Decrypt a NIP-46 message: try NIP-44 first, fall back to NIP-04.
+/// Returns (plaintext, which_encryption_worked).
 fn decrypt_nip46_msg(
     secret_key: &SecretKey,
     sender_pk: &PublicKey,
     content: &str,
-) -> Result<String, String> {
+) -> Result<(String, Nip46Encryption), String> {
     // Try NIP-44 first (current spec)
     if let Ok(plain) = nip44::decrypt(secret_key, sender_pk, content) {
-        return Ok(plain);
+        return Ok((plain, Nip46Encryption::Nip44));
     }
     // Fall back to NIP-04 (legacy)
-    nip04::decrypt(secret_key, sender_pk, content)
-        .map_err(|e| format!("Decryption failed (tried NIP-44 and NIP-04): {}", e))
+    match nip04::decrypt(secret_key, sender_pk, content) {
+        Ok(plain) => Ok((plain, Nip46Encryption::Nip04)),
+        Err(e) => Err(format!("Decryption failed (tried NIP-44 and NIP-04): {}", e)),
+    }
 }
 
-/// Encrypt a NIP-46 message with NIP-44.
+/// Encrypt a NIP-46 message, matching the signer's encryption scheme.
 fn encrypt_nip46_msg(
     secret_key: &SecretKey,
     recipient_pk: &PublicKey,
     content: &str,
+    encryption: Nip46Encryption,
 ) -> Result<String, String> {
-    nip44::encrypt(secret_key, recipient_pk, content, nip44::Version::V2)
-        .map_err(|e| format!("NIP-44 encryption failed: {}", e))
+    match encryption {
+        Nip46Encryption::Nip44 => {
+            nip44::encrypt(secret_key, recipient_pk, content, nip44::Version::V2)
+                .map_err(|e| format!("NIP-44 encryption failed: {}", e))
+        }
+        Nip46Encryption::Nip04 => {
+            nip04::encrypt(secret_key, recipient_pk, content)
+                .map_err(|e| format!("NIP-04 encryption failed: {}", e))
+        }
+    }
 }
 
 impl Nip46Client {
-    /// Connect via a `bunker://` URI.
+    /// Connect via a `bunker://` URI (with connect handshake).
     pub async fn connect_bunker(
         uri: &NostrConnectURI,
         app_keys: Keys,
@@ -72,26 +96,71 @@ impl Nip46Client {
             .ok_or("bunker:// URI must contain signer public key")?;
         let secret = uri.secret();
 
+        tracing::info!("[nip46] connect_bunker: signer_pk={}..., has_secret={}, relays={:?}",
+            &signer_pk.to_hex()[..12], secret.is_some(), uri.relays().iter().map(|u| u.as_str()).collect::<Vec<_>>());
+
         let pool = Self::create_pool(uri.relays()).await?;
         Self::subscribe(&app_keys, &pool).await?;
 
-        let client = Self {
+        // Start with NIP-44, will detect signer's preference from response
+        let mut client = Self {
             app_keys,
             signer_public_key: signer_pk,
             pool,
             timeout,
+            secret: secret.clone(),
+            encryption: Nip46Encryption::Nip44,
         };
 
-        // Send `connect` command
+        // Send `connect` command — try NIP-44 first, fall back to NIP-04
         let req = Nip46Request::Connect {
             public_key: signer_pk,
             secret,
         };
-        let res = client.send_request(req).await?;
-        res.to_connect().map_err(|e| format!("Connect handshake failed: {}", e))?;
+        match client.send_request(req.clone()).await {
+            Ok(res) => {
+                res.to_connect().map_err(|e| format!("Connect handshake failed: {}", e))?;
+            }
+            Err(_) => {
+                tracing::info!("[nip46] NIP-44 connect failed, retrying with NIP-04...");
+                client.encryption = Nip46Encryption::Nip04;
+                let res = client.send_request(req).await?;
+                res.to_connect().map_err(|e| format!("Connect handshake (NIP-04) failed: {}", e))?;
+            }
+        }
 
-        tracing::info!("[nip46] Bunker connected, signer_pk={}", signer_pk.to_hex()[..16].to_string());
+        tracing::info!("[nip46] Bunker connected (encryption={:?}), signer_pk={}",
+            client.encryption, signer_pk.to_hex()[..16].to_string());
         Ok(client)
+    }
+
+    /// Reconnect to a previously paired signer without sending a `connect` request.
+    /// Used for sessions that were originally established via nostrconnect:// — the
+    /// signer already knows our app_keys from the initial pairing, so we just need
+    /// to set up the relay pool and subscription, then can send requests directly.
+    pub async fn reconnect(
+        signer_public_key: PublicKey,
+        relays: Vec<Url>,
+        app_keys: Keys,
+        secret: Option<String>,
+        encryption: Nip46Encryption,
+        timeout: Duration,
+    ) -> Result<Self, String> {
+        tracing::info!("[nip46] reconnect: signer_pk={}..., encryption={:?}, relays={:?}",
+            &signer_public_key.to_hex()[..12], encryption, relays.iter().map(|u| u.as_str()).collect::<Vec<_>>());
+
+        let pool = Self::create_pool(relays).await?;
+        Self::subscribe(&app_keys, &pool).await?;
+
+        tracing::info!("[nip46] reconnect: pool ready, using stored encryption={:?}", encryption);
+        Ok(Self {
+            app_keys,
+            signer_public_key,
+            pool,
+            timeout,
+            secret,
+            encryption,
+        })
     }
 
     /// Connect via a `nostrconnect://` URI (client-initiated).
@@ -105,14 +174,17 @@ impl Nip46Client {
         Self::subscribe(&app_keys, &pool).await?;
 
         // Wait for the signer to send a connect message
-        let signer_pk = Self::wait_for_signer(&app_keys, &pool, timeout).await?;
+        let (signer_pk, encryption) = Self::wait_for_signer(&app_keys, &pool, timeout).await?;
 
-        tracing::info!("[nip46] Nostr Connect completed, signer_pk={}", signer_pk.to_hex()[..16].to_string());
+        tracing::info!("[nip46] Nostr Connect completed (encryption={:?}), signer_pk={}",
+            encryption, signer_pk.to_hex()[..16].to_string());
         Ok(Self {
             app_keys,
             signer_public_key: signer_pk,
             pool,
             timeout,
+            secret: None,
+            encryption,
         })
     }
 
@@ -121,18 +193,37 @@ impl Nip46Client {
         self.signer_public_key
     }
 
-    /// Get a bunker:// URI for reconnection.
+    /// Get the detected encryption scheme.
+    pub fn encryption(&self) -> Nip46Encryption {
+        self.encryption
+    }
+
+    /// Get a bunker:// URI for reconnection (includes original secret if available).
     pub async fn bunker_uri(&self) -> NostrConnectURI {
         NostrConnectURI::Bunker {
             signer_public_key: self.signer_public_key,
             relays: self.pool.relays().await.into_keys().collect(),
-            secret: None,
+            secret: self.secret.clone(),
         }
     }
 
     /// Get the app's local keys (for persisting to keychain).
     pub fn local_keys(&self) -> &Keys {
         &self.app_keys
+    }
+
+    /// Request NIP-04 encryption from the remote signer.
+    pub async fn nip04_encrypt(
+        &self,
+        public_key: PublicKey,
+        text: String,
+    ) -> Result<String, String> {
+        let req = Nip46Request::Nip04Encrypt {
+            public_key,
+            text,
+        };
+        let res = self.send_request(req).await?;
+        res.to_encrypt_decrypt().map_err(|e| format!("Encrypt response error: {}", e))
     }
 
     /// Request NIP-04 decryption from the remote signer.
@@ -150,10 +241,47 @@ impl Nip46Client {
     }
 
     /// Request event signing from the remote signer.
-    pub async fn sign_event(&self, unsigned: UnsignedEvent) -> Result<Event, String> {
+    /// Tries detected encryption first (15s). If no response, retries with
+    /// the other encryption. Handles signers using different encryption than
+    /// what was detected during the connect handshake.
+    pub async fn sign_event(&mut self, unsigned: UnsignedEvent) -> Result<Event, String> {
+        tracing::info!("[nip46] sign_event: kind={}, content_len={}, signer_pk={}..., encryption={:?}",
+            unsigned.kind.as_u16(), unsigned.content.len(),
+            &self.signer_public_key.to_hex()[..12], self.encryption);
+
         let req = Nip46Request::SignEvent(unsigned);
-        let res = self.send_request(req).await?;
-        res.to_sign_event().map_err(|e| format!("Sign response error: {}", e))
+        let primary = self.encryption;
+
+        // Try primary encryption with 15s timeout
+        match self.send_request_with_timeout(req.clone(), Duration::from_secs(15)).await {
+            Ok(res) => {
+                tracing::info!("[nip46] sign_event succeeded with {:?}", primary);
+                return res.to_sign_event().map_err(|e| format!("Sign response error: {}", e));
+            }
+            Err(e) => {
+                tracing::warn!("[nip46] {:?} no response in 15s: {} — trying other encryption", primary, e);
+            }
+        }
+
+        // Flip encryption and retry
+        let fallback = match primary {
+            Nip46Encryption::Nip44 => Nip46Encryption::Nip04,
+            Nip46Encryption::Nip04 => Nip46Encryption::Nip44,
+        };
+        self.encryption = fallback;
+        tracing::info!("[nip46] retrying sign_event with {:?}", fallback);
+
+        match self.send_request_with_timeout(req, self.timeout).await {
+            Ok(res) => {
+                tracing::info!("[nip46] sign_event succeeded with {:?}", fallback);
+                res.to_sign_event().map_err(|e| format!("Sign response error: {}", e))
+            }
+            Err(e) => {
+                self.encryption = primary;
+                tracing::error!("[nip46] sign_event failed with both NIP-44 and NIP-04");
+                Err(format!("Signer did not respond (tried NIP-44 and NIP-04): {}", e))
+            }
+        }
     }
 
     /// Shut down the relay pool.
@@ -229,11 +357,12 @@ impl Nip46Client {
     }
 
     /// Wait for a remote signer to send a connect message (nostrconnect:// flow).
+    /// Returns (signer_public_key, detected_encryption).
     async fn wait_for_signer(
         app_keys: &Keys,
         pool: &RelayPool,
         timeout: Duration,
-    ) -> Result<PublicKey, String> {
+    ) -> Result<(PublicKey, Nip46Encryption), String> {
         let secret_key = app_keys.secret_key();
         let mut notifications = pool.notifications();
 
@@ -242,17 +371,18 @@ impl Nip46Client {
                 if let RelayPoolNotification::Event { event, .. } = notification {
                     if event.kind == Kind::NostrConnect {
                         match decrypt_nip46_msg(secret_key, &event.pubkey, &event.content) {
-                            Ok(json) => {
-                                tracing::debug!("[nip46] Received message: {}", &json[..json.len().min(120)]);
+                            Ok((json, enc)) => {
+                                tracing::info!("[nip46] Received connect message (encryption={:?}): {}",
+                                    enc, &json[..json.len().min(120)]);
                                 match Nip46Message::from_json(&json) {
                                     Ok(Nip46Message::Request {
                                         req: Nip46Request::Connect { public_key, .. },
                                         ..
-                                    }) => return Ok(public_key),
+                                    }) => return Ok((public_key, enc)),
                                     Ok(Nip46Message::Response {
                                         result: Some(Nip46Response::Connect),
                                         ..
-                                    }) => return Ok(event.pubkey),
+                                    }) => return Ok((event.pubkey, enc)),
                                     _ => {} // ignore non-connect messages
                                 }
                             }
@@ -271,40 +401,108 @@ impl Nip46Client {
         result
     }
 
-    /// Send a NIP-46 request and wait for the matching response.
+    /// Ensure relay pool is connected and subscribed before sending requests.
+    async fn ensure_connected(&self) -> Result<(), String> {
+        // Check if any relay is connected
+        let relay_map = self.pool.relays().await;
+        let mut any_connected = false;
+        for (url, relay) in &relay_map {
+            let status = relay.status().await;
+            tracing::info!("[nip46] relay {} status: {}", url, status);
+            if status == nostr_sdk::RelayStatus::Connected {
+                any_connected = true;
+            }
+        }
+
+        if !any_connected {
+            tracing::warn!("[nip46] no relays connected, attempting reconnect...");
+            self.pool.connect(Some(Duration::from_secs(10))).await;
+
+            // Wait for at least one connection
+            for _ in 0..20 {
+                let relay_map = self.pool.relays().await;
+                for (_, relay) in &relay_map {
+                    if relay.status().await == nostr_sdk::RelayStatus::Connected {
+                        any_connected = true;
+                        break;
+                    }
+                }
+                if any_connected { break; }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+
+            if !any_connected {
+                return Err("NIP-46 relay pool: no relays could reconnect".to_string());
+            }
+            tracing::info!("[nip46] relay reconnected");
+        }
+
+        // Re-subscribe to ensure we receive responses (relays may drop subscriptions)
+        Self::subscribe(&self.app_keys, &self.pool).await?;
+        tracing::info!("[nip46] subscription refreshed");
+
+        Ok(())
+    }
+
+    /// Send a NIP-46 request with default timeout.
     async fn send_request(&self, req: Nip46Request) -> Result<Nip46Response, String> {
+        self.send_request_with_timeout(req, self.timeout).await
+    }
+
+    /// Send a NIP-46 request and wait for the matching response.
+    async fn send_request_with_timeout(&self, req: Nip46Request, timeout: Duration) -> Result<Nip46Response, String> {
         let secret_key = self.app_keys.secret_key();
         let signer_pk = self.signer_public_key;
+
+        // Ensure pool is healthy before sending
+        self.ensure_connected().await?;
 
         // Build the request message
         let msg = Nip46Message::request(req);
         let req_id = msg.id().to_string();
         let msg_json = msg.as_json();
 
-        tracing::debug!("[nip46] Sending request {}: {}", &req_id, &msg_json[..msg_json.len().min(100)]);
+        tracing::info!("[nip46] === NIP-46 REQUEST ===");
+        tracing::info!("[nip46] req_id={}, encryption={:?}, timeout={}s", &req_id, self.encryption, timeout.as_secs());
+        tracing::info!("[nip46] app_pubkey={}", self.app_keys.public_key().to_hex());
+        tracing::info!("[nip46] signer_pk={} (p-tag target)", signer_pk.to_hex());
+        tracing::info!("[nip46] method={}", &msg_json[..msg_json.len().min(80)]);
 
-        // Encrypt with NIP-44 and build kind 24133 event
-        let encrypted = encrypt_nip46_msg(secret_key, &signer_pk, &msg_json)?;
+        // Encrypt and build kind 24133 event
+        let encrypted = encrypt_nip46_msg(secret_key, &signer_pk, &msg_json, self.encryption)?;
         let event = EventBuilder::new(Kind::NostrConnect, encrypted, [Tag::public_key(signer_pk)])
             .to_event(&self.app_keys)
             .map_err(|e| format!("Failed to build event: {}", e))?;
 
+        // Subscribe to notifications BEFORE sending so we don't miss the response
         let mut notifications = self.pool.notifications();
 
         // Send the event
-        self.pool
-            .send_event(event, RelaySendOptions::new())
-            .await
-            .map_err(|e| format!("Failed to send request: {}", e))?;
+        match self.pool.send_event(event.clone(), RelaySendOptions::new()).await {
+            Ok(output) => {
+                let accepted: Vec<String> = output.success.iter().map(|u| u.to_string()).collect();
+                let rejected: Vec<String> = output.failed.iter().map(|(u, e)| format!("{}: {:?}", u, e)).collect();
+                tracing::info!("[nip46] event {} sent — accepted=[{}], rejected=[{}]",
+                    &event.id.to_hex()[..12], accepted.join(", "), rejected.join(", "));
+                if output.success.is_empty() {
+                    return Err("Event was not accepted by any relay".to_string());
+                }
+            }
+            Err(e) => {
+                return Err(format!("Failed to send NIP-46 request: {}", e));
+            }
+        }
+
+        tracing::info!("[nip46] waiting for response (timeout={}s, req_id={})...", timeout.as_secs(), &req_id);
 
         // Wait for matching response
-        let result = async_utility::time::timeout(Some(self.timeout), async {
+        let result = async_utility::time::timeout(Some(timeout), async {
             while let Ok(notification) = notifications.recv().await {
                 if let RelayPoolNotification::Event { event, .. } = notification {
                     if event.kind == Kind::NostrConnect {
                         match decrypt_nip46_msg(secret_key, &event.pubkey, &event.content) {
-                            Ok(json) => {
-                                tracing::debug!("[nip46] Received response: {}", &json[..json.len().min(120)]);
+                            Ok((json, enc)) => {
+                                tracing::info!("[nip46] received NIP-46 message (enc={:?}): {}", enc, &json[..json.len().min(200)]);
                                 match Nip46Message::from_json(&json) {
                                     Ok(Nip46Message::Response { id, result, error }) if id == req_id => {
                                         if let Some(result) = result {
@@ -312,6 +510,7 @@ impl Nip46Client {
                                                 tracing::warn!("[nip46] Auth URL received: {:?}", error);
                                                 continue; // wait for real response
                                             }
+                                            tracing::info!("[nip46] got matching response for req_id={}", &req_id);
                                             return Ok(result);
                                         }
                                         if let Some(error) = error {
@@ -319,11 +518,16 @@ impl Nip46Client {
                                         }
                                         return Err("Empty response from signer".to_string());
                                     }
-                                    _ => {} // ignore non-matching messages
+                                    Ok(other) => {
+                                        tracing::debug!("[nip46] ignoring non-matching message: {:?}", other);
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("[nip46] failed to parse NIP-46 message: {}", e);
+                                    }
                                 }
                             }
                             Err(e) => {
-                                tracing::warn!("[nip46] Decrypt response failed: {}", e);
+                                tracing::warn!("[nip46] decrypt response failed: {}", e);
                             }
                         }
                     }
@@ -332,7 +536,10 @@ impl Nip46Client {
             Err("Response stream ended".to_string())
         })
         .await
-        .ok_or_else(|| "Timed out waiting for signer response".to_string())?;
+        .ok_or_else(|| {
+            tracing::error!("[nip46] timed out after {}s waiting for signer response (req_id={})", self.timeout.as_secs(), &req_id);
+            "Timed out waiting for signer response".to_string()
+        })?;
 
         result
     }

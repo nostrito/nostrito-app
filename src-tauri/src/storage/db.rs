@@ -1216,6 +1216,81 @@ impl Database {
         Ok(profiles)
     }
 
+    /// Search profiles by name, display_name, or nip05 in kind-0 metadata events.
+    pub fn search_profiles(&self, query: &str, limit: u32) -> Result<Vec<ProfileInfo>> {
+        let pattern = format!("%{}%", query.to_lowercase());
+        let mut profiles = Vec::new();
+
+        {
+            let conn = self.conn.lock();
+            let sql = "SELECT pubkey, content FROM nostr_events \
+                        WHERE kind = 0 \
+                        AND ( \
+                          LOWER(json_extract(content, '$.name')) LIKE ?1 \
+                          OR LOWER(json_extract(content, '$.display_name')) LIKE ?1 \
+                          OR LOWER(json_extract(content, '$.nip05')) LIKE ?1 \
+                        ) \
+                        ORDER BY created_at DESC \
+                        LIMIT ?2";
+
+            let mut stmt = conn.prepare(sql)?;
+            let rows = stmt.query_map(rusqlite::params![pattern, limit], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+
+            let mut seen = std::collections::HashSet::new();
+            for row in rows {
+                if let Ok((pubkey, content)) = row {
+                    if !seen.insert(pubkey.clone()) {
+                        continue;
+                    }
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
+                        profiles.push(ProfileInfo {
+                            pubkey,
+                            name: parsed.get("name").and_then(|v| v.as_str()).map(String::from),
+                            display_name: parsed.get("display_name").and_then(|v| v.as_str()).map(String::from),
+                            picture: parsed.get("picture").and_then(|v| v.as_str()).map(String::from),
+                            picture_local: None,
+                            nip05: parsed.get("nip05").and_then(|v| v.as_str()).map(String::from),
+                            about: parsed.get("about").and_then(|v| v.as_str()).map(String::from),
+                            banner: parsed.get("banner").and_then(|v| v.as_str()).map(String::from),
+                            website: parsed.get("website").and_then(|v| v.as_str()).map(String::from),
+                            lud16: parsed.get("lud16").and_then(|v| v.as_str()).map(String::from),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Resolve local media paths for profile pictures
+        let picture_urls: Vec<String> = profiles.iter()
+            .filter_map(|p| p.picture.clone())
+            .collect();
+
+        if !picture_urls.is_empty() {
+            if let Ok(cache_map) = self.media_cache_lookup_by_urls(&picture_urls) {
+                let home = dirs::home_dir().unwrap_or_default();
+                for profile in &mut profiles {
+                    if let Some(ref pic_url) = profile.picture {
+                        if let Some((hash, _mime, _size, _dl)) = cache_map.get(pic_url) {
+                            let local_path = home.join(".nostrito/media")
+                                .join(&hash[..2.min(hash.len())])
+                                .join(hash)
+                                .to_string_lossy()
+                                .to_string();
+                            if std::path::Path::new(&local_path).exists() {
+                                profile.picture_local = Some(local_path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        debug!("[db] search_profiles: query={:?}, found={}", query, profiles.len());
+        Ok(profiles)
+    }
+
     /// Get the last time a profile was fetched from relays.
     pub fn get_profile_fetched_at(&self, pubkey: &str) -> Result<Option<i64>> {
         let conn = self.conn.lock();

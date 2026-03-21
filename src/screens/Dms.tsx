@@ -2,15 +2,16 @@
  *  When nsec is available, messages are decrypted; otherwise shown as encrypted. */
 
 import React, { useState, useEffect, useCallback, useRef } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useLocation } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
-import { IconMessageCircle, IconLock } from "../components/Icon";
+import { IconMessageCircle, IconLock, IconSearch, IconX } from "../components/Icon";
 import { Avatar } from "../components/Avatar";
 import { EmptyState } from "../components/EmptyState";
 import { formatTimestamp } from "../utils/format";
 import { profileDisplayName } from "../utils/profiles";
 import { useProfileContext } from "../context/ProfileContext";
 import type { NostrEvent, Settings, Conversation } from "../types/nostr";
+import type { ProfileInfo } from "../utils/profiles";
 
 function getPartner(event: NostrEvent, ownPk: string): string | null {
   if (event.pubkey === ownPk) {
@@ -22,6 +23,7 @@ function getPartner(event: NostrEvent, ownPk: string): string | null {
 
 export const Dms: React.FC = () => {
   const navigate = useNavigate();
+  const location = useLocation();
   const { getProfile, ensureProfiles, profileVersion } = useProfileContext();
   void profileVersion; // subscribe to profile cache updates
   const [loading, setLoading] = useState(true);
@@ -30,6 +32,16 @@ export const Dms: React.FC = () => {
   const [selectedPartner, setSelectedPartner] = useState<string | null>(null);
   const [signingMode, setSigningMode] = useState<"nsec" | "bunker" | "connect" | "read-only">("read-only");
   const [displayCount, setDisplayCount] = useState(30);
+
+  // Message input state
+  const [messageInput, setMessageInput] = useState("");
+  const [sending, setSending] = useState(false);
+
+  // Search state
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<ProfileInfo[]>([]);
+  const [isSearching, setIsSearching] = useState(false);
+  const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Cache for decrypted message content: eventId -> plaintext
   const decryptedCache = useRef<Map<string, string>>(new Map());
@@ -235,6 +247,98 @@ export const Dms: React.FC = () => {
     return () => observer.disconnect();
   }, [selectedPartner]);
 
+  // Pre-select partner from navigation state (e.g. from profile "message" button)
+  useEffect(() => {
+    const partner = (location.state as any)?.partner;
+    if (partner && !loading) {
+      ensureProfiles([partner]);
+      // Check if conversation exists, if not create temporary one
+      const existing = conversations.find((c) => c.partnerPubkey === partner);
+      if (!existing) {
+        setConversations((prev) => [{
+          partnerPubkey: partner,
+          messages: [],
+          lastTimestamp: Math.floor(Date.now() / 1000),
+        }, ...prev]);
+      }
+      setSelectedPartner(partner);
+      // Clear the state so refreshes don't re-trigger
+      window.history.replaceState({}, document.title);
+    }
+  }, [location.state, loading, conversations, ensureProfiles]);
+
+  // Debounced profile search
+  const handleSearchInput = useCallback((value: string) => {
+    setSearchQuery(value);
+    if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
+
+    if (!value.trim()) {
+      setSearchResults([]);
+      setIsSearching(false);
+      return;
+    }
+
+    setIsSearching(true);
+    searchTimerRef.current = setTimeout(async () => {
+      try {
+        const results = await invoke<ProfileInfo[]>("search_profiles", {
+          query: value.trim(),
+          limit: 15,
+        });
+        setSearchResults(results.filter((r) => r.pubkey !== ownPubkey));
+      } catch (e) {
+        console.error("[dms] Profile search failed:", e);
+        setSearchResults([]);
+      }
+      setIsSearching(false);
+    }, 300);
+  }, [ownPubkey]);
+
+  // Handle selecting a search result
+  const handleSelectSearchResult = useCallback((pubkey: string) => {
+    setSearchQuery("");
+    setSearchResults([]);
+
+    const existing = conversations.find((c) => c.partnerPubkey === pubkey);
+    if (existing) {
+      setSelectedPartner(pubkey);
+    } else {
+      const newConv: Conversation = {
+        partnerPubkey: pubkey,
+        messages: [],
+        lastTimestamp: Math.floor(Date.now() / 1000),
+      };
+      setConversations((prev) => [newConv, ...prev]);
+      setSelectedPartner(pubkey);
+      ensureProfiles([pubkey]);
+    }
+  }, [conversations, ensureProfiles]);
+
+  // Send a DM
+  const handleSendDm = useCallback(async () => {
+    if (!messageInput.trim() || !selectedPartner || sending || signingMode === "read-only") return;
+    setSending(true);
+    try {
+      await invoke("publish_dm", {
+        content: messageInput.trim(),
+        recipientPubkey: selectedPartner,
+      });
+      setMessageInput("");
+      // Reload conversations to pick up the new message
+      await loadDms();
+      // Re-select the partner after reload
+      setSelectedPartner(selectedPartner);
+      // Scroll to bottom
+      setTimeout(() => {
+        if (threadRef.current) threadRef.current.scrollTop = threadRef.current.scrollHeight;
+      }, 100);
+    } catch (e) {
+      console.error("[dms] Failed to send DM:", e);
+    } finally {
+      setSending(false);
+    }
+  }, [messageInput, selectedPartner, sending, signingMode, loadDms]);
+
   // Loading state
   if (loading) {
     return (
@@ -403,8 +507,17 @@ export const Dms: React.FC = () => {
         </div>
         {signingMode !== "read-only" ? (
           <div className="dms-input-bar">
-            <input type="text" placeholder="coming soon..." disabled />
-            <button disabled>send</button>
+            <input
+              type="text"
+              placeholder="type a message..."
+              value={messageInput}
+              onChange={(e) => setMessageInput(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSendDm(); } }}
+              disabled={sending}
+            />
+            <button onClick={handleSendDm} disabled={sending || !messageInput.trim()}>
+              {sending ? "..." : "send"}
+            </button>
           </div>
         ) : (
           <div className="dms-input-readonly">
@@ -428,7 +541,53 @@ export const Dms: React.FC = () => {
           <span>conversations</span>
           <span className="dms-sidebar-count">{conversations.length}</span>
         </div>
-        {conversations.length === 0 ? (
+        <div className="dms-search-wrap">
+          <span className="icon dms-search-icon"><IconSearch /></span>
+          <input
+            type="text"
+            className="dms-search-input"
+            placeholder="search people..."
+            value={searchQuery}
+            onChange={(e) => handleSearchInput(e.target.value)}
+          />
+          {searchQuery && (
+            <button className="dms-search-clear" onClick={() => { setSearchQuery(""); setSearchResults([]); }}>
+              <span className="icon"><IconX /></span>
+            </button>
+          )}
+        </div>
+        {searchQuery.trim() ? (
+          <div className="dms-search-results">
+            {isSearching && <div className="dms-search-loading">searching...</div>}
+            {!isSearching && searchResults.length === 0 && searchQuery.trim() && (
+              <div className="dms-search-empty">no profiles found</div>
+            )}
+            {searchResults.map((p) => {
+              const name = profileDisplayName(p, p.pubkey);
+              return (
+                <div
+                  key={p.pubkey}
+                  className="dms-conv-item"
+                  onClick={() => handleSelectSearchResult(p.pubkey)}
+                >
+                  <div className="dms-conv-avatar">
+                    <Avatar
+                      picture={p.picture || null}
+                      pictureLocal={p.picture_local || null}
+                      pubkey={p.pubkey}
+                      className="dms-conv-avatar-img"
+                      fallbackClassName="dms-conv-avatar-fallback"
+                    />
+                  </div>
+                  <div className="dms-conv-info">
+                    <div className="dms-conv-name">{name}</div>
+                    {p.nip05 && <div className="dms-conv-preview">{p.nip05}</div>}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ) : conversations.length === 0 ? (
           <div className="dms-sidebar-empty">no conversations yet</div>
         ) : (
           <div className="dms-conversation-list">
