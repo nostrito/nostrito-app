@@ -11,6 +11,7 @@ import { extractMentionedPubkeys, replaceMentions, normalizeBareEntities, decode
 import { useProfileContext } from "../context/ProfileContext";
 import { useSigningContext } from "../context/SigningContext";
 import { useInteractionCounts } from "../hooks/useInteractionCounts";
+import { useEnrichment } from "../hooks/useEnrichment";
 import { useReactionStatus } from "../hooks/useReactionStatus";
 import { useRepostStatus } from "../hooks/useRepostStatus";
 import type { NostrEvent } from "../types/nostr";
@@ -422,6 +423,7 @@ const NoteCardInner: React.FC<{
 }> = ({ event, profile, compact, full, onSave, saved, onLike, onZap, onReply, onRepost }) => {
   const { ensureProfiles, getProfile } = useProfileContext();
   const counts = useInteractionCounts(event.id);
+  useEnrichment(event.id);
   const liked = useReactionStatus(event.id);
   const reposted = useRepostStatus(event.id);
   const { canWrite } = useSigningContext();
@@ -489,6 +491,7 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, ful
   const displayName = profileDisplayName(profile, event.pubkey);
   const { ensureProfiles, getProfile } = useProfileContext();
   const counts = useInteractionCounts(event.id);
+  useEnrichment(event.id);
   const liked = useReactionStatus(event.id);
   const reposted = useRepostStatus(event.id);
   const { canWrite } = useSigningContext();

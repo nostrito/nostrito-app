@@ -3,7 +3,7 @@ use rusqlite::Connection;
 use tracing::info;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Get the current schema version from the database.
 pub fn get_schema_version(conn: &Connection) -> u32 {
@@ -54,6 +54,10 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
 
     if current < 6 {
         migrate_v5_to_v6(conn)?;
+    }
+
+    if current < 7 {
+        migrate_v6_to_v7(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -385,6 +389,25 @@ fn migrate_v5_to_v6(conn: &Connection) -> Result<()> {
     )?;
 
     info!("Migration v5 → v6 complete");
+    Ok(())
+}
+
+/// Migrate from v6 to v7:
+/// - Add enrichment_cache table for tracking when we last fetched reactions/zaps from relays
+fn migrate_v6_to_v7(conn: &Connection) -> Result<()> {
+    info!("Running migration v6 → v7...");
+
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS enrichment_cache (
+            event_id        TEXT PRIMARY KEY,
+            last_fetched_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_enrichment_fetched ON enrichment_cache(last_fetched_at);
+        "#,
+    )?;
+
+    info!("Migration v6 → v7 complete");
     Ok(())
 }
 

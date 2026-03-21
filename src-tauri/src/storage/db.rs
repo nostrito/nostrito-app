@@ -3399,6 +3399,74 @@ impl Database {
 
         Ok((root, replies, reactions, zaps))
     }
+
+    // ── Enrichment cache ─────────────────────────────────────────────
+
+    /// Return event IDs that have no enrichment_cache entry or whose
+    /// last_fetched_at is older than `now - max_age_secs`.
+    pub fn get_stale_enrichment_ids(&self, event_ids: &[String], max_age_secs: i64) -> Result<Vec<String>> {
+        if event_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.conn.lock();
+        let now = chrono::Utc::now().timestamp();
+        let cutoff = now - max_age_secs;
+
+        let placeholders: Vec<String> = (1..=event_ids.len()).map(|i| format!("?{}", i)).collect();
+        let sql = format!(
+            "SELECT eid FROM (
+                SELECT value AS eid FROM json_each(json_array({}))
+             ) AS requested
+             WHERE eid NOT IN (
+                SELECT event_id FROM enrichment_cache WHERE last_fetched_at > ?{}
+             )",
+            placeholders.join(","),
+            event_ids.len() + 1,
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = event_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        params.push(&cutoff);
+
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            row.get::<_, String>(0)
+        })?;
+
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Batch upsert enrichment timestamps for event IDs.
+    pub fn set_enrichment_timestamps(&self, event_ids: &[String]) -> Result<()> {
+        if event_ids.is_empty() {
+            return Ok(());
+        }
+
+        let conn = self.conn.lock();
+        let now = chrono::Utc::now().timestamp();
+
+        let mut stmt = conn.prepare(
+            "INSERT INTO enrichment_cache (event_id, last_fetched_at) VALUES (?1, ?2)
+             ON CONFLICT(event_id) DO UPDATE SET last_fetched_at = ?2"
+        )?;
+
+        for id in event_ids {
+            stmt.execute(rusqlite::params![id, now])?;
+        }
+
+        Ok(())
+    }
+
+    /// Delete enrichment_cache entries older than `max_age_secs` to prevent unbounded growth.
+    pub fn cleanup_old_enrichment(&self, max_age_secs: i64) -> Result<u64> {
+        let conn = self.conn.lock();
+        let cutoff = chrono::Utc::now().timestamp() - max_age_secs;
+        let deleted = conn.execute(
+            "DELETE FROM enrichment_cache WHERE last_fetched_at < ?1",
+            rusqlite::params![cutoff],
+        )?;
+        Ok(deleted as u64)
+    }
 }
 
 #[cfg(test)]

@@ -1469,6 +1469,97 @@ async fn fetch_note_context_from_relays(
 }
 
 #[tauri::command]
+async fn fetch_enrichment_from_relays(
+    event_ids: Vec<String>,
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<u32, String> {
+    use nostr_sdk::prelude::*;
+
+    if event_ids.is_empty() {
+        return Ok(0);
+    }
+
+    // Filter to only stale IDs (not fetched in last 10 minutes)
+    let stale_ids = state.db().get_stale_enrichment_ids(&event_ids, 600)
+        .map_err(|e| format!("Failed to check enrichment staleness: {}", e))?;
+
+    if stale_ids.is_empty() {
+        return Ok(0);
+    }
+
+    // Cap batch size to avoid relay overload
+    let batch: Vec<String> = stale_ids.into_iter().take(50).collect();
+
+    let cfg = state.config.read().await;
+    let hex_pubkey = cfg.hex_pubkey.clone().unwrap_or_default();
+    let fallback_relays = cfg.outbound_relays.clone();
+    drop(cfg);
+
+    let relay_urls = resolve_sync_relays(&state.db(), &hex_pubkey, &fallback_relays);
+    if relay_urls.is_empty() {
+        return Err("No relays available".into());
+    }
+
+    // Build filters: reactions + zaps for each event
+    let mut filters = Vec::new();
+    for id_hex in &batch {
+        if let Ok(event_id) = EventId::from_hex(id_hex) {
+            filters.push(
+                Filter::new()
+                    .event(event_id)
+                    .kinds(vec![Kind::Reaction, Kind::from(9735u16)])
+                    .limit(200),
+            );
+        }
+    }
+
+    if filters.is_empty() {
+        return Ok(0);
+    }
+
+    let pool = crate::sync::pool::RelayPool::new();
+    let events = pool.subscribe_and_collect(
+        &relay_urls,
+        filters,
+        15,
+    ).await.map_err(|e| format!("Enrichment relay fetch failed: {}", e))?;
+
+    let stored = if events.is_empty() {
+        0u32
+    } else {
+        let db = state.db();
+        let graph = Arc::clone(&state.wot_graph);
+        let (s, _) = crate::sync::processing::process_events(
+            &events,
+            &db,
+            &graph,
+            &hex_pubkey,
+            crate::sync::types::EventSource::ThreadContext,
+            crate::sync::types::MEDIA_PRIORITY_OTHERS,
+            None,
+            "enrichment",
+        );
+        s
+    };
+
+    // Mark all batch IDs as enriched (even if 0 results — we checked)
+    state.db().set_enrichment_timestamps(&batch)
+        .map_err(|e| format!("Failed to update enrichment timestamps: {}", e))?;
+
+    // Notify frontend
+    app_handle.emit("enrichment-updated", &batch).ok();
+
+    tracing::info!(
+        "[cmd:fetch_enrichment] enriched {} events, stored {} from relays",
+        batch.len(),
+        stored
+    );
+
+    Ok(stored)
+}
+
+#[tauri::command]
 async fn fetch_addressable_event_from_relays(
     kind: u16,
     pubkey: String,
@@ -6519,6 +6610,7 @@ pub fn run() {
             fetch_profiles_from_relay,
             fetch_profile_content_from_relays,
             fetch_note_context_from_relays,
+            fetch_enrichment_from_relays,
             fetch_addressable_event_from_relays,
             get_data_dir,
             get_default_data_dir,

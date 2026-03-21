@@ -61,6 +61,17 @@ pub fn run_pruning(
         );
     }
 
+    // Clean up stale enrichment_cache entries (older than 24 hours)
+    match db.cleanup_old_enrichment(86400) {
+        Ok(cleaned) if cleaned > 0 => {
+            debug!("Pruning: cleaned {} stale enrichment_cache entries", cleaned);
+        }
+        Err(e) => {
+            debug!("Pruning: enrichment cleanup error: {}", e);
+        }
+        _ => {}
+    }
+
     Ok(stats)
 }
 
