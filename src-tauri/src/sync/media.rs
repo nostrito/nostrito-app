@@ -14,10 +14,11 @@ pub struct MediaDownloader {
     tracked_limit_bytes: u64,
     wot_limit_bytes: u64,
     tracked_pubkeys: HashSet<String>,
+    media_root: PathBuf,
 }
 
 impl MediaDownloader {
-    pub fn new(db: Arc<Database>, own_pubkey: String, tracked_media_gb: f64, wot_media_gb: f64) -> Self {
+    pub fn new(db: Arc<Database>, own_pubkey: String, tracked_media_gb: f64, wot_media_gb: f64, data_dir: PathBuf) -> Self {
         let tracked = db.get_tracked_pubkeys()
             .unwrap_or_default()
             .into_iter()
@@ -28,6 +29,7 @@ impl MediaDownloader {
             tracked_limit_bytes: (tracked_media_gb * 1_073_741_824.0) as u64,
             wot_limit_bytes: (wot_media_gb * 1_073_741_824.0) as u64,
             tracked_pubkeys: tracked,
+            media_root: crate::paths::media_dir(&data_dir),
         }
     }
 
@@ -170,7 +172,7 @@ impl MediaDownloader {
         }
 
         // Write to disk
-        let file_path = media_file_path(hash);
+        let file_path = self.media_root.join(&hash[..2.min(hash.len())]).join(hash);
         if let Some(parent) = file_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -202,7 +204,7 @@ impl MediaDownloader {
 
         for (hash, size) in candidates {
             if current <= target { break; }
-            let path = media_file_path(&hash);
+            let path = self.media_root.join(&hash[..2.min(hash.len())]).join(&hash);
             if let Err(e) = tokio::fs::remove_file(&path).await {
                 warn!("Media: evict failed {:?}: {}", path, e);
             }
@@ -237,7 +239,7 @@ impl MediaDownloader {
 
         for (hash, size) in candidates {
             if current <= target { break; }
-            let path = media_file_path(&hash);
+            let path = self.media_root.join(&hash[..2.min(hash.len())]).join(&hash);
             if let Err(e) = tokio::fs::remove_file(&path).await {
                 warn!("Media: evict failed {:?}: {}", path, e);
             }
@@ -373,13 +375,9 @@ pub fn extract_urls_from_text(text: &str) -> Vec<String> {
     urls
 }
 
-/// Media file path: ~/.nostrito/media/<hash[0..2]>/<hash>
-pub fn media_file_path(hash: &str) -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_default()
-        .join(".nostrito/media")
-        .join(&hash[..2.min(hash.len())])
-        .join(hash)
+/// Media file path: `{data_root}/media/<hash[0..2]>/<hash>`
+pub fn media_file_path(data_root: &std::path::Path, hash: &str) -> PathBuf {
+    crate::paths::media_file_path(data_root, hash)
 }
 
 #[derive(Debug, Default)]
@@ -446,7 +444,8 @@ mod tests {
 
     #[test]
     fn test_media_file_path() {
-        let path = media_file_path("abcdef1234567890");
-        assert!(path.to_string_lossy().contains(".nostrito/media/ab/abcdef1234567890"));
+        let root = std::path::PathBuf::from("/tmp/testroot");
+        let path = media_file_path(&root, "abcdef1234567890");
+        assert_eq!(path, root.join("media/ab/abcdef1234567890"));
     }
 }

@@ -32,7 +32,7 @@
       "csp": null,
       "assetProtocol": {
         "enable": true,
-        "scope": ["$HOME/.nostrito/media/**"]
+        "scope": ["$HOME/.nostrito/media/**", "$APPDATA/nostrito/media/**"]
       }
     }
   },

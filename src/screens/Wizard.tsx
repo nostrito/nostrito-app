@@ -1,6 +1,7 @@
-import React, { useState, useRef, useCallback } from "react";
+import React, { useState, useRef, useCallback, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import { QRCodeSVG } from "qrcode.react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
@@ -118,11 +119,49 @@ export const Wizard: React.FC = () => {
   const [browserIntegration, setBrowserIntegration] = useState(false);
   const [copyFeedback, setCopyFeedback] = useState(false);
 
+  // Data directory state
+  const [dataDir, setDataDir] = useState("");
+  const [defaultDataDir, setDefaultDataDir] = useState("");
+  const [platform, setPlatform] = useState("macos");
+
   // Finish state
   const [finishing, setFinishing] = useState(false);
   const [finishError, setFinishError] = useState<string | null>(null);
 
   const npubInputRef = useRef<HTMLInputElement>(null);
+
+  // Fetch data directory info on mount and restore wizard progress after restart
+  useEffect(() => {
+    Promise.all([
+      invoke<string>("get_data_dir"),
+      invoke<string>("get_default_data_dir"),
+      invoke<string>("get_platform"),
+    ]).then(([dir, defDir, plat]) => {
+      setDataDir(dir);
+      setDefaultDataDir(defDir);
+      setPlatform(plat);
+    }).catch(() => {});
+
+    // Restore wizard progress if returning from a data-dir restart
+    const saved = localStorage.getItem("nostrito_wizard_progress");
+    if (saved) {
+      try {
+        const p = JSON.parse(saved);
+        if (p.npub) setNpub(p.npub);
+        if (p.identityMode) setIdentityMode(p.identityMode);
+        if (p.signerType) setSignerType(p.signerType);
+        if (p.nsecInput) setNsecInput(p.nsecInput);
+        if (p.selectedRelays) setSelectedRelays(new Set(p.selectedRelays));
+        if (p.storagePreset) setStoragePreset(p.storagePreset);
+        if (p.othersEventsGb != null) setOthersEventsGb(p.othersEventsGb);
+        if (p.trackedMediaGb != null) setTrackedMediaGb(p.trackedMediaGb);
+        if (p.wotMediaGb != null) setWotMediaGb(p.wotMediaGb);
+        if (p.mediaTypes) setMediaTypes(p.mediaTypes);
+        if (p.step) setStep(p.step);
+      } catch (_) {}
+      localStorage.removeItem("nostrito_wizard_progress");
+    }
+  }, []);
 
   /* --- titlebar actions --------------------------------------------- */
   const handleClose = useCallback(() => getCurrentWindow().close(), []);
@@ -260,6 +299,31 @@ export const Wizard: React.FC = () => {
     const relays = Array.from(selectedRelays).map(resolveRelayUrl);
 
     try {
+      // If custom data directory selected, write bootstrap config and restart
+      if (dataDir && defaultDataDir && dataDir !== defaultDataDir) {
+        console.log("[wizard] Setting custom data dir:", dataDir);
+        // Save wizard progress to localStorage so it survives restart
+        localStorage.setItem("nostrito_wizard_progress", JSON.stringify({
+          step: 3,
+          identityMode,
+          npub,
+          signerType,
+          nsecInput: identityMode === "full" && signerType === "nsec" ? nsecInput : "",
+          selectedRelays: Array.from(selectedRelays),
+          storagePreset,
+          othersEventsGb,
+          trackedMediaGb,
+          wotMediaGb,
+          mediaTypes,
+          bunkerUri: identityMode === "full" && signerType === "bunker" ? bunkerUri : "",
+        }));
+        await invoke("set_data_dir", { path: dataDir, migrate: false });
+        // Restart the app so it picks up the new path
+        const { relaunch } = await import("@tauri-apps/plugin-process");
+        await relaunch();
+        return;
+      }
+
       const preset = STORAGE_PRESETS[storagePreset];
       console.log("[wizard] Calling init_nostrito with preset:", storagePreset);
       await invoke("init_nostrito", {
@@ -488,6 +552,10 @@ export const Wizard: React.FC = () => {
                 mediaTypes={mediaTypes}
                 onToggleMediaType={toggleMediaType}
                 finishError={finishError}
+                dataDir={dataDir}
+                defaultDataDir={defaultDataDir}
+                platform={platform}
+                onDataDirChange={setDataDir}
               />
             )}
           </div>
@@ -801,6 +869,10 @@ interface StepStorageProps {
   mediaTypes: MediaTypes;
   onToggleMediaType: (type: keyof MediaTypes) => void;
   finishError: string | null;
+  dataDir: string;
+  defaultDataDir: string;
+  platform: string;
+  onDataDirChange: (path: string) => void;
 }
 
 const StepStorage: React.FC<StepStorageProps> = ({
@@ -817,6 +889,10 @@ const StepStorage: React.FC<StepStorageProps> = ({
   mediaTypes,
   onToggleMediaType,
   finishError,
+  dataDir,
+  defaultDataDir,
+  platform,
+  onDataDirChange,
 }) => {
   const estimate = estimateStorage(200, storagePreset);
 
@@ -824,6 +900,42 @@ const StepStorage: React.FC<StepStorageProps> = ({
     <>
       <h3 className="wiz-title">storage</h3>
       <p className="wiz-subtitle">choose how much to store. you can change this later in settings.</p>
+
+      {/* Data directory picker (hidden on Android) */}
+      {platform !== "android" && (
+        <div className="storage-section" style={{ marginBottom: 16 }}>
+          <div className="storage-row">
+            <div className="storage-row-info">
+              <span className="storage-row-label">data location</span>
+              <span className="storage-row-meta" style={{ wordBreak: "break-all" }}>
+                {dataDir || defaultDataDir || "loading..."}
+                {dataDir && defaultDataDir && dataDir !== defaultDataDir && (
+                  <span
+                    style={{ marginLeft: 8, cursor: "pointer", opacity: 0.7, textDecoration: "underline" }}
+                    onClick={() => onDataDirChange(defaultDataDir)}
+                  >
+                    reset to default
+                  </span>
+                )}
+              </span>
+            </div>
+            <button
+              className="btn btn-secondary"
+              style={{ whiteSpace: "nowrap", marginLeft: 12 }}
+              onClick={async () => {
+                try {
+                  const selected = await open({ directory: true, multiple: false, title: "Choose data folder" });
+                  if (selected && typeof selected === "string") {
+                    onDataDirChange(selected);
+                  }
+                } catch (_) {}
+              }}
+            >
+              change...
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Your events & media — locked */}
       <div className="storage-section">

@@ -441,6 +441,7 @@ impl SyncEngine {
             self.hex_pubkey.clone(),
             self.tracked_media_gb,
             self.wot_media_gb,
+            self.db.data_dir.clone(),
         );
 
         let stats = media.run(50).await?;
