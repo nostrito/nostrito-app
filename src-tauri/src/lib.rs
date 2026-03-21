@@ -4401,12 +4401,13 @@ async fn fetch_new_dms(
         client.add_relay(url.as_str()).await.ok();
     }
     client.connect().await;
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     let mut stored = 0u32;
+    let timeout_secs = if is_full { 15 } else { 8 };
 
     match tokio::time::timeout(
-        std::time::Duration::from_secs(8),
+        std::time::Duration::from_secs(timeout_secs),
         client.get_events_of(
             vec![nip04_filter, gw_filter],
             nostr_sdk::EventSource::both(Some(std::time::Duration::from_secs(6))),
@@ -4439,7 +4440,40 @@ async fn fetch_new_dms(
 
     client.disconnect().await.ok();
     tracing::info!("[cmd:fetch_new_dms] {} new DMs stored", stored);
+
     Ok(stored)
+}
+
+/// Check for new DMs stored locally since `since_ts` (unix epoch) and show a native notification.
+/// Returns the count of new DMs found.
+#[tauri::command]
+async fn check_new_dms_notify(
+    since_ts: i64,
+    app_handle: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<i64, String> {
+    use tauri_plugin_notification::NotificationExt;
+
+    let config = state.config.read().await;
+    let hex_pubkey = config.hex_pubkey.clone().ok_or("No pubkey")?;
+    drop(config);
+
+    let count = state.db().count_new_dms_since(&hex_pubkey, since_ts)
+        .map_err(|e| format!("DB error: {}", e))?;
+
+    if count > 0 {
+        let label = if count == 1 { "new message" } else { "new messages" };
+        if let Err(e) = app_handle.notification()
+            .builder()
+            .title("Nostrito")
+            .body(&format!("{} {}", count, label))
+            .show()
+        {
+            tracing::debug!("[check_new_dms_notify] notification error: {}", e);
+        }
+    }
+
+    Ok(count)
 }
 
 /// Result of unwrapping a NIP-17 gift-wrapped DM.
@@ -6458,6 +6492,7 @@ pub fn run() {
             unwrap_gift_wrap,
             publish_gift_wrap_dm,
             fetch_new_dms,
+            check_new_dms_notify,
             publish_inbox_relays,
             connect_bunker,
             generate_nostr_connect_uri,

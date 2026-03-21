@@ -1317,6 +1317,20 @@ impl Database {
         Ok(())
     }
 
+    /// Count DM events stored locally since a given timestamp (uses stored_at, not created_at).
+    /// Detects new DMs from ANY source (sync engine, relay WebSocket, fetch_new_dms).
+    pub fn count_new_dms_since(&self, own_pubkey: &str, since_stored_at: i64) -> Result<i64> {
+        let conn = self.conn.lock();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM nostr_events \
+             WHERE kind IN (4, 1059) AND stored_at > ?1 \
+             AND (pubkey = ?2 OR tags LIKE '%' || ?2 || '%')",
+            params![since_stored_at, own_pubkey],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
     /// Get DM events (kind:4 NIP-04 + kind:1059 NIP-17 gift wrap) involving a specific pubkey.
     /// Returns (id, pubkey, created_at, kind, tags_json, content, sig).
     pub fn get_dm_events(

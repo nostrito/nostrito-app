@@ -1,9 +1,10 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { QRCodeSVG } from "qrcode.react";
 import { RELAYS, resolveRelayUrl, urlToAlias } from "../relays";
-import { profileDisplayName } from "../utils/profiles";
+import { profileDisplayName, type ProfileInfo } from "../utils/profiles";
+import { npubToHex, decodeEntity } from "../utils/mentions";
 import { useProfileContext } from "../context/ProfileContext";
 import { RelayCard } from "../components/RelayCard";
 import { Slider } from "../components/Slider";
@@ -27,6 +28,8 @@ import {
   IconWifiOff,
   IconFeather,
   IconArchive,
+  IconSearch,
+  IconX,
 } from "../components/Icon";
 import {
   STORAGE_PRESETS,
@@ -76,6 +79,60 @@ type TabId = "identity" | "relays" | "storage" | "advanced" | "tracked";
 interface SaveFeedback {
   type: "success" | "error";
   message: string;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Input classification for tracked-profile input                     */
+/* ------------------------------------------------------------------ */
+
+type InputKind =
+  | { type: "empty" }
+  | { type: "hex"; pubkey: string }
+  | { type: "npub"; raw: string }
+  | { type: "nprofile"; pubkey: string }
+  | { type: "url"; pubkey: string }
+  | { type: "search"; query: string };
+
+function classifyInput(raw: string): InputKind {
+  const q = raw.trim();
+  if (!q) return { type: "empty" };
+
+  // Strip nostr: URI prefix and re-classify
+  if (q.startsWith("nostr:")) {
+    return classifyInput(q.slice(6));
+  }
+
+  // URL containing npub/nprofile
+  if (q.startsWith("http://") || q.startsWith("https://")) {
+    const npubMatch = q.match(/(npub1[a-z0-9]{58,})/);
+    if (npubMatch) {
+      const hex = npubToHex(npubMatch[1]);
+      if (hex) return { type: "url", pubkey: hex };
+    }
+    const nprofileMatch = q.match(/(nprofile1[a-z0-9]{20,})/);
+    if (nprofileMatch) {
+      const decoded = decodeEntity(nprofileMatch[1]);
+      if (decoded?.pubkey) return { type: "url", pubkey: decoded.pubkey };
+    }
+    // URL with no recognizable entity — fall through to search
+    return { type: "search", query: q };
+  }
+
+  // npub
+  if (q.startsWith("npub1")) return { type: "npub", raw: q };
+
+  // nprofile
+  if (q.startsWith("nprofile1")) {
+    const decoded = decodeEntity(q);
+    if (decoded?.pubkey) return { type: "nprofile", pubkey: decoded.pubkey };
+  }
+
+  // 64-char hex pubkey
+  if (q.length === 64 && /^[0-9a-f]{64}$/i.test(q)) {
+    return { type: "hex", pubkey: q };
+  }
+
+  return { type: "search", query: q };
 }
 
 /* ------------------------------------------------------------------ */
@@ -283,6 +340,9 @@ export const Settings: React.FC = () => {
   const [trackedProfiles, setTrackedProfiles] = useState<TrackedProfile[]>([]);
   const [trackedLoading, setTrackedLoading] = useState(true);
   const [trackInput, setTrackInput] = useState("");
+  const [trackSearchResults, setTrackSearchResults] = useState<ProfileInfo[]>([]);
+  const [trackSearching, setTrackSearching] = useState(false);
+  const trackSearchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   /* --- offline mode -------------------------------------------------- */
   const [offlineMode, setOfflineMode] = useState(false);
@@ -753,17 +813,60 @@ export const Settings: React.FC = () => {
   }, [offlineMode, settings]);
 
   /* --- tracked profiles --------------------------------------------- */
-  const handleTrackProfile = useCallback(async () => {
-    if (!trackInput.trim()) return;
+  const doTrackPubkey = useCallback(async (pubkey: string) => {
     try {
-      await invoke("track_profile", { pubkey: trackInput.trim(), note: null });
+      await invoke("track_profile", { pubkey, note: null });
       setTrackInput("");
+      setTrackSearchResults([]);
       loadTrackedProfiles();
       try { await invoke("restart_sync"); } catch (e) { console.warn("[settings] restart_sync after track failed:", e); }
     } catch (e) {
       console.error("[settings] track_profile failed:", e);
     }
-  }, [trackInput, loadTrackedProfiles]);
+  }, [loadTrackedProfiles]);
+
+  const handleTrackProfile = useCallback(async () => {
+    const kind = classifyInput(trackInput);
+    switch (kind.type) {
+      case "npub": return doTrackPubkey(kind.raw);
+      case "hex": return doTrackPubkey(kind.pubkey);
+      case "nprofile": return doTrackPubkey(kind.pubkey);
+      case "url": return doTrackPubkey(kind.pubkey);
+      default: return; // search / empty — user must pick from dropdown
+    }
+  }, [trackInput, doTrackPubkey]);
+
+  const handleTrackInputChange = useCallback((value: string) => {
+    setTrackInput(value);
+    if (trackSearchTimer.current) clearTimeout(trackSearchTimer.current);
+
+    const kind = classifyInput(value.trim());
+    if (kind.type !== "search") {
+      setTrackSearchResults([]);
+      setTrackSearching(false);
+      return;
+    }
+
+    setTrackSearching(true);
+    trackSearchTimer.current = setTimeout(async () => {
+      try {
+        const results = await invoke<ProfileInfo[]>("search_profiles", {
+          query: kind.query,
+          limit: 10,
+        });
+        const trackedSet = new Set(trackedProfiles.map((p) => p.pubkey));
+        setTrackSearchResults(results.filter((r) => !trackedSet.has(r.pubkey)));
+      } catch (e) {
+        console.error("[settings] search_profiles failed:", e);
+        setTrackSearchResults([]);
+      }
+      setTrackSearching(false);
+    }, 300);
+  }, [trackedProfiles]);
+
+  const handleSelectTrackResult = useCallback((pubkey: string) => {
+    doTrackPubkey(pubkey);
+  }, [doTrackPubkey]);
 
   const handleUntrackProfile = useCallback(
     async (pubkey: string) => {
@@ -2052,33 +2155,112 @@ export const Settings: React.FC = () => {
             )}
           </div>
 
-          <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
-            <input
-              type="text"
-              placeholder="npub or hex pubkey"
-              value={trackInput}
-              onChange={(e) => setTrackInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") handleTrackProfile();
-              }}
-              style={{
-                flex: 1,
-                padding: "8px 12px",
-                borderRadius: 8,
-                border: "1px solid var(--border)",
-                background: "var(--bg)",
-                color: "var(--text)",
-                fontSize: "0.82rem",
-                fontFamily: "var(--mono)",
-              }}
-            />
-            <button
-              className="btn btn-primary"
-              style={{ fontSize: "0.82rem", padding: "8px 16px" }}
-              onClick={handleTrackProfile}
-            >
-              track
-            </button>
+          <div style={{ position: "relative", marginTop: 12 }}>
+            <div style={{ display: "flex", gap: 8 }}>
+              <div style={{ flex: 1, position: "relative" }}>
+                <span className="icon" style={{
+                  position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)",
+                  width: 14, height: 14, color: "var(--text-muted)", pointerEvents: "none",
+                }}><IconSearch /></span>
+                <input
+                  type="text"
+                  placeholder="search by name, npub, or nip-05"
+                  value={trackInput}
+                  onChange={(e) => handleTrackInputChange(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") handleTrackProfile(); }}
+                  style={{
+                    width: "100%",
+                    padding: "8px 32px 8px 32px",
+                    borderRadius: 8,
+                    border: "1px solid var(--border)",
+                    background: "var(--bg)",
+                    color: "var(--text)",
+                    fontSize: "0.82rem",
+                  }}
+                />
+                {trackInput && (
+                  <button
+                    onClick={() => { setTrackInput(""); setTrackSearchResults([]); }}
+                    style={{
+                      position: "absolute", right: 8, top: "50%", transform: "translateY(-50%)",
+                      background: "none", border: "none", color: "var(--text-muted)",
+                      cursor: "pointer", padding: "2px 4px",
+                    }}
+                  >
+                    <span className="icon" style={{ width: 12, height: 12 }}><IconX /></span>
+                  </button>
+                )}
+              </div>
+              {trackInput.trim() && classifyInput(trackInput.trim()).type !== "search" && classifyInput(trackInput.trim()).type !== "empty" && (
+                <button
+                  className="btn btn-primary"
+                  style={{ fontSize: "0.82rem", padding: "8px 16px" }}
+                  onClick={handleTrackProfile}
+                >
+                  track
+                </button>
+              )}
+            </div>
+
+            {trackInput.trim() && classifyInput(trackInput.trim()).type === "search" && (
+              <div style={{
+                position: "absolute", left: 0, right: 0, top: "100%",
+                zIndex: 50, maxHeight: 280, overflowY: "auto",
+                background: "var(--bg-card, var(--bg))", border: "1px solid var(--border)",
+                borderRadius: 8, marginTop: 4,
+                boxShadow: "0 4px 16px rgba(0,0,0,0.3)",
+              }}>
+                {trackSearching && (
+                  <div style={{ padding: "16px", textAlign: "center", fontSize: "0.78rem", color: "var(--text-muted)" }}>
+                    searching...
+                  </div>
+                )}
+                {!trackSearching && trackSearchResults.length === 0 && trackInput.trim() && (
+                  <div style={{ padding: "16px", textAlign: "center", fontSize: "0.78rem", color: "var(--text-muted)" }}>
+                    no profiles found
+                  </div>
+                )}
+                {trackSearchResults.map((p) => {
+                  const name = profileDisplayName(p, p.pubkey);
+                  return (
+                    <div
+                      key={p.pubkey}
+                      onClick={() => handleSelectTrackResult(p.pubkey)}
+                      style={{
+                        display: "flex", alignItems: "center", gap: 10,
+                        padding: "8px 12px", cursor: "pointer",
+                        borderBottom: "1px solid var(--border)",
+                      }}
+                      onMouseEnter={(e) => (e.currentTarget.style.background = "rgba(255,255,255,0.04)")}
+                      onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+                    >
+                      <Avatar
+                        picture={p.picture || null}
+                        pictureLocal={p.picture_local || null}
+                        pubkey={p.pubkey}
+                        className="tracked-profile-avatar"
+                      />
+                      <div style={{ flex: 1, minWidth: 0, overflow: "hidden" }}>
+                        <div style={{
+                          fontWeight: 600, fontSize: "0.84rem", color: "var(--text)",
+                          whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+                        }}>
+                          {name}
+                        </div>
+                        {p.nip05 && (
+                          <div style={{
+                            fontSize: "0.72rem", color: "var(--text-muted)",
+                            whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+                          }}>
+                            {p.nip05}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
         </div>
       </div>

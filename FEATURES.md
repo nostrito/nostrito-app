@@ -94,6 +94,7 @@ Last updated: 2026-03-21
 - [x] **NIP-17 private DMs** (kind 14/1059 gift wrap) — send & receive NIP-17 gift-wrapped DMs with NIP-44 encryption
 - [x] **NIP-04 legacy DMs** (kind 4) — full send/receive/decrypt, toggleable from compose bar
 - [ ] **Group DMs** — not supported
+- [ ] **DM notifications** — native macOS notification when a new DM is received
 
 #### DM Protocol Architecture: NIP-04 vs NIP-17
 

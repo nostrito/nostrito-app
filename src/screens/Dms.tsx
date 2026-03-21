@@ -22,6 +22,9 @@ interface UnwrappedDm {
   rumor_kind: number;
 }
 
+// Session-level flag: only do the expensive 30-day relay scan once
+let hasFullScanned = false;
+
 function getPartner(event: NostrEvent, ownPk: string): string | null {
   if (event.pubkey === ownPk) {
     const pTag = event.tags.find((t) => t[0] === "p" && t[1]);
@@ -71,6 +74,103 @@ export const Dms: React.FC = () => {
     | "error"
   >(null);
 
+  // ── Build conversations from local DB events ─────────────────
+  const buildConversations = useCallback(
+    async (pk: string, mode: string) => {
+      const events = await invoke<NostrEvent[]>("get_dm_events", {
+        ownPubkey: pk,
+        limit: 500,
+      });
+
+      if (!events || events.length === 0) {
+        try {
+          const kindCounts = await invoke<{ counts: Record<number, number> }>("get_kind_counts");
+          const dmCount = (kindCounts.counts[4] || 0) + (kindCounts.counts[1059] || 0);
+          if (dmCount > 0) return { convs: [] as Conversation[], empty: "read-only" as const };
+        } catch { /* */ }
+        return { convs: [] as Conversation[], empty: "no-dms" as const };
+      }
+
+      const nip04Events = events.filter((e) => e.kind === 4);
+      const giftWrapEvents = events.filter((e) => e.kind === 1059);
+
+      const gwCache = giftWrapCache.current;
+      const dCache = decryptedCache.current;
+      const senderCache = giftWrapSenderCache.current;
+
+      // Unwrap gift wraps — use cache for already-unwrapped ones
+      if (mode !== "read-only" && giftWrapEvents.length > 0) {
+        const toUnwrap = giftWrapEvents.filter((ev) => !gwCache.has(ev.id));
+        if (toUnwrap.length > 0) {
+          const results = await Promise.allSettled(
+            toUnwrap.map(async (ev) => {
+              const result = await invoke<UnwrappedDm>("unwrap_gift_wrap", {
+                eventId: ev.id,
+                eventPubkey: ev.pubkey,
+                eventContent: ev.content,
+                eventCreatedAt: ev.created_at,
+                eventTags: ev.tags,
+                eventSig: ev.sig,
+              });
+              return { eventId: ev.id, unwrapped: result };
+            }),
+          );
+          for (const r of results) {
+            if (r.status === "fulfilled") {
+              const { eventId, unwrapped } = r.value;
+              gwCache.set(eventId, unwrapped);
+              dCache.set(eventId, unwrapped.content);
+              senderCache.set(eventId, unwrapped.sender_pubkey);
+            }
+          }
+        }
+      }
+
+      // Group by conversation partner
+      const convMap = new Map<string, NostrEvent[]>();
+
+      for (const ev of nip04Events) {
+        const partner = getPartner(ev, pk);
+        if (!partner) continue;
+        if (!convMap.has(partner)) convMap.set(partner, []);
+        convMap.get(partner)!.push(ev);
+      }
+
+      for (const ev of giftWrapEvents) {
+        const unwrapped = gwCache.get(ev.id);
+        if (!unwrapped) continue;
+        let partner: string;
+        if (unwrapped.sender_pubkey === pk) {
+          partner = unwrapped.recipient_pubkey || "";
+        } else {
+          partner = unwrapped.sender_pubkey;
+        }
+        if (!partner) continue;
+        if (!convMap.has(partner)) convMap.set(partner, []);
+        convMap.get(partner)!.push(ev);
+      }
+
+      const getTimestamp = (m: NostrEvent) => {
+        const u = gwCache.get(m.id);
+        return u ? u.created_at : m.created_at;
+      };
+
+      const sorted = Array.from(convMap.entries())
+        .map(([partnerPubkey, messages]) => ({
+          partnerPubkey,
+          messages: messages.sort((a, b) => getTimestamp(b) - getTimestamp(a)),
+          lastTimestamp: Math.max(...messages.map(getTimestamp)),
+        }))
+        .sort((a, b) => b.lastTimestamp - a.lastTimestamp);
+
+      ensureProfiles(sorted.map((c) => c.partnerPubkey));
+
+      return { convs: sorted, empty: null };
+    },
+    [ensureProfiles],
+  );
+
+  // ── Main load: instant from local DB, then background sync ──
   const loadDms = useCallback(async () => {
     setLoading(true);
     setEmptyReason(null);
@@ -83,7 +183,6 @@ export const Dms: React.FC = () => {
         return;
       }
 
-      // Check signing mode
       let mode: string = "read-only";
       try {
         mode = await invoke<string>("get_signing_mode");
@@ -107,137 +206,43 @@ export const Dms: React.FC = () => {
       }
       setOwnPubkey(pk);
 
-      // On first load: publish inbox relays if needed + do a full relay scan for DMs
+      // ── Phase A: load from local DB instantly ──
+      const { convs, empty } = await buildConversations(pk, mode);
+      if (empty) setEmptyReason(empty);
+      setConversations(convs);
+      prevTotalMessages.current = convs.reduce((sum, c) => sum + c.messages.length, 0);
+      setLoading(false); // user sees messages NOW
+
+      // Decrypt NIP-04 previews in background (non-blocking)
       if (mode !== "read-only") {
-        try {
-          // Publish kind 10050 inbox relay list so others know where to send us gift wraps
-          await invoke("publish_inbox_relays");
-        } catch (e) {
-          console.debug("[dms] publish_inbox_relays:", e);
-        }
-        try {
-          // Full scan: fetch DMs from all known relays going back 30 days
-          const fetched = await invoke<number>("fetch_new_dms", { fullScan: true });
-          if (fetched > 0) console.log(`[dms] full scan fetched ${fetched} new DMs`);
-        } catch (e) {
-          console.debug("[dms] full scan:", e);
-        }
+        decryptPreviews(convs, pk);
       }
 
-      const events = await invoke<NostrEvent[]>("get_dm_events", {
-        ownPubkey: pk,
-        limit: 500,
-      });
-
-      if (!events || events.length === 0) {
-        try {
-          const kindCounts = await invoke<{ counts: Record<number, number> }>("get_kind_counts");
-          const dmCount = (kindCounts.counts[4] || 0) + (kindCounts.counts[1059] || 0);
-          if (dmCount > 0) {
-            setEmptyReason("read-only");
-            setLoading(false);
-            return;
-          }
-        } catch {
-          /* kind counts not critical */
-        }
-        setEmptyReason("no-dms");
-        setLoading(false);
-        return;
-      }
-
-      // Separate NIP-04 (kind 4) and NIP-17 gift wraps (kind 1059)
-      const nip04Events = events.filter((e) => e.kind === 4);
-      const giftWrapEvents = events.filter((e) => e.kind === 1059);
-
-      // Unwrap gift wraps if we have signing capability
-      const gwCache = giftWrapCache.current;
-      const dCache = decryptedCache.current;
-      const senderCache = giftWrapSenderCache.current;
-
-      if (mode !== "read-only" && giftWrapEvents.length > 0) {
-        const results = await Promise.allSettled(
-          giftWrapEvents.map(async (ev) => {
-            // Skip if already cached
-            if (gwCache.has(ev.id)) return { eventId: ev.id, cached: true };
-            const result = await invoke<UnwrappedDm>("unwrap_gift_wrap", {
-              eventId: ev.id,
-              eventPubkey: ev.pubkey,
-              eventContent: ev.content,
-              eventCreatedAt: ev.created_at,
-              eventTags: ev.tags,
-              eventSig: ev.sig,
-            });
-            return { eventId: ev.id, cached: false, unwrapped: result };
-          }),
-        );
-
-        for (const r of results) {
-          if (r.status === "fulfilled" && !r.value.cached && r.value.unwrapped) {
-            const { eventId, unwrapped } = r.value;
-            gwCache.set(eventId, unwrapped);
-            dCache.set(eventId, unwrapped.content);
-            senderCache.set(eventId, unwrapped.sender_pubkey);
-          }
-        }
-      }
-
-      // Group by conversation partner
-      const convMap = new Map<string, NostrEvent[]>();
-
-      // NIP-04 events: partner determined from event data
-      for (const ev of nip04Events) {
-        const partner = getPartner(ev, pk);
-        if (!partner) continue;
-        if (!convMap.has(partner)) convMap.set(partner, []);
-        convMap.get(partner)!.push(ev);
-      }
-
-      // NIP-17 gift wrap events: partner determined from unwrapped data
-      for (const ev of giftWrapEvents) {
-        const unwrapped = gwCache.get(ev.id);
-        if (!unwrapped) continue; // couldn't unwrap (read-only or failed)
-
-        let partner: string;
-        if (unwrapped.sender_pubkey === pk) {
-          // We sent this — partner is the recipient from the rumor's p-tag
-          partner = unwrapped.recipient_pubkey || "";
-        } else {
-          // We received this — partner is the sender
-          partner = unwrapped.sender_pubkey;
-        }
-        if (!partner) continue;
-
-        if (!convMap.has(partner)) convMap.set(partner, []);
-        convMap.get(partner)!.push(ev);
-      }
-
-      const sorted = Array.from(convMap.entries())
-        .map(([partnerPubkey, messages]) => {
-          // For gift wraps, use the rumor's created_at for sorting (more accurate than the tweaked timestamp)
-          const getTimestamp = (m: NostrEvent) => {
-            const unwrapped = gwCache.get(m.id);
-            return unwrapped ? unwrapped.created_at : m.created_at;
-          };
-          return {
-            partnerPubkey,
-            messages: messages.sort((a, b) => getTimestamp(b) - getTimestamp(a)),
-            lastTimestamp: Math.max(...messages.map(getTimestamp)),
-          };
-        })
-        .sort((a, b) => b.lastTimestamp - a.lastTimestamp);
-
-      // Fetch profiles for all partners
-      const partnerKeys = sorted.map((c) => c.partnerPubkey);
-      ensureProfiles(partnerKeys);
-
-      setConversations(sorted);
-      setLoading(false);
-
-      // Decrypt last message of NIP-04 conversations for sidebar preview
-      // (NIP-17 messages are already decrypted from unwrapping)
+      // ── Phase B: background relay sync (fire-and-forget) ──
       if (mode !== "read-only") {
-        decryptPreviews(sorted, pk);
+        (async () => {
+          try {
+            // Publish inbox relays so others know where to send us gift wraps
+            invoke("publish_inbox_relays").catch(() => {});
+
+            // Full scan only once per session; short poll otherwise
+            const doFull = !hasFullScanned;
+            if (doFull) hasFullScanned = true;
+
+            const fetched = await invoke<number>("fetch_new_dms", { fullScan: doFull });
+            if (fetched > 0) {
+              console.log(`[dms] background sync: ${fetched} new DMs`);
+              // Silently rebuild conversations with new data
+              const { convs: updated, empty: updatedEmpty } = await buildConversations(pk, mode);
+              if (updatedEmpty) setEmptyReason(updatedEmpty);
+              else setEmptyReason(null);
+              setConversations(updated);
+              if (mode !== "read-only") decryptPreviews(updated, pk);
+            }
+          } catch (e) {
+            console.debug("[dms] background sync:", e);
+          }
+        })();
       }
     } catch (e) {
       console.error("[dms] Error loading DMs:", e);
@@ -245,14 +250,12 @@ export const Dms: React.FC = () => {
       setLoading(false);
     }
 
-    // Inner helper — uses closure over decryptedCache
     async function decryptPreviews(convs: Conversation[], pk: string) {
       const cache = decryptedCache.current;
       let updated = false;
       for (const conv of convs) {
-        const lastMsg = conv.messages[0]; // sorted desc, first = latest
+        const lastMsg = conv.messages[0];
         if (!lastMsg || cache.has(lastMsg.id)) continue;
-        // Only decrypt NIP-04 messages here; NIP-17 are already cached
         if (lastMsg.kind === 1059) continue;
         const senderPk = lastMsg.pubkey === pk ? conv.partnerPubkey : lastMsg.pubkey;
         try {
@@ -269,29 +272,37 @@ export const Dms: React.FC = () => {
       }
       if (updated) setDecryptTick((v) => v + 1);
     }
-  }, []);
+  }, [buildConversations]);
 
   useEffect(() => {
     loadDms();
   }, [loadDms]);
 
-  // Poll for new DMs every 30s when a conversation is selected
+  // Poll for new DMs — 5s when a chat is open (near-realtime feel), 60s on sidebar.
+  const prevTotalMessages = useRef<number>(0);
   useEffect(() => {
-    if (!selectedPartner || signingMode === "read-only") return;
+    if (!ownPubkey || signingMode === "read-only") return;
+    const pollMs = selectedPartner ? 5000 : 60000;
     const interval = setInterval(async () => {
       try {
-        const newCount = await invoke<number>("fetch_new_dms", { fullScan: false });
-        if (newCount > 0) {
-          console.log(`[dms] ${newCount} new DMs fetched, reloading`);
-          await loadDms();
-          setSelectedPartner(selectedPartner);
+        await invoke("fetch_new_dms", { fullScan: false });
+        const { convs, empty } = await buildConversations(ownPubkey, signingMode);
+
+        const totalNow = convs.reduce((sum, c) => sum + c.messages.length, 0);
+        const prevTotal = prevTotalMessages.current;
+        prevTotalMessages.current = totalNow;
+
+        if (totalNow !== prevTotal) {
+          if (empty) setEmptyReason(empty);
+          else setEmptyReason(null);
+          setConversations(convs);
         }
       } catch (e) {
-        console.debug("[dms] fetch_new_dms poll error:", e);
+        console.debug("[dms] poll error:", e);
       }
-    }, 30000);
+    }, pollMs);
     return () => clearInterval(interval);
-  }, [selectedPartner, signingMode, loadDms]);
+  }, [selectedPartner, ownPubkey, signingMode, buildConversations]);
 
   // Decrypt messages for the selected thread
   const decryptThread = useCallback(async (messages: NostrEvent[], partnerPubkey: string) => {
@@ -356,19 +367,64 @@ export const Dms: React.FC = () => {
     decryptThread(conv.messages, selectedPartner);
   }, [selectedPartner, signingMode, conversations, decryptThread]);
 
-  // Auto-scroll thread to bottom on conversation change
+  // Track whether user is scrolled to the bottom of the thread
   const threadRef = useRef<HTMLDivElement>(null);
+  const isAtBottomRef = useRef(true);
+  const [hasNewMessages, setHasNewMessages] = useState(false);
+  const prevMessageCount = useRef<number>(0);
+
+  const scrollToBottom = useCallback((smooth = true) => {
+    const el = threadRef.current;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior: smooth ? "smooth" : "instant" });
+    setHasNewMessages(false);
+  }, []);
+
+  // Auto-scroll on conversation switch
   const prevPartnerRef = useRef<string | null>(null);
   useEffect(() => {
     if (selectedPartner && threadRef.current && selectedPartner !== prevPartnerRef.current) {
-      // Reset display count and scroll to bottom on new conversation
       setDisplayCount(30);
-      setTimeout(() => {
-        if (threadRef.current) threadRef.current.scrollTop = threadRef.current.scrollHeight;
-      }, 0);
+      setHasNewMessages(false);
+      prevMessageCount.current = 0;
+      setTimeout(() => scrollToBottom(false), 0);
     }
     prevPartnerRef.current = selectedPartner;
-  }, [selectedPartner, conversations]);
+  }, [selectedPartner, scrollToBottom]);
+
+  // When conversations update: auto-scroll if at bottom, show indicator if not.
+  // Uses isAtBottomRef (updated by scroll listener) instead of checking scroll position
+  // at render time, since the DOM hasn't updated yet when this effect fires.
+  useEffect(() => {
+    if (!selectedPartner) return;
+    const conv = conversations.find((c) => c.partnerPubkey === selectedPartner);
+    if (!conv) return;
+    const count = conv.messages.length;
+    if (prevMessageCount.current > 0 && count > prevMessageCount.current) {
+      if (isAtBottomRef.current) {
+        // User was at bottom — scroll to show new message after DOM paints
+        requestAnimationFrame(() => {
+          setTimeout(() => scrollToBottom(true), 0);
+        });
+      } else {
+        setHasNewMessages(true);
+      }
+    }
+    prevMessageCount.current = count;
+  }, [conversations, selectedPartner, scrollToBottom]);
+
+  // Track scroll position to detect if user is at bottom
+  useEffect(() => {
+    const el = threadRef.current;
+    if (!el) return;
+    const onScroll = () => {
+      const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+      isAtBottomRef.current = atBottom;
+      if (atBottom) setHasNewMessages(false);
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => el.removeEventListener("scroll", onScroll);
+  }, [selectedPartner]);
 
   // Sentinel observer to load older messages on scroll-up
   const sentinelRef = useRef<HTMLDivElement>(null);
@@ -503,6 +559,11 @@ export const Dms: React.FC = () => {
       return updated;
     });
     setDecryptTick((v) => v + 1);
+    // Bump message count so the new-message effect doesn't trigger for our own send
+    prevMessageCount.current += 1;
+    prevTotalMessages.current += 1;
+    // Ensure we're "at bottom" so the scroll works
+    isAtBottomRef.current = true;
 
     // Clear input immediately — user can keep typing
     setMessageInput("");
@@ -522,8 +583,9 @@ export const Dms: React.FC = () => {
         } else {
           await invoke("publish_gift_wrap_dm", { content: text, recipientPubkey: partner });
         }
-        // After publish succeeds, reload to replace optimistic message with real one
-        await loadDms();
+        // After publish succeeds, rebuild from local DB to replace optimistic message
+        const { convs } = await buildConversations(ownPubkey, signingMode);
+        setConversations(convs);
       } catch (e) {
         console.error("[dms] Background publish failed:", e);
         // Mark the optimistic message as failed
@@ -531,7 +593,7 @@ export const Dms: React.FC = () => {
         setDecryptTick((v) => v + 1);
       }
     })();
-  }, [messageInput, selectedPartner, signingMode, sendAsLegacy, ownPubkey, loadDms]);
+  }, [messageInput, selectedPartner, signingMode, sendAsLegacy, ownPubkey, buildConversations]);
 
   // Loading state
   if (loading) {
@@ -699,32 +761,42 @@ export const Dms: React.FC = () => {
             <span className="icon"><IconLock /></span> messages are encrypted. connect a signer in settings to decrypt.
           </div>
         )}
-        <div className="dms-thread-messages" ref={threadRef}>
-          <div className="dms-thread-messages-inner">
-            {hasMore && <div ref={sentinelRef} className="dms-scroll-sentinel" />}
-            {visible.map((msg) => {
-              const sent = isSentByUs(msg);
-              const timeStr = formatTimestamp(effectiveTimestamp(msg));
-              const decrypted = cache.get(msg.id);
+        <div className="dms-thread-messages-wrap">
+          <div className="dms-thread-messages" ref={threadRef}>
+            <div className="dms-thread-messages-inner">
+              {hasMore && <div ref={sentinelRef} className="dms-scroll-sentinel" />}
+              {visible.map((msg) => {
+                const sent = isSentByUs(msg);
+                const timeStr = formatTimestamp(effectiveTimestamp(msg));
+                const decrypted = cache.get(msg.id);
 
-              return (
-                <div key={msg.id} className={`dms-msg ${sent ? "dms-msg-sent" : "dms-msg-received"}`}>
-                  <div className="dms-msg-bubble">
-                    <div className="dms-msg-content">
-                      {decrypted
-                        ? decrypted
-                        : <><span className="icon"><IconLock /></span> encrypted message</>
-                      }
-                    </div>
-                    <div className="dms-msg-meta">
-                      {protocolTag(msg)}
-                      <span className="dms-msg-time">{timeStr}</span>
+                return (
+                  <div key={msg.id} className={`dms-msg ${sent ? "dms-msg-sent" : "dms-msg-received"}`}>
+                    <div className="dms-msg-bubble">
+                      <div className="dms-msg-content">
+                        {decrypted
+                          ? decrypted
+                          : <><span className="icon"><IconLock /></span> encrypted message</>
+                        }
+                      </div>
+                      <div className="dms-msg-meta">
+                        {protocolTag(msg)}
+                        <span className="dms-msg-time">{timeStr}</span>
+                      </div>
                     </div>
                   </div>
-                </div>
-              );
-            })}
+                );
+              })}
+            </div>
           </div>
+          {hasNewMessages && (
+            <button className="dms-new-msg-indicator" onClick={() => scrollToBottom(true)}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="6 9 12 15 18 9" />
+              </svg>
+              new messages
+            </button>
+          )}
         </div>
         {signingMode !== "read-only" ? (
           <div className="dms-input-bar">
