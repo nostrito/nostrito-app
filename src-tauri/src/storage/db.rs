@@ -1317,7 +1317,7 @@ impl Database {
         Ok(())
     }
 
-    /// Get DM events (kind:4) involving a specific pubkey (as sender or recipient).
+    /// Get DM events (kind:4 NIP-04 + kind:1059 NIP-17 gift wrap) involving a specific pubkey.
     /// Returns (id, pubkey, created_at, kind, tags_json, content, sig).
     pub fn get_dm_events(
         &self,
@@ -1328,7 +1328,7 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT id, pubkey, created_at, kind, tags, content, sig \
              FROM nostr_events \
-             WHERE kind = 4 AND (pubkey = ?1 OR tags LIKE '%' || ?1 || '%') \
+             WHERE kind IN (4, 1059) AND (pubkey = ?1 OR tags LIKE '%' || ?1 || '%') \
              ORDER BY created_at DESC \
              LIMIT ?2",
         )?;

@@ -418,10 +418,12 @@ const NoteCardInner: React.FC<{
   onLike?: (event: NostrEvent) => void;
   onZap?: (event: NostrEvent) => void;
   onReply?: (event: NostrEvent) => void;
-}> = ({ event, profile, compact, full, onSave, saved, onLike, onZap, onReply }) => {
+  onRepost?: (event: NostrEvent) => void;
+}> = ({ event, profile, compact, full, onSave, saved, onLike, onZap, onReply, onRepost }) => {
   const { ensureProfiles, getProfile } = useProfileContext();
   const counts = useInteractionCounts(event.id);
   const liked = useReactionStatus(event.id);
+  const reposted = useRepostStatus(event.id);
   const { canWrite } = useSigningContext();
   const toast = useActionToast();
   const displayName = profileDisplayName(profile, event.pubkey);
@@ -463,7 +465,7 @@ const NoteCardInner: React.FC<{
           <div className="ev-actions" style={{ position: "relative" }}>
             <ActionToast message={toast.message} />
             <button className={`ev-action${!canWrite || !onReply ? " ev-action-disabled" : ""}`} onClick={canWrite && onReply ? (e) => { e.stopPropagation(); onReply(event); } : !canWrite ? handleSigningClick : undefined}><span className="icon"><IconMessageCircle /></span>{counts?.replies ? ` ${counts.replies}` : ""}</button>
-            <button className={`ev-action${!canWrite ? " ev-action-disabled" : ""}`} onClick={!canWrite ? handleSigningClick : undefined}><span className="icon"><IconRepeat /></span>{counts?.reposts ? ` ${counts.reposts}` : ""}</button>
+            <button className={`ev-action${reposted ? " ev-action-reposted" : ""}${!canWrite || reposted || !onRepost ? " ev-action-disabled" : ""}`} onClick={canWrite && !reposted && onRepost ? (e) => { e.stopPropagation(); onRepost(event); } : !canWrite ? handleSigningClick : undefined}><span className="icon"><IconRepeat /></span>{counts?.reposts ? ` ${counts.reposts}` : ""}</button>
             <button className={`ev-action${liked ? " ev-action-liked" : ""}${!canWrite || liked ? " ev-action-disabled" : ""}`} onClick={canWrite && !liked ? (e) => { e.stopPropagation(); onLike?.(event); } : !canWrite && !liked ? handleSigningClick : undefined}><span className="icon">{liked ? <IconHeartFilled /> : <IconHeart />}</span>{counts?.reactions ? ` ${counts.reactions}` : ""}</button>
             <button className={`ev-action${!canWrite ? " ev-action-disabled" : ""}`} onClick={canWrite ? (e) => { e.stopPropagation(); onZap?.(event); } : handleZapClick}><span className="icon"><IconZap /></span>{counts?.zaps ? ` ${counts.zaps}` : ""}</button>
             {onSave && (
@@ -623,7 +625,7 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, ful
           <div className="ev-actions" style={{ position: "relative" }}>
             <ActionToast message={toast.message} />
             <button className={`ev-action${!canWrite || !onReply ? " ev-action-disabled" : ""}`} onClick={canWrite && onReply ? (e) => { e.stopPropagation(); onReply(event); } : !canWrite ? handleSigningClick : undefined}><span className="icon"><IconMessageCircle /></span>{counts?.replies ? ` ${counts.replies}` : ""}</button>
-            <button className={`ev-action${!canWrite || !onRepost ? " ev-action-disabled" : ""}`} onClick={canWrite && onRepost ? (e) => { e.stopPropagation(); onRepost(event); } : !canWrite ? handleSigningClick : undefined}><span className="icon"><IconRepeat /></span>{counts?.reposts ? ` ${counts.reposts}` : ""}</button>
+            <button className={`ev-action${reposted ? " ev-action-reposted" : ""}${!canWrite || reposted || !onRepost ? " ev-action-disabled" : ""}`} onClick={canWrite && !reposted && onRepost ? (e) => { e.stopPropagation(); onRepost(event); } : !canWrite ? handleSigningClick : undefined}><span className="icon"><IconRepeat /></span>{counts?.reposts ? ` ${counts.reposts}` : ""}</button>
             <button className={`ev-action${liked ? " ev-action-liked" : ""}${!canWrite || liked ? " ev-action-disabled" : ""}`} onClick={canWrite && !liked ? (e) => { e.stopPropagation(); onLike?.(event); } : !canWrite && !liked ? handleSigningClick : undefined}><span className="icon">{liked ? <IconHeartFilled /> : <IconHeart />}</span>{counts?.reactions ? ` ${counts.reactions}` : ""}</button>
             <button className={`ev-action${!canWrite ? " ev-action-disabled" : ""}`} onClick={canWrite ? (e) => { e.stopPropagation(); onZap?.(event); } : handleZapClick}><span className="icon"><IconZap /></span>{counts?.zaps ? ` ${counts.zaps}` : ""}</button>
             {onSave && (

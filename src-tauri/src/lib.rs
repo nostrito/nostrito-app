@@ -4309,6 +4309,448 @@ async fn decrypt_dm(content: String, sender_pubkey: String, state: State<'_, App
     Err("No signer available — read-only mode".into())
 }
 
+/// Fetch new DMs from relays on-demand (called by frontend when a chat is open).
+/// Queries inbox relays for recent kind 4 + kind 1059 events addressed to the user.
+#[tauri::command]
+async fn fetch_new_dms(
+    state: State<'_, AppState>,
+) -> Result<u32, String> {
+    use nostr_sdk::prelude::*;
+
+    let config = state.config.read().await;
+    let hex_pubkey = config.hex_pubkey.clone().ok_or("No pubkey")?;
+    let outbound_relays = config.outbound_relays.clone();
+    drop(config);
+
+    let pk = PublicKey::from_hex(&hex_pubkey)
+        .map_err(|e| format!("Invalid pubkey: {}", e))?;
+
+    let inbox_relays = resolve_inbox_relays(state.db(), &hex_pubkey, &outbound_relays);
+
+    tracing::debug!("[cmd:fetch_new_dms] querying {} relays for new DMs", inbox_relays.len());
+
+    // Look back 5 minutes for new messages
+    let since = chrono::Utc::now().timestamp() - 300;
+    // For gift wraps, look back further due to timestamp randomization
+    let gw_since = since - 172800;
+
+    let nip04_filter = Filter::new()
+        .pubkey(pk)
+        .kind(Kind::EncryptedDirectMessage)
+        .since(Timestamp::from(since as u64))
+        .limit(50);
+
+    let gw_filter = Filter::new()
+        .pubkey(pk)
+        .kind(Kind::GiftWrap)
+        .since(Timestamp::from(gw_since.max(0) as u64))
+        .limit(50);
+
+    let client = Client::default();
+    for url in &inbox_relays {
+        client.add_relay(url.as_str()).await.ok();
+    }
+    client.connect().await;
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+    let mut stored = 0u32;
+
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        client.get_events_of(vec![nip04_filter, gw_filter], None),
+    ).await {
+        Ok(Ok(events)) => {
+            tracing::info!("[cmd:fetch_new_dms] fetched {} events", events.len());
+            for event in &events {
+                let event_id = event.id.to_hex();
+                let pubkey = event.pubkey.to_hex();
+                let kind = event.kind.as_u16() as u32;
+                let created_at = event.created_at.as_u64() as i64;
+                let tags_json = serde_json::to_string(
+                    &event.tags.iter()
+                        .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect::<Vec<String>>())
+                        .collect::<Vec<Vec<String>>>()
+                ).unwrap_or_else(|_| "[]".to_string());
+
+                if state.db().store_event(
+                    &event_id, &pubkey, created_at, kind,
+                    &tags_json, &event.content.to_string(), &event.sig.to_string(),
+                ).unwrap_or(false) {
+                    stored += 1;
+                }
+            }
+        }
+        Ok(Err(e)) => tracing::warn!("[cmd:fetch_new_dms] fetch error: {}", e),
+        Err(_) => tracing::debug!("[cmd:fetch_new_dms] fetch timed out"),
+    }
+
+    client.disconnect().await.ok();
+    tracing::info!("[cmd:fetch_new_dms] {} new DMs stored", stored);
+    Ok(stored)
+}
+
+/// Result of unwrapping a NIP-17 gift-wrapped DM.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnwrappedDm {
+    pub sender_pubkey: String,
+    pub recipient_pubkey: Option<String>,
+    pub content: String,
+    pub created_at: u64,
+    pub rumor_kind: u32,
+}
+
+#[tauri::command]
+async fn unwrap_gift_wrap(
+    event_id: String,
+    event_pubkey: String,
+    event_content: String,
+    event_created_at: u64,
+    event_tags: Vec<Vec<String>>,
+    event_sig: String,
+    state: State<'_, AppState>,
+) -> Result<UnwrappedDm, String> {
+    use nostr_sdk::prelude::*;
+
+    tracing::info!("[cmd:unwrap_gift_wrap] unwrapping event {}...", &event_id[..12.min(event_id.len())]);
+
+    // Try local nsec first (fast path — can use nip59::extract_rumor directly)
+    {
+        let config = state.config.read().await;
+        if let Some(ref nsec_str) = config.nsec {
+            if config.signing_mode == "nsec" {
+                let secret_key = SecretKey::from_bech32(nsec_str)
+                    .map_err(|e| format!("Invalid nsec: {}", e))?;
+                let receiver_keys = Keys::new(secret_key);
+
+                // Reconstruct the Event from components
+                let gift_wrap_event = reconstruct_event(
+                    &event_id, &event_pubkey, event_created_at,
+                    1059, &event_tags, &event_content, &event_sig,
+                )?;
+
+                let unwrapped = nip59::extract_rumor(&receiver_keys, &gift_wrap_event)
+                    .map_err(|e| format!("Gift wrap extraction failed: {}", e))?;
+
+                let content = unwrapped.rumor.content.clone();
+                let created_at = unwrapped.rumor.created_at.as_u64();
+                let kind = unwrapped.rumor.kind.as_u16() as u32;
+                let sender = unwrapped.sender.to_hex();
+
+                // Extract recipient from rumor's p-tag
+                let recipient = unwrapped.rumor.tags.iter()
+                    .find(|t| t.kind() == nostr_sdk::prelude::TagKind::SingleLetter(nostr_sdk::prelude::SingleLetterTag::lowercase(nostr_sdk::prelude::Alphabet::P)))
+                    .and_then(|t| t.content().map(|pk| pk.to_string()));
+
+                tracing::info!("[cmd:unwrap_gift_wrap] unwrapped: sender={}..., kind={}, content_len={}",
+                    &sender[..12], kind, content.len());
+
+                return Ok(UnwrappedDm {
+                    sender_pubkey: sender,
+                    recipient_pubkey: recipient,
+                    content,
+                    created_at,
+                    rumor_kind: kind,
+                });
+            }
+        }
+    }
+
+    // NIP-46 path: manually decrypt each layer using the remote signer's nip44_decrypt
+    let signer_opt = {
+        let guard = state.nip46_signer.read().await;
+        guard.clone()
+    };
+    if let Some(signer) = signer_opt {
+        tracing::info!("[cmd:unwrap_gift_wrap] using NIP-46 signer for unwrapping");
+
+        // Layer 1: decrypt gift wrap content to get the seal
+        let seal_json = signer.nip44_decrypt(
+            PublicKey::from_hex(&event_pubkey)
+                .map_err(|e| format!("Invalid gift wrap pubkey: {}", e))?,
+            event_content,
+        ).await.map_err(|e| format!("Gift wrap NIP-44 decrypt failed: {}", e))?;
+
+        let seal: Event = Event::from_json(&seal_json)
+            .map_err(|e| format!("Failed to parse seal event: {}", e))?;
+
+        // Layer 2: decrypt seal content to get the rumor
+        let rumor_json = signer.nip44_decrypt(
+            seal.pubkey,
+            seal.content.to_string(),
+        ).await.map_err(|e| format!("Seal NIP-44 decrypt failed: {}", e))?;
+
+        let rumor: UnsignedEvent = UnsignedEvent::from_json(&rumor_json)
+            .map_err(|e| format!("Failed to parse rumor event: {}", e))?;
+
+        let sender = seal.pubkey.to_hex();
+
+        // Extract recipient from rumor's p-tag
+        let recipient = rumor.tags.iter()
+            .find(|t| t.kind() == nostr_sdk::prelude::TagKind::SingleLetter(nostr_sdk::prelude::SingleLetterTag::lowercase(nostr_sdk::prelude::Alphabet::P)))
+            .and_then(|t| t.content().map(|pk| pk.to_string()));
+
+        tracing::info!("[cmd:unwrap_gift_wrap] NIP-46 unwrapped: sender={}..., kind={}, content_len={}",
+            &sender[..12], rumor.kind.as_u16(), rumor.content.len());
+
+        return Ok(UnwrappedDm {
+            sender_pubkey: sender,
+            recipient_pubkey: recipient,
+            content: rumor.content.clone(),
+            created_at: rumor.created_at.as_u64(),
+            rumor_kind: rumor.kind.as_u16() as u32,
+        });
+    }
+
+    Err("No signer available — cannot unwrap gift wrap in read-only mode".into())
+}
+
+/// Reconstruct a nostr_sdk Event from its component parts.
+fn reconstruct_event(
+    id: &str, pubkey: &str, created_at: u64,
+    kind: u16, tags: &[Vec<String>], content: &str, sig: &str,
+) -> Result<nostr_sdk::prelude::Event, String> {
+    use nostr_sdk::prelude::*;
+    let json = serde_json::json!({
+        "id": id,
+        "pubkey": pubkey,
+        "created_at": created_at,
+        "kind": kind,
+        "tags": tags,
+        "content": content,
+        "sig": sig,
+    });
+    Event::from_json(json.to_string())
+        .map_err(|e| format!("Failed to reconstruct event: {}", e))
+}
+
+/// Resolve inbox relays for a pubkey: kind 10050 → NIP-65 read → outbound + well-known DM relays.
+fn resolve_inbox_relays(db: &crate::storage::db::Database, pubkey: &str, fallback_relays: &[String]) -> Vec<String> {
+    use std::collections::HashSet;
+    let mut set: HashSet<String> = HashSet::new();
+
+    // 1. Kind 10050 (NIP-17 DM relay list) — highest priority
+    if let Ok(events) = db.query_events(
+        None,
+        Some(&[pubkey.to_string()]),
+        Some(&[10050]),
+        None,
+        None,
+        1,
+    ) {
+        for (_, _, _, _, tags_json, _, _) in &events {
+            if let Ok(tags) = serde_json::from_str::<Vec<Vec<String>>>(tags_json) {
+                for tag in &tags {
+                    if tag.len() >= 2 && tag[0] == "relay" {
+                        set.insert(tag[1].trim_end_matches('/').to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. NIP-65 read relays
+    if let Ok(nip65) = db.get_read_relays(pubkey) {
+        for (url, _) in nip65 {
+            set.insert(url);
+        }
+    }
+
+    // 3. Always include well-known DM relays and fallback outbound relays
+    for url in &[
+        "wss://auth.nostr1.com",
+        "wss://relay.0xchat.com",
+        "wss://nos.lol",
+        "wss://relay.damus.io",
+        "wss://relay.primal.net",
+    ] {
+        set.insert(url.to_string());
+    }
+    for url in fallback_relays {
+        set.insert(url.clone());
+    }
+
+    set.into_iter().collect()
+}
+
+/// Publish an event to a set of relays (fire-and-forget with timeout).
+async fn publish_to_relays(event: &nostr_sdk::prelude::Event, relays: &[String], label: &str) {
+    let client = nostr_sdk::Client::default();
+    for url in relays {
+        client.add_relay(url.as_str()).await.ok();
+    }
+    client.connect().await;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.send_event(event.clone()),
+    ).await {
+        Ok(Ok(output)) => {
+            tracing::info!("[publish_to_relays] {} sent (ok={}, fail={})",
+                label, output.success.len(), output.failed.len());
+            for (url, err) in &output.failed {
+                tracing::debug!("[publish_to_relays] {} rejected by {}: {:?}", label, url, err);
+            }
+        }
+        Ok(Err(e)) => tracing::warn!("[publish_to_relays] {} broadcast error: {}", label, e),
+        Err(_) => tracing::warn!("[publish_to_relays] {} broadcast timed out", label),
+    }
+    client.disconnect().await.ok();
+}
+
+#[tauri::command]
+async fn publish_gift_wrap_dm(
+    content: String,
+    recipient_pubkey: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    use nostr_sdk::prelude::*;
+
+    tracing::info!("[cmd:publish_gift_wrap_dm] sending NIP-17 DM to {}...",
+        &recipient_pubkey[..12.min(recipient_pubkey.len())]);
+
+    let recipient_pk = PublicKey::from_hex(&recipient_pubkey)
+        .map_err(|e| format!("Invalid recipient pubkey: {}", e))?;
+
+    let config = state.config.read().await;
+    let nsec = config.nsec.clone();
+    let signing_mode = config.signing_mode.clone();
+    let hex_pubkey = config.hex_pubkey.clone();
+    let outbound_relays = config.outbound_relays.clone();
+    drop(config);
+
+    let sender_pk = PublicKey::from_hex(
+        hex_pubkey.as_deref().ok_or("No pubkey configured")?
+    ).map_err(|e| format!("Invalid own pubkey: {}", e))?;
+
+    // Resolve recipient's inbox relays (kind 10050), falling back to NIP-65 read relays,
+    // then our outbound relays + well-known DM relays.
+    let recipient_relays = resolve_inbox_relays(state.db(), &recipient_pubkey, &outbound_relays);
+    // For self-copy: use our own inbox/outbound relays
+    let own_hex = hex_pubkey.as_deref().unwrap_or("");
+    let self_relays = resolve_inbox_relays(state.db(), own_hex, &outbound_relays);
+
+    tracing::info!("[cmd:publish_gift_wrap_dm] recipient relays: {:?}, self relays: {:?}",
+        recipient_relays, self_relays);
+
+    // Create the rumor (kind 14 private direct message)
+    let rumor = EventBuilder::private_msg_rumor(recipient_pk, &content, None)
+        .to_unsigned_event(sender_pk);
+
+    let use_nsec = signing_mode == "nsec" && nsec.is_some();
+
+    if use_nsec {
+        tracing::info!("[cmd:publish_gift_wrap_dm] creating gift wraps with local nsec");
+        let secret_key = SecretKey::from_bech32(nsec.as_ref().unwrap())
+            .map_err(|e| format!("Invalid nsec: {}", e))?;
+        let sender_keys = Keys::new(secret_key);
+
+        // Gift wrap to recipient
+        let gw_to_recipient = EventBuilder::gift_wrap(
+            &sender_keys, &recipient_pk, rumor.clone(), None,
+        ).map_err(|e| format!("Gift wrap to recipient failed: {}", e))?;
+
+        // Gift wrap self-copy (so we can see our sent messages)
+        let gw_to_self = EventBuilder::gift_wrap(
+            &sender_keys, &sender_pk, rumor, None,
+        ).map_err(|e| format!("Gift wrap to self failed: {}", e))?;
+
+        // Publish recipient copy to recipient's inbox relays
+        publish_to_relays(&gw_to_recipient, &recipient_relays, "recipient").await;
+        // Publish self-copy to our own relays
+        publish_to_relays(&gw_to_self, &self_relays, "self").await;
+
+        // Store both locally
+        for gw in [&gw_to_recipient, &gw_to_self] {
+            let tags_json = serde_json::to_string(
+                &gw.tags.iter()
+                    .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect::<Vec<String>>())
+                    .collect::<Vec<Vec<String>>>()
+            ).unwrap_or_else(|_| "[]".to_string());
+
+            state.db().store_event(
+                &gw.id.to_hex(),
+                &gw.pubkey.to_hex(),
+                gw.created_at.as_u64() as i64,
+                gw.kind.as_u16() as u32,
+                &tags_json,
+                &gw.content.to_string(),
+                &gw.sig.to_string(),
+            ).ok();
+        }
+
+        let id = gw_to_recipient.id.to_hex();
+        tracing::info!("[cmd:publish_gift_wrap_dm] published NIP-17 DM {}", &id[..12]);
+        return Ok(id);
+    }
+
+    // NIP-46 path: build seal + gift wrap using remote signer
+    tracing::info!("[cmd:publish_gift_wrap_dm] creating gift wraps via NIP-46");
+
+    let signer_opt = {
+        let guard = state.nip46_signer.read().await;
+        guard.clone()
+    };
+    let mut signer = signer_opt
+        .ok_or("No signer available — cannot send DMs in read-only mode")?;
+
+    // For each target (recipient + self), create seal + gift wrap
+    let mut first_id = String::new();
+    for (label, target_pk) in [("recipient", recipient_pk), ("self", sender_pk)] {
+        // Step 1: NIP-44 encrypt the rumor to create seal content
+        let mut rumor_copy = rumor.clone();
+        rumor_copy.ensure_id();
+        let sealed_content = signer.nip44_encrypt(target_pk, rumor_copy.as_json())
+            .await
+            .map_err(|e| format!("NIP-44 encrypt for {} seal failed: {}", label, e))?;
+
+        // Step 2: Build and sign the seal event (kind 13)
+        let seal_builder = EventBuilder::new(Kind::Seal, sealed_content, [])
+            .custom_created_at(Timestamp::tweaked(nip59::RANGE_RANDOM_TIMESTAMP_TWEAK));
+        let seal_unsigned = seal_builder.to_unsigned_event(sender_pk);
+        let seal = signer.sign_event(seal_unsigned).await
+            .map_err(|e| format!("Remote signing of {} seal failed: {}", label, e))?;
+
+        // Step 3: Gift wrap the seal with a random key (local operation)
+        let gw = EventBuilder::gift_wrap_from_seal(&target_pk, &seal, None)
+            .map_err(|e| format!("Gift wrap for {} failed: {}", label, e))?;
+
+        // Publish to the target's inbox relays
+        let target_relays = if label == "recipient" { &recipient_relays } else { &self_relays };
+        publish_to_relays(&gw, target_relays, label).await;
+
+        // Store locally
+        let tags_json = serde_json::to_string(
+            &gw.tags.iter()
+                .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect::<Vec<String>>())
+                .collect::<Vec<Vec<String>>>()
+        ).unwrap_or_else(|_| "[]".to_string());
+
+        state.db().store_event(
+            &gw.id.to_hex(),
+            &gw.pubkey.to_hex(),
+            gw.created_at.as_u64() as i64,
+            gw.kind.as_u16() as u32,
+            &tags_json,
+            &gw.content.to_string(),
+            &gw.sig.to_string(),
+        ).ok();
+
+        if label == "recipient" {
+            first_id = gw.id.to_hex();
+        }
+    }
+
+    // Write back the signer with updated encryption preference
+    {
+        let mut guard = state.nip46_signer.write().await;
+        *guard = Some(signer);
+    }
+
+    tracing::info!("[cmd:publish_gift_wrap_dm] NIP-46 NIP-17 DM published {}", &first_id[..12.min(first_id.len())]);
+    Ok(first_id)
+}
+
 // ── NIP-46 Commands ────────────────────────────────────────────────
 
 #[tauri::command]
@@ -4899,37 +5341,7 @@ async fn sign_build_publish_store(
         }
     };
 
-    // Publish to outbound relays
-    tracing::info!("[publish] publishing to {} outbound relays...", relays.len());
-    let client = Client::default();
-    for url in &relays {
-        client.add_relay(url.as_str()).await.ok();
-    }
-    // Connect and wait briefly for at least some relays to be ready
-    client.connect().await;
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
-    // Send with a timeout so it doesn't hang forever
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        client.send_event(signed.clone())
-    ).await {
-        Ok(Ok(output)) => {
-            tracing::info!("[publish] broadcast complete: event {} sent (success={}, failed={})",
-                &signed.id.to_hex()[..12], output.success.len(), output.failed.len());
-        }
-        Ok(Err(e)) => {
-            tracing::error!("[publish] broadcast failed: {}", e);
-            // Don't fail — event is signed and stored locally, will be broadcast later
-            tracing::warn!("[publish] event stored locally, will retry broadcast on next sync");
-        }
-        Err(_) => {
-            tracing::warn!("[publish] broadcast timed out after 10s, event stored locally");
-        }
-    }
-    client.disconnect().await.ok();
-
-    // Store locally
+    // Store locally FIRST — event is available instantly in the local relay
     let tags_json = serde_json::to_string(
         &signed.tags.iter()
             .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect::<Vec<String>>())
@@ -4948,6 +5360,36 @@ async fn sign_build_publish_store(
         Ok(stored) => tracing::info!("[publish] stored locally: new={}", stored),
         Err(e) => tracing::warn!("[publish] local store failed (non-fatal): {}", e),
     }
+
+    // Broadcast to outbound relays in the background — don't block the caller
+    let signed_clone = signed.clone();
+    tokio::spawn(async move {
+        tracing::info!("[publish] broadcasting to {} outbound relays (background)...", relays.len());
+        let client = Client::default();
+        for url in &relays {
+            client.add_relay(url.as_str()).await.ok();
+        }
+        client.connect().await;
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.send_event(signed_clone.clone())
+        ).await {
+            Ok(Ok(output)) => {
+                tracing::info!("[publish] broadcast complete: event {} sent (success={}, failed={})",
+                    &signed_clone.id.to_hex()[..12], output.success.len(), output.failed.len());
+            }
+            Ok(Err(e)) => {
+                tracing::error!("[publish] broadcast failed: {}", e);
+                tracing::warn!("[publish] event stored locally, will retry broadcast on next sync");
+            }
+            Err(_) => {
+                tracing::warn!("[publish] broadcast timed out after 10s, event stored locally");
+            }
+        }
+        client.disconnect().await.ok();
+    });
 
     Ok(signed)
 }
@@ -4999,7 +5441,7 @@ async fn publish_note(
     root_id: Option<String>,
     root_pubkey: Option<String>,
     state: State<'_, AppState>,
-) -> Result<String, String> {
+) -> Result<NostrEvent, String> {
     use nostr_sdk::prelude::*;
 
     if content.trim().is_empty() {
@@ -5029,7 +5471,20 @@ async fn publish_note(
     let signed = sign_build_publish_store(builder, &state).await?;
     let note_id = signed.id.to_hex();
     tracing::info!("[cmd:publish_note] published note {}", &note_id[..12.min(note_id.len())]);
-    Ok(note_id)
+
+    let tags_vec: Vec<Vec<String>> = signed.tags.iter()
+        .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
+        .collect();
+
+    Ok(NostrEvent {
+        id: note_id,
+        pubkey: signed.pubkey.to_hex(),
+        created_at: signed.created_at.as_u64(),
+        kind: signed.kind.as_u16() as u32,
+        tags: tags_vec,
+        content: signed.content.to_string(),
+        sig: signed.sig.to_string(),
+    })
 }
 
 #[tauri::command]
@@ -5947,6 +6402,8 @@ pub fn run() {
             clear_nsec,
             get_signing_mode,
             decrypt_dm,
+            unwrap_gift_wrap,
+            publish_gift_wrap_dm,
             connect_bunker,
             generate_nostr_connect_uri,
             await_nostr_connect,

@@ -16,6 +16,7 @@ import { formatDate, timeAgo } from "../utils/format";
 import { profileDisplayName } from "../utils/profiles";
 import { invalidateInteractionCounts } from "../hooks/useInteractionCounts";
 import { markReacted } from "../hooks/useReactionStatus";
+import { markReposted } from "../hooks/useRepostStatus";
 import { useOnDemandFetch } from "../hooks/useOnDemandFetch";
 import type { NostrEvent } from "../types/nostr";
 
@@ -216,6 +217,7 @@ export const NoteDetail: React.FC = () => {
     if (!repostConfirm) return;
     const ev = repostConfirm;
     setRepostConfirm(null);
+    markReposted(ev.id);
     try {
       const eventJson = JSON.stringify({
         id: ev.id, pubkey: ev.pubkey, created_at: ev.created_at,

@@ -366,6 +366,22 @@ export const ProfileView: React.FC = () => {
     }
   }, [pubkey, profileLoading]);
 
+  /* --- pick up own notes published from compose ---------------------- */
+  useEffect(() => {
+    if (!pubkey) return;
+    const handler = (e: Event) => {
+      const event = (e as CustomEvent).detail as NostrEvent;
+      if (event && event.pubkey === pubkey) {
+        setNotes((prev) => {
+          if (prev.some((n) => n.id === event.id)) return prev;
+          return [event, ...prev];
+        });
+      }
+    };
+    window.addEventListener("nostrito:note-published", handler);
+    return () => window.removeEventListener("nostrito:note-published", handler);
+  }, [pubkey]);
+
   /* --- listen for relay content updates ------------------------------ */
   useEffect(() => {
     if (!pubkey) return;

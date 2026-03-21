@@ -65,7 +65,14 @@ export const Sidebar: React.FC = () => {
         </NavLink>
       )}
       <div className="sidebar-status"><span className="pulse-dot" /> live · wss://localhost:4869</div>
-      {showCompose && <ComposeModal onClose={() => setShowCompose(false)} />}
+      {showCompose && (
+        <ComposeModal
+          onClose={() => setShowCompose(false)}
+          onPublished={(event) => {
+            window.dispatchEvent(new CustomEvent("nostrito:note-published", { detail: event }));
+          }}
+        />
+      )}
     </aside>
   );
 };

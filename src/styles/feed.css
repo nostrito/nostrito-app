@@ -1139,6 +1139,8 @@
 /* ── Like button active state ────────────────────────── */
 .ev-action-liked { color: #f43f5e; opacity: 0.85; }
 .ev-action-liked.ev-action-disabled { color: #f43f5e; opacity: 0.85; cursor: default !important; }
+.ev-action-reposted { color: #22c55e; opacity: 0.85; }
+.ev-action-reposted.ev-action-disabled { color: #22c55e; opacity: 0.85; cursor: default !important; }
 
 /* ── Article card counts ─────────────────────────────── */
 .article-card-counts {

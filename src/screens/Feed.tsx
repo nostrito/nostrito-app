@@ -17,6 +17,7 @@ import { useSigningContext } from "../context/SigningContext";
 import { profileDisplayName } from "../utils/profiles";
 import { useInteractionCounts, invalidateInteractionCounts } from "../hooks/useInteractionCounts";
 import { useReactionStatus, markReacted } from "../hooks/useReactionStatus";
+import { markReposted } from "../hooks/useRepostStatus";
 import { useTauriEvent } from "../hooks/useTauriEvent";
 import { useInterval } from "../hooks/useInterval";
 import type { NostrEvent } from "../types/nostr";
@@ -267,6 +268,22 @@ export const Feed: React.FC = () => {
 
   const { getProfile, ensureProfiles } = useProfileContext();
 
+  // Listen for notes published from compose (sidebar or reply)
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const event = (e as CustomEvent).detail as NostrEvent;
+      if (event) {
+        setFeedEvents((prev) => {
+          if (prev.some((ev) => ev.id === event.id)) return prev;
+          return [event, ...prev];
+        });
+        ensureProfiles([event.pubkey]);
+      }
+    };
+    window.addEventListener("nostrito:note-published", handler);
+    return () => window.removeEventListener("nostrito:note-published", handler);
+  }, [ensureProfiles]);
+
   const [zapTarget, setZapTarget] = useState<NostrEvent | null>(null);
   const [replyTarget, setReplyTarget] = useState<NostrEvent | null>(null);
 
@@ -288,6 +305,7 @@ export const Feed: React.FC = () => {
     if (!repostConfirm) return;
     const event = repostConfirm;
     setRepostConfirm(null);
+    markReposted(event.id);
     try {
       const eventJson = JSON.stringify({
         id: event.id,
@@ -1216,6 +1234,12 @@ export const Feed: React.FC = () => {
           replyTo={replyTarget}
           replyToProfile={getProfile(replyTarget.pubkey)}
           onClose={() => setReplyTarget(null)}
+          onPublished={(event) => {
+            setFeedEvents((prev) => [event, ...prev]);
+            ensureProfiles([event.pubkey]);
+            invalidateInteractionCounts([replyTarget.id]);
+            window.dispatchEvent(new CustomEvent("nostrito:note-published", { detail: event }));
+          }}
         />
       )}
       {repostConfirm && (

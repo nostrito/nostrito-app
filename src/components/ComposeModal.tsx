@@ -10,11 +10,12 @@ type Mode = "note" | "article";
 
 interface ComposeModalProps {
   onClose: () => void;
+  onPublished?: (event: NostrEvent) => void;
   replyTo?: NostrEvent | null;
   replyToProfile?: ProfileInfo;
 }
 
-export const ComposeModal: React.FC<ComposeModalProps> = ({ onClose, replyTo, replyToProfile }) => {
+export const ComposeModal: React.FC<ComposeModalProps> = ({ onClose, onPublished, replyTo, replyToProfile }) => {
   const { signingMode } = useSigningContext();
   const [phase, setPhase] = useState<Phase>("compose");
   const [mode, setMode] = useState<Mode>("note");
@@ -53,13 +54,14 @@ export const ComposeModal: React.FC<ComposeModalProps> = ({ onClose, replyTo, re
           }
         }
 
-        await invoke("publish_note", {
+        const published = await invoke<NostrEvent>("publish_note", {
           content: content.trim(),
           replyTo: replyTo?.id ?? null,
           replyToPubkey: replyTo?.pubkey ?? null,
           rootId: rootId ?? null,
           rootPubkey: rootPubkey ?? null,
         });
+        onPublished?.(published);
       } else {
         const ht = hashtags.trim()
           ? hashtags.split(",").map((t) => t.trim()).filter(Boolean)
@@ -76,13 +78,13 @@ export const ComposeModal: React.FC<ComposeModalProps> = ({ onClose, replyTo, re
       }
 
       setPhase("success");
-      setTimeout(() => onClose(), 1000);
+      setTimeout(() => onClose(), 400);
     } catch (err: any) {
       console.error("[compose] publish failed:", err);
       setErrorMsg(typeof err === "string" ? err : err?.message || "Failed to publish");
       setPhase("error");
     }
-  }, [mode, content, title, summary, imageUrl, hashtags, replyTo, signingMode, onClose]);
+  }, [mode, content, title, summary, imageUrl, hashtags, replyTo, signingMode, onClose, onPublished]);
 
   const handleRetry = () => {
     setErrorMsg("");

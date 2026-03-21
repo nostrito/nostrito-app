@@ -1,20 +1,14 @@
-/** Batched interaction counts hook.
- * Collects event IDs from all rendered NoteCards, debounces 100ms,
- * then calls get_interaction_counts in a single batch invoke.
+/** Batched "has user reposted" hook.
+ * Same pattern as useReactionStatus — collects event IDs from all
+ * rendered NoteCards, debounces 100ms, then calls get_reposted_event_ids
+ * in a single batch invoke.
  */
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
-export interface InteractionCounts {
-  replies: number;
-  reposts: number;
-  reactions: number;
-  zaps: number;
-}
-
 // Module-level shared state for batching
 const pendingIds = new Set<string>();
-const cache = new Map<string, InteractionCounts>();
+const cache = new Map<string, boolean>();
 const listeners = new Set<() => void>();
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -34,18 +28,19 @@ async function flush() {
   if (toFetch.length === 0) return;
 
   try {
-    const result = await invoke<Record<string, InteractionCounts>>(
-      "get_interaction_counts",
+    const repostedIds = await invoke<string[]>(
+      "get_reposted_event_ids",
       { eventIds: toFetch },
     );
 
+    const repostedSet = new Set(repostedIds);
     for (const id of toFetch) {
-      cache.set(id, result[id] ?? { replies: 0, reposts: 0, reactions: 0, zaps: 0 });
+      cache.set(id, repostedSet.has(id));
     }
 
     notifyListeners();
   } catch (e) {
-    console.warn("[useInteractionCounts] batch fetch failed:", e);
+    console.warn("[useRepostStatus] batch fetch failed:", e);
   }
 }
 
@@ -54,7 +49,8 @@ function scheduleFlush() {
   flushTimer = setTimeout(flush, 100);
 }
 
-export function useInteractionCounts(eventId: string): InteractionCounts | null {
+/** Returns whether the current user has reposted this event. */
+export function useRepostStatus(eventId: string): boolean {
   const [, setTick] = useState(0);
   const idRef = useRef(eventId);
   idRef.current = eventId;
@@ -63,7 +59,6 @@ export function useInteractionCounts(eventId: string): InteractionCounts | null 
     const cb = () => setTick((t) => t + 1);
     listeners.add(cb);
 
-    // Request this event ID
     if (!cache.has(eventId)) {
       pendingIds.add(eventId);
       scheduleFlush();
@@ -74,19 +69,11 @@ export function useInteractionCounts(eventId: string): InteractionCounts | null 
     };
   }, [eventId]);
 
-  return cache.get(eventId) ?? null;
+  return cache.get(eventId) ?? false;
 }
 
-/** Invalidate cache for specific IDs and trigger a re-fetch. */
-export function invalidateInteractionCounts(ids?: string[]) {
-  if (ids) {
-    for (const id of ids) {
-      cache.delete(id);
-      pendingIds.add(id);
-    }
-  } else {
-    for (const id of cache.keys()) pendingIds.add(id);
-    cache.clear();
-  }
-  scheduleFlush();
+/** Mark an event as reposted (optimistic update). */
+export function markReposted(eventId: string) {
+  cache.set(eventId, true);
+  notifyListeners();
 }
