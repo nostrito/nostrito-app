@@ -25,6 +25,7 @@ pub struct ProfileInfo {
 
 pub struct Database {
     conn: Mutex<Connection>,
+    pub data_dir: std::path::PathBuf,
 }
 
 /// Batch update item for efficient multi-event persistence
@@ -45,11 +46,16 @@ pub struct SyncState {
 
 impl Database {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let conn = Connection::open(path)?;
+        let db_path = path.as_ref();
+        let data_dir = db_path.parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let conn = Connection::open(db_path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
 
         let db = Self {
             conn: Mutex::new(conn),
+            data_dir,
         };
         db.init_schema()?;
         Ok(db)
@@ -1194,13 +1200,10 @@ impl Database {
 
         if !picture_urls.is_empty() {
             if let Ok(cache_map) = self.media_cache_lookup_by_urls(&picture_urls) {
-                let home = dirs::home_dir().unwrap_or_default();
                 for profile in &mut profiles {
                     if let Some(ref pic_url) = profile.picture {
                         if let Some((hash, _mime, _size, _dl)) = cache_map.get(pic_url) {
-                            let local_path = home.join(".nostrito/media")
-                                .join(&hash[..2.min(hash.len())])
-                                .join(hash)
+                            let local_path = crate::paths::media_file_path(&self.data_dir, hash)
                                 .to_string_lossy()
                                 .to_string();
                             if std::path::Path::new(&local_path).exists() {
@@ -1269,13 +1272,10 @@ impl Database {
 
         if !picture_urls.is_empty() {
             if let Ok(cache_map) = self.media_cache_lookup_by_urls(&picture_urls) {
-                let home = dirs::home_dir().unwrap_or_default();
                 for profile in &mut profiles {
                     if let Some(ref pic_url) = profile.picture {
                         if let Some((hash, _mime, _size, _dl)) = cache_map.get(pic_url) {
-                            let local_path = home.join(".nostrito/media")
-                                .join(&hash[..2.min(hash.len())])
-                                .join(hash)
+                            let local_path = crate::paths::media_file_path(&self.data_dir, hash)
                                 .to_string_lossy()
                                 .to_string();
                             if std::path::Path::new(&local_path).exists() {
@@ -3254,6 +3254,74 @@ impl Database {
         }
 
         Ok(result)
+    }
+
+    /// Given a list of target event IDs and the user's pubkey, return those IDs
+    /// that the user has already reacted to (kind 7 with an e-tag referencing the target).
+    pub fn get_reacted_event_ids(&self, event_ids: &[String], user_pubkey: &str) -> Result<Vec<String>> {
+        if event_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.conn.lock();
+
+        let placeholders: Vec<String> = (1..=event_ids.len()).map(|i| format!("?{}", i)).collect();
+        let pk_idx = event_ids.len() + 1;
+        let sql = format!(
+            "SELECT DISTINCT json_extract(j.value, '$[1]') as ref_id
+             FROM nostr_events e, json_each(e.tags) j
+             WHERE e.kind = 7
+               AND e.pubkey = ?{}
+               AND json_extract(j.value, '$[0]') = 'e'
+               AND json_extract(j.value, '$[1]') IN ({})",
+            pk_idx,
+            placeholders.join(",")
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = event_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let user_pk = user_pubkey.to_string();
+        params.push(&user_pk);
+
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            row.get::<_, String>(0)
+        })?;
+
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Given a list of target event IDs and the user's pubkey, return those IDs
+    /// that the user has already reposted (kind 6 with an e-tag referencing the target).
+    pub fn get_reposted_event_ids(&self, event_ids: &[String], user_pubkey: &str) -> Result<Vec<String>> {
+        if event_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.conn.lock();
+
+        let placeholders: Vec<String> = (1..=event_ids.len()).map(|i| format!("?{}", i)).collect();
+        let pk_idx = event_ids.len() + 1;
+        let sql = format!(
+            "SELECT DISTINCT json_extract(j.value, '$[1]') as ref_id
+             FROM nostr_events e, json_each(e.tags) j
+             WHERE e.kind = 6
+               AND e.pubkey = ?{}
+               AND json_extract(j.value, '$[0]') = 'e'
+               AND json_extract(j.value, '$[1]') IN ({})",
+            pk_idx,
+            placeholders.join(",")
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = event_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let user_pk = user_pubkey.to_string();
+        params.push(&user_pk);
+
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            row.get::<_, String>(0)
+        })?;
+
+        Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     /// Get all thread events for a given root ID (the root itself + all events referencing it).

@@ -1,4 +1,5 @@
 mod nip46;
+mod paths;
 mod relay;
 mod search;
 mod storage;
@@ -7,7 +8,7 @@ mod wallet;
 mod wot;
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
@@ -250,21 +251,21 @@ impl Default for AppConfig {
                 "wss://nostr.wine".into(),
             ],
             auto_start: true,
-            storage_others_gb: 5.0,
-            storage_media_gb: 2.0,
-            storage_own_media_gb: 5.0,
-            storage_tracked_media_gb: 3.0,
-            storage_wot_media_gb: 2.0,
-            wot_event_retention_days: 30,
-            thread_retention_days: 30,
-            sync_lookback_days: 30,
+            storage_others_gb: 0.0,
+            storage_media_gb: 0.0,
+            storage_own_media_gb: 0.0,
+            storage_tracked_media_gb: 0.0,
+            storage_wot_media_gb: 0.0,
+            wot_event_retention_days: 0,
+            thread_retention_days: 0,
+            sync_lookback_days: 7,
             sync_batch_size: 50,
             sync_events_per_batch: 50,
             sync_batch_pause_secs: 7,
             sync_relay_min_interval_secs: 3,
             sync_wot_batch_size: 5,
             sync_wot_events_per_batch: 15,
-            max_event_age_days: 30,
+            max_event_age_days: 0,
             sync_wot_notes_per_cycle: 50,
             offline_mode: false,
             nsec: None,
@@ -575,9 +576,10 @@ async fn init_nostrito(
             .map_err(|e| format!("Failed to save relays: {}", e))?;
     }
 
-    // Persist per-category media limits
+    // Persist per-category storage limits
     {
         let config = state.config.read().await;
+        state.db().set_config("storage_others_gb", &config.storage_others_gb.to_string()).ok();
         state.db().set_config("storage_tracked_media_gb", &config.storage_tracked_media_gb.to_string()).ok();
         state.db().set_config("storage_wot_media_gb", &config.storage_wot_media_gb.to_string()).ok();
         state.db().set_config("wot_event_retention_days", &config.wot_event_retention_days.to_string()).ok();
@@ -651,13 +653,12 @@ async fn init_nostrito(
     // Auto-setup mkcert (desktop only — needs OS trust store)
     #[cfg(desktop)]
     {
-        let cert_path = dirs::home_dir()
-            .unwrap_or_default()
-            .join(".nostrito/certs/localhost.pem");
-        if !cert_path.exists() {
+        let cp = paths::cert_path(&state.data_dir);
+        if !cp.exists() {
             tracing::info!("[mkcert] First launch — setting up browser integration automatically");
             let app_clone = app_handle.clone();
-            match tokio::task::spawn_blocking(move || run_mkcert_setup(&app_clone)).await {
+            let data_dir_for_mkcert = state.data_dir.clone();
+            match tokio::task::spawn_blocking(move || run_mkcert_setup(&app_clone, &data_dir_for_mkcert)).await {
                 Ok(Ok(_)) => tracing::info!("[mkcert] Browser integration ready"),
                 Ok(Err(e)) => tracing::warn!("[mkcert] Setup failed (non-fatal): {}", e),
                 Err(e) => tracing::warn!("[mkcert] Task panicked (non-fatal): {}", e),
@@ -677,12 +678,8 @@ async fn init_nostrito(
         let relay_cancel_clone = relay_cancel.clone();
         let outbound_tx = spawn_outbound_broadcaster(state.config.clone(), app_handle.clone());
 
-        let cert_path = dirs::home_dir()
-            .unwrap_or_default()
-            .join(".nostrito/certs/localhost.pem");
-        let key_path = dirs::home_dir()
-            .unwrap_or_default()
-            .join(".nostrito/certs/localhost-key.pem");
+        let cert_path = paths::cert_path(&state.data_dir);
+        let key_path = paths::key_path(&state.data_dir);
 
         if cert_path.exists() && key_path.exists() {
             let tls_cancel = relay_cancel_clone.clone();
@@ -1241,6 +1238,28 @@ async fn get_interaction_counts(
         .collect();
 
     Ok(result)
+}
+
+#[tauri::command]
+async fn get_reacted_event_ids(
+    event_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    let own_pk = state.config.read().await.hex_pubkey.clone()
+        .ok_or_else(|| "No pubkey configured".to_string())?;
+    state.db().get_reacted_event_ids(&event_ids, &own_pk)
+        .map_err(|e| format!("Failed to get reacted event IDs: {}", e))
+}
+
+#[tauri::command]
+async fn get_reposted_event_ids(
+    event_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    let own_pk = state.config.read().await.hex_pubkey.clone()
+        .ok_or_else(|| "No pubkey configured".to_string())?;
+    state.db().get_reposted_event_ids(&event_ids, &own_pk)
+        .map_err(|e| format!("Failed to get reposted event IDs: {}", e))
 }
 
 #[tauri::command]
@@ -2052,7 +2071,7 @@ async fn delete_media_files(
     let mut deleted = 0u32;
     let mut hashes = Vec::new();
     for (_url, (hash, _mime, _size, _ts)) in &lookup {
-        let path = sync::media::media_file_path(hash);
+        let path = paths::media_file_path(&state.data_dir, hash);
         if path.exists() {
             if let Err(e) = std::fs::remove_file(&path) {
                 tracing::warn!("[cmd:delete_media_files] failed to delete {}: {}", path.display(), e);
@@ -2506,14 +2525,10 @@ async fn start_relay(app_handle: tauri::AppHandle, state: State<'_, AppState>) -
     let cancel_clone = cancel.clone();
     let outbound_tx = spawn_outbound_broadcaster(state.config.clone(), app_handle);
 
-    let cert_path = dirs::home_dir()
-        .unwrap_or_default()
-        .join(".nostrito/certs/localhost.pem");
-    let key_path = dirs::home_dir()
-        .unwrap_or_default()
-        .join(".nostrito/certs/localhost-key.pem");
+    let cp = paths::cert_path(&state.data_dir);
+    let kp = paths::key_path(&state.data_dir);
 
-    if cert_path.exists() && key_path.exists() {
+    if cp.exists() && kp.exists() {
         let tls_cancel = cancel_clone.clone();
         let tls_db = db.clone();
         let tls_allowed = allowed_pubkey.clone();
@@ -2521,7 +2536,7 @@ async fn start_relay(app_handle: tauri::AppHandle, state: State<'_, AppState>) -
         tracing::info!("[relay] Starting TLS relay on wss://127.0.0.1:{}", port);
         tokio::spawn(async move {
             if let Err(e) =
-                relay::run_relay_tls(port, cert_path, key_path, tls_db, tls_allowed, tls_cancel, Some(tls_outbound))
+                relay::run_relay_tls(port, cp, kp, tls_db, tls_allowed, tls_cancel, Some(tls_outbound))
                     .await
             {
                 tracing::error!("TLS relay error: {}", e);
@@ -3211,11 +3226,8 @@ async fn get_media_for_category(
         .get_media_for_category(&own_pubkey, &category)
         .map_err(|e| e.to_string())?;
 
-    let home = dirs::home_dir().unwrap_or_default();
     Ok(records.into_iter().map(|(hash, url, mime_type, size_bytes, downloaded_at)| {
-        let local_path = home.join(".nostrito/media")
-            .join(&hash[..2])
-            .join(&hash)
+        let local_path = paths::media_file_path(&state.data_dir, &hash)
             .to_string_lossy()
             .to_string();
         OwnMediaItem {
@@ -3313,12 +3325,9 @@ async fn get_event_media_for_category(
     let all_urls: Vec<String> = items.iter().map(|(u, _, _)| u.clone()).collect();
     let cache_map = db.media_cache_lookup_by_urls(&all_urls).map_err(|e| e.to_string())?;
 
-    let home = dirs::home_dir().unwrap_or_default();
     let result: Vec<EventMediaRef> = items.into_iter().map(|(url, pubkey, created_at)| {
         if let Some((hash, mime, size, _downloaded_at)) = cache_map.get(&url) {
-            let local_path = home.join(".nostrito/media")
-                .join(&hash[..2])
-                .join(hash)
+            let local_path = paths::media_file_path(&state.data_dir, hash)
                 .to_string_lossy()
                 .to_string();
             EventMediaRef {
@@ -3389,6 +3398,7 @@ async fn download_tracked_media(state: State<'_, AppState>) -> Result<u32, Strin
         own_pubkey,
         tracked_media_gb,
         wot_media_gb,
+        state.data_dir.clone(),
     );
     match downloader.run(200).await {
         Ok(stats) => {
@@ -3447,7 +3457,7 @@ async fn get_own_profile(state: State<'_, AppState>) -> Result<Option<ProfileInf
 
 /// Core mkcert setup logic — synchronous, reusable by both auto-setup and manual command.
 #[cfg(desktop)]
-fn run_mkcert_setup(app: &tauri::AppHandle) -> Result<String, String> {
+fn run_mkcert_setup(app: &tauri::AppHandle, data_dir: &Path) -> Result<String, String> {
     use std::process::Command;
 
     // Find bundled mkcert
@@ -3495,9 +3505,7 @@ fn run_mkcert_setup(app: &tauri::AppHandle) -> Result<String, String> {
     }
 
     // Generate cert
-    let cert_dir = dirs::home_dir()
-        .ok_or("no home dir")?
-        .join(".nostrito/certs");
+    let cert_dir = paths::certs_dir(data_dir);
     std::fs::create_dir_all(&cert_dir).map_err(|e| e.to_string())?;
 
     let gen = Command::new(&mkcert_path)
@@ -3525,11 +3533,12 @@ fn run_mkcert_setup(app: &tauri::AppHandle) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn setup_browser_integration(#[allow(unused)] app: tauri::AppHandle) -> Result<String, String> {
+async fn setup_browser_integration(#[allow(unused)] app: tauri::AppHandle, #[allow(unused)] state: State<'_, AppState>) -> Result<String, String> {
     #[cfg(desktop)]
     {
         let app_clone = app.clone();
-        let result = tokio::task::spawn_blocking(move || run_mkcert_setup(&app_clone))
+        let data_dir = state.data_dir.clone();
+        let result = tokio::task::spawn_blocking(move || run_mkcert_setup(&app_clone, &data_dir))
             .await
             .map_err(|e| format!("Task failed: {}", e))??;
         app.emit("relay:restart_required", ()).ok();
@@ -3596,11 +3605,8 @@ async fn get_own_media(state: State<'_, AppState>) -> Result<Vec<OwnMediaItem>, 
     let records = state.db().get_own_media(&own_pubkey).map_err(|e| e.to_string())?;
     tracing::info!("[cmd:get_own_media] returning {} own media items", records.len());
 
-    let home = dirs::home_dir().unwrap_or_default();
     Ok(records.into_iter().map(|(hash, url, mime_type, size_bytes, downloaded_at)| {
-        let local_path = home.join(".nostrito/media")
-            .join(&hash[..2])
-            .join(&hash)
+        let local_path = paths::media_file_path(&state.data_dir, &hash)
             .to_string_lossy()
             .to_string();
         OwnMediaItem {
@@ -3621,11 +3627,8 @@ async fn get_profile_media(pubkey: String, state: State<'_, AppState>) -> Result
     let records = state.db().get_profile_media(&pubkey).map_err(|e| e.to_string())?;
     tracing::info!("[cmd:get_profile_media] returning {} media items for {}...", records.len(), &pubkey[..pubkey.len().min(8)]);
 
-    let home = dirs::home_dir().unwrap_or_default();
     Ok(records.into_iter().map(|(hash, url, mime_type, size_bytes, downloaded_at)| {
-        let local_path = home.join(".nostrito/media")
-            .join(&hash[..2])
-            .join(&hash)
+        let local_path = paths::media_file_path(&state.data_dir, &hash)
             .to_string_lossy()
             .to_string();
         OwnMediaItem {
@@ -3884,16 +3887,110 @@ async fn get_profile_with_refresh(
 }
 
 #[tauri::command]
-async fn check_browser_integration() -> Result<bool, String> {
+async fn check_browser_integration(state: State<'_, AppState>) -> Result<bool, String> {
     #[cfg(desktop)]
     {
-        let cert_path = dirs::home_dir()
-            .ok_or("no home")?
-            .join(".nostrito/certs/localhost.pem");
-        return Ok(cert_path.exists());
+        let cp = paths::cert_path(&state.data_dir);
+        return Ok(cp.exists());
     }
     #[cfg(mobile)]
     Ok(false)
+}
+
+// ── Data Directory Management ──────────────────────────────────────
+
+#[tauri::command]
+fn get_data_dir(state: State<'_, AppState>) -> String {
+    state.data_dir.to_string_lossy().to_string()
+}
+
+#[tauri::command]
+fn get_default_data_dir() -> String {
+    paths::default_data_root().to_string_lossy().to_string()
+}
+
+#[tauri::command]
+fn get_platform() -> String {
+    paths::platform().to_string()
+}
+
+#[tauri::command]
+async fn set_data_dir(
+    path: String,
+    migrate: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let new_root = PathBuf::from(&path);
+
+    // Validate the path is writable
+    std::fs::create_dir_all(&new_root)
+        .map_err(|e| format!("Cannot create directory {}: {}", path, e))?;
+
+    // Test write access
+    let test_file = new_root.join(".nostrito_write_test");
+    std::fs::write(&test_file, b"test")
+        .map_err(|e| format!("Directory is not writable: {}", e))?;
+    std::fs::remove_file(&test_file).ok();
+
+    if migrate {
+        let old_root = state.data_dir.clone();
+        if old_root != new_root {
+            tracing::info!(
+                "[set_data_dir] Migrating data from {} → {}",
+                old_root.display(),
+                new_root.display()
+            );
+
+            // Copy all files from old root to new root
+            copy_data_dir_contents(&old_root, &new_root)
+                .map_err(|e| format!("Migration failed: {}", e))?;
+
+            tracing::info!("[set_data_dir] Migration complete");
+        }
+    }
+
+    // Write the bootstrap config
+    paths::write_data_root(&new_root)?;
+
+    tracing::info!("[set_data_dir] Bootstrap config updated to {}", new_root.display());
+    Ok(())
+}
+
+/// Copy all data files from one root to another (databases, media, certs, logs).
+fn copy_data_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dst).map_err(|e| format!("create dst: {}", e))?;
+
+    for entry in std::fs::read_dir(src).map_err(|e| format!("read src: {}", e))? {
+        let entry = entry.map_err(|e| format!("read entry: {}", e))?;
+        let dest_path = dst.join(entry.file_name());
+
+        if dest_path.exists() {
+            continue; // Don't overwrite existing files in destination
+        }
+
+        if entry.file_type().map_err(|e| format!("file type: {}", e))?.is_dir() {
+            copy_dir_recursive_fallible(&entry.path(), &dest_path)?;
+        } else {
+            std::fs::copy(entry.path(), &dest_path)
+                .map_err(|e| format!("copy {:?}: {}", entry.file_name(), e))?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_dir_recursive_fallible(src: &Path, dst: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dst).map_err(|e| format!("create dir {:?}: {}", dst, e))?;
+    for entry in std::fs::read_dir(src).map_err(|e| format!("read dir: {}", e))? {
+        let entry = entry.map_err(|e| format!("entry: {}", e))?;
+        let dest_path = dst.join(entry.file_name());
+        if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+            copy_dir_recursive_fallible(&entry.path(), &dest_path)?;
+        } else {
+            std::fs::copy(entry.path(), &dest_path)
+                .map_err(|e| format!("copy {:?}: {}", entry.file_name(), e))?;
+        }
+    }
+    Ok(())
 }
 
 // ── Mobile secret storage (file-based, app-private sandbox) ─────────
@@ -3904,9 +4001,7 @@ mod mobile_secrets {
     use std::path::PathBuf;
 
     fn secrets_path() -> PathBuf {
-        dirs::data_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("nostrito")
+        crate::paths::default_data_root()
             .join(".secrets.json")
     }
 
@@ -4877,6 +4972,26 @@ async fn publish_reaction(
 }
 
 #[tauri::command]
+async fn publish_repost(
+    event_id: String,
+    event_pubkey: String,
+    event_json: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    use nostr_sdk::prelude::*;
+
+    let tags = vec![
+        Tag::parse(&["e", &event_id]).map_err(|e| format!("bad e-tag: {}", e))?,
+        Tag::parse(&["p", &event_pubkey]).map_err(|e| format!("bad p-tag: {}", e))?,
+    ];
+    let builder = EventBuilder::new(Kind::Repost, &event_json, tags);
+    let signed = sign_build_publish_store(builder, &state).await?;
+    let repost_id = signed.id.to_hex();
+    tracing::info!("[cmd:publish_repost] published repost {} for event {}", &repost_id[..12.min(repost_id.len())], &event_id[..12.min(event_id.len())]);
+    Ok(repost_id)
+}
+
+#[tauri::command]
 async fn publish_note(
     content: String,
     reply_to: Option<String>,
@@ -5228,15 +5343,7 @@ pub fn run() {
     {
         use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-        let log_dir = dirs::home_dir()
-            .or_else(|| dirs::data_dir())
-            .or_else(|| std::env::var("HOME").ok().map(PathBuf::from))
-            .or_else(|| {
-                let p = PathBuf::from("/data/data/lat.nostrito/files");
-                if p.exists() || std::fs::create_dir_all(&p).is_ok() { Some(p) } else { None }
-            })
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join(".nostrito");
+        let log_dir = paths::read_data_root();
 
         let env_filter = EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| EnvFilter::new("info,nostrito_lib=info,nostrito_lib::sync=debug"));
@@ -5276,24 +5383,15 @@ pub fn run() {
 
     tracing::info!("[init] Starting nostrito");
 
-    // Determine data directory
-    let data_dir = dirs::data_dir()
-        .or_else(|| dirs::home_dir())
-        .or_else(|| std::env::var("HOME").ok().map(PathBuf::from))
-        .or_else(|| {
-            // Android fallback: app-private internal storage
-            let android_path = PathBuf::from("/data/data/lat.nostrito/files");
-            if android_path.exists() || std::fs::create_dir_all(&android_path).is_ok() {
-                Some(android_path)
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("nostrito");
+    // Determine data directory (reads bootstrap config or falls back to OS default)
+    let data_dir = paths::read_data_root();
     if let Err(e) = std::fs::create_dir_all(&data_dir) {
         fatal_exit(&format!("Failed to create data directory {}: {}", data_dir.display(), e));
     }
+    tracing::info!("[init] data_dir={}", data_dir.display());
+
+    // One-time migration: consolidate old ~/.nostrito/ layout into data_dir
+    paths::migrate_old_layout_if_needed(&data_dir);
 
     // Open lobby DB to check for saved npub
     let lobby_path = lobby_db_path(&data_dir);
@@ -5492,6 +5590,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_process::init())
         .manage(app_state)
         .setup(|app| {
             let state = app.state::<AppState>();
@@ -5502,6 +5602,14 @@ pub fn run() {
             let sync_stats = state.sync_stats.clone();
             let sync_cancel = state.sync_cancel.clone();
             let app_handle = app.handle().clone();
+
+            // Register custom data_dir media path with the asset protocol scope
+            {
+                let media_path = paths::media_dir(&state.data_dir);
+                if let Err(e) = app.asset_protocol_scope().allow_directory(&media_path, true) {
+                    tracing::warn!("[init] Failed to add media dir to asset scope: {}", e);
+                }
+            }
 
             // Restore wallet connection from keychain
             {
@@ -5641,6 +5749,7 @@ pub fn run() {
             // Auto-resume sync and relay if previously configured
             let relay_cancel_setup = state.relay_cancel.clone();
             let db_relay = state.db();
+            let data_dir_for_setup = state.data_dir.clone();
 
             tauri::async_runtime::spawn(async move {
                 let cfg = config.read().await;
@@ -5693,13 +5802,12 @@ pub fn run() {
                     // Auto-setup mkcert (desktop only — needs OS trust store)
                     #[cfg(desktop)]
                     {
-                        let cert_check = dirs::home_dir()
-                            .unwrap_or_default()
-                            .join(".nostrito/certs/localhost.pem");
+                        let cert_check = paths::cert_path(&data_dir_for_setup);
                         if !cert_check.exists() {
                             tracing::info!("[mkcert] Certs missing — setting up browser integration automatically");
                             let app_clone = app_handle.clone();
-                            match tokio::task::spawn_blocking(move || run_mkcert_setup(&app_clone)).await {
+                            let dd = data_dir_for_setup.clone();
+                            match tokio::task::spawn_blocking(move || run_mkcert_setup(&app_clone, &dd)).await {
                                 Ok(Ok(_)) => tracing::info!("[mkcert] Browser integration ready"),
                                 Ok(Err(e)) => tracing::warn!("[mkcert] Setup failed (non-fatal): {}", e),
                                 Err(e) => tracing::warn!("[mkcert] Task panicked (non-fatal): {}", e),
@@ -5712,12 +5820,8 @@ pub fn run() {
                     let relay_ct_clone = relay_ct.clone();
                     let outbound_tx = spawn_outbound_broadcaster(config.clone(), app_handle.clone());
 
-                    let cert_path = dirs::home_dir()
-                        .unwrap_or_default()
-                        .join(".nostrito/certs/localhost.pem");
-                    let key_path = dirs::home_dir()
-                        .unwrap_or_default()
-                        .join(".nostrito/certs/localhost-key.pem");
+                    let cert_path = paths::cert_path(&data_dir_for_setup);
+                    let key_path = paths::key_path(&data_dir_for_setup);
 
                     if cert_path.exists() && key_path.exists() {
                         let tls_cancel = relay_ct_clone.clone();
@@ -5776,6 +5880,8 @@ pub fn run() {
             get_note_zaps,
             get_thread_events,
             get_interaction_counts,
+            get_reacted_event_ids,
+            get_reposted_event_ids,
             fetch_thread_from_relays,
             fetch_global_feed,
             fetch_wot_articles,
@@ -5858,6 +5964,7 @@ pub fn run() {
             wallet_provision,
             send_zap,
             publish_reaction,
+            publish_repost,
             publish_note,
             publish_dm,
             publish_article,
@@ -5866,6 +5973,10 @@ pub fn run() {
             fetch_profile_content_from_relays,
             fetch_note_context_from_relays,
             fetch_addressable_event_from_relays,
+            get_data_dir,
+            get_default_data_dir,
+            set_data_dir,
+            get_platform,
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|e| {

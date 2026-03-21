@@ -5,7 +5,7 @@ import { listen } from "@tauri-apps/api/event";
 import { NoteCard } from "../components/NoteCard";
 import { ZapModal } from "../components/ZapModal";
 import { ComposeModal } from "../components/ComposeModal";
-import { IconMessageCircle } from "../components/Icon";
+import { IconMessageCircle, IconRepeat, IconX } from "../components/Icon";
 import { useCanWrite } from "../context/SigningContext";
 import { Avatar } from "../components/Avatar";
 import { EmptyState } from "../components/EmptyState";
@@ -15,6 +15,7 @@ import { getArticleTitle, getArticleImage, getArticleTimestamp } from "../compon
 import { formatDate, timeAgo } from "../utils/format";
 import { profileDisplayName } from "../utils/profiles";
 import { invalidateInteractionCounts } from "../hooks/useInteractionCounts";
+import { markReacted } from "../hooks/useReactionStatus";
 import { useOnDemandFetch } from "../hooks/useOnDemandFetch";
 import type { NostrEvent } from "../types/nostr";
 
@@ -198,6 +199,7 @@ export const NoteDetail: React.FC = () => {
   const canWrite = useCanWrite();
 
   const handleLike = useCallback(async (event: NostrEvent) => {
+    markReacted(event.id);
     try {
       await invoke("publish_reaction", { eventId: event.id, eventPubkey: event.pubkey });
       invalidateInteractionCounts([event.id]);
@@ -205,6 +207,26 @@ export const NoteDetail: React.FC = () => {
       console.warn("[note-detail] Failed to publish reaction:", err);
     }
   }, []);
+
+  const [repostConfirm, setRepostConfirm] = useState<NostrEvent | null>(null);
+  const handleRepost = useCallback((event: NostrEvent) => {
+    setRepostConfirm(event);
+  }, []);
+  const confirmRepost = useCallback(async () => {
+    if (!repostConfirm) return;
+    const ev = repostConfirm;
+    setRepostConfirm(null);
+    try {
+      const eventJson = JSON.stringify({
+        id: ev.id, pubkey: ev.pubkey, created_at: ev.created_at,
+        kind: ev.kind, tags: ev.tags, content: ev.content, sig: ev.sig,
+      });
+      await invoke("publish_repost", { eventId: ev.id, eventPubkey: ev.pubkey, eventJson });
+      invalidateInteractionCounts([ev.id]);
+    } catch (err) {
+      console.warn("[note-detail] Failed to publish repost:", err);
+    }
+  }, [repostConfirm]);
 
   // Determine root ID for thread fetching
   const rootId = useMemo(() => {
@@ -433,6 +455,7 @@ export const NoteDetail: React.FC = () => {
                 full
                 onZap={setZapTarget}
                 onLike={handleLike}
+                onRepost={handleRepost}
               />
             )}
           </div>
@@ -596,6 +619,31 @@ export const NoteDetail: React.FC = () => {
             }
           }}
         />
+      )}
+      {repostConfirm && (
+        <div className="wallet-modal-overlay" onClick={() => setRepostConfirm(null)}>
+          <div className="wallet-modal" onClick={(e) => e.stopPropagation()} style={{ width: 380 }}>
+            <div className="wallet-modal-header">
+              <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span className="icon"><IconRepeat /></span>
+                repost
+              </span>
+              <button className="wallet-modal-close" onClick={() => setRepostConfirm(null)}><IconX /></button>
+            </div>
+            <div className="wallet-modal-body">
+              <p style={{ fontSize: "0.88rem", color: "var(--text-dim)", marginBottom: 12 }}>
+                Repost this note by <strong style={{ color: "var(--text)" }}>{profileDisplayName(getProfile(repostConfirm.pubkey), repostConfirm.pubkey)}</strong>?
+              </p>
+              <div style={{ fontSize: "0.82rem", color: "var(--text-muted)", borderLeft: "2px solid var(--border)", paddingLeft: 10, marginBottom: 16, maxHeight: 120, overflow: "hidden" }}>
+                {repostConfirm.content.slice(0, 200)}{repostConfirm.content.length > 200 ? "\u2026" : ""}
+              </div>
+              <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+                <button className="wallet-setup-connect-btn" style={{ background: "transparent", color: "var(--text-dim)", border: "1px solid var(--border)" }} onClick={() => setRepostConfirm(null)}>cancel</button>
+                <button className="wallet-setup-connect-btn" onClick={confirmRepost}>repost</button>
+              </div>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

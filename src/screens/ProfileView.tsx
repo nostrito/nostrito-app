@@ -15,6 +15,7 @@ import { formatBytes, shortPubkey } from "../utils/format";
 import { profileDisplayName } from "../utils/profiles";
 import { initMediaViewer } from "../utils/media";
 import { invalidateInteractionCounts } from "../hooks/useInteractionCounts";
+import { markReacted } from "../hooks/useReactionStatus";
 import { useOnDemandFetch } from "../hooks/useOnDemandFetch";
 import { useProfileContext, useProfile } from "../context/ProfileContext";
 import { listen } from "@tauri-apps/api/event";
@@ -93,6 +94,7 @@ export const ProfileView: React.FC = () => {
   const [zapTarget, setZapTarget] = useState<NostrEvent | null>(null);
 
   const handleLike = useCallback(async (event: NostrEvent) => {
+    markReacted(event.id);
     try {
       await invoke("publish_reaction", { eventId: event.id, eventPubkey: event.pubkey });
       invalidateInteractionCounts([event.id]);
@@ -258,11 +260,17 @@ export const ProfileView: React.FC = () => {
     setHasMoreNotes(true);
     try {
       const events = await invoke<NostrEvent[]>("get_feed", {
-        filter: { kinds: [1], limit: 50, author: pubkey },
+        filter: { kinds: [1, 6], limit: 50, author: pubkey },
       });
       const sorted = events.sort((a, b) => b.created_at - a.created_at);
       setNotes(sorted);
-      ensureProfiles(events.map((e) => e.pubkey));
+      const pubkeys = new Set(events.map((e) => e.pubkey));
+      for (const e of events) {
+        if (e.kind === 6) {
+          try { const orig = JSON.parse(e.content); if (orig?.pubkey) pubkeys.add(orig.pubkey); } catch {}
+        }
+      }
+      ensureProfiles([...pubkeys]);
       if (events.length < 50) setHasMoreNotes(false);
     } catch (e) {
       console.error("[profile] Failed to load notes:", e);
@@ -278,14 +286,20 @@ export const ProfileView: React.FC = () => {
     try {
       const oldest = notes[notes.length - 1].created_at;
       const events = await invoke<NostrEvent[]>("get_feed", {
-        filter: { kinds: [1], limit: 50, author: pubkey, until: oldest - 1 },
+        filter: { kinds: [1, 6], limit: 50, author: pubkey, until: oldest - 1 },
       });
       if (events.length === 0) {
         setHasMoreNotes(false);
       } else {
         const sorted = events.sort((a, b) => b.created_at - a.created_at);
         setNotes((prev) => [...prev, ...sorted]);
-        ensureProfiles(events.map((e) => e.pubkey));
+        const pubkeys = new Set(events.map((e) => e.pubkey));
+        for (const e of events) {
+          if (e.kind === 6) {
+            try { const orig = JSON.parse(e.content); if (orig?.pubkey) pubkeys.add(orig.pubkey); } catch {}
+          }
+        }
+        ensureProfiles([...pubkeys]);
         if (events.length < 50) setHasMoreNotes(false);
       }
     } catch (e) {

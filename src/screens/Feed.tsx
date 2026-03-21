@@ -3,7 +3,7 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
-import { IconX, IconHeart, IconMessageCircle, IconZap } from "../components/Icon";
+import { IconX, IconHeart, IconHeartFilled, IconMessageCircle, IconZap, IconRepeat } from "../components/Icon";
 import { NoteCard, GroupedRepostCard, getRepostOriginalId, type GroupedRepost } from "../components/NoteCard";
 import { ZapModal } from "../components/ZapModal";
 import { ComposeModal } from "../components/ComposeModal";
@@ -13,9 +13,10 @@ import { formatDate } from "../utils/format";
 import { renderMarkdown } from "../utils/markdown";
 import { initMediaViewer } from "../utils/media";
 import { useProfileContext } from "../context/ProfileContext";
-import { useCanWrite } from "../context/SigningContext";
+import { useSigningContext } from "../context/SigningContext";
 import { profileDisplayName } from "../utils/profiles";
 import { useInteractionCounts, invalidateInteractionCounts } from "../hooks/useInteractionCounts";
+import { useReactionStatus, markReacted } from "../hooks/useReactionStatus";
 import { useTauriEvent } from "../hooks/useTauriEvent";
 import { useInterval } from "../hooks/useInterval";
 import type { NostrEvent } from "../types/nostr";
@@ -71,8 +72,17 @@ const ArticleSidebar: React.FC<{
 }> = ({ event, profile, onSelectArticle, onLike, onZap }) => {
   const [otherArticles, setOtherArticles] = useState<NostrEvent[]>([]);
   const counts = useInteractionCounts(event.id);
-  const canWrite = useCanWrite();
+  const liked = useReactionStatus(event.id);
+  const { canWrite } = useSigningContext();
+  const [toastKind, setToastKind] = useState<"signing" | "zap" | null>(null);
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const displayName = profileDisplayName(profile, event.pubkey);
+
+  const showToast = (kind: "signing" | "zap") => {
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    setToastKind(kind);
+    toastTimer.current = setTimeout(() => setToastKind(null), 4000);
+  };
 
   useEffect(() => {
     invoke<NostrEvent[]>("get_author_articles", {
@@ -81,6 +91,8 @@ const ArticleSidebar: React.FC<{
       limit: 5,
     }).then(setOtherArticles).catch(() => {});
   }, [event.pubkey, event.id]);
+
+  useEffect(() => () => { if (toastTimer.current) clearTimeout(toastTimer.current); }, []);
 
   return (
     <>
@@ -96,16 +108,39 @@ const ArticleSidebar: React.FC<{
         <span><span className="icon"><IconZap /></span> {counts?.zaps || 0} zaps</span>
       </div>
 
-      {canWrite && (
-        <div className="sidebar-actions">
-          <button className="sidebar-like-btn" onClick={() => onLike(event)}>
-            <span className="icon"><IconHeart /></span> Like
-          </button>
-          <button className="sidebar-zap-btn" onClick={() => onZap(event)}>
-            <span className="icon"><IconZap /></span> Zap
-          </button>
-        </div>
-      )}
+      <div className="sidebar-actions" style={{ position: "relative" }}>
+        {toastKind && (
+          <div className="signing-toast">
+            {toastKind === "signing" ? (
+              <>
+                <strong>Signing not available</strong>
+                <br />
+                Add your nsec or connect a remote signer (bunker) in Settings.
+                <br />
+                <span style={{ color: "var(--text-muted)", fontSize: "0.74rem" }}>
+                  If you're using a remote signer, make sure it allows this type of event — some signing apps restrict which event kinds can be signed.
+                </span>
+              </>
+            ) : (
+              <>
+                <strong>Wallet not configured</strong>
+                <br />
+                Zaps require a signing key and a connected wallet. Go to Settings to add your nsec and configure a wallet (NWC or LNbits).
+                <br />
+                <span style={{ color: "var(--text-muted)", fontSize: "0.74rem" }}>
+                  If you're using a remote signer, check that it allows kind 9734 (zap request) events.
+                </span>
+              </>
+            )}
+          </div>
+        )}
+        <button className={`sidebar-like-btn${liked ? " sidebar-like-btn-liked" : ""}${!canWrite ? " ev-action-disabled" : ""}`} onClick={canWrite ? (liked ? undefined : () => onLike(event)) : () => showToast("signing")} disabled={liked && canWrite}>
+          <span className="icon">{liked ? <IconHeartFilled /> : <IconHeart />}</span> {liked ? "Liked" : "Like"}
+        </button>
+        <button className={`sidebar-zap-btn${!canWrite ? " ev-action-disabled" : ""}`} onClick={canWrite ? () => onZap(event) : () => showToast("zap")}>
+          <span className="icon"><IconZap /></span> Zap
+        </button>
+      </div>
 
       {otherArticles.length > 0 && (
         <div className="sidebar-more-articles">
@@ -236,6 +271,7 @@ export const Feed: React.FC = () => {
   const [replyTarget, setReplyTarget] = useState<NostrEvent | null>(null);
 
   const handleLike = useCallback(async (event: NostrEvent) => {
+    markReacted(event.id);
     try {
       await invoke("publish_reaction", { eventId: event.id, eventPubkey: event.pubkey });
       invalidateInteractionCounts([event.id]);
@@ -243,6 +279,31 @@ export const Feed: React.FC = () => {
       console.warn("[feed] Failed to publish reaction:", err);
     }
   }, []);
+
+  const [repostConfirm, setRepostConfirm] = useState<NostrEvent | null>(null);
+  const handleRepost = useCallback((event: NostrEvent) => {
+    setRepostConfirm(event);
+  }, []);
+  const confirmRepost = useCallback(async () => {
+    if (!repostConfirm) return;
+    const event = repostConfirm;
+    setRepostConfirm(null);
+    try {
+      const eventJson = JSON.stringify({
+        id: event.id,
+        pubkey: event.pubkey,
+        created_at: event.created_at,
+        kind: event.kind,
+        tags: event.tags,
+        content: event.content,
+        sig: event.sig,
+      });
+      await invoke("publish_repost", { eventId: event.id, eventPubkey: event.pubkey, eventJson });
+      invalidateInteractionCounts([event.id]);
+    } catch (err) {
+      console.warn("[feed] Failed to publish repost:", err);
+    }
+  }, [repostConfirm]);
 
   const [groupedReposts, setGroupedReposts] = useState<Map<string, GroupedRepost>>(new Map());
   const fetchedOriginalIdsRef = useRef(new Set<string>());
@@ -1053,6 +1114,7 @@ export const Feed: React.FC = () => {
                 onZap={setZapTarget}
                 onLike={handleLike}
                 onReply={setReplyTarget}
+                onRepost={handleRepost}
               />
             ))}
 
@@ -1155,6 +1217,31 @@ export const Feed: React.FC = () => {
           replyToProfile={getProfile(replyTarget.pubkey)}
           onClose={() => setReplyTarget(null)}
         />
+      )}
+      {repostConfirm && (
+        <div className="wallet-modal-overlay" onClick={() => setRepostConfirm(null)}>
+          <div className="wallet-modal" onClick={(e) => e.stopPropagation()} style={{ width: 380 }}>
+            <div className="wallet-modal-header">
+              <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span className="icon"><IconRepeat /></span>
+                repost
+              </span>
+              <button className="wallet-modal-close" onClick={() => setRepostConfirm(null)}><IconX /></button>
+            </div>
+            <div className="wallet-modal-body">
+              <p style={{ fontSize: "0.88rem", color: "var(--text-dim)", marginBottom: 12 }}>
+                Repost this note by <strong style={{ color: "var(--text)" }}>{profileDisplayName(getProfile(repostConfirm.pubkey), repostConfirm.pubkey)}</strong>?
+              </p>
+              <div style={{ fontSize: "0.82rem", color: "var(--text-muted)", borderLeft: "2px solid var(--border)", paddingLeft: 10, marginBottom: 16, maxHeight: 120, overflow: "hidden" }}>
+                {repostConfirm.content.slice(0, 200)}{repostConfirm.content.length > 200 ? "\u2026" : ""}
+              </div>
+              <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+                <button className="wallet-setup-connect-btn" style={{ background: "transparent", color: "var(--text-dim)", border: "1px solid var(--border)" }} onClick={() => setRepostConfirm(null)}>cancel</button>
+                <button className="wallet-setup-connect-btn" onClick={confirmRepost}>repost</button>
+              </div>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
