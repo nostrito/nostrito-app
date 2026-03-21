@@ -16,7 +16,7 @@ Last updated: 2026-03-21
 ### Identity & Signing
 - **4 signing modes** — nsec (keychain), NIP-46 bunker, Nostr Connect, read-only
 - **Setup Wizard** — identity selection, relay config, storage presets
-- **Multi-account** — switch accounts with separate databases
+- **Change account** — switch to a different npub (destructive: clears keychain, returns to wizard). Not true multi-account yet — see Future Decisions below
 
 ### Social
 - **Direct Messages (NIP-04 + NIP-17)** — encrypted DMs grouped by conversation; NIP-17 gift wrap (default) + NIP-04 legacy with toggle
@@ -187,3 +187,67 @@ for backward compatibility with older clients.
 8. Add **media upload** (nostr.build or blossom)
 9. Add **global / explore feed** UI
 10. Add **quote reposts**
+
+---
+
+## Future Decisions
+
+### Multi-Account Support
+
+Full analysis in `MULTI_ACCOUNT_ANALYSIS.md`. Key decisions to make:
+
+#### 1. Switching Model — How do we switch between accounts?
+
+| Option | Switch Time | Effort | Notes |
+|--------|------------|--------|-------|
+| **Cold Switch** | 2-5 sec | Small | Make `change_account` non-destructive, add account registry. Minimal changes. |
+| **Concurrent** | <1 sec | Very large | All accounts sync in parallel. ~130 commands become account-aware. |
+| **Hybrid** | 1-3 sec | Moderate | One active + dormant accounts with optional DM/mention heartbeat. |
+
+**Leaning toward**: Cold Switch for initial release — leverages existing per-npub DB
+isolation and keychain-per-npub storage. Can evolve to Hybrid later.
+
+**Status**: Undecided
+
+#### 2. Database Strategy — How do multiple accounts' data coexist?
+
+| Option | Notes |
+|--------|-------|
+| **Separate DBs per account (current)** | Zero migration. Full isolation. Media already shared on filesystem. |
+| **Single unified DB** | Massive refactor (31 tables). Not worth it for one-owner scenario. |
+| **Hybrid shared + per-account** | Shared relay stats + media metadata. Nice but not needed initially. |
+
+**Leaning toward**: Keep separate DBs. Add `accounts` table to lobby DB as registry.
+
+**Status**: Undecided
+
+#### 3. App Authentication — Should the app require a password/PIN?
+
+| Option | Notes |
+|--------|-------|
+| **No password** | Rely on macOS keychain + screen lock. Zero friction. Current model. |
+| **Master PIN** | One PIN for the app. Protects against unlocked-Mac access. PIN fatigue. |
+| **Biometric + PIN** | Touch ID when available, PIN fallback. Best UX but most complex. |
+| **Per-account passwords** | Not recommended — one person owns all accounts, no benefit. |
+
+**Leaning toward**: No password initially. Optional "App Lock" (biometric + PIN) as
+a future settings toggle.
+
+**Status**: Undecided
+
+#### 4. Account Removal — What happens to data when removing an account?
+
+| Option | Notes |
+|--------|-------|
+| **Ask each time** | Confirmation dialog with "also delete data" checkbox |
+| **Always delete** | Clean break, remove DB + keychain |
+| **Never delete** | Just unlink from registry, data stays on disk |
+
+**Status**: Undecided
+
+#### 5. Cross-Account Notifications — Should dormant accounts get checked?
+
+A lightweight heartbeat could check dormant accounts for DMs/mentions every ~5 min
+without running a full sync. Shows macOS notification like "Your @altname got a DM".
+
+**Status**: Undecided — could be deferred to a later release
