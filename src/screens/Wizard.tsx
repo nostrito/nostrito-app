@@ -20,6 +20,7 @@ import {
   IconFeather,
   IconScale,
   IconArchive,
+  IconUsers,
 } from "../components/Icon";
 import {
   STORAGE_PRESETS,
@@ -773,13 +774,15 @@ const StepRelays: React.FC<StepRelaysProps> = ({ selectedRelays, onToggle }) => 
 /* ================================================================== */
 
 const PRESET_ICONS: Record<string, React.ReactNode> = {
+  personal: <IconUsers />,
   minimal: <IconFeather />,
   balanced: <IconScale />,
   archive: <IconArchive />,
 };
 
 const PRESET_DETAILS: Record<string, string[]> = {
-  minimal: ["last 7 days for follows & WoT", "tracked profiles: full history", "images only, no WoT media"],
+  personal: ["your own events only", "tracked profiles: full history", "no WoT sync, no media from others"],
+  minimal: ["last 3 days for follows only", "tracked profiles: full history", "images only, no WoT media"],
   balanced: ["last 30 days for follows, 7 days for WoT", "tracked profiles: full history", "all media types, 2 GB WoT media"],
   archive: ["last year for follows, 90 days for WoT", "tracked profiles: full history", "all media types, 10 GB WoT media"],
 };
@@ -857,7 +860,9 @@ const StepStorage: React.FC<StepStorageProps> = ({
                 <span className="storage-preset-card-name">{preset.label}</span>
               </div>
               <span className="storage-preset-card-size">
-                ~{preset.estimatedGb.low}-{preset.estimatedGb.typical} GB
+                {preset.estimatedGb.typical < 1
+                  ? `~${Math.round(preset.estimatedGb.low * 1000)}-${Math.round(preset.estimatedGb.typical * 1000)} MB`
+                  : `~${preset.estimatedGb.low}-${preset.estimatedGb.typical} GB`}
               </span>
               <p className="storage-preset-card-desc">{preset.description}</p>
               <ul className="storage-preset-card-details">
@@ -872,7 +877,9 @@ const StepStorage: React.FC<StepStorageProps> = ({
 
       {/* Estimation summary */}
       <div className="storage-estimate-summary">
-        with ~200 follows: ~{estimate.eventsPerDay.toLocaleString()} events/day, ~{estimate.growthGbPerMonth} GB/month
+        {estimate.eventsPerDay === 0
+          ? "only your own events will be stored locally"
+          : `with ~200 follows: ~${estimate.eventsPerDay.toLocaleString()} events/day, ~${estimate.growthGbPerMonth} GB/month`}
       </div>
 
       {/* Custom mode toggle */}
@@ -888,12 +895,12 @@ const StepStorage: React.FC<StepStorageProps> = ({
             <div className="storage-row">
               <div className="storage-row-info">
                 <span className="storage-row-label">others' events</span>
-                <span className="storage-row-meta">from your web of trust</span>
+                <span className="storage-row-meta">from your web of trust (0 = disabled)</span>
               </div>
               <Slider
                 variant="storage"
                 id="othersEventsSlider"
-                min={1}
+                min={0}
                 max={50}
                 value={othersEventsGb}
                 suffix=" GB"
@@ -912,7 +919,7 @@ const StepStorage: React.FC<StepStorageProps> = ({
               <Slider
                 variant="storage"
                 id="trackedMediaSlider"
-                min={1}
+                min={0}
                 max={50}
                 value={trackedMediaGb}
                 suffix=" GB"
@@ -926,12 +933,12 @@ const StepStorage: React.FC<StepStorageProps> = ({
             <div className="storage-row">
               <div className="storage-row-info">
                 <span className="storage-row-label">WoT media</span>
-                <span className="storage-row-meta">images, videos, audio from your network</span>
+                <span className="storage-row-meta">images, videos, audio from your network (0 = disabled)</span>
               </div>
               <Slider
                 variant="storage"
                 id="wotMediaSlider"
-                min={1}
+                min={0}
                 max={50}
                 value={wotMediaGb}
                 suffix=" GB"
