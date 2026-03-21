@@ -3,7 +3,7 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
-import { IconX, IconHeart, IconMessageCircle, IconZap, IconPenSquare } from "../components/Icon";
+import { IconX, IconHeart, IconMessageCircle, IconZap } from "../components/Icon";
 import { NoteCard, GroupedRepostCard, getRepostOriginalId, type GroupedRepost } from "../components/NoteCard";
 import { ZapModal } from "../components/ZapModal";
 import { ComposeModal } from "../components/ComposeModal";
@@ -233,9 +233,7 @@ export const Feed: React.FC = () => {
   const { getProfile, ensureProfiles } = useProfileContext();
 
   const [zapTarget, setZapTarget] = useState<NostrEvent | null>(null);
-  const [showCompose, setShowCompose] = useState(false);
   const [replyTarget, setReplyTarget] = useState<NostrEvent | null>(null);
-  const canWrite = useCanWrite();
 
   const handleLike = useCallback(async (event: NostrEvent) => {
     try {
@@ -961,11 +959,6 @@ export const Feed: React.FC = () => {
             </button>
           )}
         </div>
-        {canWrite && (
-          <button className="feed-compose-btn" onClick={() => setShowCompose(true)}>
-            <span className="icon"><IconPenSquare /></span>
-          </button>
-        )}
       </div>
 
       {searchStatus && (
@@ -1155,9 +1148,6 @@ export const Feed: React.FC = () => {
           recipientLud16={getProfile(zapTarget.pubkey)?.lud16 ?? null}
           onClose={() => setZapTarget(null)}
         />
-      )}
-      {showCompose && (
-        <ComposeModal onClose={() => setShowCompose(false)} />
       )}
       {replyTarget && (
         <ComposeModal

@@ -1,11 +1,17 @@
-import React from "react";
-import { NavLink } from "react-router-dom";
+import React, { useState } from "react";
+import { NavLink, useNavigate } from "react-router-dom";
 import logoUrl from "../assets/logo.png";
-import { IconDashboard, IconFeed, IconMessageCircle, IconImage, IconNetwork, IconWallet, IconDatabase, IconSettings } from "./Icon";
+import { IconDashboard, IconFeed, IconMessageCircle, IconImage, IconNetwork, IconWallet, IconDatabase, IconSettings, IconPenSquare, IconLock, IconX } from "./Icon";
 import { useAppContext } from "../context/AppContext";
+import { useCanWrite } from "../context/SigningContext";
+import { ComposeModal } from "./ComposeModal";
 
 export const Sidebar: React.FC = () => {
   const { ownProfile } = useAppContext();
+  const canWrite = useCanWrite();
+  const navigate = useNavigate();
+  const [showCompose, setShowCompose] = useState(false);
+  const [showSigningPrompt, setShowSigningPrompt] = useState(false);
 
   const navItems = [
     { to: "/", icon: <IconFeed />, label: "feed" },
@@ -34,6 +40,20 @@ export const Sidebar: React.FC = () => {
         </NavLink>
       ))}
       <div className="sidebar-spacer" />
+      <button
+        className="sidebar-compose-btn"
+        onClick={() => canWrite ? setShowCompose(true) : setShowSigningPrompt(true)}
+      >
+        <span className="icon"><IconPenSquare /></span> new post
+      </button>
+      {showSigningPrompt && (
+        <div className="sidebar-signing-prompt">
+          <span className="icon"><IconLock /></span>
+          <span>connect a signer to publish</span>
+          <button className="sidebar-signing-prompt-btn" onClick={() => { setShowSigningPrompt(false); navigate("/settings"); }}>settings</button>
+          <button className="sidebar-signing-prompt-close" onClick={() => setShowSigningPrompt(false)}><span className="icon"><IconX /></span></button>
+        </div>
+      )}
       {ownProfile && (
         <NavLink to={`/profile/${ownProfile.pubkey}`} className="own-profile" style={{ display: "flex", cursor: "pointer" }}>
           {ownProfile.picture ? (
@@ -45,6 +65,7 @@ export const Sidebar: React.FC = () => {
         </NavLink>
       )}
       <div className="sidebar-status"><span className="pulse-dot" /> live · wss://localhost:4869</div>
+      {showCompose && <ComposeModal onClose={() => setShowCompose(false)} />}
     </aside>
   );
 };

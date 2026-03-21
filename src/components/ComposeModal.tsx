@@ -2,9 +2,10 @@ import React, { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { IconX, IconSend, IconCheck, IconAlertTriangle } from "./Icon";
 import { profileDisplayName, type ProfileInfo } from "../utils/profiles";
+import { useSigningContext } from "../context/SigningContext";
 import type { NostrEvent } from "../types/nostr";
 
-type Phase = "compose" | "publishing" | "success" | "error";
+type Phase = "compose" | "signing" | "broadcasting" | "success" | "error";
 type Mode = "note" | "article";
 
 interface ComposeModalProps {
@@ -14,6 +15,7 @@ interface ComposeModalProps {
 }
 
 export const ComposeModal: React.FC<ComposeModalProps> = ({ onClose, replyTo, replyToProfile }) => {
+  const { signingMode } = useSigningContext();
   const [phase, setPhase] = useState<Phase>("compose");
   const [mode, setMode] = useState<Mode>("note");
   const [content, setContent] = useState("");
@@ -33,7 +35,8 @@ export const ComposeModal: React.FC<ComposeModalProps> = ({ onClose, replyTo, re
     if (mode === "note" && !content.trim()) return;
     if (mode === "article" && (!title.trim() || !content.trim())) return;
 
-    setPhase("publishing");
+    const isRemote = signingMode === "bunker" || signingMode === "connect";
+    setPhase(isRemote ? "signing" : "broadcasting");
 
     try {
       if (mode === "note") {
@@ -75,10 +78,11 @@ export const ComposeModal: React.FC<ComposeModalProps> = ({ onClose, replyTo, re
       setPhase("success");
       setTimeout(() => onClose(), 1000);
     } catch (err: any) {
+      console.error("[compose] publish failed:", err);
       setErrorMsg(typeof err === "string" ? err : err?.message || "Failed to publish");
       setPhase("error");
     }
-  }, [mode, content, title, summary, imageUrl, hashtags, replyTo, onClose]);
+  }, [mode, content, title, summary, imageUrl, hashtags, replyTo, signingMode, onClose]);
 
   const handleRetry = () => {
     setErrorMsg("");
@@ -171,9 +175,18 @@ export const ComposeModal: React.FC<ComposeModalProps> = ({ onClose, replyTo, re
             </>
           )}
 
-          {phase === "publishing" && (
-            <div style={{ textAlign: "center", padding: 24, color: "var(--text-muted)" }}>
-              publishing...
+          {phase === "signing" && (
+            <div style={{ textAlign: "center", padding: 32, color: "var(--text-muted)" }}>
+              <div style={{ marginBottom: 8, fontSize: "0.92rem" }}>waiting for remote signer...</div>
+              <div style={{ fontSize: "0.78rem", color: "var(--text-dim)" }}>
+                approve the signing request in your signer app
+              </div>
+            </div>
+          )}
+
+          {phase === "broadcasting" && (
+            <div style={{ textAlign: "center", padding: 32, color: "var(--text-muted)" }}>
+              <div style={{ fontSize: "0.92rem" }}>signing &amp; broadcasting...</div>
             </div>
           )}
 
@@ -200,6 +213,7 @@ export const ComposeModal: React.FC<ComposeModalProps> = ({ onClose, replyTo, re
         {phase === "compose" && (
           <div className="compose-footer">
             <span className="compose-status">
+              {signingMode !== "nsec" && <span title={`signing via ${signingMode}`}>remote signer · </span>}
               {content.length > 0 && `${content.length} chars`}
             </span>
             <button

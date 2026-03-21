@@ -4076,6 +4076,7 @@ async fn set_nsec(nsec: String, app_handle: tauri::AppHandle, state: State<'_, A
     {
         let mut config = state.config.write().await;
         config.nsec = Some(nsec_trimmed.to_string());
+        config.signing_mode = "nsec".to_string();
     }
 
     app_handle.emit("signing-mode-changed", "nsec").ok();
@@ -4132,36 +4133,40 @@ async fn publish_dm(
 
     let recipient_pk = PublicKey::from_hex(&recipient_pubkey)
         .map_err(|e| format!("Invalid recipient pubkey: {}", e))?;
+    tracing::info!("[cmd:publish_dm] step 1: parsed recipient pk");
 
     // Encrypt content with NIP-04
-    let encrypted = {
-        let config = state.config.read().await;
-        let nsec = config.nsec.clone();
-        let signing_mode = config.signing_mode.clone();
-        drop(config);
+    let config = state.config.read().await;
+    let nsec = config.nsec.clone();
+    let signing_mode = config.signing_mode.clone();
+    drop(config);
+    tracing::info!("[cmd:publish_dm] step 2: got config, signing_mode={}, has_nsec={}", signing_mode, nsec.is_some());
 
-        let use_nsec = signing_mode == "nsec" && nsec.is_some();
-        if use_nsec {
-            let secret_key = SecretKey::from_bech32(nsec.as_ref().unwrap())
-                .map_err(|e| format!("Invalid nsec: {}", e))?;
-            nip04::encrypt(&secret_key, &recipient_pk, &content)
-                .map_err(|e| format!("NIP-04 encryption failed: {}", e))?
-        } else {
-            // Use NIP-46 remote signer for encryption
-            let signer_opt = {
-                let guard = state.nip46_signer.read().await;
-                guard.clone()
-            };
-            match signer_opt {
-                Some(signer) => {
-                    signer.nip04_encrypt(recipient_pk, content.clone())
-                        .await
-                        .map_err(|e| format!("Remote NIP-04 encryption failed: {}", e))?
-                }
-                None => return Err("No signer available — cannot send DMs in read-only mode".into()),
+    let use_nsec = nsec.is_some();
+    let encrypted = if use_nsec {
+        tracing::info!("[cmd:publish_dm] step 3a: encrypting locally with nsec");
+        let secret_key = SecretKey::from_bech32(nsec.as_ref().unwrap())
+            .map_err(|e| format!("Invalid nsec: {}", e))?;
+        let enc = nip04::encrypt(&secret_key, &recipient_pk, &content)
+            .map_err(|e| format!("NIP-04 encryption failed: {}", e))?;
+        tracing::info!("[cmd:publish_dm] step 3a: encrypted OK, len={}", enc.len());
+        enc
+    } else {
+        tracing::info!("[cmd:publish_dm] step 3b: encrypting via NIP-46");
+        let signer_opt = {
+            let guard = state.nip46_signer.read().await;
+            guard.clone()
+        };
+        match signer_opt {
+            Some(signer) => {
+                signer.nip04_encrypt(recipient_pk, content.clone())
+                    .await
+                    .map_err(|e| format!("Remote NIP-04 encryption failed: {}", e))?
             }
+            None => return Err("No signer available — cannot send DMs in read-only mode".into()),
         }
     };
+    tracing::info!("[cmd:publish_dm] step 4: content encrypted, building event");
 
     let tags = vec![
         Tag::public_key(recipient_pk),
@@ -4802,28 +4807,29 @@ async fn sign_build_publish_store(
     // Publish to outbound relays
     tracing::info!("[publish] publishing to {} outbound relays...", relays.len());
     let client = Client::default();
-    let mut connected_count = 0u32;
     for url in &relays {
-        match client.add_relay(url.as_str()).await {
-            Ok(_) => {
-                client.connect_relay(url.as_str()).await.ok();
-                connected_count += 1;
-            }
-            Err(e) => {
-                tracing::warn!("[publish] failed to add relay {}: {}", url, e);
-            }
-        }
+        client.add_relay(url.as_str()).await.ok();
     }
-    tracing::info!("[publish] connected to {}/{} relays", connected_count, relays.len());
+    // Connect and wait briefly for at least some relays to be ready
+    client.connect().await;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    match client.send_event(signed.clone()).await {
-        Ok(output) => {
-            tracing::info!("[publish] broadcast complete: event {} sent", &signed.id.to_hex()[..12]);
-            let _ = output; // SendEventOutput
+    // Send with a timeout so it doesn't hang forever
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.send_event(signed.clone())
+    ).await {
+        Ok(Ok(output)) => {
+            tracing::info!("[publish] broadcast complete: event {} sent (success={}, failed={})",
+                &signed.id.to_hex()[..12], output.success.len(), output.failed.len());
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::error!("[publish] broadcast failed: {}", e);
-            return Err(format!("Failed to publish event: {}", e));
+            // Don't fail — event is signed and stored locally, will be broadcast later
+            tracing::warn!("[publish] event stored locally, will retry broadcast on next sync");
+        }
+        Err(_) => {
+            tracing::warn!("[publish] broadcast timed out after 10s, event stored locally");
         }
     }
     client.disconnect().await.ok();

@@ -241,22 +241,35 @@ impl Nip46Client {
     }
 
     /// Request event signing from the remote signer.
-    /// Tries detected encryption first (15s). If no response, retries with
-    /// the other encryption. Handles signers using different encryption than
-    /// what was detected during the connect handshake.
+    /// Builds the sign_event request manually per NIP-46 spec (only kind, content,
+    /// tags, created_at — no id/pubkey). Tries detected encryption first (15s),
+    /// then falls back to the other encryption scheme.
     pub async fn sign_event(&mut self, unsigned: UnsignedEvent) -> Result<Event, String> {
         tracing::info!("[nip46] sign_event: kind={}, content_len={}, signer_pk={}..., encryption={:?}",
             unsigned.kind.as_u16(), unsigned.content.len(),
             &self.signer_public_key.to_hex()[..12], self.encryption);
 
-        let req = Nip46Request::SignEvent(unsigned);
+        // Build the sign_event request manually per NIP-46 spec.
+        // The spec example only includes: kind, content, tags, created_at.
+        // Some signers reject events with pre-computed id/pubkey fields.
+        let event_json = serde_json::json!({
+            "kind": unsigned.kind.as_u16(),
+            "content": unsigned.content,
+            "tags": unsigned.tags.iter()
+                .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect::<Vec<String>>())
+                .collect::<Vec<Vec<String>>>(),
+            "created_at": unsigned.created_at.as_u64(),
+        });
+        let event_str = event_json.to_string();
+        tracing::info!("[nip46] sign_event params (manual): {}", &event_str[..event_str.len().min(200)]);
+
         let primary = self.encryption;
 
         // Try primary encryption with 15s timeout
-        match self.send_request_with_timeout(req.clone(), Duration::from_secs(15)).await {
-            Ok(res) => {
+        match self.send_sign_event_raw(&event_str, Duration::from_secs(15)).await {
+            Ok(event) => {
                 tracing::info!("[nip46] sign_event succeeded with {:?}", primary);
-                return res.to_sign_event().map_err(|e| format!("Sign response error: {}", e));
+                return Ok(event);
             }
             Err(e) => {
                 tracing::warn!("[nip46] {:?} no response in 15s: {} — trying other encryption", primary, e);
@@ -271,10 +284,10 @@ impl Nip46Client {
         self.encryption = fallback;
         tracing::info!("[nip46] retrying sign_event with {:?}", fallback);
 
-        match self.send_request_with_timeout(req, self.timeout).await {
-            Ok(res) => {
+        match self.send_sign_event_raw(&event_str, self.timeout).await {
+            Ok(event) => {
                 tracing::info!("[nip46] sign_event succeeded with {:?}", fallback);
-                res.to_sign_event().map_err(|e| format!("Sign response error: {}", e))
+                Ok(event)
             }
             Err(e) => {
                 self.encryption = primary;
@@ -282,6 +295,109 @@ impl Nip46Client {
                 Err(format!("Signer did not respond (tried NIP-44 and NIP-04): {}", e))
             }
         }
+    }
+
+    /// Send a raw sign_event request (bypasses nostr-sdk serialization).
+    async fn send_sign_event_raw(&self, event_json: &str, timeout: Duration) -> Result<Event, String> {
+        let secret_key = self.app_keys.secret_key();
+        let signer_pk = self.signer_public_key;
+
+        self.ensure_connected().await?;
+
+        // Build NIP-46 JSON-RPC message manually
+        let req_id = format!("{}", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 10_000_000_000u128);
+        let msg_json = serde_json::json!({
+            "id": req_id,
+            "method": "sign_event",
+            "params": [event_json]
+        }).to_string();
+
+        tracing::info!("[nip46] raw sign_event: req_id={}, encryption={:?}", &req_id, self.encryption);
+        tracing::info!("[nip46] raw request: {}", &msg_json[..msg_json.len().min(300)]);
+
+        // Encrypt and build kind 24133 event
+        let encrypted = encrypt_nip46_msg(secret_key, &signer_pk, &msg_json, self.encryption)?;
+        let event = EventBuilder::new(Kind::NostrConnect, encrypted, [Tag::public_key(signer_pk)])
+            .to_event(&self.app_keys)
+            .map_err(|e| format!("Failed to build event: {}", e))?;
+
+        let mut notifications = self.pool.notifications();
+
+        // Send
+        match self.pool.send_event(event.clone(), RelaySendOptions::new()).await {
+            Ok(output) => {
+                let accepted: Vec<String> = output.success.iter().map(|u| u.to_string()).collect();
+                tracing::info!("[nip46] event {} sent to [{}]", &event.id.to_hex()[..12], accepted.join(", "));
+                if output.success.is_empty() {
+                    return Err("Event was not accepted by any relay".to_string());
+                }
+            }
+            Err(e) => return Err(format!("Failed to send: {}", e)),
+        }
+
+        tracing::info!("[nip46] waiting for sign response (timeout={}s, req_id={})...", timeout.as_secs(), &req_id);
+
+        // Wait for response
+        let result = async_utility::time::timeout(Some(timeout), async {
+            loop {
+                let notification = match notifications.recv().await {
+                    Ok(n) => n,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("[nip46] notification channel lagged by {} messages, continuing...", n);
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
+                };
+                if let RelayPoolNotification::Event { event, .. } = notification {
+                    if event.kind == Kind::NostrConnect {
+                        match decrypt_nip46_msg(secret_key, &event.pubkey, &event.content) {
+                            Ok((json, enc)) => {
+                                tracing::info!("[nip46] received NIP-46 response (enc={:?}): {}", enc, &json[..json.len().min(200)]);
+
+                                // Parse manually — look for our req_id
+                                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json) {
+                                    if parsed.get("id").and_then(|v| v.as_str()) == Some(&req_id) {
+                                        if let Some(error) = parsed.get("error").and_then(|v| v.as_str()) {
+                                            if !error.is_empty() {
+                                                return Err(format!("Signer error: {}", error));
+                                            }
+                                        }
+                                        if let Some(result) = parsed.get("result").and_then(|v| v.as_str()) {
+                                            // result is a JSON-stringified signed event
+                                            match Event::from_json(result) {
+                                                Ok(signed) => {
+                                                    tracing::info!("[nip46] got signed event: id={}", &signed.id.to_hex()[..12]);
+                                                    return Ok(signed);
+                                                }
+                                                Err(e) => {
+                                                    tracing::error!("[nip46] failed to parse signed event: {}", e);
+                                                    return Err(format!("Failed to parse signed event: {}", e));
+                                                }
+                                            }
+                                        }
+                                        return Err("Empty result from signer".to_string());
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("[nip46] decrypt failed: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
+            Err("Response stream ended".to_string())
+        })
+        .await
+        .ok_or_else(|| {
+            tracing::error!("[nip46] timed out after {}s (req_id={})", timeout.as_secs(), &req_id);
+            format!("Timed out after {}s waiting for signer", timeout.as_secs())
+        })?;
+
+        result
     }
 
     /// Shut down the relay pool.
@@ -367,7 +483,17 @@ impl Nip46Client {
         let mut notifications = pool.notifications();
 
         let result = async_utility::time::timeout(Some(timeout), async {
-            while let Ok(notification) = notifications.recv().await {
+            loop {
+                let notification = match notifications.recv().await {
+                    Ok(n) => n,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("[nip46] notification channel lagged by {} messages, continuing...", n);
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
+                };
                 if let RelayPoolNotification::Event { event, .. } = notification {
                     if event.kind == Kind::NostrConnect {
                         match decrypt_nip46_msg(secret_key, &event.pubkey, &event.content) {
@@ -401,24 +527,23 @@ impl Nip46Client {
         result
     }
 
-    /// Ensure relay pool is connected and subscribed before sending requests.
+    /// Ensure relay pool is connected before sending requests.
     async fn ensure_connected(&self) -> Result<(), String> {
-        // Check if any relay is connected
         let relay_map = self.pool.relays().await;
         let mut any_connected = false;
         for (url, relay) in &relay_map {
             let status = relay.status().await;
-            tracing::info!("[nip46] relay {} status: {}", url, status);
             if status == nostr_sdk::RelayStatus::Connected {
                 any_connected = true;
+            } else {
+                tracing::warn!("[nip46] relay {} status: {}", url, status);
             }
         }
 
         if !any_connected {
-            tracing::warn!("[nip46] no relays connected, attempting reconnect...");
+            tracing::warn!("[nip46] no relays connected, reconnecting...");
             self.pool.connect(Some(Duration::from_secs(10))).await;
 
-            // Wait for at least one connection
             for _ in 0..20 {
                 let relay_map = self.pool.relays().await;
                 for (_, relay) in &relay_map {
@@ -434,12 +559,11 @@ impl Nip46Client {
             if !any_connected {
                 return Err("NIP-46 relay pool: no relays could reconnect".to_string());
             }
-            tracing::info!("[nip46] relay reconnected");
-        }
 
-        // Re-subscribe to ensure we receive responses (relays may drop subscriptions)
-        Self::subscribe(&self.app_keys, &self.pool).await?;
-        tracing::info!("[nip46] subscription refreshed");
+            // Only re-subscribe after a reconnection (subscription was lost)
+            Self::subscribe(&self.app_keys, &self.pool).await?;
+            tracing::info!("[nip46] reconnected and re-subscribed");
+        }
 
         Ok(())
     }
@@ -497,7 +621,17 @@ impl Nip46Client {
 
         // Wait for matching response
         let result = async_utility::time::timeout(Some(timeout), async {
-            while let Ok(notification) = notifications.recv().await {
+            loop {
+                let notification = match notifications.recv().await {
+                    Ok(n) => n,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("[nip46] notification channel lagged by {} messages, continuing...", n);
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
+                };
                 if let RelayPoolNotification::Event { event, .. } = notification {
                     if event.kind == Kind::NostrConnect {
                         match decrypt_nip46_msg(secret_key, &event.pubkey, &event.content) {

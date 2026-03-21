@@ -102,6 +102,60 @@
   flex: 1;
 }
 
+.sidebar-compose-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: calc(100% - 24px);
+  margin: 8px 12px;
+  padding: 10px 14px;
+  background: var(--accent);
+  border: none;
+  border-radius: 10px;
+  color: #fff;
+  font-size: 0.88rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+.sidebar-compose-btn:hover { opacity: 0.85; }
+.sidebar-compose-btn .icon { font-size: 1.1em; }
+
+.sidebar-signing-prompt {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 4px 12px 8px;
+  padding: 8px 10px;
+  background: rgba(124, 58, 237, 0.08);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+.sidebar-signing-prompt .icon { color: var(--accent); font-size: 0.85em; }
+.sidebar-signing-prompt-btn {
+  background: var(--accent);
+  border: none;
+  border-radius: 5px;
+  padding: 3px 10px;
+  color: #fff;
+  cursor: pointer;
+  font-size: 0.73rem;
+  margin-left: auto;
+}
+.sidebar-signing-prompt-btn:hover { opacity: 0.85; }
+.sidebar-signing-prompt-close {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 1px;
+  display: flex;
+}
+.sidebar-signing-prompt-close:hover { color: var(--text); }
+
 .sidebar-status {
   padding: 12px 20px;
   font-size: 0.72rem;
