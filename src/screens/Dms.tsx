@@ -1,4 +1,4 @@
-/** DMs -- Direct Messages screen. Shows NIP-04 DMs grouped by conversation.
+/** DMs -- Direct Messages screen. Shows NIP-04 + NIP-17 DMs grouped by conversation.
  *  When nsec is available, messages are decrypted; otherwise shown as encrypted. */
 
 import React, { useState, useEffect, useCallback, useRef } from "react";
@@ -12,6 +12,15 @@ import { profileDisplayName } from "../utils/profiles";
 import { useProfileContext } from "../context/ProfileContext";
 import type { NostrEvent, Settings, Conversation } from "../types/nostr";
 import type { ProfileInfo } from "../utils/profiles";
+
+/** Unwrapped gift wrap result from the backend */
+interface UnwrappedDm {
+  sender_pubkey: string;
+  recipient_pubkey: string | null;
+  content: string;
+  created_at: number;
+  rumor_kind: number;
+}
 
 function getPartner(event: NostrEvent, ownPk: string): string | null {
   if (event.pubkey === ownPk) {
@@ -32,10 +41,10 @@ export const Dms: React.FC = () => {
   const [selectedPartner, setSelectedPartner] = useState<string | null>(null);
   const [signingMode, setSigningMode] = useState<"nsec" | "bunker" | "connect" | "read-only">("read-only");
   const [displayCount, setDisplayCount] = useState(30);
+  const [sendAsLegacy, setSendAsLegacy] = useState(false);
 
   // Message input state
   const [messageInput, setMessageInput] = useState("");
-  const [sending, setSending] = useState(false);
 
   // Search state
   const [searchQuery, setSearchQuery] = useState("");
@@ -45,6 +54,10 @@ export const Dms: React.FC = () => {
 
   // Cache for decrypted message content: eventId -> plaintext
   const decryptedCache = useRef<Map<string, string>>(new Map());
+  // Cache for unwrapped gift wraps: eventId -> UnwrappedDm
+  const giftWrapCache = useRef<Map<string, UnwrappedDm>>(new Map());
+  // Track which gift wrap event IDs map to which partner (for isSent detection)
+  const giftWrapSenderCache = useRef<Map<string, string>>(new Map());
   // Incremented to force re-render after async decryption
   const [, setDecryptTick] = useState(0);
 
@@ -94,15 +107,32 @@ export const Dms: React.FC = () => {
       }
       setOwnPubkey(pk);
 
+      // On first load: publish inbox relays if needed + do a full relay scan for DMs
+      if (mode !== "read-only") {
+        try {
+          // Publish kind 10050 inbox relay list so others know where to send us gift wraps
+          await invoke("publish_inbox_relays");
+        } catch (e) {
+          console.debug("[dms] publish_inbox_relays:", e);
+        }
+        try {
+          // Full scan: fetch DMs from all known relays going back 30 days
+          const fetched = await invoke<number>("fetch_new_dms", { fullScan: true });
+          if (fetched > 0) console.log(`[dms] full scan fetched ${fetched} new DMs`);
+        } catch (e) {
+          console.debug("[dms] full scan:", e);
+        }
+      }
+
       const events = await invoke<NostrEvent[]>("get_dm_events", {
         ownPubkey: pk,
-        limit: 200,
+        limit: 500,
       });
 
       if (!events || events.length === 0) {
         try {
           const kindCounts = await invoke<{ counts: Record<number, number> }>("get_kind_counts");
-          const dmCount = kindCounts.counts[4] || 0;
+          const dmCount = (kindCounts.counts[4] || 0) + (kindCounts.counts[1059] || 0);
           if (dmCount > 0) {
             setEmptyReason("read-only");
             setLoading(false);
@@ -116,21 +146,85 @@ export const Dms: React.FC = () => {
         return;
       }
 
+      // Separate NIP-04 (kind 4) and NIP-17 gift wraps (kind 1059)
+      const nip04Events = events.filter((e) => e.kind === 4);
+      const giftWrapEvents = events.filter((e) => e.kind === 1059);
+
+      // Unwrap gift wraps if we have signing capability
+      const gwCache = giftWrapCache.current;
+      const dCache = decryptedCache.current;
+      const senderCache = giftWrapSenderCache.current;
+
+      if (mode !== "read-only" && giftWrapEvents.length > 0) {
+        const results = await Promise.allSettled(
+          giftWrapEvents.map(async (ev) => {
+            // Skip if already cached
+            if (gwCache.has(ev.id)) return { eventId: ev.id, cached: true };
+            const result = await invoke<UnwrappedDm>("unwrap_gift_wrap", {
+              eventId: ev.id,
+              eventPubkey: ev.pubkey,
+              eventContent: ev.content,
+              eventCreatedAt: ev.created_at,
+              eventTags: ev.tags,
+              eventSig: ev.sig,
+            });
+            return { eventId: ev.id, cached: false, unwrapped: result };
+          }),
+        );
+
+        for (const r of results) {
+          if (r.status === "fulfilled" && !r.value.cached && r.value.unwrapped) {
+            const { eventId, unwrapped } = r.value;
+            gwCache.set(eventId, unwrapped);
+            dCache.set(eventId, unwrapped.content);
+            senderCache.set(eventId, unwrapped.sender_pubkey);
+          }
+        }
+      }
+
       // Group by conversation partner
       const convMap = new Map<string, NostrEvent[]>();
-      for (const ev of events) {
+
+      // NIP-04 events: partner determined from event data
+      for (const ev of nip04Events) {
         const partner = getPartner(ev, pk);
         if (!partner) continue;
         if (!convMap.has(partner)) convMap.set(partner, []);
         convMap.get(partner)!.push(ev);
       }
 
+      // NIP-17 gift wrap events: partner determined from unwrapped data
+      for (const ev of giftWrapEvents) {
+        const unwrapped = gwCache.get(ev.id);
+        if (!unwrapped) continue; // couldn't unwrap (read-only or failed)
+
+        let partner: string;
+        if (unwrapped.sender_pubkey === pk) {
+          // We sent this — partner is the recipient from the rumor's p-tag
+          partner = unwrapped.recipient_pubkey || "";
+        } else {
+          // We received this — partner is the sender
+          partner = unwrapped.sender_pubkey;
+        }
+        if (!partner) continue;
+
+        if (!convMap.has(partner)) convMap.set(partner, []);
+        convMap.get(partner)!.push(ev);
+      }
+
       const sorted = Array.from(convMap.entries())
-        .map(([partnerPubkey, messages]) => ({
-          partnerPubkey,
-          messages: messages.sort((a, b) => b.created_at - a.created_at),
-          lastTimestamp: Math.max(...messages.map((m) => m.created_at)),
-        }))
+        .map(([partnerPubkey, messages]) => {
+          // For gift wraps, use the rumor's created_at for sorting (more accurate than the tweaked timestamp)
+          const getTimestamp = (m: NostrEvent) => {
+            const unwrapped = gwCache.get(m.id);
+            return unwrapped ? unwrapped.created_at : m.created_at;
+          };
+          return {
+            partnerPubkey,
+            messages: messages.sort((a, b) => getTimestamp(b) - getTimestamp(a)),
+            lastTimestamp: Math.max(...messages.map(getTimestamp)),
+          };
+        })
         .sort((a, b) => b.lastTimestamp - a.lastTimestamp);
 
       // Fetch profiles for all partners
@@ -140,7 +234,8 @@ export const Dms: React.FC = () => {
       setConversations(sorted);
       setLoading(false);
 
-      // Decrypt last message of each conversation for sidebar preview
+      // Decrypt last message of NIP-04 conversations for sidebar preview
+      // (NIP-17 messages are already decrypted from unwrapping)
       if (mode !== "read-only") {
         decryptPreviews(sorted, pk);
       }
@@ -157,6 +252,8 @@ export const Dms: React.FC = () => {
       for (const conv of convs) {
         const lastMsg = conv.messages[0]; // sorted desc, first = latest
         if (!lastMsg || cache.has(lastMsg.id)) continue;
+        // Only decrypt NIP-04 messages here; NIP-17 are already cached
+        if (lastMsg.kind === 1059) continue;
         const senderPk = lastMsg.pubkey === pk ? conv.partnerPubkey : lastMsg.pubkey;
         try {
           const plaintext = await invoke<string>("decrypt_dm", {
@@ -178,6 +275,24 @@ export const Dms: React.FC = () => {
     loadDms();
   }, [loadDms]);
 
+  // Poll for new DMs every 30s when a conversation is selected
+  useEffect(() => {
+    if (!selectedPartner || signingMode === "read-only") return;
+    const interval = setInterval(async () => {
+      try {
+        const newCount = await invoke<number>("fetch_new_dms", { fullScan: false });
+        if (newCount > 0) {
+          console.log(`[dms] ${newCount} new DMs fetched, reloading`);
+          await loadDms();
+          setSelectedPartner(selectedPartner);
+        }
+      } catch (e) {
+        console.debug("[dms] fetch_new_dms poll error:", e);
+      }
+    }, 30000);
+    return () => clearInterval(interval);
+  }, [selectedPartner, signingMode, loadDms]);
+
   // Decrypt messages for the selected thread
   const decryptThread = useCallback(async (messages: NostrEvent[], partnerPubkey: string) => {
     const cache = decryptedCache.current;
@@ -186,6 +301,30 @@ export const Dms: React.FC = () => {
     for (const msg of messages) {
       if (cache.has(msg.id)) continue;
 
+      // NIP-17 gift wraps: try unwrapping if not already cached
+      if (msg.kind === 1059) {
+        try {
+          const unwrapped = await invoke<UnwrappedDm>("unwrap_gift_wrap", {
+            eventId: msg.id,
+            eventPubkey: msg.pubkey,
+            eventContent: msg.content,
+            eventCreatedAt: msg.created_at,
+            eventTags: msg.tags,
+            eventSig: msg.sig,
+          });
+          giftWrapCache.current.set(msg.id, unwrapped);
+          giftWrapSenderCache.current.set(msg.id, unwrapped.sender_pubkey);
+          cache.set(msg.id, unwrapped.content);
+          updated = true;
+        } catch (e) {
+          console.warn("[dms] Gift wrap unwrap failed for", msg.id, e);
+          cache.set(msg.id, "[Unwrap failed]");
+          updated = true;
+        }
+        continue;
+      }
+
+      // NIP-04: decrypt as before
       const senderPk = msg.pubkey === ownPubkey ? partnerPubkey : msg.pubkey;
 
       try {
@@ -314,30 +453,85 @@ export const Dms: React.FC = () => {
     }
   }, [conversations, ensureProfiles]);
 
-  // Send a DM
-  const handleSendDm = useCallback(async () => {
-    if (!messageInput.trim() || !selectedPartner || sending || signingMode === "read-only") return;
-    setSending(true);
-    try {
-      await invoke("publish_dm", {
-        content: messageInput.trim(),
-        recipientPubkey: selectedPartner,
-      });
-      setMessageInput("");
-      // Reload conversations to pick up the new message
-      await loadDms();
-      // Re-select the partner after reload
-      setSelectedPartner(selectedPartner);
-      // Scroll to bottom
-      setTimeout(() => {
-        if (threadRef.current) threadRef.current.scrollTop = threadRef.current.scrollHeight;
-      }, 100);
-    } catch (e) {
-      console.error("[dms] Failed to send DM:", e);
-    } finally {
-      setSending(false);
+  // Send a DM — optimistic: message appears instantly, publish happens in background
+  const pendingIdCounter = useRef(0);
+  const handleSendDm = useCallback(() => {
+    const text = messageInput.trim();
+    if (!text || !selectedPartner || signingMode === "read-only") return;
+
+    // Generate a temporary optimistic ID
+    pendingIdCounter.current += 1;
+    const optimisticId = `pending-${Date.now()}-${pendingIdCounter.current}`;
+    const now = Math.floor(Date.now() / 1000);
+
+    // Create an optimistic message event
+    const optimisticMsg: NostrEvent = {
+      id: optimisticId,
+      pubkey: ownPubkey,
+      created_at: now,
+      kind: sendAsLegacy ? 4 : 1059,
+      tags: [["p", selectedPartner]],
+      content: "",
+      sig: "",
+    };
+
+    // Cache the plaintext so it renders immediately
+    decryptedCache.current.set(optimisticId, text);
+    // For gift wraps, also mark as sent by us
+    if (!sendAsLegacy) {
+      giftWrapSenderCache.current.set(optimisticId, ownPubkey);
     }
-  }, [messageInput, selectedPartner, sending, signingMode, loadDms]);
+
+    // Insert into conversations optimistically
+    setConversations((prev) => {
+      const updated = prev.map((conv) => {
+        if (conv.partnerPubkey !== selectedPartner) return conv;
+        return {
+          ...conv,
+          messages: [optimisticMsg, ...conv.messages],
+          lastTimestamp: now,
+        };
+      });
+      // If no conversation existed yet, create one
+      if (!updated.find((c) => c.partnerPubkey === selectedPartner)) {
+        updated.unshift({
+          partnerPubkey: selectedPartner,
+          messages: [optimisticMsg],
+          lastTimestamp: now,
+        });
+      }
+      return updated;
+    });
+    setDecryptTick((v) => v + 1);
+
+    // Clear input immediately — user can keep typing
+    setMessageInput("");
+
+    // Scroll to bottom
+    setTimeout(() => {
+      if (threadRef.current) threadRef.current.scrollTop = threadRef.current.scrollHeight;
+    }, 50);
+
+    // Publish in background — no await, no blocking
+    const partner = selectedPartner;
+    const legacy = sendAsLegacy;
+    (async () => {
+      try {
+        if (legacy) {
+          await invoke("publish_dm", { content: text, recipientPubkey: partner });
+        } else {
+          await invoke("publish_gift_wrap_dm", { content: text, recipientPubkey: partner });
+        }
+        // After publish succeeds, reload to replace optimistic message with real one
+        await loadDms();
+      } catch (e) {
+        console.error("[dms] Background publish failed:", e);
+        // Mark the optimistic message as failed
+        decryptedCache.current.set(optimisticId, `[send failed] ${text}`);
+        setDecryptTick((v) => v + 1);
+      }
+    })();
+  }, [messageInput, selectedPartner, signingMode, sendAsLegacy, ownPubkey, loadDms]);
 
   // Loading state
   if (loading) {
@@ -390,6 +584,22 @@ export const Dms: React.FC = () => {
     : null;
   const cache = decryptedCache.current;
 
+  // Determine if a message was sent by us
+  function isSentByUs(msg: NostrEvent): boolean {
+    if (msg.kind === 1059) {
+      // Gift wrap: check the unwrapped sender
+      const sender = giftWrapSenderCache.current.get(msg.id);
+      return sender === ownPubkey;
+    }
+    return msg.pubkey === ownPubkey;
+  }
+
+  // Get the effective timestamp for sorting (rumor's created_at for gift wraps)
+  function effectiveTimestamp(msg: NostrEvent): number {
+    const unwrapped = giftWrapCache.current.get(msg.id);
+    return unwrapped ? unwrapped.created_at : msg.created_at;
+  }
+
   // Truncate preview text
   function previewText(conv: Conversation): React.ReactNode {
     if (signingMode === "read-only") {
@@ -401,6 +611,14 @@ export const Dms: React.FC = () => {
     if (!decrypted) return "...";
     const maxLen = 40;
     return decrypted.length > maxLen ? decrypted.slice(0, maxLen) + "\u2026" : decrypted;
+  }
+
+  // Protocol label for a message
+  function protocolTag(msg: NostrEvent): React.ReactNode {
+    if (msg.kind === 1059) {
+      return <span className="dms-msg-protocol dms-msg-nip17" title="NIP-17 (private)">nip-17</span>;
+    }
+    return <span className="dms-msg-protocol dms-msg-nip04" title="NIP-04 (legacy)">nip-04</span>;
   }
 
   // Render right panel
@@ -453,7 +671,7 @@ export const Dms: React.FC = () => {
     const name = profileDisplayName(profile, selectedPartner!);
     const avatar = profile?.picture || "";
     const avatarLocal = profile?.picture_local || null;
-    const sorted = [...selectedConv.messages].sort((a, b) => a.created_at - b.created_at);
+    const sorted = [...selectedConv.messages].sort((a, b) => effectiveTimestamp(a) - effectiveTimestamp(b));
     const visible = sorted.slice(Math.max(0, sorted.length - displayCount));
     const hasMore = sorted.length > displayCount;
 
@@ -485,12 +703,12 @@ export const Dms: React.FC = () => {
           <div className="dms-thread-messages-inner">
             {hasMore && <div ref={sentinelRef} className="dms-scroll-sentinel" />}
             {visible.map((msg) => {
-              const isSent = msg.pubkey === ownPubkey;
-              const timeStr = formatTimestamp(msg.created_at);
+              const sent = isSentByUs(msg);
+              const timeStr = formatTimestamp(effectiveTimestamp(msg));
               const decrypted = cache.get(msg.id);
 
               return (
-                <div key={msg.id} className={`dms-msg ${isSent ? "dms-msg-sent" : "dms-msg-received"}`}>
+                <div key={msg.id} className={`dms-msg ${sent ? "dms-msg-sent" : "dms-msg-received"}`}>
                   <div className="dms-msg-bubble">
                     <div className="dms-msg-content">
                       {decrypted
@@ -498,7 +716,10 @@ export const Dms: React.FC = () => {
                         : <><span className="icon"><IconLock /></span> encrypted message</>
                       }
                     </div>
-                    <div className="dms-msg-time">{timeStr}</div>
+                    <div className="dms-msg-meta">
+                      {protocolTag(msg)}
+                      <span className="dms-msg-time">{timeStr}</span>
+                    </div>
                   </div>
                 </div>
               );
@@ -513,10 +734,16 @@ export const Dms: React.FC = () => {
               value={messageInput}
               onChange={(e) => setMessageInput(e.target.value)}
               onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSendDm(); } }}
-              disabled={sending}
             />
-            <button onClick={handleSendDm} disabled={sending || !messageInput.trim()}>
-              {sending ? "..." : "send"}
+            <button
+              className="dms-protocol-toggle"
+              onClick={() => setSendAsLegacy(!sendAsLegacy)}
+              title={sendAsLegacy ? "Sending as NIP-04 (legacy). Click for NIP-17." : "Sending as NIP-17 (private). Click for NIP-04."}
+            >
+              {sendAsLegacy ? "04" : "17"}
+            </button>
+            <button onClick={handleSendDm} disabled={!messageInput.trim()}>
+              send
             </button>
           </div>
         ) : (

@@ -4309,10 +4309,54 @@ async fn decrypt_dm(content: String, sender_pubkey: String, state: State<'_, App
     Err("No signer available — read-only mode".into())
 }
 
+/// Publish a kind 10050 inbox relay list so other clients know where to send gift wraps.
+#[tauri::command]
+async fn publish_inbox_relays(
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    use nostr_sdk::prelude::*;
+
+    let config = state.config.read().await;
+    let outbound_relays = config.outbound_relays.clone();
+    drop(config);
+
+    // Use a subset of outbound relays as inbox relays, plus well-known DM relays
+    let mut inbox: Vec<String> = Vec::new();
+    for url in &[
+        "wss://auth.nostr1.com",
+        "wss://relay.0xchat.com",
+        "wss://nos.lol",
+        "wss://relay.damus.io",
+        "wss://relay.primal.net",
+    ] {
+        inbox.push(url.to_string());
+    }
+    // Add some of the user's outbound relays too
+    for url in outbound_relays.iter().take(3) {
+        if !inbox.contains(url) {
+            inbox.push(url.clone());
+        }
+    }
+
+    let tags: Vec<nostr_sdk::prelude::Tag> = inbox.iter()
+        .map(|url| Tag::custom(TagKind::Custom(std::borrow::Cow::Borrowed("relay")), vec![url.clone()]))
+        .collect();
+
+    tracing::info!("[cmd:publish_inbox_relays] publishing kind 10050 with {} relays: {:?}", tags.len(), inbox);
+
+    let builder = EventBuilder::new(Kind::from(10050), "", tags);
+    let signed = sign_build_publish_store(builder, &state).await?;
+    let id = signed.id.to_hex();
+    tracing::info!("[cmd:publish_inbox_relays] published kind 10050: {}", &id[..12]);
+    Ok(id)
+}
+
 /// Fetch new DMs from relays on-demand (called by frontend when a chat is open).
 /// Queries inbox relays for recent kind 4 + kind 1059 events addressed to the user.
+/// Pass `full_scan: true` on first load to go back 30 days instead of 5 minutes.
 #[tauri::command]
 async fn fetch_new_dms(
+    full_scan: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<u32, String> {
     use nostr_sdk::prelude::*;
@@ -4325,26 +4369,32 @@ async fn fetch_new_dms(
     let pk = PublicKey::from_hex(&hex_pubkey)
         .map_err(|e| format!("Invalid pubkey: {}", e))?;
 
-    let inbox_relays = resolve_inbox_relays(state.db(), &hex_pubkey, &outbound_relays);
+    let inbox_relays = resolve_inbox_relays(&state.db(), &hex_pubkey, &outbound_relays);
 
-    tracing::debug!("[cmd:fetch_new_dms] querying {} relays for new DMs", inbox_relays.len());
+    let is_full = full_scan.unwrap_or(false);
+    tracing::info!("[cmd:fetch_new_dms] querying {} relays (full_scan={})", inbox_relays.len(), is_full);
 
-    // Look back 5 minutes for new messages
-    let since = chrono::Utc::now().timestamp() - 300;
-    // For gift wraps, look back further due to timestamp randomization
-    let gw_since = since - 172800;
+    // For polling: 5 minutes + 2 days for gift wrap timestamp fuzz
+    // For full scan: 30 days back
+    let since = if is_full {
+        chrono::Utc::now().timestamp() - (30 * 86400)
+    } else {
+        chrono::Utc::now().timestamp() - 300 - 172800 // 2 days + 5 min
+    };
+
+    let limit = if is_full { 500 } else { 50 };
 
     let nip04_filter = Filter::new()
         .pubkey(pk)
         .kind(Kind::EncryptedDirectMessage)
-        .since(Timestamp::from(since as u64))
-        .limit(50);
+        .since(Timestamp::from(since.max(0) as u64))
+        .limit(limit);
 
     let gw_filter = Filter::new()
         .pubkey(pk)
         .kind(Kind::GiftWrap)
-        .since(Timestamp::from(gw_since.max(0) as u64))
-        .limit(50);
+        .since(Timestamp::from(since.max(0) as u64))
+        .limit(limit);
 
     let client = Client::default();
     for url in &inbox_relays {
@@ -4357,7 +4407,10 @@ async fn fetch_new_dms(
 
     match tokio::time::timeout(
         std::time::Duration::from_secs(8),
-        client.get_events_of(vec![nip04_filter, gw_filter], None),
+        client.get_events_of(
+            vec![nip04_filter, gw_filter],
+            nostr_sdk::EventSource::both(Some(std::time::Duration::from_secs(6))),
+        ),
     ).await {
         Ok(Ok(events)) => {
             tracing::info!("[cmd:fetch_new_dms] fetched {} events", events.len());
@@ -4625,10 +4678,10 @@ async fn publish_gift_wrap_dm(
 
     // Resolve recipient's inbox relays (kind 10050), falling back to NIP-65 read relays,
     // then our outbound relays + well-known DM relays.
-    let recipient_relays = resolve_inbox_relays(state.db(), &recipient_pubkey, &outbound_relays);
+    let recipient_relays = resolve_inbox_relays(&state.db(), &recipient_pubkey, &outbound_relays);
     // For self-copy: use our own inbox/outbound relays
     let own_hex = hex_pubkey.as_deref().unwrap_or("");
-    let self_relays = resolve_inbox_relays(state.db(), own_hex, &outbound_relays);
+    let self_relays = resolve_inbox_relays(&state.db(), own_hex, &outbound_relays);
 
     tracing::info!("[cmd:publish_gift_wrap_dm] recipient relays: {:?}, self relays: {:?}",
         recipient_relays, self_relays);
@@ -6404,6 +6457,8 @@ pub fn run() {
             decrypt_dm,
             unwrap_gift_wrap,
             publish_gift_wrap_dm,
+            fetch_new_dms,
+            publish_inbox_relays,
             connect_bunker,
             generate_nostr_connect_uri,
             await_nostr_connect,

@@ -734,10 +734,25 @@
   background: var(--bg); border: 1px solid var(--border); border-bottom-left-radius: 4px;
 }
 .dms-msg-content { font-size: 0.84rem; color: var(--text-dim); }
+.dms-msg-meta {
+  display: flex; align-items: center; gap: 6px; margin-top: 4px;
+}
 .dms-msg-time {
-  font-size: 0.65rem; color: var(--text-muted); margin-top: 4px;
+  font-size: 0.65rem; color: var(--text-muted);
   font-family: var(--mono);
 }
+.dms-msg-protocol {
+  font-size: 0.55rem; font-family: var(--mono); padding: 1px 4px;
+  border-radius: 3px; text-transform: uppercase; letter-spacing: 0.03em;
+}
+.dms-msg-nip17 { background: rgba(74,158,255,0.12); color: var(--accent); }
+.dms-msg-nip04 { background: rgba(255,170,60,0.12); color: var(--text-muted); }
+.dms-protocol-toggle {
+  font-size: 0.7rem; font-family: var(--mono); padding: 4px 8px;
+  background: var(--bg-hover); border: 1px solid var(--border); border-radius: 4px;
+  color: var(--text-muted); cursor: pointer; flex-shrink: 0;
+}
+.dms-protocol-toggle:hover { color: var(--text-dim); border-color: var(--accent); }
 
 /* DMs input bar */
 .dms-input-bar {

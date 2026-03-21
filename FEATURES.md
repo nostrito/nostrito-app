@@ -19,7 +19,7 @@ Last updated: 2026-03-21
 - **Multi-account** — switch accounts with separate databases
 
 ### Social
-- **Direct Messages (NIP-04)** — encrypted DMs grouped by conversation, send/receive/decrypt
+- **Direct Messages (NIP-04 + NIP-17)** — encrypted DMs grouped by conversation; NIP-17 gift wrap (default) + NIP-04 legacy with toggle
 - **Follow/Unfollow** — contact lists (kind 3)
 - **Mute/Unmute** — mute pubkeys (kind 10000)
 - **Track/Untrack Profiles** — persistent tracking with dedicated sync priority
@@ -91,8 +91,53 @@ Last updated: 2026-03-21
 - [ ] **Labels** (NIP-32) — not supported
 
 ### Messaging
-- [ ] **NIP-44 encrypted DMs** (kind 14/1059) — only NIP-04 (kind 4) supported, which is legacy/deprecated
+- [x] **NIP-17 private DMs** (kind 14/1059 gift wrap) — send & receive NIP-17 gift-wrapped DMs with NIP-44 encryption
+- [x] **NIP-04 legacy DMs** (kind 4) — full send/receive/decrypt, toggleable from compose bar
 - [ ] **Group DMs** — not supported
+
+#### DM Protocol Architecture: NIP-04 vs NIP-17
+
+Nostrito supports both the legacy NIP-04 and the modern NIP-17 direct messaging
+standards. NIP-17 is the default for sending; NIP-04 is available as a toggle
+for backward compatibility with older clients.
+
+**NIP-04 (legacy, kind 4)**
+- Simple: sender publishes a kind 4 event with NIP-04 (AES-CBC + ECDH) encrypted
+  content and a `p` tag naming the recipient.
+- The **event metadata is fully public**: anyone can see who is messaging whom, how
+  often, and the exact timestamps. Only the message body is encrypted.
+- Encryption uses AES-CBC which lacks modern authenticated-encryption guarantees.
+- Supported by every Nostr client since the beginning.
+
+**NIP-17 (modern, kinds 13 / 14 / 1059)**
+- Three-layer envelope: **rumor → seal → gift wrap**.
+  1. **Rumor (kind 14)** — the actual message. Unsigned, contains the `p` tag
+     pointing to the recipient, and the plaintext content.
+  2. **Seal (kind 13)** — the rumor encrypted with NIP-44 (XChaCha20-Poly1305)
+     to the *recipient's* key, signed by the sender. Has a **randomised
+     timestamp** (±2 days) so observers cannot correlate events by time.
+  3. **Gift Wrap (kind 1059)** — the seal encrypted with NIP-44 to the
+     recipient's key, signed by a **random throwaway key**. The only public
+     metadata is the `p` tag (recipient) and another randomised timestamp.
+- Because the outer event is signed by a random key, **observers cannot
+  determine the sender**. Combined with the fuzzy timestamps, message frequency
+  and timing are also hidden.
+- Encryption uses NIP-44 (XChaCha20-Poly1305 + HKDF) — authenticated encryption
+  with a proper KDF, replacing NIP-04's weaker AES-CBC.
+- Sender creates **two** gift wraps per message: one addressed to the recipient
+  and one addressed to themselves (the "self-copy"), so sent messages appear in
+  the sender's conversation view.
+
+**How we maintain seamless compatibility**
+
+| Concern | Approach |
+|---|---|
+| **Receiving** | The sync engine fetches both kind 4 and kind 1059 events addressed to the user. The DB query returns both kinds in a single call. |
+| **Decryption** | Kind 4 → `nip04::decrypt`. Kind 1059 → three-layer unwrap (`gift_wrap → seal → rumor`) using `nip44::decrypt` at each layer. Both paths work with local nsec *and* NIP-46 remote signers. |
+| **Conversation grouping** | Kind 4 messages identify the partner from `pubkey` / `p` tag directly. Kind 1059 messages are unwrapped first to extract the real sender and recipient from the inner rumor, then merged into the same conversation map. |
+| **Sending (default NIP-17)** | New messages are sent as NIP-17 gift wraps by default. A toggle in the compose bar lets the user switch to NIP-04 for specific conversations (e.g. when messaging someone whose client only supports NIP-04). |
+| **Timestamps** | Gift wrap timestamps are intentionally randomised (±2 days). For display and sorting we use the rumor's `created_at` which reflects the actual send time. |
+| **NIP-46 remote signers** | Gift wrap creation requires NIP-44 encrypt + event signing. For NIP-46: the seal content is encrypted via `nip44_encrypt` on the remote signer, the seal is signed via `sign_event`, and the outer gift wrap uses a locally-generated random key (no remote call needed). Unwrapping mirrors this with `nip44_decrypt`. |
 
 ### Discovery & Social Graph
 - [ ] **Trending / popular content** — no trending notes, hashtags, or profiles
@@ -138,7 +183,7 @@ Last updated: 2026-03-21
 
 ### Medium Effort, High Impact
 6. Add **notifications screen** (reactions/replies/zaps/follows about you)
-7. Upgrade DMs to **NIP-44** (kind 14/1059)
+7. ~~Upgrade DMs to **NIP-44** (kind 14/1059)~~ ✅ Done — NIP-17 gift wrap DMs with NIP-44 encryption
 8. Add **media upload** (nostr.build or blossom)
 9. Add **global / explore feed** UI
 10. Add **quote reposts**

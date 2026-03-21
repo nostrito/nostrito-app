@@ -240,6 +240,34 @@ impl Nip46Client {
         res.to_encrypt_decrypt().map_err(|e| format!("Decrypt response error: {}", e))
     }
 
+    /// Request NIP-44 encryption from the remote signer.
+    pub async fn nip44_encrypt(
+        &self,
+        public_key: PublicKey,
+        text: String,
+    ) -> Result<String, String> {
+        let req = Nip46Request::Nip44Encrypt {
+            public_key,
+            text,
+        };
+        let res = self.send_request(req).await?;
+        res.to_encrypt_decrypt().map_err(|e| format!("NIP-44 encrypt response error: {}", e))
+    }
+
+    /// Request NIP-44 decryption from the remote signer.
+    pub async fn nip44_decrypt(
+        &self,
+        public_key: PublicKey,
+        ciphertext: String,
+    ) -> Result<String, String> {
+        let req = Nip46Request::Nip44Decrypt {
+            public_key,
+            ciphertext,
+        };
+        let res = self.send_request(req).await?;
+        res.to_encrypt_decrypt().map_err(|e| format!("NIP-44 decrypt response error: {}", e))
+    }
+
     /// Request event signing from the remote signer.
     /// Builds the sign_event request manually per NIP-46 spec (only kind, content,
     /// tags, created_at — no id/pubkey). Tries detected encryption first (15s),
