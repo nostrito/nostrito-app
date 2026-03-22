@@ -8,6 +8,41 @@ import { Titlebar } from "./components/Titlebar";
 import { Sidebar } from "./components/Sidebar";
 import { initMediaViewer, closeMediaViewer } from "./utils/media";
 
+class ErrorBoundary extends React.Component<
+  { children: React.ReactNode },
+  { hasError: boolean; error: Error | null }
+> {
+  state = { hasError: false, error: null as Error | null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: Error, info: React.ErrorInfo) {
+    console.error("[ErrorBoundary]", error, info.componentStack);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={{ padding: 40, color: "#ccc", fontFamily: "sans-serif" }}>
+          <h2 style={{ color: "#fff" }}>Something went wrong</h2>
+          <pre style={{ whiteSpace: "pre-wrap", opacity: 0.7, fontSize: 13 }}>
+            {this.state.error?.message}
+          </pre>
+          <button
+            onClick={() => { this.setState({ hasError: false, error: null }); window.location.hash = "/"; window.location.reload(); }}
+            style={{ marginTop: 16, padding: "8px 16px", cursor: "pointer", background: "#333", color: "#fff", border: "1px solid #555", borderRadius: 4 }}
+          >
+            Reload app
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 // Lazy load screens
 import { Dashboard } from "./screens/Dashboard";
 import { Feed } from "./screens/Feed";
@@ -143,7 +178,7 @@ const AppRoutes: React.FC = () => {
       const hashtagEl = el.closest("[data-hashtag]") as HTMLElement | null;
       if (hashtagEl) {
         const tag = hashtagEl.dataset.hashtag;
-        if (tag) navigate(`/feed?q=${encodeURIComponent("#" + tag)}`);
+        if (tag) navigate(`/?q=${encodeURIComponent("#" + tag)}`);
         return;
       }
     };
@@ -179,19 +214,22 @@ const AppRoutes: React.FC = () => {
         <Route path="/settings" element={<Settings />} />
         <Route path="/profile/:pubkey" element={<ProfileView />} />
         <Route path="/note/:noteId" element={<NoteDetail />} />
+        <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>
   );
 };
 
 export const App: React.FC = () => (
-  <AppProvider>
-    <SigningProvider>
-      <ProfileProvider>
-        <BrowserRouter>
-          <AppRoutes />
-        </BrowserRouter>
-      </ProfileProvider>
-    </SigningProvider>
-  </AppProvider>
+  <ErrorBoundary>
+    <AppProvider>
+      <SigningProvider>
+        <ProfileProvider>
+          <BrowserRouter>
+            <AppRoutes />
+          </BrowserRouter>
+        </ProfileProvider>
+      </SigningProvider>
+    </AppProvider>
+  </ErrorBoundary>
 );
