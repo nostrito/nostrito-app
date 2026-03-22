@@ -116,6 +116,8 @@ export const ProfileView: React.FC = () => {
   const [notesLoading, setNotesLoading] = useState(false);
   const [articlesLoading, setArticlesLoading] = useState(false);
   const [mediaLoading, setMediaLoading] = useState(false);
+  const [mediaFetching, setMediaFetching] = useState(false);
+  const mediaLoadedRef = useRef(false);
 
   /* --- profile context for batch operations ------------------------- */
   const { ensureProfiles, getProfile } = useProfileContext();
@@ -327,9 +329,15 @@ export const ProfileView: React.FC = () => {
 
   /* --- load media --------------------------------------------------- */
   const loadMedia = useCallback(async () => {
-    if (!pubkey || mediaLoading) return;
-    setMediaLoading(true);
+    if (!pubkey) return;
+
+    const firstLoad = !mediaLoadedRef.current;
+    mediaLoadedRef.current = true;
+
+    if (firstLoad) setMediaLoading(true);
     try {
+      // Always refresh cached media list (picks up items downloaded
+      // in the background since last visit)
       let items: MediaItem[];
       if (isOwn) {
         items = await invoke<MediaItem[]>("get_own_media");
@@ -337,10 +345,24 @@ export const ProfileView: React.FC = () => {
         items = await invoke<MediaItem[]>("get_profile_media", { pubkey });
       }
       setMedia(items);
+
+      // Only trigger on-demand download once per profile visit
+      if (firstLoad && !isOwn) {
+        setMediaFetching(true);
+        invoke<number>("fetch_profile_media", { pubkey })
+          .then(async (downloaded) => {
+            if (downloaded > 0) {
+              const updated = await invoke<MediaItem[]>("get_profile_media", { pubkey });
+              setMedia(updated);
+            }
+          })
+          .catch((e) => console.warn("[profile] Media fetch error:", e))
+          .finally(() => setMediaFetching(false));
+      }
     } catch (e) {
       console.error("[profile] Failed to load media:", e);
     } finally {
-      setMediaLoading(false);
+      if (firstLoad) setMediaLoading(false);
     }
   }, [pubkey, isOwn]);
 
@@ -354,7 +376,7 @@ export const ProfileView: React.FC = () => {
         if (articles.length === 0) loadArticles();
         break;
       case "media":
-        if (media.length === 0) loadMedia();
+        loadMedia();
         break;
     }
   }, [activeTab, loadNotes, loadArticles, loadMedia]);
@@ -381,6 +403,19 @@ export const ProfileView: React.FC = () => {
     window.addEventListener("nostrito:note-published", handler);
     return () => window.removeEventListener("nostrito:note-published", handler);
   }, [pubkey]);
+
+  /* --- listen for progressive media batch downloads ------------------- */
+  useEffect(() => {
+    if (!pubkey || activeTab !== "media") return;
+    const unlisten = listen<MediaItem[]>("profile-media-batch", (ev) => {
+      setMedia((prev) => {
+        const existing = new Set(prev.map((m) => m.hash));
+        const newItems = ev.payload.filter((m) => !existing.has(m.hash));
+        return newItems.length > 0 ? [...prev, ...newItems] : prev;
+      });
+    });
+    return () => { unlisten.then((fn) => fn()); };
+  }, [pubkey, activeTab]);
 
   /* --- listen for relay content updates ------------------------------ */
   useEffect(() => {
@@ -718,7 +753,7 @@ export const ProfileView: React.FC = () => {
                         event={note}
                         profile={getProfile(note.pubkey) ?? profile ?? undefined}
                         compact
-                        onClick={() => navigate(`/note/${note.id}`)}
+                        onClick={() => { console.log("[profile] navigate to note:", note.id.slice(0, 12)); navigate(`/note/${note.id}`); }}
                         onZap={setZapTarget}
                         onLike={handleLike}
                       />
@@ -750,6 +785,7 @@ export const ProfileView: React.FC = () => {
                             key={article.id}
                             event={article}
                             profile={getProfile(article.pubkey) ?? profile ?? undefined}
+                            onClick={() => navigate(`/note/${article.id}`)}
                           />
                         ))}
                       </div>
@@ -763,11 +799,16 @@ export const ProfileView: React.FC = () => {
                     {mediaLoading && media.length === 0 && (
                       <div style={{ color: "var(--text-muted)", padding: 16 }}>loading media...</div>
                     )}
-                    {!mediaLoading && media.length === 0 && (
+                    {!mediaLoading && !mediaFetching && media.length === 0 && (
                       <EmptyState
                         icon={<span className="icon"><IconImage /></span>}
                         message="no media found for this profile."
                       />
+                    )}
+                    {mediaFetching && (
+                      <div style={{ color: "var(--text-muted)", padding: "8px 16px", fontSize: 13 }}>
+                        downloading media{media.length > 0 ? ` (${media.length} loaded)` : ""}...
+                      </div>
                     )}
                     <div className="profile-media-grid">
                       {media.map((item) => {

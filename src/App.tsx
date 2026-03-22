@@ -6,7 +6,7 @@ import { ProfileProvider } from "./context/ProfileContext";
 import { SigningProvider } from "./context/SigningContext";
 import { Titlebar } from "./components/Titlebar";
 import { Sidebar } from "./components/Sidebar";
-import { initMediaViewer } from "./utils/media";
+import { initMediaViewer, closeMediaViewer } from "./utils/media";
 
 // Lazy load screens
 import { Dashboard } from "./screens/Dashboard";
@@ -80,15 +80,24 @@ const AppRoutes: React.FC = () => {
     };
   }, [navigate, setInitialized]);
 
+  // Close media viewer overlay on route change
+  const location = useLocation();
+  useEffect(() => {
+    console.log("[app] route changed to:", location.pathname);
+    closeMediaViewer();
+  }, [location.pathname]);
+
   // Click delegation for [data-pubkey], [data-note-id], [data-naddr] elements
   useEffect(() => {
     const handler = async (e: MouseEvent) => {
       const el = e.target as HTMLElement;
+      console.log("[app:click-delegation] click on:", el.tagName, el.className, "closest event-card:", !!el.closest(".event-card"));
 
       // Profile links
       const pubkeyEl = el.closest("[data-pubkey]") as HTMLElement | null;
       if (pubkeyEl) {
         const pubkey = pubkeyEl.dataset.pubkey;
+        console.log("[app:click-delegation] → profile navigation:", pubkey?.slice(0, 12));
         if (pubkey) navigate(`/profile/${pubkey}`);
         return;
       }
@@ -97,6 +106,7 @@ const AppRoutes: React.FC = () => {
       const noteEl = el.closest("[data-note-id]") as HTMLElement | null;
       if (noteEl) {
         const noteId = noteEl.dataset.noteId;
+        console.log("[app:click-delegation] → note navigation:", noteId?.slice(0, 12));
         if (noteId) navigate(`/note/${noteId}`);
         return;
       }

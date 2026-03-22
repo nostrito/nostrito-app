@@ -3733,6 +3733,113 @@ async fn get_profile_media(pubkey: String, state: State<'_, AppState>) -> Result
     }).collect())
 }
 
+/// On-demand download of a profile's media. Queues URLs from their events,
+/// then downloads in batches, emitting `profile-media-batch` events for
+/// progressive UI updates. Media is cached for at least 1 hour before
+/// becoming eligible for LRU eviction.
+#[tauri::command]
+async fn fetch_profile_media(
+    pubkey: String,
+    app_handle: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<u32, String> {
+    tracing::info!("[cmd:fetch_profile_media] pubkey={}...", &pubkey[..pubkey.len().min(12)]);
+
+    let config = state.config.read().await;
+    let own_pubkey = config.hex_pubkey.clone().unwrap_or_default();
+    let tracked_media_gb = config.storage_tracked_media_gb;
+    let wot_media_gb = config.storage_wot_media_gb;
+    drop(config);
+
+    let db = state.db();
+
+    // Step 1: queue all media URLs from this profile's events
+    let queued = db.requeue_events_media(&pubkey).unwrap_or(0);
+    tracing::info!("[cmd:fetch_profile_media] queued {} URLs for {}...", queued, &pubkey[..pubkey.len().min(12)]);
+
+    if queued == 0 {
+        // Nothing new to download — check if there's already queued items
+        let pending = db.media_queue_count_for_pubkey(&pubkey).unwrap_or(0);
+        if pending == 0 {
+            return Ok(0);
+        }
+    }
+
+    // Step 2: download in batches of 10, emitting progress events
+    let downloader = sync::media::MediaDownloader::new(
+        db.clone(),
+        own_pubkey,
+        tracked_media_gb,
+        wot_media_gb,
+        state.data_dir.clone(),
+    );
+
+    let data_dir = state.data_dir.clone();
+    let mut total_downloaded: u32 = 0;
+    const BATCH_SIZE: usize = 10;
+
+    loop {
+        let urls = db.dequeue_media_urls_for_pubkey(&pubkey, BATCH_SIZE)
+            .unwrap_or_default();
+        if urls.is_empty() {
+            break;
+        }
+
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| e.to_string())?;
+
+        let mut batch_items: Vec<OwnMediaItem> = Vec::new();
+
+        for (url, pk) in &urls {
+            let hash = sync::media::extract_sha256_from_url(url)
+                .unwrap_or_else(|| sync::media::sha256_of_string(url));
+
+            if db.media_exists(&hash) {
+                continue;
+            }
+
+            match downloader.download_one(&http_client, url, &hash, pk).await {
+                Ok(Some((mime, size))) => {
+                    let local_path = paths::media_file_path(&data_dir, &hash)
+                        .to_string_lossy()
+                        .to_string();
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    batch_items.push(OwnMediaItem {
+                        hash,
+                        url: url.clone(),
+                        local_path,
+                        mime_type: mime,
+                        size_bytes: size,
+                        downloaded_at: now,
+                    });
+                    total_downloaded += 1;
+                }
+                Ok(None) => {} // skipped
+                Err(e) => {
+                    tracing::debug!("[cmd:fetch_profile_media] failed {}: {}", url, e);
+                }
+            }
+        }
+
+        // Emit batch of newly downloaded items so the UI can update progressively
+        if !batch_items.is_empty() {
+            app_handle.emit("profile-media-batch", &batch_items).ok();
+        }
+    }
+
+    tracing::info!(
+        "[cmd:fetch_profile_media] done: {} items downloaded for {}...",
+        total_downloaded,
+        &pubkey[..pubkey.len().min(12)]
+    );
+    Ok(total_downloaded)
+}
+
 // ── Profile Fetch Types ────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -6554,6 +6661,7 @@ pub fn run() {
             get_media_stats,
             get_own_media,
             get_profile_media,
+            fetch_profile_media,
             restart_sync,
             reset_sync_cursors,
             get_followers,

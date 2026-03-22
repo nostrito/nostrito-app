@@ -1673,11 +1673,15 @@ impl Database {
     /// List media ordered by last_accessed ASC, EXCLUDING items from a specific pubkey (never evict own media)
     pub fn media_list_lru_excluding_pubkey(&self, limit: usize, exclude_pubkey: &str) -> Result<Vec<(String, u64)>> {
         let conn = self.conn.lock();
+        let one_hour_ago = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64 - 3600;
         let mut stmt = conn.prepare(
-            "SELECT hash, size_bytes FROM media_cache WHERE pubkey != ?1 AND pubkey NOT IN (SELECT pubkey FROM tracked_profiles) ORDER BY last_accessed ASC LIMIT ?2"
+            "SELECT hash, size_bytes FROM media_cache WHERE pubkey != ?1 AND pubkey NOT IN (SELECT pubkey FROM tracked_profiles) AND downloaded_at < ?3 ORDER BY last_accessed ASC LIMIT ?2"
         )?;
         let rows = stmt
-            .query_map(params![exclude_pubkey, limit as i64], |row| {
+            .query_map(params![exclude_pubkey, limit as i64, one_hour_ago], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
             })?
             .filter_map(|r| r.ok())
@@ -1890,6 +1894,40 @@ impl Database {
         }
 
         Ok(rows)
+    }
+
+    /// Dequeue up to `limit` media URLs for a specific pubkey. Deletes them from the queue.
+    pub fn dequeue_media_urls_for_pubkey(&self, pubkey: &str, limit: usize) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT url, pubkey FROM media_queue WHERE pubkey = ?1 ORDER BY priority DESC, queued_at ASC LIMIT ?2",
+        )?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map(params![pubkey, limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if !rows.is_empty() {
+            let placeholders: Vec<String> = rows.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+            let sql = format!("DELETE FROM media_queue WHERE url IN ({})", placeholders.join(","));
+            let param_refs: Vec<&dyn rusqlite::ToSql> = rows.iter().map(|(u, _)| u as &dyn rusqlite::ToSql).collect();
+            conn.execute(&sql, param_refs.as_slice())?;
+        }
+
+        Ok(rows)
+    }
+
+    /// Count pending media queue items for a specific pubkey.
+    pub fn media_queue_count_for_pubkey(&self, pubkey: &str) -> Result<u64> {
+        let conn = self.conn.lock();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM media_queue WHERE pubkey = ?1",
+            params![pubkey],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
     }
 
     /// Get all own media records for the media explorer.

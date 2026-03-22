@@ -64,8 +64,8 @@ impl MediaDownloader {
 
             let bypass_limit = pubkey == &self.own_pubkey || self.tracked_pubkeys.contains(pubkey);
             match self.download_media(&http_client, url, &hash, pubkey, bypass_limit).await {
-                Ok(true) => stats.downloaded += 1,
-                Ok(false) => stats.skipped += 1,
+                Ok(Some(_)) => stats.downloaded += 1,
+                Ok(None) => stats.skipped += 1,
                 Err(e) => {
                     debug!("Media: failed to download {}: {}", url, e);
                     stats.failed += 1;
@@ -87,7 +87,21 @@ impl MediaDownloader {
         Ok(stats)
     }
 
+    /// Download a single media file — public for on-demand profile media fetching.
+    /// Returns Ok(Some((mime, size))) on success, Ok(None) if skipped, Err on failure.
+    pub async fn download_one(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        hash: &str,
+        pubkey: &str,
+    ) -> Result<Option<(String, u64)>> {
+        let bypass_limit = pubkey == &self.own_pubkey || self.tracked_pubkeys.contains(pubkey);
+        self.download_media(client, url, hash, pubkey, bypass_limit).await
+    }
+
     /// Download a single media file.
+    /// Returns Ok(Some((mime, size))) on success, Ok(None) if skipped, Err on failure.
     async fn download_media(
         &self,
         client: &reqwest::Client,
@@ -95,7 +109,7 @@ impl MediaDownloader {
         hash: &str,
         pubkey: &str,
         bypass_limit: bool,
-    ) -> Result<bool> {
+    ) -> Result<Option<(String, u64)>> {
         const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024; // 50 MB
 
         // HEAD request for size/type hints
@@ -115,17 +129,17 @@ impl MediaDownloader {
         // Pre-flight size check
         if let Some(cl) = content_length_hint {
             if cl > MAX_FILE_SIZE {
-                return Ok(false);
+                return Ok(None);
             }
             if !bypass_limit {
                 let used = self.db.media_others_bytes(&self.own_pubkey).unwrap_or(0);
                 if used + cl > self.wot_limit_bytes {
-                    return Ok(false);
+                    return Ok(None);
                 }
             } else if pubkey != &self.own_pubkey && self.tracked_pubkeys.contains(pubkey) {
                 let used = self.db.media_tracked_bytes(&self.own_pubkey).unwrap_or(0);
                 if used + cl > self.tracked_limit_bytes {
-                    return Ok(false);
+                    return Ok(None);
                 }
             }
         }
@@ -133,7 +147,7 @@ impl MediaDownloader {
         // GET
         let response = match client.get(url).send().await {
             Ok(r) if r.status().is_success() => r,
-            _ => return Ok(false),
+            _ => return Ok(None),
         };
 
         let response_mime = response.headers().get("content-type")
@@ -149,25 +163,25 @@ impl MediaDownloader {
             });
 
         if !mime.starts_with("image/") && !mime.starts_with("video/") && !mime.starts_with("audio/") {
-            return Ok(false);
+            return Ok(None);
         }
 
         let bytes = response.bytes().await?;
         let size_bytes = bytes.len() as u64;
 
         if size_bytes == 0 || size_bytes > MAX_FILE_SIZE {
-            return Ok(false);
+            return Ok(None);
         }
 
         if !bypass_limit {
             let used = self.db.media_others_bytes(&self.own_pubkey).unwrap_or(0);
             if used + size_bytes > self.wot_limit_bytes {
-                return Ok(false);
+                return Ok(None);
             }
         } else if pubkey != &self.own_pubkey && self.tracked_pubkeys.contains(pubkey) {
             let used = self.db.media_tracked_bytes(&self.own_pubkey).unwrap_or(0);
             if used + size_bytes > self.tracked_limit_bytes {
-                return Ok(false);
+                return Ok(None);
             }
         }
 
@@ -181,7 +195,7 @@ impl MediaDownloader {
         self.db.store_media_record(hash, url, &mime, size_bytes, pubkey)?;
 
         debug!("Media: downloaded {} ({} bytes, {})", &hash[..12.min(hash.len())], size_bytes, mime);
-        Ok(true)
+        Ok(Some((mime.clone(), size_bytes)))
     }
 
     /// Enforce tracked media storage limit — evict LRU tracked items if over 95%.

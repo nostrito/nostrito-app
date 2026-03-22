@@ -436,4 +436,21 @@ export function initMediaViewer(): void {
 
   // Expose global openMediaViewer for imperative calls (ProfileView, MyMedia grids)
   (window as any).openMediaViewer = showMedia;
+  (window as any).closeMediaViewer = closeViewer;
+}
+
+/** Close the media viewer overlay if it is currently open. */
+export function closeMediaViewer(): void {
+  const viewer = document.getElementById("media-viewer");
+  if (viewer && viewer.style.display === "flex") {
+    viewer.style.display = "none";
+    const video = viewer.querySelector("#media-viewer-video") as HTMLVideoElement | null;
+    if (video) {
+      video.pause();
+      video.removeAttribute("src");
+      video.load();
+    }
+    const img = viewer.querySelector("#media-viewer-img") as HTMLImageElement | null;
+    if (img) img.removeAttribute("src");
+  }
 }

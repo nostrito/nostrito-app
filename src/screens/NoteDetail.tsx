@@ -240,6 +240,7 @@ export const NoteDetail: React.FC = () => {
   // Load the main event first, then thread data
   useEffect(() => {
     if (!noteId) return;
+    console.log("[note-detail] loading noteId:", noteId);
     setLoading(true);
     setThreadData(null);
     setShowNonWot(false);
@@ -249,7 +250,9 @@ export const NoteDetail: React.FC = () => {
       // Load the main event — show it immediately
       let mainEvent: NostrEvent | null = null;
       try {
+        console.log("[note-detail] calling get_event...");
         mainEvent = await invoke<NostrEvent | null>("get_event", { id: noteId });
+        console.log("[note-detail] get_event result:", mainEvent ? `kind=${mainEvent.kind}` : "null");
         setEvent(mainEvent);
         if (mainEvent) ensureProfiles([mainEvent.pubkey]);
       } catch (e) {
@@ -258,9 +261,11 @@ export const NoteDetail: React.FC = () => {
 
       // If event not in local DB, fetch from relays
       if (!mainEvent) {
+        console.log("[note-detail] event not found locally, fetching from relays...");
         try {
           await invoke("fetch_note_context_from_relays", { noteId });
           mainEvent = await invoke<NostrEvent | null>("get_event", { id: noteId });
+          console.log("[note-detail] relay fetch result:", mainEvent ? `kind=${mainEvent.kind}` : "null");
           if (mainEvent) {
             setEvent(mainEvent);
             ensureProfiles([mainEvent.pubkey]);
@@ -270,6 +275,7 @@ export const NoteDetail: React.FC = () => {
         }
       }
 
+      console.log("[note-detail] setLoading(false), displayEvent:", mainEvent ? "found" : "NOT FOUND");
       setLoading(false);
 
       // Determine root for thread fetch
@@ -394,6 +400,7 @@ export const NoteDetail: React.FC = () => {
 
   // Determine the display event (root event if available, otherwise the clicked event)
   const displayEvent = threadData?.root ?? event;
+  console.log("[note-detail] render: noteId=", noteId?.slice(0, 12), "loading=", loading, "displayEvent=", displayEvent ? `kind=${displayEvent.kind}` : "null", "event=", event ? "yes" : "no", "threadData=", threadData ? "yes" : "no");
 
   return (
     <div className="screen-page note-detail-page">

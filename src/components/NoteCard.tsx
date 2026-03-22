@@ -595,12 +595,14 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, ful
   const eventContent = renderEventContent(displayContent, mentionProfiles, full, { eventId: event.id, pubkey: event.pubkey });
 
   const handleClick = (e: React.MouseEvent) => {
-    if ((e.target as HTMLElement).closest("[data-pubkey]")) return;
-    if ((e.target as HTMLElement).closest("[data-note-id]")) return;
-    if ((e.target as HTMLElement).closest("[data-naddr]")) return;
-    if ((e.target as HTMLElement).closest("[data-media-url]")) return;
-    if ((e.target as HTMLElement).closest("a")) return;
-    if ((e.target as HTMLElement).closest(".ev-actions")) return;
+    const target = e.target as HTMLElement;
+    if (target.closest("[data-pubkey]")) { console.log("[notecard] click blocked: data-pubkey"); return; }
+    if (target.closest("[data-note-id]")) { console.log("[notecard] click blocked: data-note-id"); return; }
+    if (target.closest("[data-naddr]")) { console.log("[notecard] click blocked: data-naddr"); return; }
+    if (target.closest("[data-media-url]")) { console.log("[notecard] click blocked: data-media-url"); return; }
+    if (target.closest("a")) { console.log("[notecard] click blocked: anchor"); return; }
+    if (target.closest(".ev-actions")) { console.log("[notecard] click blocked: ev-actions"); return; }
+    console.log("[notecard] click → onClick(), event.id:", event.id.slice(0, 12), "target:", target.tagName, target.className);
     onClick?.();
   };
 
