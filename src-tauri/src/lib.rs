@@ -4339,6 +4339,44 @@ fn nsec_to_npub(nsec: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+fn generate_keypair() -> Result<serde_json::Value, String> {
+    use nostr_sdk::prelude::*;
+    let keys = Keys::generate();
+    let nsec = keys.secret_key().to_bech32()
+        .map_err(|e| format!("Failed to encode nsec: {}", e))?;
+    let npub = keys.public_key().to_bech32()
+        .map_err(|e| format!("Failed to encode npub: {}", e))?;
+    Ok(serde_json::json!({ "nsec": nsec, "npub": npub }))
+}
+
+#[tauri::command]
+async fn publish_metadata(
+    name: Option<String>,
+    about: Option<String>,
+    picture: Option<String>,
+    nip05: Option<String>,
+    lud16: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    use nostr_sdk::prelude::*;
+
+    let mut metadata = Metadata::new();
+    if let Some(v) = name { metadata = metadata.name(v); }
+    if let Some(v) = about { metadata = metadata.about(v); }
+    if let Some(v) = picture {
+        if let Ok(url) = nostr_sdk::prelude::Url::parse(&v) {
+            metadata = metadata.picture(url);
+        }
+    }
+    if let Some(v) = nip05 { metadata = metadata.nip05(v); }
+    if let Some(v) = lud16 { metadata = metadata.lud16(v); }
+
+    let builder = EventBuilder::metadata(&metadata);
+    let event = sign_build_publish_store(builder, &state).await?;
+    Ok(event.id.to_hex())
+}
+
+#[tauri::command]
 async fn set_nsec(nsec: String, app_handle: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     use nostr_sdk::prelude::*;
 
@@ -6684,6 +6722,8 @@ pub fn run() {
             fetch_profile,
             get_profile_with_refresh,
             nsec_to_npub,
+            generate_keypair,
+            publish_metadata,
             set_nsec,
             clear_nsec,
             get_signing_mode,

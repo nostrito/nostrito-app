@@ -73,7 +73,7 @@ Last updated: 2026-03-21
 ## Missing Entirely
 
 ### Core Social
-- [ ] **Profile editing** — no way to update your own kind 0 metadata (name, bio, picture, banner, NIP-05, LN address)
+- [ ] **Profile editing** — no way to update your own kind 0 metadata after initial setup (name, bio, picture, banner, NIP-05, LN address). Backend `publish_metadata` command exists.
 - [ ] **Repost button** — can view reposts but can't create them
 - [ ] **Unlike / unreact** — no toggle for reactions
 - [ ] **Quote reposts** (kind 1 with `q` tag) — not supported
@@ -82,7 +82,14 @@ Last updated: 2026-03-21
 - [ ] **Bookmark lists** (NIP-51 kind 30001/10003) — media bookmarks exist but no event/note bookmarking
 
 ### Content
-- [ ] **Media upload** — can only reference URLs, no upload to nostr.build / blossom / void.cat
+- [ ] **Media upload service** — need a real upload integration (default provider configurable in settings). Required for:
+  1. **Profile pictures** — upload during setup wizard and profile editing
+  2. **Banners** — upload during profile editing
+  3. **Article covers** — upload when composing/editing kind 30023 articles
+  4. **Notes** — media uploader in compose modal for attaching images/videos to kind 1 notes
+  - Candidate services: nostr.build, blossom (NIP-96), void.cat, nostrimg.com
+  - Should support at minimum image upload; video/audio as stretch goals
+  - Provider selection in Settings with a sensible default (e.g. nostr.build)
 - [ ] **Image/video preview in compose** — no preview when pasting media URLs
 - [ ] **Content warnings** (NIP-36) — no support for `content-warning` tag
 - [ ] **Custom emoji** (NIP-30) — no custom emoji reactions or display
@@ -165,6 +172,17 @@ for backward compatibility with older clients.
 - [ ] **Auto-zaps / recurring zaps** — not supported
 - [ ] **Split zaps** (NIP-57) — not supported
 - [ ] **Lightning address verification** — no verification of lud16 before zapping
+
+### Data Preservation & Rebroadcasting
+- [ ] **Event rebroadcasting** — detect when tracked users' events have fallen off relays and re-publish them from the local cache. Fully feasible: signed events are immutable, any relay will accept a valid signature regardless of age.
+- [ ] **Media rebroadcasting / dead-link recovery** — detect when cached media files are no longer available at their original URLs (blossom servers down, nostr.build purged, etc.) and re-upload from local cache to a working media service.
+  - **Limitation**: re-uploading to a *different* service produces a new URL, but **existing notes cannot be rewritten** — the event id is a hash of the content, so changing the URL would invalidate the signature. The original links in published notes stay broken.
+  - **Blossom (content-addressed)**: URLs are `https://server/<sha256>.<ext>`. If re-uploaded to the *same* server the URL works again. If to a different blossom server, the hash matches but the domain differs — would require clients to support multi-server hash lookup (not widely adopted yet).
+  - **Possible mitigations**:
+    1. Publish **NIP-94 file metadata events (kind 1063)** mapping the original URL / file hash → new URL. Smart clients could use these as fallback resolution. Ecosystem support is still nascent.
+    2. For the user's *own* notes: offer to publish a **new event** (delete old + repost with updated links). Destructive but functional.
+    3. Proactive redundancy: at upload time, push to multiple media services simultaneously so if one dies the others still serve the file.
+  - **Bottom line**: event rebroadcasting is a clear win. Media recovery is partially solvable today and will improve as blossom and NIP-94 adoption grows.
 
 ### Platform
 - [ ] **Keyboard shortcuts** — none implemented

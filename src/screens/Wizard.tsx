@@ -22,6 +22,8 @@ import {
   IconScale,
   IconArchive,
   IconUsers,
+  IconAlertTriangle,
+  IconCopy,
 } from "../components/Icon";
 import {
   STORAGE_PRESETS,
@@ -44,6 +46,13 @@ interface MediaTypes {
   images: boolean;
   videos: boolean;
   audio: boolean;
+}
+interface ProfileData {
+  name: string;
+  about: string;
+  picture: string;
+  nip05: string;
+  lud16: string;
 }
 
 /* ------------------------------------------------------------------ */
@@ -101,6 +110,12 @@ export const Wizard: React.FC = () => {
   const [wotMediaGb, setWotMediaGb] = useState(2);
   const [mediaTypes, setMediaTypes] = useState<MediaTypes>({ images: true, videos: true, audio: true });
 
+  // New account state
+  const [newAccountGenerated, setNewAccountGenerated] = useState(false);
+  const [newAccountNsec, setNewAccountNsec] = useState("");
+  const [newAccountNsecCopied, setNewAccountNsecCopied] = useState(false);
+  const [profileData, setProfileData] = useState<ProfileData>({ name: "", about: "", picture: "", nip05: "", lud16: "" });
+
   // NIP-46 bunker state
   const [bunkerUri, setBunkerUri] = useState("");
   const [bunkerError, setBunkerError] = useState("");
@@ -157,6 +172,9 @@ export const Wizard: React.FC = () => {
         if (p.trackedMediaGb != null) setTrackedMediaGb(p.trackedMediaGb);
         if (p.wotMediaGb != null) setWotMediaGb(p.wotMediaGb);
         if (p.mediaTypes) setMediaTypes(p.mediaTypes);
+        if (p.profileData) setProfileData(p.profileData);
+        if (p.newAccountGenerated) setNewAccountGenerated(true);
+        if (p.newAccountNsec) setNewAccountNsec(p.newAccountNsec);
         if (p.step) setStep(p.step);
       } catch (_) {}
       localStorage.removeItem("nostrito_wizard_progress");
@@ -242,6 +260,19 @@ export const Wizard: React.FC = () => {
     }
   }, [connectRelay]);
 
+  /* --- new account handler ------------------------------------------ */
+  const handleGenerateKeypair = useCallback(async () => {
+    try {
+      const result = await invoke<{ nsec: string; npub: string }>("generate_keypair");
+      setNewAccountNsec(result.nsec);
+      setNsecInput(result.nsec);
+      setNpub(result.npub);
+      setNewAccountGenerated(true);
+    } catch (e: any) {
+      setNsecError(String(e));
+    }
+  }, []);
+
   /* --- navigation logic --------------------------------------------- */
   const canGoNext = (): boolean => {
     if (step === 1) {
@@ -250,6 +281,7 @@ export const Wizard: React.FC = () => {
         if (signerType === "nsec") return nsecInput.trim().startsWith("nsec1");
         if (signerType === "bunker") return bunkerConnected;
         if (signerType === "connect") return connectConnected;
+        if (signerType === "new") return newAccountGenerated;
         return signerType !== null;
       }
     }
@@ -308,7 +340,7 @@ export const Wizard: React.FC = () => {
           identityMode,
           npub,
           signerType,
-          nsecInput: identityMode === "full" && signerType === "nsec" ? nsecInput : "",
+          nsecInput: identityMode === "full" && (signerType === "nsec" || signerType === "new") ? nsecInput : "",
           selectedRelays: Array.from(selectedRelays),
           storagePreset,
           othersEventsGb,
@@ -316,6 +348,9 @@ export const Wizard: React.FC = () => {
           wotMediaGb,
           mediaTypes,
           bunkerUri: identityMode === "full" && signerType === "bunker" ? bunkerUri : "",
+          profileData: signerType === "new" ? profileData : undefined,
+          newAccountGenerated: signerType === "new" ? newAccountGenerated : undefined,
+          newAccountNsec: signerType === "new" ? newAccountNsec : undefined,
         }));
         await invoke("set_data_dir", { path: dataDir, migrate: false });
         // Restart the app so it picks up the new path
@@ -341,9 +376,25 @@ export const Wizard: React.FC = () => {
       console.log("[wizard] init_nostrito succeeded");
 
       // If nsec was provided, store it in keychain
-      if (identityMode === "full" && signerType === "nsec" && nsecInput.trim()) {
+      if (identityMode === "full" && (signerType === "nsec" || signerType === "new") && nsecInput.trim()) {
         await invoke("set_nsec", { nsec: nsecInput.trim() });
         console.log("[wizard] nsec saved to keychain");
+      }
+
+      // If new account, publish profile metadata (kind 0)
+      if (signerType === "new" && profileData.name.trim()) {
+        try {
+          await invoke("publish_metadata", {
+            name: profileData.name.trim() || null,
+            about: profileData.about.trim() || null,
+            picture: profileData.picture.trim() || null,
+            nip05: profileData.nip05.trim() || null,
+            lud16: profileData.lud16.trim() || null,
+          });
+          console.log("[wizard] profile metadata published");
+        } catch (e) {
+          console.warn("[wizard] failed to publish profile metadata:", e);
+        }
       }
 
       localStorage.setItem("nostrito_initialized", "true");
@@ -529,6 +580,17 @@ export const Wizard: React.FC = () => {
                 connectError={connectError}
                 onGenerateConnectUri={handleGenerateConnectUri}
                 onCopyConnectUri={() => navigator.clipboard.writeText(connectUri)}
+                newAccountGenerated={newAccountGenerated}
+                newAccountNsec={newAccountNsec}
+                newAccountNsecCopied={newAccountNsecCopied}
+                onCopyNsec={async () => {
+                  await navigator.clipboard.writeText(newAccountNsec);
+                  setNewAccountNsecCopied(true);
+                  setTimeout(() => setNewAccountNsecCopied(false), 2000);
+                }}
+                onGenerateKeypair={handleGenerateKeypair}
+                profileData={profileData}
+                onProfileDataChange={setProfileData}
               />
             )}
             {step === 2 && (
@@ -615,6 +677,14 @@ interface StepIdentityProps {
   connectError: string;
   onGenerateConnectUri: () => void;
   onCopyConnectUri: () => void;
+  // New account
+  newAccountGenerated: boolean;
+  newAccountNsec: string;
+  newAccountNsecCopied: boolean;
+  onCopyNsec: () => void;
+  onGenerateKeypair: () => void;
+  profileData: ProfileData;
+  onProfileDataChange: (data: ProfileData) => void;
 }
 
 const StepIdentity: React.FC<StepIdentityProps> = ({
@@ -643,172 +713,298 @@ const StepIdentity: React.FC<StepIdentityProps> = ({
   connectError,
   onGenerateConnectUri,
   onCopyConnectUri,
-}) => (
-  <>
-    <h3 className="wiz-title">your identity</h3>
-    <p className="wiz-subtitle">choose how to connect. you can always upgrade later.</p>
+  newAccountGenerated,
+  newAccountNsec,
+  newAccountNsecCopied,
+  onCopyNsec,
+  onGenerateKeypair,
+  profileData,
+  onProfileDataChange,
+}) => {
+  /* Does the selected signer have an expanded right panel? */
+  const hasRightPanel =
+    identityMode === "full" && signerType !== null;
 
-    <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 20, width: "100%", maxWidth: 480 }}>
-      <div
-        className={`wiz-identity-option${identityMode === "readonly" ? " selected" : ""}`}
-        onClick={() => onIdentityModeChange("readonly")}
-      >
-        <div className="wiz-identity-title">
-          <span className="icon"><IconBookOpen /></span> read-only
+  /* Right panel content for each signer type */
+  const renderRightPanel = () => {
+    if (identityMode === "readonly") {
+      return (
+        <div className="wiz-identity-detail">
+          <input
+            type="text"
+            className="wiz-input"
+            placeholder="npub1..."
+            value={npub}
+            onChange={onNpubChange}
+            spellCheck={false}
+            autoComplete="off"
+            autoFocus
+            ref={npubInputRef}
+            style={{ maxWidth: "100%" }}
+          />
+          {npubError && <p className="wiz-error">{npubError}</p>}
         </div>
-        <div className="wiz-identity-desc">
-          paste your npub. DMs disabled, everything else works.
-        </div>
-      </div>
-      <div
-        className={`wiz-identity-option${identityMode === "full" ? " selected" : ""}`}
-        onClick={() => onIdentityModeChange("full")}
-      >
-        <div className="wiz-identity-title">
-          <span className="icon"><IconKey /></span> full access
-        </div>
-        <div className="wiz-identity-desc">
-          connect nsec, nbunker, or nostr connect. unlocks DMs.
-        </div>
-      </div>
-    </div>
+      );
+    }
 
-    {/* Readonly: npub input */}
-    {identityMode === "readonly" && (
-      <div style={{ width: "100%", maxWidth: 480 }}>
-        <input
-          type="text"
-          className="wiz-input"
-          placeholder="npub1..."
-          value={npub}
-          onChange={onNpubChange}
-          spellCheck={false}
-          autoComplete="off"
-          autoFocus
-          ref={npubInputRef}
-        />
-        {npubError && <p className="wiz-error">{npubError}</p>}
-      </div>
-    )}
+    if (signerType === "nsec") {
+      return (
+        <div className="wiz-identity-detail">
+          <h4 className="wiz-detail-title">paste your private key</h4>
+          <p className="wiz-detail-desc">stored encrypted in your macOS keychain. never leaves your device.</p>
+          <input
+            type="password"
+            className="wiz-input"
+            placeholder="nsec1..."
+            value={nsecInput}
+            onChange={onNsecChange}
+            spellCheck={false}
+            autoComplete="off"
+            autoFocus
+            style={{ maxWidth: "100%" }}
+          />
+          {nsecError && <p className="wiz-error">{nsecError}</p>}
+        </div>
+      );
+    }
 
-    {/* Full access: signer options */}
-    {identityMode === "full" && (
-      <div style={{ display: "flex", flexDirection: "column", gap: 10, width: "100%", maxWidth: 480 }}>
-        {SIGNER_OPTIONS.map((opt) => (
-          <div
-            key={opt.type}
-            className={`wiz-signer-option${signerType === opt.type ? " selected" : ""}`}
-            onClick={() => onSignerTypeChange(opt.type)}
-          >
-            {opt.icon} {opt.label}
-          </div>
-        ))}
-        {signerType === "nsec" && (
-          <div style={{ marginTop: 8 }}>
-            <input
-              type="password"
-              className="wiz-input"
-              placeholder="nsec1..."
-              value={nsecInput}
-              onChange={onNsecChange}
-              spellCheck={false}
-              autoComplete="off"
-              autoFocus
-            />
-            {nsecError && <p className="wiz-error">{nsecError}</p>}
-          </div>
-        )}
-        {signerType === "bunker" && (
-          <div style={{ marginTop: 8 }}>
-            <input
-              type="text"
-              className="wiz-input"
-              placeholder="bunker://..."
-              value={bunkerUri}
-              onChange={onBunkerUriChange}
-              spellCheck={false}
-              autoComplete="off"
-              autoFocus
-              disabled={bunkerConnecting || bunkerConnected}
-            />
-            {bunkerError && <p className="wiz-error">{bunkerError}</p>}
-            {bunkerConnected ? (
-              <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 8, color: "var(--accent)", fontSize: "0.82rem" }}>
-                <span className="icon"><IconCheckCircle /></span> Connected as {npub.slice(0, 20)}...
-              </div>
-            ) : (
-              <button
-                className={`btn btn-primary${bunkerConnecting || !bunkerUri.trim().startsWith("bunker://") ? " disabled" : ""}`}
-                disabled={bunkerConnecting || !bunkerUri.trim().startsWith("bunker://")}
-                onClick={onConnectBunker}
-                style={{ marginTop: 8 }}
-              >
-                {bunkerConnecting ? "Connecting..." : "Connect to Bunker"}
+    if (signerType === "bunker") {
+      return (
+        <div className="wiz-identity-detail">
+          <h4 className="wiz-detail-title">connect to a NIP-46 bunker</h4>
+          <p className="wiz-detail-desc">your keys stay on the bunker server. paste the bunker URI below.</p>
+          <input
+            type="text"
+            className="wiz-input"
+            placeholder="bunker://..."
+            value={bunkerUri}
+            onChange={onBunkerUriChange}
+            spellCheck={false}
+            autoComplete="off"
+            autoFocus
+            disabled={bunkerConnecting || bunkerConnected}
+            style={{ maxWidth: "100%" }}
+          />
+          {bunkerError && <p className="wiz-error">{bunkerError}</p>}
+          {bunkerConnected ? (
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 10, color: "var(--green)", fontSize: "0.82rem" }}>
+              <span className="icon"><IconCheckCircle /></span> connected as {npub.slice(0, 20)}...
+            </div>
+          ) : (
+            <button
+              className={`btn btn-primary${bunkerConnecting || !bunkerUri.trim().startsWith("bunker://") ? " disabled" : ""}`}
+              disabled={bunkerConnecting || !bunkerUri.trim().startsWith("bunker://")}
+              onClick={onConnectBunker}
+              style={{ marginTop: 10 }}
+            >
+              {bunkerConnecting ? "connecting..." : "connect"}
+            </button>
+          )}
+        </div>
+      );
+    }
+
+    if (signerType === "connect") {
+      return (
+        <div className="wiz-identity-detail">
+          <h4 className="wiz-detail-title">nostr connect (NIP-46)</h4>
+          <p className="wiz-detail-desc">scan the QR code with your signer app (nsec.app, Amber, etc.)</p>
+          {!connectUri ? (
+            <>
+              <input
+                type="text"
+                className="wiz-input"
+                placeholder="wss://relay.nsec.app"
+                value={connectRelay}
+                onChange={onConnectRelayChange}
+                spellCheck={false}
+                autoComplete="off"
+                style={{ marginBottom: 10, maxWidth: "100%" }}
+              />
+              <button className="btn btn-primary" onClick={onGenerateConnectUri}>
+                generate QR code
               </button>
-            )}
-          </div>
-        )}
-        {signerType === "connect" && (
-          <div style={{ marginTop: 8 }}>
-            {!connectUri ? (
-              <>
-                <input
-                  type="text"
-                  className="wiz-input"
-                  placeholder="wss://relay.nsec.app"
-                  value={connectRelay}
-                  onChange={onConnectRelayChange}
-                  spellCheck={false}
-                  autoComplete="off"
-                  style={{ marginBottom: 8 }}
-                />
-                <button className="btn btn-primary" onClick={onGenerateConnectUri}>
-                  Generate Connect URI
+            </>
+          ) : connectConnected ? (
+            <div style={{ display: "flex", alignItems: "center", gap: 6, color: "var(--green)", fontSize: "0.82rem" }}>
+              <span className="icon"><IconCheckCircle /></span> connected as {npub.slice(0, 20)}...
+            </div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 12 }}>
+              <div style={{ padding: 12, background: "#fff", borderRadius: 12, display: "inline-flex" }}>
+                <QRCodeSVG value={connectUri} size={180} level="M" />
+              </div>
+              <div style={{ display: "flex", gap: 8, alignItems: "center", width: "100%" }}>
+                <code style={{
+                  fontSize: "0.68rem", flex: 1, overflow: "hidden", textOverflow: "ellipsis",
+                  whiteSpace: "nowrap", padding: "8px", background: "var(--bg-card)", borderRadius: 6,
+                  border: "1px solid var(--border)", color: "var(--text-dim)",
+                }}>
+                  {connectUri}
+                </code>
+                <button className="btn btn-secondary" onClick={onCopyConnectUri} title="Copy" style={{ flexShrink: 0 }}>
+                  <span className="icon"><IconClipboard /></span>
                 </button>
-              </>
-            ) : connectConnected ? (
-              <div style={{ display: "flex", alignItems: "center", gap: 6, color: "var(--accent)", fontSize: "0.82rem" }}>
-                <span className="icon"><IconCheckCircle /></span> Connected as {npub.slice(0, 20)}...
               </div>
-            ) : (
-              <div>
-                <p style={{ fontSize: "0.8rem", color: "var(--text-muted)", marginBottom: 12 }}>
-                  Scan with your signer app or copy the URI:
+              {connectWaiting && (
+                <p style={{ fontSize: "0.8rem", color: "var(--text-muted)", textAlign: "center" }}>
+                  waiting for signer to connect...
                 </p>
-                <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 12 }}>
-                  <div style={{
-                    padding: 12, background: "#fff", borderRadius: 12,
-                    display: "inline-flex",
-                  }}>
-                    <QRCodeSVG value={connectUri} size={180} level="M" />
-                  </div>
-                  <div style={{ display: "flex", gap: 8, alignItems: "center", width: "100%" }}>
-                    <code style={{
-                      fontSize: "0.68rem", flex: 1, overflow: "hidden", textOverflow: "ellipsis",
-                      whiteSpace: "nowrap", padding: "8px", background: "var(--bg-card)", borderRadius: 6,
-                      border: "1px solid var(--border)", color: "var(--text-dim)",
-                    }}>
-                      {connectUri}
-                    </code>
-                    <button className="btn btn-secondary" onClick={onCopyConnectUri} title="Copy" style={{ flexShrink: 0 }}>
-                      <span className="icon"><IconClipboard /></span>
-                    </button>
-                  </div>
+              )}
+            </div>
+          )}
+          {connectError && <p className="wiz-error">{connectError}</p>}
+        </div>
+      );
+    }
+
+    if (signerType === "new") {
+      return (
+        <div className="wiz-identity-detail">
+          {!newAccountGenerated ? (
+            <>
+              <h4 className="wiz-detail-title">create a new nostr identity</h4>
+              <p className="wiz-detail-desc">
+                we'll generate a fresh keypair for you. your private key (nsec) will be stored
+                in your macOS keychain.
+              </p>
+              <button className="btn btn-primary" onClick={onGenerateKeypair}>
+                <span className="icon"><IconSparkles /></span> generate keys
+              </button>
+            </>
+          ) : (
+            <>
+              {/* nsec display + warning */}
+              <div className="wiz-nsec-box">
+                <div className="wiz-nsec-warning">
+                  <span className="icon" style={{ color: "var(--yellow, #ffbd2e)" }}><IconAlertTriangle /></span>
+                  <span>save your private key somewhere safe. if you lose it, you lose your identity forever.</span>
                 </div>
-                {connectWaiting && (
-                  <p style={{ fontSize: "0.8rem", color: "var(--text-muted)", marginTop: 8, textAlign: "center" }}>
-                    Waiting for signer to connect...
-                  </p>
-                )}
+                <div className="wiz-nsec-display">
+                  <code className="wiz-nsec-text">{newAccountNsec}</code>
+                  <button className="btn btn-secondary wiz-nsec-copy" onClick={onCopyNsec} title="Copy nsec">
+                    <span className="icon"><IconCopy /></span>
+                  </button>
+                </div>
+                <span className={`wiz-copy-feedback${newAccountNsecCopied ? " visible" : ""}`}>
+                  {newAccountNsecCopied ? "copied!" : ""}
+                </span>
               </div>
-            )}
-            {connectError && <p className="wiz-error">{connectError}</p>}
+
+              {/* Profile form */}
+              <div className="wiz-profile-form">
+                <h4 className="wiz-detail-title" style={{ marginTop: 16 }}>set up your profile</h4>
+                <p className="wiz-detail-desc">optional — you can always edit this later.</p>
+                <div className="wiz-profile-fields">
+                  <input
+                    type="text"
+                    className="wiz-input wiz-input-sm"
+                    placeholder="display name"
+                    value={profileData.name}
+                    onChange={(e) => onProfileDataChange({ ...profileData, name: e.target.value })}
+                    autoFocus
+                  />
+                  <textarea
+                    className="wiz-input wiz-input-sm wiz-textarea"
+                    placeholder="about you..."
+                    value={profileData.about}
+                    onChange={(e) => onProfileDataChange({ ...profileData, about: e.target.value })}
+                    rows={3}
+                  />
+                  <input
+                    type="url"
+                    className="wiz-input wiz-input-sm"
+                    placeholder="profile picture URL"
+                    value={profileData.picture}
+                    onChange={(e) => onProfileDataChange({ ...profileData, picture: e.target.value })}
+                  />
+                  <input
+                    type="text"
+                    className="wiz-input wiz-input-sm"
+                    placeholder="NIP-05 (e.g. you@domain.com)"
+                    value={profileData.nip05}
+                    onChange={(e) => onProfileDataChange({ ...profileData, nip05: e.target.value })}
+                  />
+                  <input
+                    type="text"
+                    className="wiz-input wiz-input-sm"
+                    placeholder="lightning address (e.g. you@getalby.com)"
+                    value={profileData.lud16}
+                    onChange={(e) => onProfileDataChange({ ...profileData, lud16: e.target.value })}
+                  />
+                </div>
+              </div>
+            </>
+          )}
+          {nsecError && <p className="wiz-error">{nsecError}</p>}
+        </div>
+      );
+    }
+
+    return null;
+  };
+
+  const rightContent = renderRightPanel();
+
+  return (
+    <>
+      <h3 className="wiz-title">your identity</h3>
+      <p className="wiz-subtitle">choose how to connect. you can always upgrade later.</p>
+
+      <div className={`wiz-identity-columns${hasRightPanel || identityMode === "readonly" ? " has-detail" : ""}`}>
+        {/* Left column: mode + signer options */}
+        <div className="wiz-identity-left">
+          <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: identityMode === "full" ? 16 : 0 }}>
+            <div
+              className={`wiz-identity-option${identityMode === "readonly" ? " selected" : ""}`}
+              onClick={() => onIdentityModeChange("readonly")}
+            >
+              <div className="wiz-identity-title">
+                <span className="icon"><IconBookOpen /></span> read-only
+              </div>
+              <div className="wiz-identity-desc">
+                paste your npub. DMs disabled, everything else works.
+              </div>
+            </div>
+            <div
+              className={`wiz-identity-option${identityMode === "full" ? " selected" : ""}`}
+              onClick={() => onIdentityModeChange("full")}
+            >
+              <div className="wiz-identity-title">
+                <span className="icon"><IconKey /></span> full access
+              </div>
+              <div className="wiz-identity-desc">
+                connect nsec, nbunker, or nostr connect. unlocks DMs.
+              </div>
+            </div>
+          </div>
+
+          {/* Signer options (shown when full access selected) */}
+          {identityMode === "full" && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {SIGNER_OPTIONS.map((opt) => (
+                <div
+                  key={opt.type}
+                  className={`wiz-signer-option${signerType === opt.type ? " selected" : ""}`}
+                  onClick={() => onSignerTypeChange(opt.type)}
+                >
+                  {opt.icon} {opt.label}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Right column: detail panel for selected option */}
+        {rightContent && (
+          <div className="wiz-identity-right">
+            {rightContent}
           </div>
         )}
       </div>
-    )}
-  </>
-);
+    </>
+  );
+};
 
 /* ================================================================== */
 /*  Step 2: Relays                                                     */
