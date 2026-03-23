@@ -197,7 +197,7 @@ export const Storage: React.FC = () => {
       {/* ---- Ownership grid ---- */}
       <div className="ownership-grid">
         {/* Own Events */}
-        <Link to="/storage/own-events" className="ownership-card own" style={{ textDecoration: "none", color: "inherit" }}>
+        <Link to="/settings/analytics/own-events" className="ownership-card own" style={{ textDecoration: "none", color: "inherit" }}>
           <div className="ownership-card-header">
             <div className="ownership-card-header-left">
               {ownProfile && (
@@ -233,7 +233,7 @@ export const Storage: React.FC = () => {
         </Link>
 
         {/* Tracked Profiles */}
-        <Link to="/storage/tracked-profiles" className="ownership-card tracked" style={{ textDecoration: "none", color: "inherit" }}>
+        <Link to="/settings/analytics/tracked-profiles" className="ownership-card tracked" style={{ textDecoration: "none", color: "inherit" }}>
           <div className="ownership-card-header">
             <div className="ownership-card-header-left">
               {trackedAvatars.length > 0 && (
@@ -274,7 +274,7 @@ export const Storage: React.FC = () => {
         </Link>
 
         {/* WoT Profiles */}
-        <Link to="/storage/wot-profiles" className="ownership-card wot" style={{ textDecoration: "none", color: "inherit" }}>
+        <Link to="/settings/analytics/wot-profiles" className="ownership-card wot" style={{ textDecoration: "none", color: "inherit" }}>
           <div className="ownership-card-header">
             <div className="ownership-card-header-left">
               {wotAvatarPubkeys.length > 0 && (
