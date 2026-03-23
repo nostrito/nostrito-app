@@ -2,16 +2,20 @@
  * Same pattern as useReactionStatus — collects event IDs from all
  * rendered NoteCards, debounces 100ms, then calls get_bookmarked_event_ids
  * in a single batch invoke.
+ *
+ * Bookmark status is private (NIP-51 encrypted) — never reveal it without a signing key.
  */
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { useSigningContext } from "../context/SigningContext";
 
 // Module-level shared state for batching
 const pendingIds = new Set<string>();
 const cache = new Map<string, boolean>();
 const listeners = new Set<() => void>();
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
+let hasSigningKey = false;
 
 function notifyListeners() {
   for (const cb of listeners) cb();
@@ -19,7 +23,7 @@ function notifyListeners() {
 
 async function flush() {
   flushTimer = null;
-  if (pendingIds.size === 0) return;
+  if (pendingIds.size === 0 || !hasSigningKey) return;
 
   const ids = Array.from(pendingIds);
   pendingIds.clear();
@@ -55,13 +59,20 @@ listen<number>("bookmarks-synced", () => {
   invalidateBookmarkStatus();
 });
 
-/** Returns whether the current user has bookmarked this event. */
+/** Returns whether the current user has bookmarked this event.
+ *  Always returns false when no signing key is available — bookmark status is private. */
 export function useBookmarkStatus(eventId: string): boolean {
+  const { canWrite } = useSigningContext();
   const [, setTick] = useState(0);
   const idRef = useRef(eventId);
   idRef.current = eventId;
 
+  // Sync module-level flag so flush() respects signing state
+  hasSigningKey = canWrite;
+
   useEffect(() => {
+    if (!canWrite) return;
+
     const cb = () => setTick((t) => t + 1);
     listeners.add(cb);
 
@@ -73,8 +84,9 @@ export function useBookmarkStatus(eventId: string): boolean {
     return () => {
       listeners.delete(cb);
     };
-  }, [eventId]);
+  }, [eventId, canWrite]);
 
+  if (!canWrite) return false;
   return cache.get(eventId) ?? false;
 }
 

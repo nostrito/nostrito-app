@@ -45,7 +45,7 @@ class ErrorBoundary extends React.Component<
 
 // Lazy load screens
 import { Feed } from "./screens/Feed";
-import { Bookmarks } from "./screens/Bookmarks";
+// import { Bookmarks } from "./screens/Bookmarks"; // TODO: NIP-51 bookmarks pending interop fixes
 import { Dms } from "./screens/Dms";
 import { Wot } from "./screens/Wot";
 import { Settings } from "./screens/Settings";
@@ -202,7 +202,7 @@ const AppRoutes: React.FC = () => {
       <Route path="/wizard" element={isInitialized ? <Navigate to="/" replace /> : <Wizard />} />
       <Route element={isInitialized ? <AppShell /> : <Navigate to="/wizard" replace />}>
         <Route path="/" element={<Feed />} />
-        <Route path="/bookmarks" element={<Bookmarks />} />
+        {/* <Route path="/bookmarks" element={<Bookmarks />} /> TODO: NIP-51 bookmarks pending interop fixes */}
         <Route path="/dms" element={<Dms />} />
         <Route path="/gallery" element={<Gallery />} />
         <Route path="/wallet" element={<Wallet />} />

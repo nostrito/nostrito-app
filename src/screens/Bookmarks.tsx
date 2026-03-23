@@ -1,4 +1,5 @@
-/** Bookmarks — shows all bookmarked notes (NIP-51 private bookmarks). */
+/** Bookmarks — shows all bookmarked notes (NIP-51 private bookmarks).
+ *  On mount: publish local bookmarks to relays, then sync from relays — fully automatic. */
 
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { useNavigate } from "react-router-dom";
@@ -20,7 +21,6 @@ export const Bookmarks: React.FC = () => {
 
   const [events, setEvents] = useState<NostrEvent[]>([]);
   const [loading, setLoading] = useState(true);
-  const [syncing, setSyncing] = useState(false);
   const [zapTarget, setZapTarget] = useState<NostrEvent | null>(null);
   const [replyTarget, setReplyTarget] = useState<NostrEvent | null>(null);
   const loadingRef = useRef(false);
@@ -47,33 +47,30 @@ export const Bookmarks: React.FC = () => {
     }
   }, [ensureProfiles]);
 
-  // Load bookmarks and auto-sync from relays on first mount
+  // Auto publish + sync on mount (only with key)
   const didSyncRef = useRef(false);
   useEffect(() => {
-    loadBookmarks().then(() => {
-      if (canWrite && !didSyncRef.current) {
-        didSyncRef.current = true;
-        invoke<number>("sync_bookmarks_from_relays").then((count) => {
-          if (count > 0) loadBookmarks();
-        }).catch(() => {});
+    if (!canWrite) {
+      setLoading(false);
+      return;
+    }
+    loadBookmarks().then(async () => {
+      if (didSyncRef.current) return;
+      didSyncRef.current = true;
+      // Publish local bookmarks to relays first, then sync back
+      try {
+        await invoke<string>("publish_bookmarks_to_relays");
+      } catch (err) {
+        console.warn("[bookmarks] Auto-publish failed:", err);
+      }
+      try {
+        const count = await invoke<number>("sync_bookmarks_from_relays");
+        if (count > 0) loadBookmarks();
+      } catch (err) {
+        console.warn("[bookmarks] Auto-sync failed:", err);
       }
     });
   }, [loadBookmarks, canWrite]);
-
-  const handleSyncFromRelays = useCallback(async () => {
-    setSyncing(true);
-    try {
-      const count = await invoke<number>("sync_bookmarks_from_relays");
-      if (count > 0) {
-        // Reload the feed after sync
-        await loadBookmarks();
-      }
-    } catch (err) {
-      console.warn("[bookmarks] Sync failed:", err);
-    } finally {
-      setSyncing(false);
-    }
-  }, [loadBookmarks]);
 
   const handleLike = useCallback(async (event: NostrEvent) => {
     try {
@@ -101,18 +98,16 @@ export const Bookmarks: React.FC = () => {
     <div className="bookmarks-screen">
       <div className="bookmarks-header">
         <h2 className="bookmarks-title">bookmarks</h2>
-        {canWrite && (
-          <button
-            className="bookmarks-sync-btn"
-            onClick={handleSyncFromRelays}
-            disabled={syncing}
-          >
-            {syncing ? "syncing..." : "sync from relays"}
-          </button>
-        )}
       </div>
 
-      {loading ? (
+      {!canWrite ? (
+        <div style={{ padding: "40px 20px", textAlign: "center", color: "var(--text-muted)" }}>
+          <p>Private bookmarks are encrypted.</p>
+          <p style={{ fontSize: "0.82rem", marginTop: 8 }}>
+            Set up your signing key in settings to view and manage bookmarks.
+          </p>
+        </div>
+      ) : loading ? (
         <div style={{ padding: "40px 0", textAlign: "center", color: "var(--text-muted)" }}>
           Loading bookmarks...
         </div>
