@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
+import { useNavigate, useLocation } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { QRCodeSVG } from "qrcode.react";
@@ -16,6 +17,7 @@ import {
   IconRadio,
   IconDatabase,
   IconSettings as IconSettingsIcon,
+  IconDashboard,
   IconLock,
   IconCastle,
   IconPlug,
@@ -74,7 +76,7 @@ interface TrackedProfile {
   note: string | null;
 }
 
-type TabId = "identity" | "relays" | "storage" | "advanced" | "tracked";
+type TabId = "identity" | "relays" | "storage" | "advanced" | "tracked" | "analytics";
 
 interface SaveFeedback {
   type: "success" | "error";
@@ -213,6 +215,7 @@ const TABS: { id: TabId; label: string; Icon: React.FC }[] = [
   { id: "relays", label: "relays", Icon: IconRadio },
   { id: "storage", label: "storage", Icon: IconDatabase },
   { id: "tracked", label: "tracked profiles", Icon: IconUsers },
+  { id: "analytics", label: "analytics", Icon: IconDashboard },
   { id: "advanced", label: "advanced", Icon: IconSettingsIcon },
 ];
 
@@ -280,11 +283,18 @@ const StorageEstimationPanel: React.FC = () => {
 };
 
 export const Settings: React.FC = () => {
+  const settingsNavigate = useNavigate();
+  const location = useLocation();
   const { getProfile, ensureProfiles } = useProfileContext();
 
   /* --- core state --------------------------------------------------- */
-  const [activeTab, setActiveTab] = useState<TabId>("identity");
+  const navTab = (location.state as { tab?: TabId } | null)?.tab;
+  const [activeTab, setActiveTab] = useState<TabId>(navTab || "identity");
   const [settings, setSettings] = useState<Settings | null>(null);
+
+  useEffect(() => {
+    if (navTab) setActiveTab(navTab);
+  }, [navTab]);
 
   /* --- identity ----------------------------------------------------- */
   // (npub comes from settings)
@@ -295,7 +305,7 @@ export const Settings: React.FC = () => {
   const [relayFeedback, setRelayFeedback] = useState<SaveFeedback | null>(null);
 
   /* --- storage ------------------------------------------------------ */
-  const [storagePreset, setStoragePreset] = useState<string>("balanced");
+  const [storagePreset, setStoragePreset] = useState<string>("");
   const [othersEventsGb, setOthersEventsGb] = useState(0);
   const [trackedMediaGb, setTrackedMediaGb] = useState(0);
   const [wotRetentionDays, setWotRetentionDays] = useState(0);
@@ -410,18 +420,22 @@ export const Settings: React.FC = () => {
       setMaxEventAgeDays(s.max_event_age_days);
 
       // Detect active storage preset by matching values
+      let matched = false;
       for (const key of STORAGE_PRESET_KEYS) {
         const p = STORAGE_PRESETS[key];
         if (
           Math.round(s.storage_others_gb) === p.othersEventsGb &&
           Math.round(s.storage_tracked_media_gb) === p.trackedMediaGb &&
           Math.round(s.storage_wot_media_gb) === p.wotMediaGb &&
-          s.wot_event_retention_days === p.wotRetentionDays
+          s.wot_event_retention_days === p.wotRetentionDays &&
+          s.max_event_age_days === p.maxEventAgeDays
         ) {
           setStoragePreset(key);
+          matched = true;
           break;
         }
       }
+      if (!matched) setStoragePreset("");
 
       // Advanced sync sliders
       setSyncLookback(s.sync_lookback_days);
@@ -618,16 +632,37 @@ export const Settings: React.FC = () => {
     setSyncInterval(p.interval);
   }, []);
 
-  const applyStoragePreset = useCallback((presetKey: string) => {
+  const applyStoragePreset = useCallback(async (presetKey: string) => {
     const p = STORAGE_PRESETS[presetKey];
-    if (!p) return;
+    if (!p || !settings) return;
     setStoragePreset(presetKey);
     setOthersEventsGb(p.othersEventsGb);
     setTrackedMediaGb(p.trackedMediaGb);
     setWotMediaGb(p.wotMediaGb);
     setWotRetentionDays(p.wotRetentionDays);
     setMaxEventAgeDays(p.maxEventAgeDays);
-  }, []);
+
+    // Save immediately with preset values (can't rely on state being updated yet)
+    setStorageSaving(true);
+    setStorageFeedback(null);
+    try {
+      const updated: Settings = {
+        ...settings,
+        storage_others_gb: p.othersEventsGb,
+        storage_tracked_media_gb: p.trackedMediaGb,
+        storage_wot_media_gb: p.wotMediaGb,
+        wot_event_retention_days: p.wotRetentionDays,
+        max_event_age_days: p.maxEventAgeDays,
+      };
+      await invoke("save_settings", { settings: updated });
+      setSettings(updated);
+      setStorageFeedback({ type: "success", message: `"${p.label}" preset saved` });
+    } catch (e) {
+      setStorageFeedback({ type: "error", message: `failed: ${e}` });
+    } finally {
+      setStorageSaving(false);
+    }
+  }, [settings]);
 
   /* --- danger zone -------------------------------------------------- */
   const handleSaveNsec = useCallback(async () => {
@@ -895,7 +930,13 @@ export const Settings: React.FC = () => {
             key={tab.id}
             className={`settings-sub-item${activeTab === tab.id ? " active" : ""}`}
             data-settings={tab.id}
-            onClick={() => setActiveTab(tab.id)}
+            onClick={() => {
+              if (tab.id === "analytics") {
+                settingsNavigate("/settings/analytics");
+              } else {
+                setActiveTab(tab.id);
+              }
+            }}
           >
             <span className="icon">
               <tab.Icon />
@@ -1512,6 +1553,13 @@ export const Settings: React.FC = () => {
 
           {/* Estimation summary */}
           {(() => {
+            if (!storagePreset) {
+              return (
+                <div className="storage-estimate-summary" style={{ margin: "12px 0" }}>
+                  custom settings — select a preset or save manually below
+                </div>
+              );
+            }
             const estimate = estimateStorage(200, storagePreset);
             return (
               <div className="storage-estimate-summary" style={{ margin: "12px 0" }}>
