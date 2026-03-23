@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import { NavLink, useNavigate } from "react-router-dom";
 import logoUrl from "../assets/logo.png";
-import { IconDashboard, IconFeed, IconMessageCircle, IconImage, IconNetwork, IconWallet, IconDatabase, IconSettings, IconPenSquare, IconLock, IconX } from "./Icon";
+import { IconFeed, IconMessageCircle, IconImage, IconBookmark, IconWallet, IconSettings, IconPenSquare, IconLock, IconX, IconSearch } from "./Icon";
 import { useAppContext } from "../context/AppContext";
 import { useCanWrite } from "../context/SigningContext";
 import { ComposeModal } from "./ComposeModal";
@@ -13,8 +13,11 @@ export const Sidebar: React.FC = () => {
   const [showCompose, setShowCompose] = useState(false);
   const [showSigningPrompt, setShowSigningPrompt] = useState(false);
 
+  const [sidebarSearch, setSidebarSearch] = useState("");
+
   const navItems = [
     { to: "/", icon: <IconFeed />, label: "feed" },
+    { to: "/bookmarks", icon: <IconBookmark />, label: "bookmarks" },
     { to: "/dms", icon: <IconMessageCircle />, label: "messages" },
     { to: "/gallery", icon: <IconImage />, label: "gallery" },
     { to: "/wot", icon: <IconNetwork />, label: "wot" },

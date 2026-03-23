@@ -3,7 +3,7 @@ use rusqlite::Connection;
 use tracing::info;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// Get the current schema version from the database.
 pub fn get_schema_version(conn: &Connection) -> u32 {
@@ -58,6 +58,10 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
 
     if current < 7 {
         migrate_v6_to_v7(conn)?;
+    }
+
+    if current < 8 {
+        migrate_v7_to_v8(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -408,6 +412,24 @@ fn migrate_v6_to_v7(conn: &Connection) -> Result<()> {
     )?;
 
     info!("Migration v6 → v7 complete");
+    Ok(())
+}
+
+/// Migrate from v7 to v8:
+/// - Add bookmarked_events table for NIP-51 private bookmarks (local cache)
+fn migrate_v7_to_v8(conn: &Connection) -> Result<()> {
+    info!("Running migration v7 → v8...");
+
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS bookmarked_events (
+            event_id      TEXT PRIMARY KEY,
+            bookmarked_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+        );
+        "#,
+    )?;
+
+    info!("Migration v7 → v8 complete");
     Ok(())
 }
 

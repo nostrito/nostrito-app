@@ -146,6 +146,9 @@ export const IconParty: React.FC<SvgProps> = (p) => (
 export const IconBookmark: React.FC<SvgProps> = (p) => (
   <Svg {...p}><path d="m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16z" /></Svg>
 );
+export const IconBookmarkFilled: React.FC<SvgProps> = (p) => (
+  <Svg {...p}><path d="m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16z" fill="currentColor" /></Svg>
+);
 
 export const IconGlobe: React.FC<SvgProps> = (p) => (
   <Svg {...p}><circle cx="12" cy="12" r="10" /><path d="M2 12h20" /><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" /></Svg>

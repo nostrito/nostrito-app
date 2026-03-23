@@ -900,10 +900,14 @@
   opacity: 0.85;
 }
 
-/* Save button state */
-.ev-action-saved {
+/* Bookmark button state */
+.ev-action-bookmarked {
   color: var(--accent) !important;
-  opacity: 0.8;
+  opacity: 0.85;
+}
+.ev-action-bookmarked.ev-action-disabled {
+  color: var(--accent) !important;
+  opacity: 0.85;
   cursor: default !important;
 }
 

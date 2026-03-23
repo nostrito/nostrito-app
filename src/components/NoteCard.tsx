@@ -1,7 +1,7 @@
 /** Shared note/repost card used in Feed and ProfileView */
 import React, { useMemo, useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { IconMessageCircle, IconRepeat, IconZap, IconBookmark, IconHeart, IconHeartFilled } from "./Icon";
+import { IconMessageCircle, IconRepeat, IconZap, IconBookmark, IconBookmarkFilled, IconHeart, IconHeartFilled } from "./Icon";
 import { Avatar } from "./Avatar";
 import { timeAgo } from "../utils/format";
 import { kindLabel } from "../utils/ui";
@@ -14,6 +14,7 @@ import { useInteractionCounts } from "../hooks/useInteractionCounts";
 import { useEnrichment } from "../hooks/useEnrichment";
 import { useReactionStatus } from "../hooks/useReactionStatus";
 import { useRepostStatus } from "../hooks/useRepostStatus";
+import { useBookmarkStatus, markBookmarked, markUnbookmarked } from "../hooks/useBookmarkStatus";
 import type { NostrEvent } from "../types/nostr";
 
 /** Hook to show a transient toast when user clicks a disabled action. */
@@ -286,8 +287,6 @@ interface NoteCardProps {
   profile?: ProfileInfo;
   compact?: boolean;
   full?: boolean;
-  onSave?: (event: NostrEvent) => void;
-  saved?: boolean;
   onClick?: () => void;
   onZap?: (event: NostrEvent) => void;
   onLike?: (event: NostrEvent) => void;
@@ -306,10 +305,8 @@ export interface GroupedRepost {
 /** Card for grouped reposts — shows "A, B, and N others reposted" + the original note */
 export const GroupedRepostCard: React.FC<{
   group: GroupedRepost;
-  onSave?: (event: NostrEvent) => void;
-  saved?: boolean;
   onClick?: () => void;
-}> = ({ group, onSave, saved, onClick }) => {
+}> = ({ group, onClick }) => {
   const { ensureProfiles, getProfile } = useProfileContext();
 
   // Ensure reposter profiles
@@ -401,8 +398,6 @@ export const GroupedRepostCard: React.FC<{
       <NoteCardInner
         event={group.originalEvent}
         profile={getProfile(group.originalEvent.pubkey)}
-        onSave={onSave}
-        saved={saved}
       />
     </div>
   );
@@ -414,18 +409,17 @@ const NoteCardInner: React.FC<{
   profile?: ProfileInfo;
   compact?: boolean;
   full?: boolean;
-  onSave?: (event: NostrEvent) => void;
-  saved?: boolean;
   onLike?: (event: NostrEvent) => void;
   onZap?: (event: NostrEvent) => void;
   onReply?: (event: NostrEvent) => void;
   onRepost?: (event: NostrEvent) => void;
-}> = ({ event, profile, compact, full, onSave, saved, onLike, onZap, onReply, onRepost }) => {
+}> = ({ event, profile, compact, full, onLike, onZap, onReply, onRepost }) => {
   const { ensureProfiles, getProfile } = useProfileContext();
   const counts = useInteractionCounts(event.id);
   useEnrichment(event.id);
   const liked = useReactionStatus(event.id);
   const reposted = useRepostStatus(event.id);
+  const bookmarked = useBookmarkStatus(event.id);
   const { canWrite } = useSigningContext();
   const toast = useActionToast();
   const displayName = profileDisplayName(profile, event.pubkey);
@@ -470,15 +464,7 @@ const NoteCardInner: React.FC<{
             <button className={`ev-action${reposted ? " ev-action-reposted" : ""}${!canWrite || reposted || !onRepost ? " ev-action-disabled" : ""}`} onClick={canWrite && !reposted && onRepost ? (e) => { e.stopPropagation(); onRepost(event); } : !canWrite ? handleSigningClick : undefined}><span className="icon"><IconRepeat /></span>{counts?.reposts ? ` ${counts.reposts}` : ""}</button>
             <button className={`ev-action${liked ? " ev-action-liked" : ""}${!canWrite || liked ? " ev-action-disabled" : ""}`} onClick={canWrite && !liked ? (e) => { e.stopPropagation(); onLike?.(event); } : !canWrite && !liked ? handleSigningClick : undefined}><span className="icon">{liked ? <IconHeartFilled /> : <IconHeart />}</span>{counts?.reactions ? ` ${counts.reactions}` : ""}</button>
             <button className={`ev-action${!canWrite ? " ev-action-disabled" : ""}`} onClick={canWrite ? (e) => { e.stopPropagation(); onZap?.(event); } : handleZapClick}><span className="icon"><IconZap /></span>{counts?.zaps ? ` ${counts.zaps}` : ""}</button>
-            {onSave && (
-              <button
-                className={`ev-action${saved ? " ev-action-saved" : ""}`}
-                onClick={() => !saved && onSave(event)}
-                title={saved ? "Saved" : "Save to local DB"}
-              >
-                <span className="icon"><IconBookmark /></span>{saved ? " Saved" : " Save"}
-              </button>
-            )}
+            <button className={`ev-action${bookmarked ? " ev-action-bookmarked" : ""}${!canWrite && !bookmarked ? " ev-action-disabled" : ""}`} onClick={canWrite ? async (e) => { e.stopPropagation(); if (bookmarked) { markUnbookmarked(event.id); } else { markBookmarked(event.id); } try { await invoke("toggle_bookmark", { eventId: event.id }); } catch (err) { if (bookmarked) markBookmarked(event.id); else markUnbookmarked(event.id); console.warn("[bookmark] toggle failed:", err); } } : !canWrite ? handleSigningClick : undefined}><span className="icon">{bookmarked ? <IconBookmarkFilled /> : <IconBookmark />}</span></button>
           </div>
         )}
       </div>
@@ -486,7 +472,7 @@ const NoteCardInner: React.FC<{
   );
 };
 
-export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, full, onSave, saved, onClick, onZap, onLike, onReply, onRepost }) => {
+export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, full, onClick, onZap, onLike, onReply, onRepost }) => {
   const k = kindLabel(event.kind);
   const displayName = profileDisplayName(profile, event.pubkey);
   const { ensureProfiles, getProfile } = useProfileContext();
@@ -494,6 +480,7 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, ful
   useEnrichment(event.id);
   const liked = useReactionStatus(event.id);
   const reposted = useRepostStatus(event.id);
+  const bookmarked = useBookmarkStatus(event.id);
   const { canWrite } = useSigningContext();
   const toast = useActionToast();
 
@@ -566,15 +553,7 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, ful
                 <button className={`ev-action${reposted ? " ev-action-reposted" : ""}${!canWrite || reposted || !onRepost ? " ev-action-disabled" : ""}`} onClick={canWrite && !reposted && onRepost ? (e) => { e.stopPropagation(); onRepost(event); } : !canWrite ? handleSigningClick : undefined}><span className="icon"><IconRepeat /></span>{counts?.reposts ? ` ${counts.reposts}` : ""}</button>
                 <button className={`ev-action${liked ? " ev-action-liked" : ""}${!canWrite || liked ? " ev-action-disabled" : ""}`} onClick={canWrite && !liked ? (e) => { e.stopPropagation(); onLike?.(event); } : !canWrite && !liked ? handleSigningClick : undefined}><span className="icon">{liked ? <IconHeartFilled /> : <IconHeart />}</span>{counts?.reactions ? ` ${counts.reactions}` : ""}</button>
                 <button className={`ev-action${!canWrite ? " ev-action-disabled" : ""}`} onClick={canWrite ? (e) => { e.stopPropagation(); onZap?.(event); } : handleZapClick}><span className="icon"><IconZap /></span>{counts?.zaps ? ` ${counts.zaps}` : ""}</button>
-                {onSave && (
-                  <button
-                    className={`ev-action${saved ? " ev-action-saved" : ""}`}
-                    onClick={() => !saved && onSave(event)}
-                    title={saved ? "Saved" : "Save to local DB"}
-                  >
-                    <span className="icon"><IconBookmark /></span>{saved ? " Saved" : " Save"}
-                  </button>
-                )}
+                <button className={`ev-action${bookmarked ? " ev-action-bookmarked" : ""}${!canWrite && !bookmarked ? " ev-action-disabled" : ""}`} onClick={canWrite ? async (e) => { e.stopPropagation(); if (bookmarked) { markUnbookmarked(event.id); } else { markBookmarked(event.id); } try { await invoke("toggle_bookmark", { eventId: event.id }); } catch (err) { if (bookmarked) markBookmarked(event.id); else markUnbookmarked(event.id); console.warn("[bookmark] toggle failed:", err); } } : !canWrite ? handleSigningClick : undefined}><span className="icon">{bookmarked ? <IconBookmarkFilled /> : <IconBookmark />}</span></button>
               </div>
             )}
           </div>
@@ -633,15 +612,7 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, ful
             <button className={`ev-action${reposted ? " ev-action-reposted" : ""}${!canWrite || reposted || !onRepost ? " ev-action-disabled" : ""}`} onClick={canWrite && !reposted && onRepost ? (e) => { e.stopPropagation(); onRepost(event); } : !canWrite ? handleSigningClick : undefined}><span className="icon"><IconRepeat /></span>{counts?.reposts ? ` ${counts.reposts}` : ""}</button>
             <button className={`ev-action${liked ? " ev-action-liked" : ""}${!canWrite || liked ? " ev-action-disabled" : ""}`} onClick={canWrite && !liked ? (e) => { e.stopPropagation(); onLike?.(event); } : !canWrite && !liked ? handleSigningClick : undefined}><span className="icon">{liked ? <IconHeartFilled /> : <IconHeart />}</span>{counts?.reactions ? ` ${counts.reactions}` : ""}</button>
             <button className={`ev-action${!canWrite ? " ev-action-disabled" : ""}`} onClick={canWrite ? (e) => { e.stopPropagation(); onZap?.(event); } : handleZapClick}><span className="icon"><IconZap /></span>{counts?.zaps ? ` ${counts.zaps}` : ""}</button>
-            {onSave && (
-              <button
-                className={`ev-action${saved ? " ev-action-saved" : ""}`}
-                onClick={() => !saved && onSave(event)}
-                title={saved ? "Saved" : "Save to local DB"}
-              >
-                <span className="icon"><IconBookmark /></span>{saved ? " Saved" : " Save"}
-              </button>
-            )}
+            <button className={`ev-action${bookmarked ? " ev-action-bookmarked" : ""}${!canWrite && !bookmarked ? " ev-action-disabled" : ""}`} onClick={canWrite ? async (e) => { e.stopPropagation(); if (bookmarked) { markUnbookmarked(event.id); } else { markBookmarked(event.id); } try { await invoke("toggle_bookmark", { eventId: event.id }); } catch (err) { if (bookmarked) markBookmarked(event.id); else markUnbookmarked(event.id); console.warn("[bookmark] toggle failed:", err); } } : !canWrite ? handleSigningClick : undefined}><span className="icon">{bookmarked ? <IconBookmarkFilled /> : <IconBookmark />}</span></button>
           </div>
         )}
       </div>

@@ -75,6 +75,42 @@
   flex-direction: column;
 }
 
+.sidebar-search {
+  position: relative;
+  margin: 0 12px 4px;
+}
+
+.sidebar-search-icon {
+  position: absolute;
+  left: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-muted);
+  font-size: 0.8em;
+  pointer-events: none;
+}
+
+.sidebar-search-input {
+  width: 100%;
+  padding: 7px 10px 7px 28px;
+  font-size: 0.78rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  outline: none;
+  box-sizing: border-box;
+  transition: border-color 0.15s;
+}
+
+.sidebar-search-input::placeholder {
+  color: var(--text-muted);
+}
+
+.sidebar-search-input:focus {
+  border-color: var(--accent);
+}
+
 .app-nav-item {
   padding: 12px 20px;
   font-size: 0.85rem;
@@ -341,4 +377,39 @@
   .app-nav-item::before {
     font-size: 1.2rem;
   }
+}
+
+/* ── Bookmarks Screen ─────────────────────────────────────── */
+.bookmarks-screen {
+  max-width: 680px;
+  margin: 0 auto;
+  padding: 0 8px;
+}
+.bookmarks-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 4px;
+}
+.bookmarks-title {
+  font-size: 1.1rem;
+  font-weight: 600;
+  margin: 0;
+}
+.bookmarks-sync-btn {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  padding: 4px 12px;
+  border-radius: 6px;
+  font-size: 0.78rem;
+  cursor: pointer;
+}
+.bookmarks-sync-btn:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--accent);
+}
+.bookmarks-sync-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
