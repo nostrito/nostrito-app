@@ -622,7 +622,7 @@ async fn write_nip11_response(
             "description": "Your personal Nostr relay. Running locally.",
             "pubkey": hex_pubkey,
             "contact": "",
-            "supported_nips": [1, 2, 9, 11, 16, 20, 33, 40, 45],
+            "supported_nips": [1, 2, 9, 11, 16, 20, 33, 40, 45, 51],
             "software": "nostrito",
             "version": "0.1.0"
         })
@@ -737,6 +737,7 @@ async fn write_nip11_response(
         <span class="nip">NIP-33</span>
         <span class="nip">NIP-40</span>
         <span class="nip">NIP-45</span>
+        <span class="nip">NIP-51</span>
       </div>
     </div>
 

@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import { NavLink, useNavigate } from "react-router-dom";
 import logoUrl from "../assets/logo.png";
-import { IconDashboard, IconFeed, IconMessageCircle, IconImage, IconNetwork, IconWallet, IconDatabase, IconSettings, IconPenSquare, IconLock, IconX } from "./Icon";
+import { IconFeed, IconMessageCircle, IconImage, IconBookmark, IconWallet, IconSettings, IconPenSquare, IconLock, IconX, IconSearch } from "./Icon";
 import { useAppContext } from "../context/AppContext";
 import { useCanWrite } from "../context/SigningContext";
 import { ComposeModal } from "./ComposeModal";
@@ -13,14 +13,14 @@ export const Sidebar: React.FC = () => {
   const [showCompose, setShowCompose] = useState(false);
   const [showSigningPrompt, setShowSigningPrompt] = useState(false);
 
+  const [sidebarSearch, setSidebarSearch] = useState("");
+
   const navItems = [
     { to: "/", icon: <IconFeed />, label: "feed" },
+    { to: "/bookmarks", icon: <IconBookmark />, label: "bookmarks" },
     { to: "/dms", icon: <IconMessageCircle />, label: "messages" },
     { to: "/gallery", icon: <IconImage />, label: "gallery" },
-    { to: "/wot", icon: <IconNetwork />, label: "wot" },
     { to: "/wallet", icon: <IconWallet />, label: "wallet" },
-    { to: "/analytics", icon: <IconDashboard />, label: "analytics" },
-    { to: "/storage", icon: <IconDatabase />, label: "storage" },
     { to: "/settings", icon: <IconSettings />, label: "settings" },
   ];
 
@@ -28,6 +28,22 @@ export const Sidebar: React.FC = () => {
     <aside className="app-sidebar-nav">
       <div className="sidebar-logo">
         <img src={logoUrl} alt="nostrito" style={{ width: 52, height: 52, borderRadius: 12, display: "block", margin: "0 auto 8px" }} />
+      </div>
+      <div className="sidebar-search">
+        <span className="icon sidebar-search-icon"><IconSearch /></span>
+        <input
+          type="text"
+          className="sidebar-search-input"
+          placeholder="search..."
+          value={sidebarSearch}
+          onChange={(e) => setSidebarSearch(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && sidebarSearch.trim()) {
+              navigate(`/?q=${encodeURIComponent(sidebarSearch.trim())}`);
+              setSidebarSearch("");
+            }
+          }}
+        />
       </div>
       {navItems.map((item) => (
         <NavLink

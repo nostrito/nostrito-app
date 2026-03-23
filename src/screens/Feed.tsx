@@ -256,7 +256,6 @@ export const Feed: React.FC = () => {
   const [loading, setLoading] = useState(!hasCachedFeed);
   const [isSearchMode, setIsSearchMode] = useState(false);
   const [globalConsent, setGlobalConsent] = useState(false);
-  const [savedEventIds, setSavedEventIds] = useState<Set<string>>(new Set());
   const [loadingMore, setLoadingMore] = useState(false);
   const [hasMore, setHasMore] = useState(true);
   const [loadingMoreArticles, setLoadingMoreArticles] = useState(false);
@@ -333,6 +332,8 @@ export const Feed: React.FC = () => {
   const oldestArticleTimestamp = useRef<number | null>(null);
   const articleLoadingRef = useRef(false);
   const feedColumnRef = useRef<HTMLDivElement>(null);
+  const articleColumnRef = useRef<HTMLDivElement>(null);
+  const articleFullRef = useRef<HTMLDivElement>(null);
   const [newPostCount, setNewPostCount] = useState(0);
 
   // Listen for sync tier completion to trigger refresh
@@ -343,14 +344,6 @@ export const Feed: React.FC = () => {
     initMediaViewer();
   }, []);
 
-  const saveEvent = useCallback(async (event: NostrEvent) => {
-    try {
-      await invoke("save_event", { event });
-      setSavedEventIds((prev) => new Set(prev).add(event.id));
-    } catch (err) {
-      console.warn("[feed] Failed to save event:", err);
-    }
-  }, []);
 
   const loadEvents = useCallback(async () => {
     if (feedLoadingRef.current) return;
@@ -711,8 +704,6 @@ export const Feed: React.FC = () => {
           return deduplicateArticles([...prev, ...toAdd]);
         });
 
-        // Mark relay events for save buttons
-        setSavedEventIds((prev) => new Set(prev));
       }
       setRelayFetched(true);
     } catch (err) {
@@ -727,7 +718,6 @@ export const Feed: React.FC = () => {
     renderedEventIdsRef.current.clear();
     fetchedOriginalIdsRef.current.clear();
     setFeedEvents([]);
-    setSavedEventIds(new Set());
     setGroupedReposts(new Map());
     setHasMore(true);
     setHasMoreArticles(true);
@@ -941,18 +931,27 @@ export const Feed: React.FC = () => {
     [loadMoreArticles],
   );
 
-  // Auto-fetch articles when the article column is visible but empty
+  // Auto-fill: keep loading articles until the viewport is filled or no more available
   const articles = feedEvents.filter((e) => e.kind === 30023);
   useEffect(() => {
-    if (
-      (activeFilter === "all" || activeFilter === "long-form") &&
-      articles.length === 0 &&
-      !loading &&
-      hasMoreArticles
-    ) {
-      loadMoreArticles();
-    }
-  }, [activeFilter, articles.length, loading, hasMoreArticles, loadMoreArticles]);
+    if (loadingMoreArticles || !hasMoreArticles || loading) return;
+    if (activeFilter !== "all" && activeFilter !== "long-form") return;
+
+    const timer = setTimeout(() => {
+      const el = articleColumnRef.current || articleFullRef.current;
+      if (!el) {
+        // Container not mounted yet — still load if no articles at all
+        if (articles.length === 0) loadMoreArticles();
+        return;
+      }
+      // If content doesn't fill the viewport, load more
+      if (el.scrollHeight <= el.clientHeight + 50) {
+        loadMoreArticles();
+      }
+    }, 100);
+
+    return () => clearTimeout(timer);
+  }, [articles.length, loadingMoreArticles, hasMoreArticles, loading, activeFilter, loadMoreArticles]);
 
   // Article reader view
   if (view.kind === "article") {
@@ -1115,8 +1114,6 @@ export const Feed: React.FC = () => {
               <GroupedRepostCard
                 key={`group-${group.originalId}`}
                 group={group}
-                onSave={feedMode === "global" ? saveEvent : undefined}
-                saved={group.originalEvent ? savedEventIds.has(group.originalEvent.id) : false}
                 onClick={group.originalEvent ? () => navigate(`/note/${group.originalEvent!.id}`) : undefined}
               />
             ))}
@@ -1126,8 +1123,6 @@ export const Feed: React.FC = () => {
                 key={event.id}
                 event={event}
                 profile={getProfile(event.pubkey)}
-                onSave={feedMode === "global" ? saveEvent : undefined}
-                saved={savedEventIds.has(event.id)}
                 onClick={() => navigate(`/note/${event.id}`)}
                 onZap={setZapTarget}
                 onLike={handleLike}
@@ -1158,7 +1153,7 @@ export const Feed: React.FC = () => {
 
         {/* Articles column (right vertical carousel) — split view */}
         {showArticleColumn && showNotesColumn && (
-          <div className="feed-articles-column" onScroll={handleArticlesScroll}>
+          <div className="feed-articles-column" ref={articleColumnRef} onScroll={handleArticlesScroll}>
             {articles.map((event) => (
               <ArticleCard
                 key={event.id}
@@ -1169,19 +1164,33 @@ export const Feed: React.FC = () => {
             ))}
             {hasMoreArticles && (
               <div className="feed-sentinel">
-                {loadingMoreArticles && (
-                  <span className="feed-sentinel-text">
-                    {articleStageRef.current === "relay-follows" ? "fetching from follows\u2026" :
-                     articleStageRef.current === "relay-wot" ? "fetching from network\u2026" :
-                     "loading more\u2026"}
-                  </span>
-                )}
+                <span className="feed-sentinel-text">
+                  {articleStageRef.current === "relay-follows" ? "fetching from follows\u2026" :
+                   articleStageRef.current === "relay-wot" ? "fetching from network\u2026" :
+                   "loading more\u2026"}
+                </span>
               </div>
             )}
-            {!hasMoreArticles && articles.length === 0 && (
+            {!hasMoreArticles && articles.length === 0 && feedMode === "wot" && (
+              <div className="feed-end feed-relay-prompt">
+                <span>no articles found in your network</span>
+                <button className="feed-relay-fetch-btn" onClick={() => setFeedMode("global")}>
+                  try the global feed
+                </button>
+              </div>
+            )}
+            {!hasMoreArticles && articles.length === 0 && feedMode !== "wot" && (
               <div className="feed-end" style={{ color: "var(--text-muted)", padding: 32 }}>no articles found</div>
             )}
-            {!hasMoreArticles && articles.length > 0 && (
+            {!hasMoreArticles && articles.length > 0 && feedMode === "wot" && (
+              <div className="feed-end feed-relay-prompt">
+                <span>no more articles in your network</span>
+                <button className="feed-relay-fetch-btn" onClick={() => setFeedMode("global")}>
+                  try the global feed
+                </button>
+              </div>
+            )}
+            {!hasMoreArticles && articles.length > 0 && feedMode !== "wot" && (
               <div className="feed-end">no more articles</div>
             )}
           </div>
@@ -1189,7 +1198,7 @@ export const Feed: React.FC = () => {
 
         {/* Articles grid — full width when long-form filter only */}
         {showArticleColumn && !showNotesColumn && (
-          <div className="feed-articles-full" onScroll={handleArticlesScroll}>
+          <div className="feed-articles-full" ref={articleFullRef} onScroll={handleArticlesScroll}>
             <div className="article-cards-grid">
               {articles.map((event) => (
                 <ArticleCard
@@ -1202,19 +1211,33 @@ export const Feed: React.FC = () => {
             </div>
             {hasMoreArticles && (
               <div className="feed-sentinel">
-                {loadingMoreArticles && (
-                  <span className="feed-sentinel-text">
-                    {articleStageRef.current === "relay-follows" ? "fetching from follows\u2026" :
-                     articleStageRef.current === "relay-wot" ? "fetching from network\u2026" :
-                     "loading more\u2026"}
-                  </span>
-                )}
+                <span className="feed-sentinel-text">
+                  {articleStageRef.current === "relay-follows" ? "fetching from follows\u2026" :
+                   articleStageRef.current === "relay-wot" ? "fetching from network\u2026" :
+                   "loading more\u2026"}
+                </span>
               </div>
             )}
-            {!hasMoreArticles && articles.length === 0 && (
+            {!hasMoreArticles && articles.length === 0 && feedMode === "wot" && (
+              <div className="feed-end feed-relay-prompt">
+                <span>no long-form articles found in your network</span>
+                <button className="feed-relay-fetch-btn" onClick={() => setFeedMode("global")}>
+                  try the global feed
+                </button>
+              </div>
+            )}
+            {!hasMoreArticles && articles.length === 0 && feedMode !== "wot" && (
               <div className="feed-end" style={{ color: "var(--text-muted)", padding: 32 }}>no long-form events yet</div>
             )}
-            {!hasMoreArticles && articles.length > 0 && (
+            {!hasMoreArticles && articles.length > 0 && feedMode === "wot" && (
+              <div className="feed-end feed-relay-prompt">
+                <span>no more articles in your network</span>
+                <button className="feed-relay-fetch-btn" onClick={() => setFeedMode("global")}>
+                  try the global feed
+                </button>
+              </div>
+            )}
+            {!hasMoreArticles && articles.length > 0 && feedMode !== "wot" && (
               <div className="feed-end">no more articles</div>
             )}
           </div>

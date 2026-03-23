@@ -3376,6 +3376,127 @@ impl Database {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    // ── Bookmarked Events (NIP-51 local cache) ─────────────────────
+
+    /// Add an event to bookmarks. Returns true if newly inserted.
+    pub fn add_bookmark(&self, event_id: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let rows = conn.execute(
+            "INSERT OR IGNORE INTO bookmarked_events (event_id) VALUES (?1)",
+            params![event_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Remove an event from bookmarks. Returns true if it existed.
+    pub fn remove_bookmark(&self, event_id: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let rows = conn.execute(
+            "DELETE FROM bookmarked_events WHERE event_id = ?1",
+            params![event_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Batched check: given a list of event IDs, return those that are bookmarked.
+    pub fn get_bookmarked_event_ids(&self, event_ids: &[String]) -> Result<Vec<String>> {
+        if event_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.conn.lock();
+        let placeholders: Vec<String> = (1..=event_ids.len()).map(|i| format!("?{}", i)).collect();
+        let sql = format!(
+            "SELECT event_id FROM bookmarked_events WHERE event_id IN ({})",
+            placeholders.join(",")
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> = event_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Get all bookmarked event IDs (for building the kind 10003 event).
+    pub fn get_all_bookmark_ids(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT event_id FROM bookmarked_events ORDER BY bookmarked_at DESC"
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Return bookmarked event IDs that do NOT exist in nostr_events (need fetching from relays).
+    pub fn get_missing_bookmarked_event_ids(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT b.event_id FROM bookmarked_events b
+             LEFT JOIN nostr_events e ON e.id = b.event_id
+             WHERE e.id IS NULL"
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Get bookmarked events joined with nostr_events, for the bookmarks feed.
+    pub fn get_bookmarked_events(&self, limit: u32, before: Option<i64>) -> Result<Vec<(String, String, i64, i64, String, String, String, i64)>> {
+        type Row = (String, String, i64, i64, String, String, String, i64);
+        let conn = self.conn.lock();
+
+        let map_row = |row: &rusqlite::Row| -> rusqlite::Result<Row> {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, i64>(7)?,
+            ))
+        };
+
+        if let Some(b) = before {
+            let mut stmt = conn.prepare(
+                "SELECT e.id, e.pubkey, e.created_at, e.kind, e.tags, e.content, e.sig, b.bookmarked_at
+                 FROM bookmarked_events b
+                 INNER JOIN nostr_events e ON e.id = b.event_id
+                 WHERE b.bookmarked_at < ?1
+                 ORDER BY b.bookmarked_at DESC
+                 LIMIT ?2"
+            )?;
+            let results: Vec<Row> = stmt.query_map(params![b, limit], map_row)?.filter_map(|r| r.ok()).collect();
+            Ok(results)
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT e.id, e.pubkey, e.created_at, e.kind, e.tags, e.content, e.sig, b.bookmarked_at
+                 FROM bookmarked_events b
+                 INNER JOIN nostr_events e ON e.id = b.event_id
+                 ORDER BY b.bookmarked_at DESC
+                 LIMIT ?1"
+            )?;
+            let results: Vec<Row> = stmt.query_map(params![limit], map_row)?.filter_map(|r| r.ok()).collect();
+            Ok(results)
+        }
+    }
+
+    /// Sync bookmarks from a relay-fetched kind 10003 event (additive merge).
+    pub fn sync_bookmarks(&self, event_ids: &[String]) -> Result<u32> {
+        let conn = self.conn.lock();
+        let mut count = 0u32;
+        for event_id in event_ids {
+            let rows = conn.execute(
+                "INSERT OR IGNORE INTO bookmarked_events (event_id) VALUES (?1)",
+                params![event_id],
+            )?;
+            if rows > 0 {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     /// Get all thread events for a given root ID (the root itself + all events referencing it).
     pub fn get_thread_events(&self, root_id: &str) -> Result<(
         Option<(String, String, i64, i64, String, String, String)>,

@@ -1262,6 +1262,358 @@ async fn get_reposted_event_ids(
         .map_err(|e| format!("Failed to get reposted event IDs: {}", e))
 }
 
+// ── NIP-51 Bookmark Commands ──────────────────────────────────
+
+#[tauri::command]
+async fn toggle_bookmark(
+    event_id: String,
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<bool, String> {
+    let db = state.db();
+
+    // Check current state and toggle
+    let already = db.get_bookmarked_event_ids(&[event_id.clone()])
+        .map_err(|e| format!("Failed to check bookmark: {}", e))?;
+
+    let now_bookmarked = if already.contains(&event_id) {
+        db.remove_bookmark(&event_id)
+            .map_err(|e| format!("Failed to remove bookmark: {}", e))?;
+        false
+    } else {
+        db.add_bookmark(&event_id)
+            .map_err(|e| format!("Failed to add bookmark: {}", e))?;
+        true
+    };
+
+    tracing::info!("[cmd:toggle_bookmark] event={}... now_bookmarked={}", &event_id[..event_id.len().min(12)], now_bookmarked);
+
+    // Publish kind 10003 in background
+    let state_config = state.config.read().await;
+    let nsec = state_config.nsec.clone();
+    let signing_mode = state_config.signing_mode.clone();
+    let hex_pubkey = state_config.hex_pubkey.clone();
+    let outbound_relays = state_config.outbound_relays.clone();
+    drop(state_config);
+
+    let db_clone = state.db();
+    let nip46_signer = Arc::clone(&state.nip46_signer);
+
+    tokio::spawn(async move {
+        if let Err(e) = publish_bookmark_list(
+            db_clone, nip46_signer, nsec, signing_mode, hex_pubkey, outbound_relays, app_handle,
+        ).await {
+            tracing::warn!("[bookmark] failed to publish kind 10003: {}", e);
+        }
+    });
+
+    Ok(now_bookmarked)
+}
+
+/// Build and publish the kind 10003 bookmark list event with NIP-44 encrypted private tags.
+async fn publish_bookmark_list(
+    db: Arc<Database>,
+    nip46_signer: Arc<RwLock<Option<crate::nip46::Nip46Client>>>,
+    nsec: Option<String>,
+    signing_mode: String,
+    hex_pubkey: Option<String>,
+    outbound_relays: Vec<String>,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    use nostr_sdk::prelude::*;
+
+    let hex_pk = hex_pubkey.ok_or("No pubkey configured")?;
+    let own_pk = PublicKey::from_hex(&hex_pk)
+        .map_err(|e| format!("Invalid pubkey: {}", e))?;
+
+    // Build the private tags JSON: [["e","id1"],["e","id2"],...]
+    let all_ids = db.get_all_bookmark_ids()
+        .map_err(|e| format!("Failed to get bookmark IDs: {}", e))?;
+
+    let private_tags: Vec<Vec<String>> = all_ids.iter()
+        .map(|id| vec!["e".to_string(), id.clone()])
+        .collect();
+    let private_json = serde_json::to_string(&private_tags)
+        .map_err(|e| format!("Failed to serialize bookmarks: {}", e))?;
+
+    // Encrypt with NIP-44
+    let use_nsec = signing_mode == "nsec" && nsec.is_some();
+    let encrypted_content = if use_nsec {
+        let secret_key = SecretKey::from_bech32(nsec.as_ref().unwrap())
+            .map_err(|e| format!("Invalid nsec: {}", e))?;
+        nip44::encrypt(&secret_key, &own_pk, &private_json, nip44::Version::V2)
+            .map_err(|e| format!("NIP-44 encryption failed: {}", e))?
+    } else {
+        // Use NIP-46 remote signer for encryption
+        let signer_opt = {
+            let guard = nip46_signer.read().await;
+            guard.clone()
+        };
+        match signer_opt {
+            Some(signer) => {
+                signer.nip44_encrypt(own_pk, private_json.clone())
+                    .await
+                    .map_err(|e| format!("Remote NIP-44 encryption failed: {}", e))?
+            }
+            None => {
+                tracing::warn!("[bookmark] no signer available, bookmark saved locally only");
+                return Ok(());
+            }
+        }
+    };
+
+    // Build kind 10003 event (no public tags — all private)
+    let builder = EventBuilder::new(Kind::from(10003), &encrypted_content, vec![]);
+
+    // Sign the event
+    let signed = if use_nsec {
+        let secret_key = SecretKey::from_bech32(nsec.as_ref().unwrap())
+            .map_err(|e| format!("Invalid nsec: {}", e))?;
+        let keys = Keys::new(secret_key);
+        builder.to_event(&keys)
+            .map_err(|e| format!("Failed to sign bookmark event: {}", e))?
+    } else {
+        let signer_opt = {
+            let guard = nip46_signer.read().await;
+            guard.clone()
+        };
+        match signer_opt {
+            Some(mut signer) => {
+                let unsigned = builder.to_unsigned_event(own_pk);
+                let event = signer.sign_event(unsigned).await
+                    .map_err(|e| format!("Remote signing failed: {}", e))?;
+                // Write back signer with updated encryption preference
+                {
+                    let mut guard = nip46_signer.write().await;
+                    *guard = Some(signer);
+                }
+                event
+            }
+            None => return Err("No signer available".into()),
+        }
+    };
+
+    tracing::info!("[bookmark] signed kind 10003: id={}", &signed.id.to_hex()[..12]);
+
+    // Store locally
+    let tags_json = serde_json::to_string(
+        &signed.tags.iter()
+            .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect::<Vec<String>>())
+            .collect::<Vec<Vec<String>>>()
+    ).unwrap_or_else(|_| "[]".to_string());
+
+    let _ = db.store_event(
+        &signed.id.to_hex(),
+        &signed.pubkey.to_hex(),
+        signed.created_at.as_u64() as i64,
+        signed.kind.as_u16() as u32,
+        &tags_json,
+        &signed.content,
+        &signed.sig.to_string(),
+    );
+
+    // Broadcast to outbound relays
+    if !outbound_relays.is_empty() {
+        let event_json = serde_json::to_string(&serde_json::json!({
+            "id": signed.id.to_hex(),
+            "pubkey": signed.pubkey.to_hex(),
+            "created_at": signed.created_at.as_u64(),
+            "kind": signed.kind.as_u16(),
+            "tags": signed.tags.iter().map(|t| t.as_slice().iter().map(|s| s.to_string()).collect::<Vec<String>>()).collect::<Vec<Vec<String>>>(),
+            "content": signed.content,
+            "sig": signed.sig.to_string(),
+        })).unwrap_or_default();
+
+        if let Some(sender) = app_handle.try_state::<crate::relay::OutboundEventSender>() {
+            let _ = sender.send(event_json);
+        }
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_bookmarked_event_ids(
+    event_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    state.db().get_bookmarked_event_ids(&event_ids)
+        .map_err(|e| format!("Failed to get bookmarked event IDs: {}", e))
+}
+
+#[tauri::command]
+async fn get_bookmarks_feed(
+    limit: Option<u32>,
+    before: Option<u64>,
+    state: State<'_, AppState>,
+) -> Result<Vec<NostrEvent>, String> {
+    let lim = limit.unwrap_or(50);
+    let before_i64 = before.map(|b| b as i64);
+
+    let rows = state.db().get_bookmarked_events(lim, before_i64)
+        .map_err(|e| format!("Failed to get bookmarks feed: {}", e))?;
+
+    let events: Vec<NostrEvent> = rows.into_iter().map(|(id, pubkey, created_at, kind, tags_json, content, sig, _bookmarked_at)| {
+        let tags: Vec<Vec<String>> = serde_json::from_str(&tags_json).unwrap_or_default();
+        NostrEvent {
+            id,
+            pubkey,
+            created_at: created_at as u64,
+            kind: kind as u32,
+            tags,
+            content,
+            sig,
+        }
+    }).collect();
+
+    Ok(events)
+}
+
+#[tauri::command]
+async fn sync_bookmarks_from_relays(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<u32, String> {
+    use nostr_sdk::prelude::*;
+
+    let cfg = state.config.read().await;
+    let hex_pubkey = cfg.hex_pubkey.clone().ok_or("No pubkey configured")?;
+    let nsec = cfg.nsec.clone();
+    let signing_mode = cfg.signing_mode.clone();
+    let fallback_relays = cfg.outbound_relays.clone();
+    drop(cfg);
+
+    let own_pk = PublicKey::from_hex(&hex_pubkey)
+        .map_err(|e| format!("Invalid pubkey: {}", e))?;
+
+    let relay_urls = resolve_sync_relays(&state.db(), &hex_pubkey, &fallback_relays);
+    if relay_urls.is_empty() {
+        return Err("No relays available".into());
+    }
+
+    // Fetch kind 10003 for own pubkey
+    let filter = Filter::new()
+        .author(own_pk)
+        .kind(Kind::from(10003))
+        .limit(1);
+
+    let pool = crate::sync::pool::RelayPool::new();
+    let events = pool.subscribe_and_collect(
+        &relay_urls,
+        vec![filter],
+        10,
+    ).await.map_err(|e| format!("Relay fetch failed: {}", e))?;
+
+    if events.is_empty() {
+        tracing::info!("[bookmark_sync] no kind 10003 found on relays");
+        return Ok(0);
+    }
+
+    // Get the most recent one
+    let bookmark_event = events.into_iter()
+        .max_by_key(|e| e.created_at)
+        .unwrap();
+
+    if bookmark_event.content.is_empty() {
+        tracing::info!("[bookmark_sync] kind 10003 has empty content (no private bookmarks)");
+        return Ok(0);
+    }
+
+    // Decrypt the content
+    let use_nsec = signing_mode == "nsec" && nsec.is_some();
+    let decrypted = if use_nsec {
+        let secret_key = SecretKey::from_bech32(nsec.as_ref().unwrap())
+            .map_err(|e| format!("Invalid nsec: {}", e))?;
+        nip44::decrypt(&secret_key, &own_pk, &bookmark_event.content)
+            .map_err(|e| format!("NIP-44 decryption failed: {}", e))?
+    } else {
+        let signer_opt = {
+            let guard = state.nip46_signer.read().await;
+            guard.clone()
+        };
+        match signer_opt {
+            Some(signer) => {
+                signer.nip44_decrypt(own_pk, bookmark_event.content.clone())
+                    .await
+                    .map_err(|e| format!("Remote NIP-44 decryption failed: {}", e))?
+            }
+            None => return Err("No signer available for decryption".into()),
+        }
+    };
+
+    // Parse the decrypted JSON as array of tags
+    let tags: Vec<Vec<String>> = serde_json::from_str(&decrypted)
+        .map_err(|e| format!("Failed to parse bookmark tags: {}", e))?;
+
+    // Extract event IDs from ["e", "..."] tags
+    let event_ids: Vec<String> = tags.iter()
+        .filter(|t| t.len() >= 2 && t[0] == "e")
+        .map(|t| t[1].clone())
+        .collect();
+
+    if event_ids.is_empty() {
+        tracing::info!("[bookmark_sync] no event IDs in decrypted bookmarks");
+        return Ok(0);
+    }
+
+    // Additive merge into local table
+    let db = state.db();
+    let synced = db.sync_bookmarks(&event_ids)
+        .map_err(|e| format!("Failed to sync bookmarks: {}", e))?;
+
+    tracing::info!("[bookmark_sync] synced {} new bookmarks from relays ({} total in remote list)", synced, event_ids.len());
+
+    // Fetch any bookmarked events missing from local DB
+    let missing_ids = db.get_missing_bookmarked_event_ids()
+        .unwrap_or_default();
+    if !missing_ids.is_empty() {
+        tracing::info!("[bookmark_sync] fetching {} missing bookmarked events from relays", missing_ids.len());
+
+        let event_ids_to_fetch: Vec<EventId> = missing_ids.iter()
+            .filter_map(|id| EventId::from_hex(id).ok())
+            .collect();
+
+        if !event_ids_to_fetch.is_empty() {
+            let fetch_filter = Filter::new().ids(event_ids_to_fetch).limit(missing_ids.len());
+            let fetch_pool = crate::sync::pool::RelayPool::new();
+            match fetch_pool.subscribe_and_collect(&relay_urls, vec![fetch_filter], 15).await {
+                Ok(fetched_events) => {
+                    let mut stored = 0u32;
+                    for event in &fetched_events {
+                        let tags_json = serde_json::to_string(
+                            &event.tags.iter()
+                                .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect::<Vec<String>>())
+                                .collect::<Vec<Vec<String>>>()
+                        ).unwrap_or_else(|_| "[]".to_string());
+                        if db.store_event(
+                            &event.id.to_hex(),
+                            &event.pubkey.to_hex(),
+                            event.created_at.as_u64() as i64,
+                            event.kind.as_u16() as u32,
+                            &tags_json,
+                            &event.content,
+                            &event.sig.to_string(),
+                        ).is_ok() {
+                            stored += 1;
+                        }
+                    }
+                    tracing::info!("[bookmark_sync] fetched and stored {} missing bookmarked events", stored);
+                }
+                Err(e) => {
+                    tracing::warn!("[bookmark_sync] failed to fetch missing events: {}", e);
+                }
+            }
+        }
+    }
+
+    // Emit event for frontend cache invalidation
+    if synced > 0 {
+        let _ = app_handle.emit("bookmarks-synced", synced);
+    }
+
+    Ok(synced)
+}
+
 #[tauri::command]
 async fn fetch_thread_from_relays(
     root_id: String,
@@ -6660,6 +7012,10 @@ pub fn run() {
             get_interaction_counts,
             get_reacted_event_ids,
             get_reposted_event_ids,
+            toggle_bookmark,
+            get_bookmarked_event_ids,
+            get_bookmarks_feed,
+            sync_bookmarks_from_relays,
             fetch_thread_from_relays,
             fetch_global_feed,
             fetch_wot_articles,

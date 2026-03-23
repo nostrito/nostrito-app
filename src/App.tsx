@@ -44,12 +44,12 @@ class ErrorBoundary extends React.Component<
 }
 
 // Lazy load screens
-import { Dashboard } from "./screens/Dashboard";
 import { Feed } from "./screens/Feed";
+import { Bookmarks } from "./screens/Bookmarks";
 import { Dms } from "./screens/Dms";
 import { Wot } from "./screens/Wot";
-import { Storage } from "./screens/Storage";
 import { Settings } from "./screens/Settings";
+import { SettingsAnalytics } from "./screens/SettingsAnalytics";
 import { Wizard } from "./screens/Wizard";
 import { ProfileView } from "./screens/ProfileView";
 import { NoteDetail } from "./screens/NoteDetail";
@@ -61,16 +61,16 @@ import { Wallet } from "./screens/Wallet";
 
 const SCREEN_LABELS: Record<string, string> = {
   "/": "feed",
-  "/analytics": "analytics",
+  "/bookmarks": "bookmarks",
   "/dms": "messages",
   "/gallery": "gallery",
-  "/wot": "wot",
   "/wallet": "wallet",
-  "/storage": "storage",
-  "/storage/own-events": "storage / own events",
-  "/storage/tracked-profiles": "storage / tracked profiles",
-  "/storage/wot-profiles": "storage / wot profiles",
   "/settings": "settings",
+  "/settings/analytics": "settings / analytics",
+  "/settings/analytics/own-events": "analytics / own events",
+  "/settings/analytics/tracked-profiles": "analytics / tracked profiles",
+  "/settings/analytics/wot-profiles": "analytics / wot profiles",
+  "/settings/analytics/wot": "analytics / wot explorer",
 };
 
 const AppShell: React.FC = () => {
@@ -79,7 +79,7 @@ const AppShell: React.FC = () => {
 
   const label = SCREEN_LABELS[location.pathname] || "nostrito";
   const relayUrl = appStatus?.relay_running ? `wss://localhost:${appStatus.relay_port}` : null;
-  const titleText = relayUrl && location.pathname === "/analytics"
+  const titleText = relayUrl && location.pathname === "/settings/analytics"
     ? `nostrito — ${relayUrl}`
     : `nostrito — ${label}`;
 
@@ -202,16 +202,16 @@ const AppRoutes: React.FC = () => {
       <Route path="/wizard" element={isInitialized ? <Navigate to="/" replace /> : <Wizard />} />
       <Route element={isInitialized ? <AppShell /> : <Navigate to="/wizard" replace />}>
         <Route path="/" element={<Feed />} />
-        <Route path="/analytics" element={<Dashboard />} />
+        <Route path="/bookmarks" element={<Bookmarks />} />
         <Route path="/dms" element={<Dms />} />
         <Route path="/gallery" element={<Gallery />} />
-        <Route path="/wot" element={<Wot />} />
         <Route path="/wallet" element={<Wallet />} />
-        <Route path="/storage" element={<Storage />} />
-        <Route path="/storage/own-events" element={<StorageOwnEvents />} />
-        <Route path="/storage/tracked-profiles" element={<StorageTrackedProfiles />} />
-        <Route path="/storage/wot-profiles" element={<StorageWotProfiles />} />
         <Route path="/settings" element={<Settings />} />
+        <Route path="/settings/analytics" element={<SettingsAnalytics />} />
+        <Route path="/settings/analytics/own-events" element={<StorageOwnEvents />} />
+        <Route path="/settings/analytics/tracked-profiles" element={<StorageTrackedProfiles />} />
+        <Route path="/settings/analytics/wot-profiles" element={<StorageWotProfiles />} />
+        <Route path="/settings/analytics/wot" element={<Wot />} />
         <Route path="/profile/:pubkey" element={<ProfileView />} />
         <Route path="/note/:noteId" element={<NoteDetail />} />
         <Route path="*" element={<Navigate to="/" replace />} />
