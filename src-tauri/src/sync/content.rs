@@ -43,8 +43,7 @@ impl ContentFetch {
 
     /// Run the full content fetch phase.
     ///
-    /// Fetches in three priority passes (layers), each with its own media priority
-    /// and cursor logic:
+    /// Fetches in three priority passes (layers), each with its own cursor logic:
     ///   - **Pass 1 (Layer 0.5):** Tracked profiles — explicitly pinned by the user.
     ///   - **Pass 2 (Layer 1):** Direct follows — the user's contact list.
     ///   - **Pass 3 (Layer 2):** WoT peers — a random sample of follows-of-follows,
@@ -72,7 +71,7 @@ impl ContentFetch {
         if !tracked.is_empty() {
             info!("Content: fetching {} tracked profiles first", tracked.len());
             let pass_stats = self.fetch_pubkey_set(
-                &tracked, &refresh_set, &bands, now, super::types::MEDIA_PRIORITY_TRACKED, "tracked", "0.5",
+                &tracked, &refresh_set, &bands, now, "tracked", "0.5",
             ).await;
             stats.events_stored += pass_stats.0;
             stats.wot_updates += pass_stats.1;
@@ -96,7 +95,7 @@ impl ContentFetch {
 
         if !follows_only.is_empty() {
             let pass_stats = self.fetch_pubkey_set(
-                &follows_only, &refresh_set, &bands, now, super::types::MEDIA_PRIORITY_FOLLOWS, "tier2", "1",
+                &follows_only, &refresh_set, &bands, now, "tier2", "1",
             ).await;
             stats.events_stored += pass_stats.0;
             stats.wot_updates += pass_stats.1;
@@ -113,7 +112,7 @@ impl ContentFetch {
                 info!("Content: fetching WoT content from {} random peers (target: {} notes)", wot_peers.len(), self.wot_notes_per_cycle);
                 let pass_stats = self.fetch_pubkey_set_with_limit(
                     &wot_peers, &refresh_set, &bands, now,
-                    super::types::MEDIA_PRIORITY_FOF, "tier3", "2",
+                    "tier3", "2",
                     self.wot_notes_per_cycle,
                 ).await;
                 stats.events_stored += pass_stats.0;
@@ -141,7 +140,6 @@ impl ContentFetch {
         refresh_set: &std::collections::HashSet<&str>,
         bands: &HashMap<CursorBand, Vec<String>>,
         now: i64,
-        media_priority: i32,
         stat_key: &str,
         layer: &str,
     ) -> (u32, u32, u32) {
@@ -260,7 +258,6 @@ impl ContentFetch {
                     bands,
                     refresh_set,
                     now,
-                    media_priority,
                     layer,
                     sub_timeout,
                 ).await;
@@ -327,7 +324,6 @@ impl ContentFetch {
         bands: &HashMap<CursorBand, Vec<String>>,
         refresh_set: &std::collections::HashSet<&str>,
         now: i64,
-        media_priority: i32,
         layer: &str,
         subscription_timeout_secs: u64,
     ) -> Result<(u32, u32)> {
@@ -427,7 +423,6 @@ impl ContentFetch {
                     &self.graph,
                     &self.own_pubkey,
                     EventSource::Sync,
-                    media_priority,
                     Some(&self.app_handle),
                     layer,
                 );
@@ -471,7 +466,7 @@ impl ContentFetch {
                             &[relay_url.to_string()], vec![thread_filter], 10,
                         ).await {
                             let (ts, _) = processing::process_events(
-                                &thread_events, &self.db, &self.graph, &self.own_pubkey, EventSource::ThreadContext, super::types::MEDIA_PRIORITY_OTHERS, Some(&self.app_handle), "thread",
+                                &thread_events, &self.db, &self.graph, &self.own_pubkey, EventSource::ThreadContext, Some(&self.app_handle), "thread",
                             );
                             thread_stored = ts;
                             if ts > 0 {
@@ -567,7 +562,6 @@ impl ContentFetch {
         refresh_set: &std::collections::HashSet<&str>,
         bands: &HashMap<CursorBand, Vec<String>>,
         now: i64,
-        media_priority: i32,
         _stat_key: &str,
         layer: &str,
         max_notes: u32,
@@ -661,7 +655,6 @@ impl ContentFetch {
                     bands,
                     refresh_set,
                     now,
-                    media_priority,
                     layer,
                     sub_timeout,
                 ).await;

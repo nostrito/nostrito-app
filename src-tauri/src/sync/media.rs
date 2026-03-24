@@ -1,256 +1,58 @@
 #![allow(dead_code)]
 use anyhow::Result;
-use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::info;
 
-use crate::storage::db::Database;
+/// Download a single media URL and write it to disk.
+/// Used by Tauri commands for user-triggered "Save locally" action.
+/// Returns the hash of the downloaded file on success, or None if skipped/invalid.
+pub async fn download_single_media(
+    url: &str,
+) -> Result<Option<String>> {
+    let hash = extract_sha256_from_url(url)
+        .unwrap_or_else(|| sha256_of_string(url));
 
-/// Phase 5: Media Download — process the media queue and enforce storage limits.
-pub struct MediaDownloader {
-    db: Arc<Database>,
-    own_pubkey: String,
-    tracked_limit_bytes: u64,
-    wot_limit_bytes: u64,
-    tracked_pubkeys: HashSet<String>,
-}
+    const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024;
 
-impl MediaDownloader {
-    pub fn new(db: Arc<Database>, own_pubkey: String, tracked_media_gb: f64, wot_media_gb: f64) -> Self {
-        let tracked = db.get_tracked_pubkeys()
-            .unwrap_or_default()
-            .into_iter()
-            .collect::<HashSet<String>>();
-        Self {
-            db,
-            own_pubkey,
-            tracked_limit_bytes: (tracked_media_gb * 1_073_741_824.0) as u64,
-            wot_limit_bytes: (wot_media_gb * 1_073_741_824.0) as u64,
-            tracked_pubkeys: tracked,
-        }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()?;
+
+    let response = match client.get(url).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return Ok(None),
+    };
+
+    let response_mime = response.headers().get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(';').next().unwrap_or(s).trim().to_lowercase());
+
+    let mime = response_mime
+        .or_else(|| mime_type_from_url(url).map(|s| s.to_string()))
+        .unwrap_or_else(|| {
+            if is_nostr_media_cdn(url) { "image/jpeg".to_string() }
+            else { "application/octet-stream".to_string() }
+        });
+
+    if !mime.starts_with("image/") && !mime.starts_with("video/") && !mime.starts_with("audio/") {
+        return Ok(None);
     }
 
-    /// Run the media download phase.
-    pub async fn run(&self, batch_size: usize) -> Result<MediaStats> {
-        let mut stats = MediaStats::default();
+    let bytes = response.bytes().await?;
+    let size_bytes = bytes.len() as u64;
 
-        // Dequeue URLs
-        let urls = self.db.dequeue_media_urls(batch_size)?;
-        if urls.is_empty() {
-            return Ok(stats);
-        }
-
-        let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()?;
-
-        for (url, pubkey) in &urls {
-            let hash = extract_sha256_from_url(url)
-                .unwrap_or_else(|| sha256_of_string(url));
-
-            if self.db.media_exists(&hash) {
-                // Media already downloaded — but reassign to higher-priority pubkey if needed.
-                // Priority: own > tracked > wot. This ensures tracked/own profiles get credit
-                // for media that was first downloaded during a WoT sync pass.
-                self.db.media_reassign_if_higher_priority(
-                    &hash, pubkey, &self.own_pubkey, &self.tracked_pubkeys,
-                ).ok();
-                stats.skipped += 1;
-                continue;
-            }
-
-            let bypass_limit = pubkey == &self.own_pubkey || self.tracked_pubkeys.contains(pubkey);
-            match self.download_media(&http_client, url, &hash, pubkey, bypass_limit).await {
-                Ok(true) => stats.downloaded += 1,
-                Ok(false) => stats.skipped += 1,
-                Err(e) => {
-                    debug!("Media: failed to download {}: {}", url, e);
-                    stats.failed += 1;
-                }
-            }
-        }
-
-        // Enforce storage limits per category
-        self.enforce_tracked_media_limit().await;
-        self.enforce_wot_media_limit().await;
-
-        if stats.downloaded > 0 {
-            info!(
-                "Media: downloaded {}, skipped {}, failed {}",
-                stats.downloaded, stats.skipped, stats.failed
-            );
-        }
-
-        Ok(stats)
+    if size_bytes == 0 || size_bytes > MAX_FILE_SIZE {
+        return Ok(None);
     }
 
-    /// Download a single media file.
-    async fn download_media(
-        &self,
-        client: &reqwest::Client,
-        url: &str,
-        hash: &str,
-        pubkey: &str,
-        bypass_limit: bool,
-    ) -> Result<bool> {
-        const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024; // 50 MB
-
-        // HEAD request for size/type hints
-        let (content_length_hint, mime_hint) = match client.head(url).send().await {
-            Ok(head) if head.status().is_success() => {
-                let cl = head.headers().get("content-length")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<u64>().ok());
-                let mime = head.headers().get("content-type")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.split(';').next().unwrap_or(s).trim().to_lowercase());
-                (cl, mime)
-            }
-            _ => (None, None),
-        };
-
-        // Pre-flight size check
-        if let Some(cl) = content_length_hint {
-            if cl > MAX_FILE_SIZE {
-                return Ok(false);
-            }
-            if !bypass_limit {
-                let used = self.db.media_others_bytes(&self.own_pubkey).unwrap_or(0);
-                if used + cl > self.wot_limit_bytes {
-                    return Ok(false);
-                }
-            } else if pubkey != &self.own_pubkey && self.tracked_pubkeys.contains(pubkey) {
-                let used = self.db.media_tracked_bytes(&self.own_pubkey).unwrap_or(0);
-                if used + cl > self.tracked_limit_bytes {
-                    return Ok(false);
-                }
-            }
-        }
-
-        // GET
-        let response = match client.get(url).send().await {
-            Ok(r) if r.status().is_success() => r,
-            _ => return Ok(false),
-        };
-
-        let response_mime = response.headers().get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.split(';').next().unwrap_or(s).trim().to_lowercase());
-
-        let mime = response_mime
-            .or(mime_hint)
-            .or_else(|| mime_type_from_url(url).map(|s| s.to_string()))
-            .unwrap_or_else(|| {
-                if is_nostr_media_cdn(url) { "image/jpeg".to_string() }
-                else { "application/octet-stream".to_string() }
-            });
-
-        if !mime.starts_with("image/") && !mime.starts_with("video/") && !mime.starts_with("audio/") {
-            return Ok(false);
-        }
-
-        let bytes = response.bytes().await?;
-        let size_bytes = bytes.len() as u64;
-
-        if size_bytes == 0 || size_bytes > MAX_FILE_SIZE {
-            return Ok(false);
-        }
-
-        if !bypass_limit {
-            let used = self.db.media_others_bytes(&self.own_pubkey).unwrap_or(0);
-            if used + size_bytes > self.wot_limit_bytes {
-                return Ok(false);
-            }
-        } else if pubkey != &self.own_pubkey && self.tracked_pubkeys.contains(pubkey) {
-            let used = self.db.media_tracked_bytes(&self.own_pubkey).unwrap_or(0);
-            if used + size_bytes > self.tracked_limit_bytes {
-                return Ok(false);
-            }
-        }
-
-        // Write to disk
-        let file_path = media_file_path(hash);
-        if let Some(parent) = file_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        tokio::fs::write(&file_path, &bytes).await?;
-
-        self.db.store_media_record(hash, url, &mime, size_bytes, pubkey)?;
-
-        debug!("Media: downloaded {} ({} bytes, {})", &hash[..12.min(hash.len())], size_bytes, mime);
-        Ok(true)
+    let file_path = media_file_path(&hash);
+    if let Some(parent) = file_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
     }
+    tokio::fs::write(&file_path, &bytes).await?;
 
-    /// Enforce tracked media storage limit — evict LRU tracked items if over 95%.
-    async fn enforce_tracked_media_limit(&self) {
-        let used = match self.db.media_tracked_bytes(&self.own_pubkey) {
-            Ok(b) => b,
-            Err(_) => return,
-        };
-
-        if used < (self.tracked_limit_bytes as f64 * 0.95) as u64 {
-            return;
-        }
-
-        let target = (self.tracked_limit_bytes as f64 * 0.80) as u64;
-        info!("Media(tracked): over 95% ({}/{}), evicting to 80%", used, self.tracked_limit_bytes);
-
-        let candidates = self.db.media_list_lru_tracked(500, &self.own_pubkey).unwrap_or_default();
-        let mut evicted: Vec<String> = Vec::new();
-        let mut current = used;
-
-        for (hash, size) in candidates {
-            if current <= target { break; }
-            let path = media_file_path(&hash);
-            if let Err(e) = tokio::fs::remove_file(&path).await {
-                warn!("Media: evict failed {:?}: {}", path, e);
-            }
-            evicted.push(hash);
-            current = current.saturating_sub(size);
-        }
-
-        if !evicted.is_empty() {
-            let freed = used - current;
-            self.db.media_delete_records(&evicted).ok();
-            info!("Media(tracked): evicted {} items, freed {} bytes", evicted.len(), freed);
-        }
-    }
-
-    /// Enforce WoT media storage limit — evict LRU WoT items if over 95%.
-    async fn enforce_wot_media_limit(&self) {
-        let used = match self.db.media_others_bytes(&self.own_pubkey) {
-            Ok(b) => b,
-            Err(_) => return,
-        };
-
-        if used < (self.wot_limit_bytes as f64 * 0.95) as u64 {
-            return;
-        }
-
-        let target = (self.wot_limit_bytes as f64 * 0.80) as u64;
-        info!("Media(wot): over 95% ({}/{}), evicting to 80%", used, self.wot_limit_bytes);
-
-        let candidates = self.db.media_list_lru_excluding_pubkey(500, &self.own_pubkey).unwrap_or_default();
-        let mut evicted: Vec<String> = Vec::new();
-        let mut current = used;
-
-        for (hash, size) in candidates {
-            if current <= target { break; }
-            let path = media_file_path(&hash);
-            if let Err(e) = tokio::fs::remove_file(&path).await {
-                warn!("Media: evict failed {:?}: {}", path, e);
-            }
-            evicted.push(hash);
-            current = current.saturating_sub(size);
-        }
-
-        if !evicted.is_empty() {
-            let freed = used - current;
-            self.db.media_delete_records(&evicted).ok();
-            info!("Media(wot): evicted {} items, freed {} bytes", evicted.len(), freed);
-        }
-    }
+    info!("Media: saved {} ({} bytes, {})", &hash[..12.min(hash.len())], size_bytes, mime);
+    Ok(Some(hash))
 }
 
 // ── Media Helpers (extracted from engine.rs) ─────────────────────
@@ -380,13 +182,6 @@ pub fn media_file_path(hash: &str) -> PathBuf {
         .join(".nostrito/media")
         .join(&hash[..2.min(hash.len())])
         .join(hash)
-}
-
-#[derive(Debug, Default)]
-pub struct MediaStats {
-    pub downloaded: u32,
-    pub skipped: u32,
-    pub failed: u32,
 }
 
 #[cfg(test)]

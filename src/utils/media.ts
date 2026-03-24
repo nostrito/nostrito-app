@@ -95,6 +95,12 @@ const iconBookmarkFilled = () =>
 const iconEye = () =>
   `<svg class="icon" xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/><circle cx="12" cy="12" r="3"/></svg>`;
 
+const iconDownload = () =>
+  `<svg class="icon" xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`;
+
+const iconCheck = () =>
+  `<svg class="icon" xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`;
+
 /**
  * Initialize the media viewer (lightbox) overlay.
  * Supports both images and videos. Call once on app startup.
@@ -201,6 +207,8 @@ export function initMediaViewer(): void {
       cursor: default;
     }
     .mv-menu-item.bookmarked { color: var(--accent, #f9e2af); }
+    .mv-menu-item.saved { color: var(--green, #a6e3a1); }
+    .mv-menu-item.saving { opacity: 0.6; cursor: wait; }
     .mv-menu-sep {
       height: 1px;
       background: var(--border, rgba(255,255,255,0.08));
@@ -219,6 +227,7 @@ export function initMediaViewer(): void {
     <div id="media-viewer-menu">
       <button class="mv-menu-item" id="mv-view-event">${iconEye()}<span>View Event</span></button>
       <div class="mv-menu-sep"></div>
+      <button class="mv-menu-item" id="mv-save-local">${iconDownload()}<span>Save locally</span></button>
       <button class="mv-menu-item" id="mv-bookmark">${iconBookmark()}<span>Bookmark</span></button>
     </div>
     <button id="media-viewer-close"><span class="icon">${iconX()}</span></button>
@@ -230,6 +239,7 @@ export function initMediaViewer(): void {
   const menuBtn = viewer.querySelector("#media-viewer-menu-btn") as HTMLButtonElement;
   const menu = viewer.querySelector("#media-viewer-menu") as HTMLDivElement;
   const viewEventBtn = viewer.querySelector("#mv-view-event") as HTMLButtonElement;
+  const saveLocalBtn = viewer.querySelector("#mv-save-local") as HTMLButtonElement;
   const bookmarkBtn = viewer.querySelector("#mv-bookmark") as HTMLButtonElement;
 
   /* --- current context ------------------------------------------------ */
@@ -237,6 +247,8 @@ export function initMediaViewer(): void {
   let currentEventId = "";
   let currentPubkey = "";
   let isBookmarked = false;
+  let isSavedLocally = false;
+  let isSaving = false;
 
   /* --- helpers -------------------------------------------------------- */
   function isVideoUrl(url: string): boolean {
@@ -260,6 +272,41 @@ export function initMediaViewer(): void {
       if (iconSpan) iconSpan.outerHTML = iconBookmark();
       if (labelSpan) labelSpan.textContent = "Bookmark";
     }
+  }
+
+  function updateSaveBtn(): void {
+    const iconSpan = saveLocalBtn.querySelector(".icon") as HTMLElement;
+    const labelSpan = saveLocalBtn.querySelector("span:last-child") as HTMLElement;
+    saveLocalBtn.classList.remove("saved", "saving");
+    if (isSaving) {
+      saveLocalBtn.classList.add("saving");
+      if (labelSpan) labelSpan.textContent = "Saving...";
+    } else if (isSavedLocally) {
+      saveLocalBtn.classList.add("saved");
+      if (iconSpan) iconSpan.outerHTML = iconCheck();
+      if (labelSpan) labelSpan.textContent = "Saved";
+    } else {
+      if (iconSpan) iconSpan.outerHTML = iconDownload();
+      if (labelSpan) labelSpan.textContent = "Save locally";
+    }
+  }
+
+  async function checkSaveStatus(): Promise<void> {
+    if (!currentOriginalUrl) {
+      isSavedLocally = false;
+      updateSaveBtn();
+      return;
+    }
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const path = await invoke<string | null>("check_media_cached", {
+        url: currentOriginalUrl,
+      });
+      isSavedLocally = !!path;
+    } catch {
+      isSavedLocally = false;
+    }
+    updateSaveBtn();
   }
 
   async function checkBookmarkStatus(): Promise<void> {
@@ -323,7 +370,10 @@ export function initMediaViewer(): void {
     currentEventId = context?.eventId || "";
     currentPubkey = context?.pubkey || "";
     isBookmarked = false;
+    isSavedLocally = false;
+    isSaving = false;
     updateBookmarkBtn();
+    updateSaveBtn();
 
     console.log("[media-viewer] open:", { currentEventId, currentPubkey, currentOriginalUrl });
 
@@ -333,6 +383,9 @@ export function initMediaViewer(): void {
 
     viewer.style.display = "flex";
     closeMenu();
+
+    // Check save status immediately (doesn't need event context)
+    checkSaveStatus();
 
     // Async: resolve event if needed, then check bookmark
     resolveEventContext().then(() => {
@@ -415,6 +468,30 @@ export function initMediaViewer(): void {
       updateBookmarkBtn();
     } catch (err) {
       console.error("[media-viewer] bookmark failed:", err);
+    }
+    closeMenu();
+  });
+
+  // Save locally action
+  saveLocalBtn.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    const murl = currentOriginalUrl;
+    if (!murl || isSaving || isSavedLocally) return;
+    isSaving = true;
+    updateSaveBtn();
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const path = await invoke<string | null>("download_media_url", {
+        url: murl,
+      });
+      if (path) {
+        isSavedLocally = true;
+      }
+    } catch (err) {
+      console.error("[media-viewer] save locally failed:", err);
+    } finally {
+      isSaving = false;
+      updateSaveBtn();
     }
     closeMenu();
   });

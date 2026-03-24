@@ -15,7 +15,6 @@ use crate::wot::WotGraph;
 
 use super::content::ContentFetch;
 use super::discovery::Discovery;
-use super::media::MediaDownloader;
 use super::pool::RelayPool;
 use super::processing;
 use super::pruning;
@@ -24,12 +23,11 @@ use super::types::{EventSource, SyncConfig, SyncPhase, SyncProgress, SyncStats, 
 
 /// Relay-centric sync engine with NIP-65 outbox routing.
 ///
-/// Runs a 5-phase sync cycle:
+/// Runs a 4-phase sync cycle:
 ///   1. OwnData — fetch own profile + events
 ///   2. Discovery — discover relay info for follows
 ///   3. ContentFetch — relay-centric batched event retrieval
 ///   4. ThreadContext — fetch missing thread roots
-///   5. MediaDownload — download queued media
 pub struct SyncEngine {
     graph: Arc<WotGraph>,
     db: Arc<Database>,
@@ -39,8 +37,6 @@ pub struct SyncEngine {
     pub sync_tier: Arc<AtomicU8>,
     pub sync_stats: Arc<RwLock<SyncStats>>,
     app_handle: tauri::AppHandle,
-    tracked_media_gb: f64,
-    wot_media_gb: f64,
     sync_config: SyncConfig,
     pool: Arc<RelayPool>,
 }
@@ -54,8 +50,6 @@ impl SyncEngine {
         sync_tier: Arc<AtomicU8>,
         sync_stats: Arc<RwLock<SyncStats>>,
         app_handle: tauri::AppHandle,
-        tracked_media_gb: f64,
-        wot_media_gb: f64,
         sync_config: SyncConfig,
         _max_event_age_days: u32,
     ) -> Self {
@@ -89,8 +83,6 @@ impl SyncEngine {
             sync_tier,
             sync_stats,
             app_handle,
-            tracked_media_gb,
-            wot_media_gb,
             sync_config,
             pool: Arc::new(RelayPool::new()),
         }
@@ -159,16 +151,6 @@ impl SyncEngine {
                 warn!("Phase 4 error: {}", e);
             }
             info!("SyncEngine: Phase 4 (Thread Context) took {:.1}s", phase_start.elapsed().as_secs_f32());
-
-            if self.cancel.is_cancelled() { break; }
-
-            // Phase 5: Media Download
-            self.emit_phase(SyncPhase::MediaDownload).await;
-            let phase_start = std::time::Instant::now();
-            if let Err(e) = self.phase_media().await {
-                warn!("Phase 5 error: {}", e);
-            }
-            info!("SyncEngine: Phase 5 (Media Download) took {:.1}s", phase_start.elapsed().as_secs_f32());
 
             // Pruning: run every cycle after all phases
             if let Err(e) = self.run_pruning() {
@@ -323,7 +305,6 @@ impl SyncEngine {
             &self.graph,
             &self.hex_pubkey,
             EventSource::OwnBackup,
-            super::types::MEDIA_PRIORITY_OWNER,
             Some(&self.app_handle),
             "0",
         );
@@ -430,33 +411,6 @@ impl SyncEngine {
         Ok(())
     }
 
-    /// Phase 5: Download queued media.
-    async fn phase_media(&self) -> Result<()> {
-        {
-            let mut ss = self.sync_stats.write().await;
-            ss.tier4_fetched = 0;
-        }
-        let media = MediaDownloader::new(
-            Arc::clone(&self.db),
-            self.hex_pubkey.clone(),
-            self.tracked_media_gb,
-            self.wot_media_gb,
-        );
-
-        let stats = media.run(50).await?;
-        if stats.downloaded > 0 {
-            info!("Phase 5: {} downloaded, {} skipped", stats.downloaded, stats.skipped);
-        }
-
-        {
-            let mut ss = self.sync_stats.write().await;
-            ss.tier4_fetched += stats.downloaded as u64;
-        }
-
-        self.emit_tier_complete(5).await;
-        Ok(())
-    }
-
     /// Run tiered pruning.
     fn run_pruning(&self) -> Result<()> {
         let stats = pruning::run_pruning(&self.db, &self.graph, &self.hex_pubkey)?;
@@ -493,7 +447,7 @@ impl SyncEngine {
 
     /// WoT crawl — fetch contact lists for follows-of-follows.
     async fn phase_wot_crawl(&self) -> Result<()> {
-        // Make WoT crawl visible to the dashboard (runs after the 5 main phases)
+        // Make WoT crawl visible to the dashboard (runs after the 4 main phases)
         self.sync_tier.store(6, Ordering::Relaxed);
         {
             let mut ss = self.sync_stats.write().await;
@@ -555,7 +509,6 @@ impl SyncEngine {
                         &self.graph,
                         &self.hex_pubkey,
                         EventSource::Sync,
-                        super::types::MEDIA_PRIORITY_FOF,
                         Some(&self.app_handle),
                         "2",
                     );
@@ -587,7 +540,6 @@ impl SyncEngine {
             SyncPhase::Discovery => "",
             SyncPhase::ContentFetch => "",
             SyncPhase::ThreadContext => "thread",
-            SyncPhase::MediaDownload => "",
         };
 
         // Set sync_tier atomically BEFORE updating stats and emitting events,
@@ -648,6 +600,5 @@ mod tests {
         assert!((SyncPhase::OwnData as u8) < (SyncPhase::Discovery as u8));
         assert!((SyncPhase::Discovery as u8) < (SyncPhase::ContentFetch as u8));
         assert!((SyncPhase::ContentFetch as u8) < (SyncPhase::ThreadContext as u8));
-        assert!((SyncPhase::ThreadContext as u8) < (SyncPhase::MediaDownload as u8));
     }
 }

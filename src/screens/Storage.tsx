@@ -15,13 +15,11 @@ import { useProfileContext } from "../context/ProfileContext";
 
 interface OwnershipStorageStats {
   own_events_count: number;
-  own_media_bytes: number;
   tracked_events_count: number;
-  tracked_media_bytes: number;
   wot_events_count: number;
-  wot_media_bytes: number;
   total_events: number;
   db_size_bytes: number;
+  media_disk_bytes: number;
 }
 
 interface StorageStats {
@@ -102,17 +100,6 @@ export const Storage: React.FC = () => {
       })
       .catch(() => {});
 
-    // Trigger immediate download of tracked profile media, then refresh stats
-    invoke<number>("download_tracked_media")
-      .then((downloaded) => {
-        if (downloaded > 0) {
-          // Refresh stats after downloading
-          invoke<OwnershipStorageStats>("get_ownership_storage_stats")
-            .then(setOwnershipStats)
-            .catch(() => {});
-        }
-      })
-      .catch(() => {});
   }, []);
 
   // Refresh stats when media is deleted from Gallery
@@ -132,7 +119,7 @@ export const Storage: React.FC = () => {
   const title = useMemo(() => {
     if (ownershipError) return "storage usage \u2014 no data";
     if (!ownershipStats) return "storage usage \u2014 calculating...";
-    return `storage usage \u2014 ${ownershipStats.total_events.toLocaleString()} events \u00B7 ${formatBytes(ownershipStats.db_size_bytes)}`;
+    return `storage usage \u2014 ${ownershipStats.total_events.toLocaleString()} events \u00B7 db ${formatBytes(ownershipStats.db_size_bytes)} \u00B7 media ${formatBytes(ownershipStats.media_disk_bytes)}`;
   }, [ownershipStats, ownershipError]);
 
   const { ownPct, trackedPct, wotPct } = useMemo(() => {
@@ -218,12 +205,6 @@ export const Storage: React.FC = () => {
               </span>
               <span className="ownership-stat-label">events</span>
             </div>
-            <div className="ownership-stat">
-              <span className="ownership-stat-value">
-                {ownershipStats ? formatBytes(ownershipStats.own_media_bytes) : "\u2014"}
-              </span>
-              <span className="ownership-stat-label">media</span>
-            </div>
           </div>
           <div className="ownership-card-footer">
             always kept &mdash; never pruned &middot; &infin; unlimited
@@ -257,12 +238,6 @@ export const Storage: React.FC = () => {
                 {ownershipStats ? ownershipStats.tracked_events_count.toLocaleString() : "\u2014"}
               </span>
               <span className="ownership-stat-label">events</span>
-            </div>
-            <div className="ownership-stat">
-              <span className="ownership-stat-value">
-                {ownershipStats ? formatBytes(ownershipStats.tracked_media_bytes) : "\u2014"}
-              </span>
-              <span className="ownership-stat-label">media</span>
             </div>
           </div>
           <div className="ownership-card-footer">
@@ -300,12 +275,6 @@ export const Storage: React.FC = () => {
                 {ownershipStats ? ownershipStats.wot_events_count.toLocaleString() : "\u2014"}
               </span>
               <span className="ownership-stat-label">events</span>
-            </div>
-            <div className="ownership-stat">
-              <span className="ownership-stat-value">
-                {ownershipStats ? formatBytes(ownershipStats.wot_media_bytes) : "\u2014"}
-              </span>
-              <span className="ownership-stat-label">cached media</span>
             </div>
           </div>
           <div className="ownership-card-footer">

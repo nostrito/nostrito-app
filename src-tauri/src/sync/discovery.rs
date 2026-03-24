@@ -115,7 +115,6 @@ impl Discovery {
                         &self.graph,
                         &self.own_pubkey,
                         EventSource::Sync,
-                        super::types::MEDIA_PRIORITY_OTHERS,
                         Some(&self.app_handle),
                         "",
                     );

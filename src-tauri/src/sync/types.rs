@@ -50,7 +50,7 @@ pub struct SyncStats {
     /// Number of direct follows (for Layer 1 display).
     pub follows_count: u64,
     /// Human-readable phase name: "Own Data", "Discovery", "Content Fetch",
-    /// "Thread Context", "Media Download", "WoT Crawl", or "" (idle).
+    /// "Thread Context", "WoT Crawl", or "" (idle).
     pub current_phase: String,
 }
 
@@ -120,7 +120,7 @@ pub fn resolve_relay_url(alias: &str) -> &str {
 
 // ── Sync Phases ──────────────────────────────────────────────────
 
-/// The five phases of a v2 sync cycle, executed in order.
+/// The four phases of a v2 sync cycle, executed in order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum SyncPhase {
@@ -128,7 +128,6 @@ pub enum SyncPhase {
     Discovery = 2,
     ContentFetch = 3,
     ThreadContext = 4,
-    MediaDownload = 5,
 }
 
 impl SyncPhase {
@@ -138,7 +137,6 @@ impl SyncPhase {
             Self::Discovery => "Discovery",
             Self::ContentFetch => "Content Fetch",
             Self::ThreadContext => "Thread Context",
-            Self::MediaDownload => "Media Download",
         }
     }
 }
@@ -329,16 +327,6 @@ pub struct RoutingPlan {
 
 // ── Constants ────────────────────────────────────────────────────
 
-// ── Media Priority ──────────────────────────────────────────────
-
-/// Media download priority: owner (highest) → tracked → follows → FoF → hop3 → others (lowest).
-pub const MEDIA_PRIORITY_OWNER: i32 = 100;
-pub const MEDIA_PRIORITY_TRACKED: i32 = 80;
-pub const MEDIA_PRIORITY_FOLLOWS: i32 = 60;
-pub const MEDIA_PRIORITY_FOF: i32 = 40;
-pub const MEDIA_PRIORITY_HOP3: i32 = 20;
-pub const MEDIA_PRIORITY_OTHERS: i32 = 0;
-
 /// Relay polite interval between requests (seconds).
 pub const RELAY_MIN_INTERVAL_SECS: u64 = 3;
 /// Pause between relay subscription batches (seconds).
@@ -381,7 +369,7 @@ mod tests {
     #[test]
     fn test_sync_phase_labels() {
         assert_eq!(SyncPhase::OwnData.label(), "Own Data");
-        assert_eq!(SyncPhase::MediaDownload.label(), "Media Download");
+        assert_eq!(SyncPhase::ThreadContext.label(), "Thread Context");
     }
 
     #[test]

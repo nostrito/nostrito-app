@@ -136,7 +136,6 @@ impl ThreadContext {
                                     &self.graph,
                                     &self.own_pubkey,
                                     EventSource::ThreadContext,
-                                    super::types::MEDIA_PRIORITY_OTHERS,
                                     Some(&self.app_handle),
                                     "thread",
                                 );
@@ -271,7 +270,6 @@ impl ThreadContext {
                     &self.graph,
                     &self.own_pubkey,
                     EventSource::ThreadContext,
-                    super::types::MEDIA_PRIORITY_OTHERS,
                     Some(&self.app_handle),
                     "thread",
                 );

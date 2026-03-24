@@ -14,6 +14,20 @@ import { profileDisplayName } from "../utils/profiles";
 import { invalidateInteractionCounts } from "../hooks/useInteractionCounts";
 import type { NostrEvent } from "../types/nostr";
 
+// ── Thread fetch cache (module-level, survives re-renders) ──────
+const threadFetchCache = new Map<string, number>(); // rootId → timestamp
+const THREAD_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+function shouldFetchThread(rootId: string): boolean {
+  const lastFetch = threadFetchCache.get(rootId);
+  if (!lastFetch) return true;
+  return Date.now() - lastFetch > THREAD_CACHE_TTL;
+}
+
+function markThreadFetched(rootId: string): void {
+  threadFetchCache.set(rootId, Date.now());
+}
+
 // ── Types ───────────────────────────────────────────────────────
 
 interface ThreadData {
@@ -187,6 +201,8 @@ export const NoteDetail: React.FC = () => {
   const [fetchingRelays, setFetchingRelays] = useState(false);
   const [wotDistances, setWotDistances] = useState<Record<string, number>>({});
   const [showNonWot, setShowNonWot] = useState(false);
+  const [showNonWotReactions, setShowNonWotReactions] = useState(false);
+  const [showNonWotZaps, setShowNonWotZaps] = useState(false);
   const [zapTarget, setZapTarget] = useState<NostrEvent | null>(null);
 
   const handleLike = useCallback(async (event: NostrEvent) => {
@@ -250,12 +266,35 @@ export const NoteDetail: React.FC = () => {
         console.error("[note-detail] Failed to load WoT distances:", e);
       }
 
-      setLoading(false);
-
-      // Trigger background relay fetch for completeness
-      if (effectiveRootId) {
-        invoke("fetch_thread_from_relays", { rootId: effectiveRootId }).catch(() => {});
+      // If not found locally, fetch from relays before showing "not found"
+      if (!mainEvent) {
+        setFetchingRelays(true);
+        try {
+          const count = await invoke<number>("fetch_thread_from_relays", { rootId: effectiveRootId });
+          markThreadFetched(effectiveRootId);
+          if (count > 0) {
+            // Re-fetch the event and thread from local DB after relay fetch
+            const fetched = await invoke<NostrEvent | null>("get_event", { id: noteId });
+            setEvent(fetched);
+            if (fetched) ensureProfiles([fetched.pubkey]);
+            const freshRootId = fetched ? (findRootTag(fetched) ?? fetched.id) : effectiveRootId;
+            const data = await invoke<ThreadData>("get_thread_events", { rootId: freshRootId });
+            setThreadData(data);
+            invalidateInteractionCounts();
+          }
+        } catch (e) {
+          console.error("[note-detail] Relay fetch failed:", e);
+        } finally {
+          setFetchingRelays(false);
+        }
+      } else if (shouldFetchThread(effectiveRootId)) {
+        // Already found locally — background relay fetch (respects 5-min cache)
+        invoke("fetch_thread_from_relays", { rootId: effectiveRootId })
+          .then(() => markThreadFetched(effectiveRootId))
+          .catch(() => {});
       }
+
+      setLoading(false);
     };
 
     load();
@@ -267,6 +306,14 @@ export const NoteDetail: React.FC = () => {
     const unlisten = listen<string>("thread-updated", async (ev) => {
       if (ev.payload === rootId) {
         try {
+          // Re-fetch the main event in case it was just fetched from relays
+          if (!event && noteId) {
+            const fetched = await invoke<NostrEvent | null>("get_event", { id: noteId });
+            if (fetched) {
+              setEvent(fetched);
+              ensureProfiles([fetched.pubkey]);
+            }
+          }
           const data = await invoke<ThreadData>("get_thread_events", { rootId });
           setThreadData(data);
           invalidateInteractionCounts();
@@ -280,7 +327,7 @@ export const NoteDetail: React.FC = () => {
       }
     });
     return () => { unlisten.then((fn) => fn()); };
-  }, [rootId, ensureProfiles]);
+  }, [rootId, noteId, event, ensureProfiles]);
 
   // Manual relay re-fetch
   const fetchFromRelays = useCallback(async () => {
@@ -303,20 +350,6 @@ export const NoteDetail: React.FC = () => {
   // Derived data
   const wotPubkeys = useMemo(() => new Set(Object.keys(wotDistances)), [wotDistances]);
 
-  const reactionCounts = useMemo(() => {
-    if (!threadData) return {};
-    return threadData.reactions.reduce<Record<string, number>>((acc, r) => {
-      const emoji = r.content || "+";
-      acc[emoji] = (acc[emoji] || 0) + 1;
-      return acc;
-    }, {});
-  }, [threadData]);
-
-  const zapTotal = useMemo(() => {
-    if (!threadData) return 0;
-    return threadData.zaps.reduce((sum, z) => sum + parseZapAmount(z), 0);
-  }, [threadData]);
-
   const threadTree = useMemo(() => {
     if (!threadData || !rootId) return [];
     return buildThreadTree(rootId, threadData.replies);
@@ -326,6 +359,40 @@ export const NoteDetail: React.FC = () => {
     if (!threadData) return 0;
     return threadData.replies.filter((r) => !wotPubkeys.has(r.pubkey)).length;
   }, [threadData, wotPubkeys]);
+
+  const { wotReactions, nonWotReactionCount } = useMemo(() => {
+    if (!threadData) return { wotReactions: [], nonWotReactionCount: 0 };
+    const wot = threadData.reactions.filter((r) => wotPubkeys.has(r.pubkey));
+    return { wotReactions: wot, nonWotReactionCount: threadData.reactions.length - wot.length };
+  }, [threadData, wotPubkeys]);
+
+  const displayReactions = useMemo(() => {
+    if (!threadData) return [];
+    return showNonWotReactions ? threadData.reactions : wotReactions;
+  }, [threadData, showNonWotReactions, wotReactions]);
+
+  const displayReactionCounts = useMemo(() => {
+    return displayReactions.reduce<Record<string, number>>((acc, r) => {
+      const emoji = r.content || "+";
+      acc[emoji] = (acc[emoji] || 0) + 1;
+      return acc;
+    }, {});
+  }, [displayReactions]);
+
+  const { wotZaps, nonWotZapCount } = useMemo(() => {
+    if (!threadData) return { wotZaps: [], nonWotZapCount: 0 };
+    const wot = threadData.zaps.filter((z) => wotPubkeys.has(z.pubkey));
+    return { wotZaps: wot, nonWotZapCount: threadData.zaps.length - wot.length };
+  }, [threadData, wotPubkeys]);
+
+  const displayZaps = useMemo(() => {
+    if (!threadData) return [];
+    return showNonWotZaps ? threadData.zaps : wotZaps;
+  }, [threadData, showNonWotZaps, wotZaps]);
+
+  const displayZapTotal = useMemo(() => {
+    return displayZaps.reduce((sum, z) => sum + parseZapAmount(z), 0);
+  }, [displayZaps]);
 
   if (!noteId) {
     return (
@@ -357,8 +424,8 @@ export const NoteDetail: React.FC = () => {
         </button>
       </div>
 
-      {loading ? (
-        <div style={{ color: "var(--text-muted)", padding: 24 }}>loading note...</div>
+      {loading || fetchingRelays ? (
+        <div style={{ color: "var(--text-muted)", padding: 24 }}>{fetchingRelays ? "fetching from relays..." : "loading note..."}</div>
       ) : !displayEvent ? (
         <EmptyState message="note not found." />
       ) : (
@@ -412,9 +479,9 @@ export const NoteDetail: React.FC = () => {
           )}
           {threadData && threadData.reactions.length > 0 && (
             <div className="note-detail-reactions">
-              <div className="note-detail-section-title">reactions ({threadData.reactions.length})</div>
+              <div className="note-detail-section-title">reactions ({displayReactions.length}{nonWotReactionCount > 0 && !showNonWotReactions ? ` of ${threadData.reactions.length}` : ""})</div>
               <div className="note-detail-reaction-list">
-                {Object.entries(reactionCounts).map(([emoji, count]) => (
+                {Object.entries(displayReactionCounts).map(([emoji, count]) => (
                   <span key={emoji} className="note-detail-reaction-chip">
                     {emoji === "+" ? (
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" width="14" height="14"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>
@@ -423,7 +490,7 @@ export const NoteDetail: React.FC = () => {
                 ))}
               </div>
               <div className="note-detail-reactors">
-                {threadData.reactions.slice(0, 20).map((r) => {
+                {displayReactions.slice(0, 20).map((r) => {
                   const rProfile = getProfile(r.pubkey);
                   return (
                     <Avatar
@@ -435,10 +502,18 @@ export const NoteDetail: React.FC = () => {
                     />
                   );
                 })}
-                {threadData.reactions.length > 20 && (
-                  <span className="note-detail-more-reactors">+{threadData.reactions.length - 20}</span>
+                {displayReactions.length > 20 && (
+                  <span className="note-detail-more-reactors">+{displayReactions.length - 20}</span>
                 )}
               </div>
+              {nonWotReactionCount > 0 && !showNonWotReactions && (
+                <button
+                  className="thread-show-non-wot"
+                  onClick={() => setShowNonWotReactions(true)}
+                >
+                  show {nonWotReactionCount} reaction{nonWotReactionCount === 1 ? "" : "s"} from outside your web of trust
+                </button>
+              )}
             </div>
           )}
 
@@ -447,10 +522,10 @@ export const NoteDetail: React.FC = () => {
             <div className="note-detail-zaps">
               <div className="note-detail-section-title">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" width="14" height="14"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-                {" "}zaps ({threadData.zaps.length}) · {formatSats(zapTotal)} sats
+                {" "}zaps ({displayZaps.length}{nonWotZapCount > 0 && !showNonWotZaps ? ` of ${threadData.zaps.length}` : ""}) · {formatSats(displayZapTotal)} sats
               </div>
               <div className="note-detail-zap-list">
-                {threadData.zaps.slice(0, 20).map((zap) => {
+                {displayZaps.slice(0, 20).map((zap) => {
                   const amount = parseZapAmount(zap);
                   const zapProfile = getProfile(zap.pubkey);
                   return (
@@ -466,10 +541,18 @@ export const NoteDetail: React.FC = () => {
                     </div>
                   );
                 })}
-                {threadData.zaps.length > 20 && (
-                  <span className="note-detail-more-reactors">+{threadData.zaps.length - 20} more</span>
+                {displayZaps.length > 20 && (
+                  <span className="note-detail-more-reactors">+{displayZaps.length - 20} more</span>
                 )}
               </div>
+              {nonWotZapCount > 0 && !showNonWotZaps && (
+                <button
+                  className="thread-show-non-wot"
+                  onClick={() => setShowNonWotZaps(true)}
+                >
+                  show {nonWotZapCount} zap{nonWotZapCount === 1 ? "" : "s"} from outside your web of trust
+                </button>
+              )}
             </div>
           )}
 

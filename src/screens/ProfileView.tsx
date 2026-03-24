@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 import {
-  IconCheck, IconImage, IconBookOpen, IconFeed, IconZap,
+  IconCheck, IconBookOpen, IconFeed, IconZap,
   IconMoreVertical, IconCopy, IconShare, IconVolumeX, IconVolume,
   IconExternalLink, IconDatabase,
 } from "../components/Icon";
@@ -11,7 +11,7 @@ import { NoteCard } from "../components/NoteCard";
 import { ZapModal } from "../components/ZapModal";
 import { ArticleCard } from "../components/ArticleCard";
 import { EmptyState } from "../components/EmptyState";
-import { formatBytes, shortPubkey } from "../utils/format";
+import { shortPubkey } from "../utils/format";
 import { profileDisplayName } from "../utils/profiles";
 import { initMediaViewer } from "../utils/media";
 import { invalidateInteractionCounts } from "../hooks/useInteractionCounts";
@@ -32,16 +32,7 @@ interface NostrEvent {
   sig: string;
 }
 
-interface MediaItem {
-  hash: string;
-  url: string;
-  local_path: string;
-  mime_type: string;
-  size_bytes: number;
-  downloaded_at: number;
-}
-
-type ProfileTab = "notes" | "articles" | "media";
+type ProfileTab = "notes" | "articles";
 
 /* ------------------------------------------------------------------ */
 /*  Constants                                                          */
@@ -50,7 +41,6 @@ type ProfileTab = "notes" | "articles" | "media";
 const TAB_OPTIONS: { key: ProfileTab; label: string }[] = [
   { key: "notes", label: "notes" },
   { key: "articles", label: "articles" },
-  { key: "media", label: "media" },
 ];
 
 /* ------------------------------------------------------------------ */
@@ -102,7 +92,6 @@ export const ProfileView: React.FC = () => {
   // Tab data
   const [notes, setNotes] = useState<NostrEvent[]>([]);
   const [articles, setArticles] = useState<NostrEvent[]>([]);
-  const [media, setMedia] = useState<MediaItem[]>([]);
   const [hasMoreNotes, setHasMoreNotes] = useState(true);
   const [loadingMoreNotes, setLoadingMoreNotes] = useState(false);
   const notesSentinelRef = useRef<HTMLDivElement>(null);
@@ -111,14 +100,13 @@ export const ProfileView: React.FC = () => {
   const [profileLoading, setProfileLoading] = useState(true);
   const [notesLoading, setNotesLoading] = useState(false);
   const [articlesLoading, setArticlesLoading] = useState(false);
-  const [mediaLoading, setMediaLoading] = useState(false);
 
   /* --- profile context for batch operations ------------------------- */
   const { ensureProfiles, getProfile } = useProfileContext();
 
   /* --- init media viewer -------------------------------------------- */
   useEffect(() => {
-    if (activeTab === "media" || activeTab === "notes") {
+    if (activeTab === "notes") {
       initMediaViewer();
     }
   }, [activeTab]);
@@ -303,25 +291,6 @@ export const ProfileView: React.FC = () => {
     }
   }, [pubkey]);
 
-  /* --- load media --------------------------------------------------- */
-  const loadMedia = useCallback(async () => {
-    if (!pubkey || mediaLoading) return;
-    setMediaLoading(true);
-    try {
-      let items: MediaItem[];
-      if (isOwn) {
-        items = await invoke<MediaItem[]>("get_own_media");
-      } else {
-        items = await invoke<MediaItem[]>("get_profile_media", { pubkey });
-      }
-      setMedia(items);
-    } catch (e) {
-      console.error("[profile] Failed to load media:", e);
-    } finally {
-      setMediaLoading(false);
-    }
-  }, [pubkey, isOwn]);
-
   /* --- load tab content on tab change ------------------------------- */
   useEffect(() => {
     switch (activeTab) {
@@ -331,11 +300,8 @@ export const ProfileView: React.FC = () => {
       case "articles":
         if (articles.length === 0) loadArticles();
         break;
-      case "media":
-        if (media.length === 0) loadMedia();
-        break;
     }
-  }, [activeTab, loadNotes, loadArticles, loadMedia]);
+  }, [activeTab, loadNotes, loadArticles]);
 
   /* --- initial notes load ------------------------------------------- */
   useEffect(() => {
@@ -356,21 +322,6 @@ export const ProfileView: React.FC = () => {
     observer.observe(notesSentinelRef.current);
     return () => observer.disconnect();
   }, [loadMoreNotes, hasMoreNotes, activeTab]);
-
-  /* --- media viewer opener ------------------------------------------ */
-  const openViewer = useCallback((url: string, type?: "image" | "video", originalUrl?: string) => {
-    if (typeof (window as any).openMediaViewer === "function") {
-      (window as any).openMediaViewer(url, type, { pubkey, originalUrl: originalUrl || url });
-    }
-  }, []);
-
-  const handleImageError = useCallback(
-    (e: React.SyntheticEvent<HTMLImageElement>) => {
-      const card = e.currentTarget.parentElement;
-      if (card) card.classList.add("broken");
-    },
-    [],
-  );
 
   /* --- menu actions ------------------------------------------------- */
   const handleCopyNpub = useCallback(async () => {
@@ -685,81 +636,6 @@ export const ProfileView: React.FC = () => {
                   </div>
                 )}
 
-                {/* --- Media tab --- */}
-                {activeTab === "media" && (
-                  <div className="profile-media">
-                    {mediaLoading && media.length === 0 && (
-                      <div style={{ color: "var(--text-muted)", padding: 16 }}>loading media...</div>
-                    )}
-                    {!mediaLoading && media.length === 0 && (
-                      <EmptyState
-                        icon={<span className="icon"><IconImage /></span>}
-                        message="no media found for this profile."
-                      />
-                    )}
-                    <div className="profile-media-grid">
-                      {media.map((item) => {
-                        const localSrc = convertFileSrc(item.local_path);
-                        const date = new Date(item.downloaded_at * 1000).toLocaleDateString();
-                        const tooltip = `${date} \u00B7 ${formatBytes(item.size_bytes)}`;
-
-                        if (item.mime_type.startsWith("image/")) {
-                          return (
-                            <div
-                              key={item.hash}
-                              className="my-media-card"
-                              onClick={() => openViewer(localSrc, "image", item.url)}
-                              title={tooltip}
-                            >
-                              <img
-                                src={localSrc}
-                                loading="lazy"
-                                onError={handleImageError}
-                              />
-                              <div className="my-media-card-overlay">
-                                {formatBytes(item.size_bytes)}
-                              </div>
-                            </div>
-                          );
-                        }
-
-                        if (item.mime_type.startsWith("video/")) {
-                          return (
-                            <div
-                              key={item.hash}
-                              className="my-media-card video"
-                              onClick={() => openViewer(localSrc, "video", item.url)}
-                              title={tooltip}
-                            >
-                              <video src={localSrc} preload="metadata" muted />
-                              <div className="my-media-card-play">{"\u25B6"}</div>
-                              <div className="my-media-card-overlay">
-                                {formatBytes(item.size_bytes)}
-                              </div>
-                            </div>
-                          );
-                        }
-
-                        if (item.mime_type.startsWith("audio/")) {
-                          return (
-                            <div
-                              key={item.hash}
-                              className="my-media-card audio"
-                              title={tooltip}
-                            >
-                              <audio src={localSrc} controls preload="metadata" />
-                              <div className="my-media-card-overlay">
-                                {formatBytes(item.size_bytes)}
-                              </div>
-                            </div>
-                          );
-                        }
-
-                        return null;
-                      })}
-                    </div>
-                  </div>
-                )}
               </div>
             </div>
 

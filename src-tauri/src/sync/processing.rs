@@ -20,15 +20,13 @@ pub struct ProcessResult {
     pub relays_updated: bool,
     /// Whether mute lists were rebuilt (kind:10000).
     pub mutes_rebuilt: bool,
-    /// Media URLs queued for download.
-    pub media_urls_queued: u32,
 }
 
 /// Process a nostr event through the v2 pipeline.
 ///
 /// Handles kind-specific logic:
 /// - kind:0 → store (replaceable metadata)
-/// - kind:1/6 → check tombstone, store, queue media
+/// - kind:1/6 → check tombstone, store
 /// - kind:3 → store, WoT update, extract relay hints
 /// - kind:5 → verify author, delete refs, create tombstones
 /// - kind:10000 → store, rebuild mute tables if own
@@ -41,7 +39,6 @@ pub fn process_event(
     graph: &Arc<WotGraph>,
     own_pubkey: &str,
     source: EventSource,
-    media_priority: i32,
 ) -> ProcessResult {
     let mut result = ProcessResult::default();
 
@@ -156,11 +153,8 @@ pub fn process_event(
         }
     }
 
-    // Queue media for newly stored content events
+    // Populate thread_refs for pruning protection
     if result.stored && matches!(kind, 1 | 6 | 30023) {
-        result.media_urls_queued = queue_media_urls(db, &pubkey, &event.content.to_string(), &tags, media_priority);
-
-        // Populate thread_refs for pruning protection
         let e_tag_refs: Vec<String> = tags
             .iter()
             .filter(|t| t.len() >= 2 && t[0] == "e")
@@ -168,18 +162,6 @@ pub fn process_event(
             .collect();
         if !e_tag_refs.is_empty() {
             db.insert_thread_refs(&event_id, &e_tag_refs).ok();
-        }
-    }
-
-    // Queue profile picture/banner from kind:0 metadata events (WoT hop 0-2 only)
-    if result.stored && kind == 0 {
-        let should_download = if own_pubkey == pubkey {
-            true // Always download own media
-        } else {
-            is_within_hops(graph, own_pubkey, &pubkey, 2)
-        };
-        if should_download {
-            result.media_urls_queued = queue_profile_media(db, &pubkey, &event.content.to_string(), media_priority);
         }
     }
 
@@ -465,109 +447,6 @@ fn process_nip65(
     true
 }
 
-/// Queue media URLs from event content and tags.
-fn queue_media_urls(
-    db: &Database,
-    pubkey: &str,
-    content: &str,
-    tags: &[Vec<String>],
-    priority: i32,
-) -> u32 {
-    let mut count = 0u32;
-
-    // Extract URLs from content using byte-scan (handles markdown syntax, inline URLs, etc.)
-    let text_urls = super::media::extract_urls_from_text(content);
-    for url in &text_urls {
-        if is_media_url(url)
-            || super::media::is_nostr_media_cdn(url)
-            || super::media::mime_type_from_url(url).is_some()
-        {
-            if db.queue_media_url(url, pubkey, priority).is_ok() {
-                count += 1;
-            }
-        }
-    }
-
-    // Extract from image/video/imeta tags
-    let tag_urls = super::media::extract_urls_from_tags(
-        &serde_json::to_string(tags).unwrap_or_default(),
-    );
-    for url in &tag_urls {
-        if is_media_url(url)
-            || super::media::is_nostr_media_cdn(url)
-            || super::media::mime_type_from_url(url).is_some()
-        {
-            if db.queue_media_url(url, pubkey, priority).is_ok() {
-                count += 1;
-            }
-        }
-    }
-
-    count
-}
-
-/// Queue profile picture and banner from kind:0 metadata JSON content.
-/// Check if `target` pubkey is within `max_hops` of `root` in the WoT graph.
-/// Lightweight single-target BFS — avoids computing all hop distances.
-fn is_within_hops(graph: &WotGraph, root: &str, target: &str, max_hops: u8) -> bool {
-    let root_id = match graph.get_node_id(root) {
-        Some(id) => id,
-        None => return false,
-    };
-    let target_id = match graph.get_node_id(target) {
-        Some(id) => id,
-        None => return false,
-    };
-    if root_id == target_id {
-        return true;
-    }
-
-    graph.with_adjacency(|follows, _followers| {
-        use std::collections::{HashSet, VecDeque};
-        let mut visited = HashSet::new();
-        let mut queue = VecDeque::new();
-        visited.insert(root_id);
-        queue.push_back((root_id, 0u8));
-
-        while let Some((node, dist)) = queue.pop_front() {
-            if let Some(neighbors) = follows.get(node as usize) {
-                for &neighbor in neighbors {
-                    if neighbor == target_id {
-                        return true;
-                    }
-                    if dist + 1 < max_hops && visited.insert(neighbor) {
-                        queue.push_back((neighbor, dist + 1));
-                    }
-                }
-            }
-        }
-        false
-    })
-}
-
-fn queue_profile_media(
-    db: &Database,
-    pubkey: &str,
-    content: &str,
-    priority: i32,
-) -> u32 {
-    let mut count = 0u32;
-    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) {
-        for field in &["picture", "banner"] {
-            if let Some(url) = parsed.get(field).and_then(|v| v.as_str()) {
-                if (url.starts_with("https://") || url.starts_with("http://"))
-                    && url.len() > 10
-                {
-                    if db.queue_media_url(url, pubkey, priority).is_ok() {
-                        count += 1;
-                    }
-                }
-            }
-        }
-    }
-    count
-}
-
 /// Check if a URL looks like a media file.
 pub fn is_media_url(url: &str) -> bool {
     let lower = url.to_lowercase();
@@ -592,7 +471,6 @@ pub fn process_events(
     graph: &Arc<WotGraph>,
     own_pubkey: &str,
     source: EventSource,
-    media_priority: i32,
     app_handle: Option<&tauri::AppHandle>,
     layer: &str,
 ) -> (u32, u32) {
@@ -608,7 +486,7 @@ pub fn process_events(
 
     for (idx, event) in sorted.iter().enumerate() {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            process_event(event, db, graph, own_pubkey, source, media_priority)
+            process_event(event, db, graph, own_pubkey, source)
         }));
 
         let result = match result {

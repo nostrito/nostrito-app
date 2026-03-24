@@ -60,6 +60,7 @@ export const ArticleCard: React.FC<ArticleCardProps> = ({ event, profile, onClic
       className="article-card"
       data-kind="long-form"
       data-event-id={event.id}
+      data-note-id={event.id}
       onClick={(e) => {
         // Don't open reader when clicking author (let profile navigation handle it)
         if ((e.target as HTMLElement).closest("[data-pubkey]")) return;

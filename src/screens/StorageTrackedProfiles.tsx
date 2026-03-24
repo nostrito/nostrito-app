@@ -5,8 +5,7 @@ import { Badge } from "../components/Badge";
 import { Avatar } from "../components/Avatar";
 import { NoteCard } from "../components/NoteCard";
 import { EmptyState } from "../components/EmptyState";
-import { KindBreakdownChart, MediaBreakdownChart } from "../components/KindBreakdownChart";
-import type { MediaBreakdown } from "../components/KindBreakdownChart";
+import { KindBreakdownChart } from "../components/KindBreakdownChart";
 import { formatBytes, shortPubkey } from "../utils/format";
 import { initMediaViewer } from "../utils/media";
 import { useProfileContext } from "../context/ProfileContext";
@@ -20,32 +19,19 @@ interface TrackedProfileDetail {
   display_name: string | null;
   picture: string | null;
   event_count: number;
-  media_bytes: number;
-  media_count: number;
 }
 
 interface OwnershipStorageStats {
   own_events_count: number;
-  own_media_bytes: number;
   tracked_events_count: number;
-  tracked_media_bytes: number;
   wot_events_count: number;
-  wot_media_bytes: number;
   total_events: number;
   db_size_bytes: number;
+  media_disk_bytes: number;
 }
 
 interface KindCountsResult {
   counts: Record<string, number>;
-}
-
-interface MediaItem {
-  hash: string;
-  url: string;
-  local_path: string;
-  mime_type: string;
-  size_bytes: number;
-  downloaded_at: number;
 }
 
 interface EventMediaRef {
@@ -70,11 +56,7 @@ export const StorageTrackedProfiles: React.FC = () => {
   const [profiles, setProfiles] = useState<TrackedProfileDetail[]>([]);
   const [stats, setStats] = useState<OwnershipStorageStats | null>(null);
   const [kindCounts, setKindCounts] = useState<Record<string, number> | null>(null);
-  const [mediaBreakdown, setMediaBreakdown] = useState<MediaBreakdown | null>(null);
   const [loading, setLoading] = useState(true);
-  const [expandedPubkey, setExpandedPubkey] = useState<string | null>(null);
-  const [profileMedia, setProfileMedia] = useState<MediaItem[]>([]);
-  const [mediaLoadingProfile, setMediaLoadingProfile] = useState(false);
 
   // Notes state
   const [notes, setNotes] = useState<NostrEvent[]>([]);
@@ -100,28 +82,7 @@ export const StorageTrackedProfiles: React.FC = () => {
     invoke<KindCountsResult>("get_kind_counts_for_category", { category: "tracked" })
       .then(r => setKindCounts(r.counts))
       .catch(() => {});
-    invoke<MediaBreakdown>("get_media_breakdown_for_category", { category: "tracked" })
-      .then(setMediaBreakdown)
-      .catch(() => {});
   }, []);
-
-  const toggleProfileMedia = useCallback(async (pubkey: string) => {
-    if (expandedPubkey === pubkey) {
-      setExpandedPubkey(null);
-      setProfileMedia([]);
-      return;
-    }
-    setExpandedPubkey(pubkey);
-    setMediaLoadingProfile(true);
-    setProfileMedia([]);
-    try {
-      const items = await invoke<MediaItem[]>("get_profile_media", { pubkey });
-      setProfileMedia(items);
-    } catch (e) {
-      console.error("[storage] get_profile_media failed:", e);
-    }
-    setMediaLoadingProfile(false);
-  }, [expandedPubkey]);
 
   const openViewer = useCallback((url: string, type?: "image" | "video", originalUrl?: string, pubkey?: string) => {
     if (typeof (window as any).openMediaViewer === "function") {
@@ -213,10 +174,6 @@ export const StorageTrackedProfiles: React.FC = () => {
           <span className="storage-detail-stat-label">events</span>
         </div>
         <div className="storage-detail-stat">
-          <span className="storage-detail-stat-value">{stats ? formatBytes(stats.tracked_media_bytes) : "\u2014"}</span>
-          <span className="storage-detail-stat-label">media</span>
-        </div>
-        <div className="storage-detail-stat">
           <span className="storage-detail-stat-value">{profiles.length}</span>
           <span className="storage-detail-stat-label">profiles</span>
         </div>
@@ -248,15 +205,8 @@ export const StorageTrackedProfiles: React.FC = () => {
               />
             )}
 
-            {!loading && sortedProfiles.map(p => {
-              const isExpanded = expandedPubkey === p.pubkey;
-              return (
-                <div key={p.pubkey}>
-                  <div
-                    className={`tracked-profile-row${isExpanded ? " expanded" : ""}`}
-                    onClick={() => p.media_count > 0 && toggleProfileMedia(p.pubkey)}
-                    style={{ cursor: p.media_count > 0 ? "pointer" : undefined }}
-                  >
+            {!loading && sortedProfiles.map(p => (
+                <div key={p.pubkey} className="tracked-profile-row">
                     <div className="tracked-profile-info">
                       <Avatar
                         picture={p.picture}
@@ -275,74 +225,10 @@ export const StorageTrackedProfiles: React.FC = () => {
                         <span className="tracked-profile-stat-value">{p.event_count.toLocaleString()}</span>
                         <span className="tracked-profile-stat-label">events</span>
                       </div>
-                      <div className="tracked-profile-stat">
-                        <span className="tracked-profile-stat-value">{formatBytes(p.media_bytes)}</span>
-                        <span className="tracked-profile-stat-label">media</span>
-                      </div>
-                      <div className="tracked-profile-stat">
-                        <span className="tracked-profile-stat-value">{p.media_count}</span>
-                        <span className="tracked-profile-stat-label">files</span>
-                      </div>
                     </div>
-                  </div>
-                  {isExpanded && (
-                    <div className="tracked-profile-media-panel">
-                      {mediaLoadingProfile && (
-                        <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", padding: 12 }}>loading media...</div>
-                      )}
-                      {!mediaLoadingProfile && profileMedia.length === 0 && (
-                        <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", padding: 12 }}>no media files stored.</div>
-                      )}
-                      {!mediaLoadingProfile && profileMedia.length > 0 && (
-                        <div className="profile-media-grid">
-                          {profileMedia.map((item) => {
-                            const localSrc = convertFileSrc(item.local_path);
-                            const date = new Date(item.downloaded_at * 1000).toLocaleDateString();
-                            const tooltip = `${date} \u00B7 ${formatBytes(item.size_bytes)}`;
-
-                            if (item.mime_type.startsWith("image/")) {
-                              return (
-                                <div key={item.hash} className="my-media-card" onClick={() => openViewer(localSrc, "image", item.url, expandedPubkey || undefined)} title={tooltip}>
-                                  <img src={localSrc} loading="lazy" onError={handleImageError} />
-                                  <div className="my-media-card-overlay">{formatBytes(item.size_bytes)}</div>
-                                </div>
-                              );
-                            }
-                            if (item.mime_type.startsWith("video/")) {
-                              return (
-                                <div key={item.hash} className="my-media-card video" onClick={() => openViewer(localSrc, "video", item.url, expandedPubkey || undefined)} title={tooltip}>
-                                  <video src={localSrc} preload="metadata" muted />
-                                  <div className="my-media-card-play">{"\u25B6"}</div>
-                                  <div className="my-media-card-overlay">{formatBytes(item.size_bytes)}</div>
-                                </div>
-                              );
-                            }
-                            if (item.mime_type.startsWith("audio/")) {
-                              return (
-                                <div key={item.hash} className="my-media-card audio" title={tooltip}>
-                                  <audio src={localSrc} controls preload="metadata" onClick={(e) => e.stopPropagation()} />
-                                  <div className="my-media-card-overlay">{formatBytes(item.size_bytes)}</div>
-                                </div>
-                              );
-                            }
-                            return null;
-                          })}
-                        </div>
-                      )}
-                    </div>
-                  )}
                 </div>
-              );
-            })}
+            ))}
           </div>
-
-          {/* Media breakdown */}
-          {mediaBreakdown && mediaBreakdown.total_count > 0 && (
-            <>
-              <div className="kind-breakdown-separator" />
-              <MediaBreakdownChart mediaBreakdown={mediaBreakdown} formatBytes={formatBytes} />
-            </>
-          )}
 
           {/* Kind breakdown */}
           {kindCounts && (

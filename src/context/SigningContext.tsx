@@ -6,7 +6,7 @@ import { listen } from "@tauri-apps/api/event";
 interface SigningContextValue {
   /** true when user has nsec/bunker and can sign events */
   canWrite: boolean;
-  /** Current mode string: "nsec" | "read-only" */
+  /** Current mode string: "nsec" | "bunker" | "connect" | "read-only" */
   signingMode: string;
   /** Force re-check (e.g. after settings change) */
   refresh: () => void;
@@ -50,7 +50,7 @@ export const SigningProvider: React.FC<{ children: React.ReactNode }> = ({ child
     return () => { unlisten.then((fn) => fn()); };
   }, []);
 
-  const canWrite = signingMode === "nsec";
+  const canWrite = signingMode !== "read-only";
 
   return (
     <SigningContext.Provider value={{ canWrite, signingMode, refresh }}>

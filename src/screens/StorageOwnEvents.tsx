@@ -4,8 +4,7 @@ import { Link, useNavigate } from "react-router-dom";
 import { Badge } from "../components/Badge";
 import { NoteCard } from "../components/NoteCard";
 import { EmptyState } from "../components/EmptyState";
-import { KindBreakdownChart, MediaBreakdownChart } from "../components/KindBreakdownChart";
-import type { MediaBreakdown } from "../components/KindBreakdownChart";
+import { KindBreakdownChart } from "../components/KindBreakdownChart";
 import { formatBytes } from "../utils/format";
 import { initMediaViewer } from "../utils/media";
 import { useProfileContext } from "../context/ProfileContext";
@@ -13,13 +12,11 @@ import type { NostrEvent } from "../types/nostr";
 
 interface OwnershipStorageStats {
   own_events_count: number;
-  own_media_bytes: number;
   tracked_events_count: number;
-  tracked_media_bytes: number;
   wot_events_count: number;
-  wot_media_bytes: number;
   total_events: number;
   db_size_bytes: number;
+  media_disk_bytes: number;
 }
 
 interface KindCountsResult {
@@ -47,7 +44,6 @@ export const StorageOwnEvents: React.FC = () => {
   // Overview state
   const [stats, setStats] = useState<OwnershipStorageStats | null>(null);
   const [kindCounts, setKindCounts] = useState<Record<string, number> | null>(null);
-  const [mediaBreakdown, setMediaBreakdown] = useState<MediaBreakdown | null>(null);
 
   // Notes state
   const [notes, setNotes] = useState<NostrEvent[]>([]);
@@ -66,7 +62,6 @@ export const StorageOwnEvents: React.FC = () => {
   useEffect(() => {
     invoke<OwnershipStorageStats>("get_ownership_storage_stats").then(setStats).catch(() => {});
     invoke<KindCountsResult>("get_kind_counts_for_category", { category: "own" }).then(r => setKindCounts(r.counts)).catch(() => {});
-    invoke<MediaBreakdown>("get_media_breakdown_for_category", { category: "own" }).then(setMediaBreakdown).catch(() => {});
   }, []);
 
   // Load notes when tab changes
@@ -150,10 +145,6 @@ export const StorageOwnEvents: React.FC = () => {
           <span className="storage-detail-stat-value">{stats ? stats.own_events_count.toLocaleString() : "\u2014"}</span>
           <span className="storage-detail-stat-label">events</span>
         </div>
-        <div className="storage-detail-stat">
-          <span className="storage-detail-stat-value">{stats ? formatBytes(stats.own_media_bytes) : "\u2014"}</span>
-          <span className="storage-detail-stat-label">media</span>
-        </div>
       </div>
 
       <div className="storage-detail-note">always kept &mdash; never pruned &middot; unlimited</div>
@@ -167,16 +158,7 @@ export const StorageOwnEvents: React.FC = () => {
 
       {/* Overview tab */}
       {tab === "overview" && (
-        <>
-          {mediaBreakdown && mediaBreakdown.total_count > 0 && (
-            <>
-              <MediaBreakdownChart mediaBreakdown={mediaBreakdown} formatBytes={formatBytes} />
-              <div className="kind-breakdown-separator" />
-            </>
-          )}
-
-          <KindBreakdownChart title="event breakdown" kindCounts={kindCounts} />
-        </>
+        <KindBreakdownChart title="event breakdown" kindCounts={kindCounts} />
       )}
 
       {/* Notes tab */}

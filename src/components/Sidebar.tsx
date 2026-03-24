@@ -3,27 +3,31 @@ import { NavLink } from "react-router-dom";
 import logoUrl from "../assets/logo.png";
 import { IconDashboard, IconFeed, IconMessageCircle, IconImage, IconNetwork, IconWallet, IconDatabase, IconSettings } from "./Icon";
 import { useAppContext } from "../context/AppContext";
+import { useCanWrite } from "../context/SigningContext";
 
 export const Sidebar: React.FC = () => {
   const { ownProfile } = useAppContext();
+  const canWrite = useCanWrite();
 
   const navItems = [
     { to: "/", icon: <IconFeed />, label: "feed" },
     { to: "/dms", icon: <IconMessageCircle />, label: "messages" },
     { to: "/gallery", icon: <IconImage />, label: "gallery" },
     { to: "/wot", icon: <IconNetwork />, label: "wot" },
-    { to: "/wallet", icon: <IconWallet />, label: "wallet" },
+    { to: "/wallet", icon: <IconWallet />, label: "wallet", requiresWrite: true },
     { to: "/analytics", icon: <IconDashboard />, label: "analytics" },
     { to: "/storage", icon: <IconDatabase />, label: "storage" },
     { to: "/settings", icon: <IconSettings />, label: "settings" },
   ];
+
+  const visibleItems = navItems.filter((item) => !item.requiresWrite || canWrite);
 
   return (
     <aside className="app-sidebar-nav">
       <div className="sidebar-logo">
         <img src={logoUrl} alt="nostrito" style={{ width: 52, height: 52, borderRadius: 12, display: "block", margin: "0 auto 8px" }} />
       </div>
-      {navItems.map((item) => (
+      {visibleItems.map((item) => (
         <NavLink
           key={item.to}
           to={item.to}

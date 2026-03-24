@@ -535,16 +535,8 @@ pub mod provision {
         reqwest::Client::new()
     }
 
-    /// Auto-provision a wallet via challenge-response at the provisioning URL.
-    /// Returns (admin_key, wallet_id, instance_url).
-    pub async fn provision_wallet(
-        instance_url: Option<&str>,
-        nsec: &str,
-        hex_pubkey: &str,
-    ) -> Result<(String, String, String), String> {
-        let url = instance_url.unwrap_or(DEFAULT_PROVISION_URL).trim_end_matches('/');
-
-        // Step 1: GET challenge
+    /// Fetch a challenge string from the provisioning server.
+    async fn fetch_challenge(url: &str) -> Result<String, String> {
         let challenge_resp = client()
             .get(format!("{}/api/provision/challenge", url))
             .send()
@@ -561,29 +553,22 @@ pub mod provision {
             .await
             .map_err(|e| format!("Provision challenge parse error: {}", e))?;
 
-        let challenge = challenge_data["challenge"]
+        challenge_data["challenge"]
             .as_str()
-            .ok_or("No challenge in response")?
-            .to_string();
+            .ok_or_else(|| "No challenge in response".to_string())
+            .map(|s| s.to_string())
+    }
 
-        // Step 2: Sign challenge as kind:27235 event (NIP-98)
-        let secret_key = SecretKey::from_bech32(nsec)
-            .map_err(|e| format!("Invalid nsec: {}", e))?;
-        let keys = Keys::new(secret_key);
-
-        let tags = vec![
-            Tag::custom(TagKind::Custom("challenge".into()), vec![challenge]),
-            Tag::custom(TagKind::Custom("u".into()), vec![url.to_string()]),
-            Tag::custom(TagKind::Custom("method".into()), vec!["POST".to_string()]),
-        ];
-        let event = EventBuilder::new(Kind::Custom(27235), "", tags)
-            .to_event(&keys)
-            .map_err(|e| format!("Failed to sign provision event: {}", e))?;
-
-        let event_json = serde_json::to_string(&event)
+    /// POST the signed NIP-98 event to the provisioning endpoint.
+    /// Returns (admin_key, wallet_id, instance_url).
+    async fn post_provision(
+        url: &str,
+        event: &Event,
+        hex_pubkey: &str,
+    ) -> Result<(String, String, String), String> {
+        let event_json = serde_json::to_string(event)
             .map_err(|e| format!("Failed to serialize event: {}", e))?;
 
-        // Step 3: POST provision with signed event
         let wallet_name = format!("Nostrito:{}", &hex_pubkey[..16.min(hex_pubkey.len())]);
         let provision_resp = client()
             .post(format!("{}/api/provision", url))
@@ -615,6 +600,71 @@ pub mod provision {
             .to_string();
 
         Ok((admin_key, wallet_id, url.to_string()))
+    }
+
+    /// Build the NIP-98 challenge tags for a provision request.
+    fn challenge_tags(challenge: String, url: &str) -> Vec<Tag> {
+        vec![
+            Tag::custom(TagKind::Custom("challenge".into()), vec![challenge]),
+            Tag::custom(TagKind::Custom("u".into()), vec![url.to_string()]),
+            Tag::custom(TagKind::Custom("method".into()), vec!["POST".to_string()]),
+        ]
+    }
+
+    /// Auto-provision a wallet via challenge-response using a local nsec.
+    /// Returns (admin_key, wallet_id, instance_url).
+    pub async fn provision_wallet(
+        instance_url: Option<&str>,
+        nsec: &str,
+        hex_pubkey: &str,
+    ) -> Result<(String, String, String), String> {
+        let url = instance_url.unwrap_or(DEFAULT_PROVISION_URL).trim_end_matches('/');
+
+        // Step 1: GET challenge
+        let challenge = fetch_challenge(url).await?;
+
+        // Step 2: Sign challenge as kind:27235 event (NIP-98)
+        let secret_key = SecretKey::from_bech32(nsec)
+            .map_err(|e| format!("Invalid nsec: {}", e))?;
+        let keys = Keys::new(secret_key);
+
+        let tags = challenge_tags(challenge, url);
+        let event = EventBuilder::new(Kind::Custom(27235), "", tags)
+            .to_event(&keys)
+            .map_err(|e| format!("Failed to sign provision event: {}", e))?;
+
+        // Step 3: POST provision with signed event
+        post_provision(url, &event, hex_pubkey).await
+    }
+
+    /// Auto-provision a wallet via challenge-response using a NIP-46 remote signer.
+    /// Returns (admin_key, wallet_id, instance_url).
+    pub async fn provision_wallet_with_signer(
+        instance_url: Option<&str>,
+        signer: &crate::nip46::Nip46Client,
+        hex_pubkey: &str,
+    ) -> Result<(String, String, String), String> {
+        let url = instance_url.unwrap_or(DEFAULT_PROVISION_URL).trim_end_matches('/');
+
+        // Step 1: GET challenge
+        let challenge = fetch_challenge(url).await?;
+
+        // Step 2: Build unsigned event and sign via remote signer
+        let tags = challenge_tags(challenge, url);
+        let public_key = PublicKey::from_hex(hex_pubkey)
+            .map_err(|e| format!("Invalid pubkey: {}", e))?;
+        let unsigned = UnsignedEvent::new(
+            public_key,
+            Timestamp::now(),
+            Kind::Custom(27235),
+            tags,
+            "",
+        );
+        let event = signer.sign_event(unsigned).await
+            .map_err(|e| format!("Signer failed: {}", e))?;
+
+        // Step 3: POST provision with signed event
+        post_provision(url, &event, hex_pubkey).await
     }
 }
 

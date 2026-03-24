@@ -165,7 +165,6 @@ pub struct AppStatus {
     pub sync_status: String,
     pub sync_tier: u8,
     pub sync_stats: SyncStats,
-    pub media_stored: u64,
     pub offline_mode: bool,
     pub sync_wot_notes_per_cycle: u32,
 }
@@ -198,6 +197,7 @@ pub struct FeedFilter {
     pub wot_only: Option<bool>,
     pub search: Option<String>,
     pub author: Option<String>,
+    pub exclude_replies: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -211,13 +211,11 @@ pub struct StorageStats {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OwnershipStorageStats {
     pub own_events_count: u64,
-    pub own_media_bytes: u64,
     pub tracked_events_count: u64,
-    pub tracked_media_bytes: u64,
     pub wot_events_count: u64,
-    pub wot_media_bytes: u64,
     pub total_events: u64,
     pub db_size_bytes: u64,
+    pub media_disk_bytes: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -305,15 +303,13 @@ fn start_sync_engine(
     sync_tier: Arc<AtomicU8>,
     sync_stats: Arc<RwLock<SyncStats>>,
     app_handle: tauri::AppHandle,
-    tracked_media_gb: f64,
-    wot_media_gb: f64,
     sync_config: SyncConfig,
     max_event_age_days: u32,
 ) -> CancellationToken {
     let relays = resolve_sync_relays(&db, &hex_pubkey, &fallback_relays);
     let engine = Arc::new(SyncEngine::new(
         wot_graph, db, relays, hex_pubkey, sync_tier, sync_stats,
-        app_handle, tracked_media_gb, wot_media_gb, sync_config, max_event_age_days,
+        app_handle, sync_config, max_event_age_days,
     ));
     engine.start()
 }
@@ -330,7 +326,6 @@ async fn get_status(state: State<'_, AppState>) -> Result<AppStatus, String> {
     let current_tier = state.sync_tier.load(Ordering::Relaxed);
     let sync_stats = state.sync_stats.read().await.clone();
     let events_stored = state.db().event_count().unwrap_or(0);
-    let media_stored = state.db().media_total_bytes().unwrap_or(0);
     let offline_mode = config.offline_mode;
 
     tracing::debug!("[cmd:get_status] relay_running={}, events={}, wot_nodes={}, sync_tier={}", relay_running, events_stored, stats.node_count, current_tier);
@@ -358,7 +353,6 @@ async fn get_status(state: State<'_, AppState>) -> Result<AppStatus, String> {
         },
         sync_tier: current_tier,
         sync_stats,
-        media_stored,
         offline_mode,
         sync_wot_notes_per_cycle: config.sync_wot_notes_per_cycle,
     })
@@ -518,8 +512,6 @@ async fn init_nostrito(
             state.sync_tier.clone(),
             state.sync_stats.clone(),
             app_handle.clone(),
-            config.storage_tracked_media_gb,
-            config.storage_wot_media_gb,
             sync_config,
             config.max_event_age_days,
         );
@@ -716,8 +708,6 @@ async fn start_sync(
         state.sync_tier.clone(),
         state.sync_stats.clone(),
         app_handle,
-        config.storage_tracked_media_gb,
-        config.storage_wot_media_gb,
         sync_config,
         config.max_event_age_days,
     );
@@ -794,8 +784,6 @@ async fn set_offline_mode(
                 state.sync_tier.clone(),
                 state.sync_stats.clone(),
                 app_handle,
-                config.storage_tracked_media_gb,
-                config.storage_wot_media_gb,
                 sync_config,
                 config.max_event_age_days,
             );
@@ -854,8 +842,6 @@ async fn restart_sync(state: State<'_, AppState>, app_handle: tauri::AppHandle) 
         state.sync_tier.clone(),
         state.sync_stats.clone(),
         app_handle.clone(),
-        config.storage_tracked_media_gb,
-        config.storage_wot_media_gb,
         sync_config,
         config.max_event_age_days,
     );
@@ -917,10 +903,12 @@ async fn get_feed(filter: FeedFilter, state: State<'_, AppState>) -> Result<Vec<
     let kinds = feed_kinds.as_deref();
     let limit = filter.limit.unwrap_or(50);
 
+    let exclude_replies = filter.exclude_replies.unwrap_or(false);
+
     // Branch: WoT mode uses a SQL subquery (avoids SQLite parameter limit with large graphs)
     let events = if filter.wot_only.unwrap_or(false) {
         let own_pk = state.config.read().await.hex_pubkey.clone();
-        state.db().query_wot_feed(own_pk.as_deref(), kinds, filter.since, filter.until, limit)
+        state.db().query_wot_feed(own_pk.as_deref(), kinds, filter.since, filter.until, limit, exclude_replies)
             .map_err(|e| {
                 tracing::error!("[cmd:get_feed] wot query failed: {}", e);
                 format!("Failed to query WoT feed: {}", e)
@@ -1070,6 +1058,16 @@ pub struct InteractionCounts {
     pub zaps: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadSummary {
+    pub root_event: NostrEvent,
+    pub wot_reply_count: u32,
+    pub total_reply_count: u32,
+    pub wot_replier_pubkeys: Vec<String>,
+    pub latest_wot_reply: Option<NostrEvent>,
+    pub latest_activity: u64,
+}
+
 #[tauri::command]
 async fn get_thread_events(
     root_id: String,
@@ -1087,6 +1085,102 @@ async fn get_thread_events(
         reactions: rows_to_events(reactions),
         zaps: rows_to_events(zaps),
     })
+}
+
+#[tauri::command]
+async fn get_feed_thread_roots(
+    since: Option<u64>,
+    until: Option<u64>,
+    limit: Option<u32>,
+    state: State<'_, AppState>,
+) -> Result<Vec<ThreadSummary>, String> {
+    let own_pk = state.config.read().await.hex_pubkey.clone();
+    let db = state.db();
+    let lim = limit.unwrap_or(50);
+
+    // Get WoT reply events
+    let reply_rows = db.query_wot_replies(own_pk.as_deref(), since, until, lim * 5)
+        .map_err(|e| format!("Failed to query WoT replies: {}", e))?;
+    let replies = rows_to_events(reply_rows);
+
+    if replies.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Group replies by root event ID
+    let mut by_root: std::collections::HashMap<String, Vec<&NostrEvent>> = std::collections::HashMap::new();
+    for reply in &replies {
+        // Parse e-tags to find root ID
+        let e_tags: Vec<&Vec<String>> = reply.tags.iter().filter(|t| t.len() >= 2 && t[0] == "e").collect();
+        let root_id = e_tags.iter()
+            .find(|t| t.len() >= 4 && t[3] == "root")
+            .or_else(|| e_tags.first())
+            .map(|t| t[1].clone());
+
+        if let Some(rid) = root_id {
+            by_root.entry(rid).or_default().push(reply);
+        }
+    }
+
+    // Batch-fetch root events from DB
+    let root_ids: Vec<String> = by_root.keys().cloned().collect();
+    let root_rows = db.query_events(
+        Some(&root_ids),
+        None,
+        Some(&[1]),
+        None,
+        None,
+        root_ids.len() as u32,
+    ).map_err(|e| format!("Failed to fetch root events: {}", e))?;
+    let root_events = rows_to_events(root_rows);
+    let root_map: std::collections::HashMap<String, NostrEvent> = root_events
+        .into_iter()
+        .map(|e| (e.id.clone(), e))
+        .collect();
+
+    // Build ThreadSummary for each root
+    let mut summaries: Vec<ThreadSummary> = Vec::new();
+    for (rid, wot_replies) in &by_root {
+        let root_event = match root_map.get(rid) {
+            Some(e) => e.clone(),
+            None => continue, // Root not in DB, skip
+        };
+
+        let wot_reply_count = wot_replies.len() as u32;
+        let total_reply_count = db.count_thread_replies(rid).unwrap_or(wot_reply_count);
+
+        let mut replier_pks: Vec<String> = Vec::new();
+        let mut seen_pks = std::collections::HashSet::new();
+        for r in wot_replies.iter() {
+            if seen_pks.insert(r.pubkey.clone()) {
+                replier_pks.push(r.pubkey.clone());
+            }
+        }
+
+        let latest_wot_reply = wot_replies.iter()
+            .max_by_key(|r| r.created_at)
+            .map(|r| (*r).clone());
+
+        let latest_activity = wot_replies.iter()
+            .map(|r| r.created_at)
+            .max()
+            .unwrap_or(root_event.created_at);
+
+        summaries.push(ThreadSummary {
+            root_event,
+            wot_reply_count,
+            total_reply_count,
+            wot_replier_pubkeys: replier_pks,
+            latest_wot_reply,
+            latest_activity,
+        });
+    }
+
+    // Sort by latest_activity desc, limit
+    summaries.sort_by(|a, b| b.latest_activity.cmp(&a.latest_activity));
+    summaries.truncate(lim as usize);
+
+    Ok(summaries)
 }
 
 #[tauri::command]
@@ -1128,7 +1222,7 @@ async fn fetch_thread_from_relays(
     let event_id = EventId::from_hex(&root_id)
         .map_err(|e| format!("Invalid event ID: {}", e))?;
 
-    // Fetch the root event + all replies/reactions/zaps
+    // ── Phase 1: Fetch from user's own relays ──
     let root_filter = Filter::new().id(event_id).limit(1);
     let replies_filter = Filter::new().event(event_id).kinds(vec![Kind::TextNote]).limit(500);
     let interactions_filter = Filter::new().event(event_id).kinds(vec![Kind::Reaction, Kind::from(9735)]).limit(500);
@@ -1140,27 +1234,91 @@ async fn fetch_thread_from_relays(
         15,
     ).await.map_err(|e| format!("Relay fetch failed: {}", e))?;
 
-    if events.is_empty() {
-        return Ok(0);
-    }
-
     let db = state.db();
     let graph = Arc::clone(&state.wot_graph);
-    let (stored, _) = crate::sync::processing::process_events(
-        &events,
-        &db,
-        &graph,
-        &hex_pubkey,
-        crate::sync::types::EventSource::ThreadContext,
-        crate::sync::types::MEDIA_PRIORITY_OTHERS,
-        None,
-        "thread",
-    );
+    let mut total_stored = 0u32;
 
-    // Emit thread-updated event so frontend can refresh
-    app_handle.emit("thread-updated", &root_id).ok();
+    if !events.is_empty() {
+        let (stored, _) = crate::sync::processing::process_events(
+            &events,
+            &db,
+            &graph,
+            &hex_pubkey,
+            crate::sync::types::EventSource::ThreadContext,
+            None,
+            "thread",
+        );
+        total_stored += stored;
+        // Emit immediately so frontend gets fast partial update
+        app_handle.emit("thread-updated", &root_id).ok();
+    }
 
-    Ok(stored)
+    // ── Phase 2: Fetch from participant relays ──
+    // Collect pubkeys from phase-1 results + local DB thread data
+    let mut participant_pubkeys = std::collections::HashSet::new();
+    for ev in &events {
+        participant_pubkeys.insert(ev.pubkey.to_hex());
+    }
+    // Also include pubkeys from local thread data
+    if let Ok((root, replies, reactions, zaps)) = db.get_thread_events(&root_id) {
+        if let Some(ref r) = root {
+            participant_pubkeys.insert(r.1.clone());
+        }
+        for row in &replies {
+            participant_pubkeys.insert(row.1.clone());
+        }
+        for row in &reactions {
+            participant_pubkeys.insert(row.1.clone());
+        }
+        for row in &zaps {
+            participant_pubkeys.insert(row.1.clone());
+        }
+    }
+
+    let pubkey_list: Vec<String> = participant_pubkeys.into_iter().collect();
+    let phase1_relay_set: std::collections::HashSet<String> = relay_urls.iter().cloned().collect();
+
+    if let Ok(participant_relays) = db.get_write_relays_for_pubkeys(&pubkey_list, 30) {
+        let new_relays: Vec<String> = participant_relays
+            .into_iter()
+            .filter(|r| !phase1_relay_set.contains(r))
+            .take(20)
+            .collect();
+
+        if !new_relays.is_empty() {
+            tracing::info!(
+                "[thread] Phase 2: fetching from {} participant relays",
+                new_relays.len()
+            );
+
+            let pool2 = crate::sync::pool::RelayPool::new();
+            let root_filter2 = Filter::new().id(event_id).limit(1);
+            let replies_filter2 = Filter::new().event(event_id).kinds(vec![Kind::TextNote]).limit(500);
+            let interactions_filter2 = Filter::new().event(event_id).kinds(vec![Kind::Reaction, Kind::from(9735)]).limit(500);
+
+            if let Ok(events2) = pool2.subscribe_and_collect(
+                &new_relays,
+                vec![root_filter2, replies_filter2, interactions_filter2],
+                10,
+            ).await {
+                if !events2.is_empty() {
+                    let (stored2, _) = crate::sync::processing::process_events(
+                        &events2,
+                        &db,
+                        &graph,
+                        &hex_pubkey,
+                        crate::sync::types::EventSource::ThreadContext,
+                        None,
+                        "thread-p2",
+                    );
+                    total_stored += stored2;
+                    app_handle.emit("thread-updated", &root_id).ok();
+                }
+            }
+        }
+    }
+
+    Ok(total_stored)
 }
 
 #[tauri::command]
@@ -1507,7 +1665,6 @@ async fn fetch_wot_articles(
         &graph,
         &hex_pubkey,
         sync::types::EventSource::OwnBackup,
-        sync::types::MEDIA_PRIORITY_FOLLOWS,
         None,
         if layer == "follows" { "1" } else { "2" },
     );
@@ -1695,45 +1852,58 @@ async fn delete_media_files(
     urls: Vec<String>,
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
-) -> Result<u32, String> {
+) -> Result<u64, String> {
     if urls.is_empty() {
         return Ok(0);
     }
     tracing::info!("[cmd:delete_media_files] deleting {} media file(s)", urls.len());
-    let db = state.db();
-    let lookup = db
-        .media_cache_lookup_by_urls(&urls)
-        .map_err(|e| format!("Failed to lookup media: {}", e))?;
 
-    let mut deleted = 0u32;
-    let mut hashes = Vec::new();
-    for (_url, (hash, _mime, _size, _ts)) in &lookup {
-        let path = sync::media::media_file_path(hash);
-        if path.exists() {
-            if let Err(e) = std::fs::remove_file(&path) {
-                tracing::warn!("[cmd:delete_media_files] failed to delete {}: {}", path.display(), e);
-            } else {
-                deleted += 1;
-            }
+    let mut deleted = 0u64;
+    for url in &urls {
+        let hash = crate::sync::media::sha256_of_string(url);
+        let path = crate::sync::media::media_file_path(&hash);
+        if tokio::fs::remove_file(&path).await.is_ok() {
+            deleted += 1;
         }
-        hashes.push(hash.clone());
     }
 
-    if !hashes.is_empty() {
-        db.media_delete_records(&hashes)
-            .map_err(|e| format!("Failed to delete media records: {}", e))?;
-    }
+    // Mark as deleted so they don't reappear
+    state.db().media_mark_deleted(&urls).map_err(|e| e.to_string())?;
 
-    // Mark URLs as deleted so they don't reappear in the gallery
-    db.media_mark_deleted(&urls)
-        .map_err(|e| format!("Failed to mark media as deleted: {}", e))?;
-
-    tracing::info!("[cmd:delete_media_files] deleted {} files, {} db records, marked {} urls", deleted, hashes.len(), urls.len());
+    tracing::info!("[cmd:delete_media_files] deleted {} files, marked {} urls", deleted, urls.len());
 
     // Notify frontend to refresh storage stats
-    let _ = app_handle.emit("media-deleted", deleted);
+    app_handle.emit("media-deleted", deleted).ok();
 
     Ok(deleted)
+}
+
+/// Download a single media URL and cache it locally.
+#[tauri::command]
+async fn download_media_url(url: String) -> Result<Option<String>, String> {
+    tracing::info!("[cmd:download_media_url] url={}", &url[..url.len().min(60)]);
+
+    let hash = crate::sync::media::download_single_media(&url)
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Some(h) = &hash {
+        let path = crate::sync::media::media_file_path(h);
+        Ok(Some(path.to_string_lossy().to_string()))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Check if a media URL is already cached locally.
+#[tauri::command]
+async fn check_media_cached(url: String) -> Result<Option<String>, String> {
+    let hash = crate::sync::media::sha256_of_string(&url);
+    let path = crate::sync::media::media_file_path(&hash);
+    if path.exists() {
+        Ok(Some(path.to_string_lossy().to_string()))
+    } else {
+        Ok(None)
+    }
 }
 
 #[tauri::command]
@@ -2066,27 +2236,51 @@ async fn get_ownership_storage_stats(state: State<'_, AppState>) -> Result<Owner
 
     let db = state.db();
 
-    // Use batch query (2 SQL calls instead of 7+)
-    let (own_events_count, tracked_events_count, wot_events_count, total_events,
-         own_media_bytes, tracked_media_bytes, wot_media_bytes, db_size_bytes) =
+    // Use batch query
+    let (own_events_count, tracked_events_count, wot_events_count, total_events, db_size_bytes) =
         db.get_ownership_stats_batch(&own_pubkey).map_err(|e| e.to_string())?;
 
+    // Scan actual media directory on disk for real byte count
+    let media_disk_bytes = {
+        let media_dir = dirs::home_dir()
+            .unwrap_or_default()
+            .join(".nostrito/media");
+        tokio::task::spawn_blocking(move || {
+            let mut total: u64 = 0;
+            if let Ok(entries) = std::fs::read_dir(&media_dir) {
+                for entry in entries.flatten() {
+                    if entry.path().is_dir() {
+                        if let Ok(sub_entries) = std::fs::read_dir(entry.path()) {
+                            for sub in sub_entries.flatten() {
+                                if let Ok(meta) = sub.metadata() {
+                                    if meta.is_file() {
+                                        total += meta.len();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            total
+        }).await.unwrap_or(0)
+    };
+
     tracing::info!(
-        "[cmd:get_ownership_storage_stats] own={}/{}, tracked={}/{}, wot={}/{}",
-        own_events_count, own_media_bytes,
-        tracked_events_count, tracked_media_bytes,
-        wot_events_count, wot_media_bytes,
+        "[cmd:get_ownership_storage_stats] own={}, tracked={}, wot={}, disk={}",
+        own_events_count,
+        tracked_events_count,
+        wot_events_count,
+        media_disk_bytes,
     );
 
     Ok(OwnershipStorageStats {
         own_events_count,
-        own_media_bytes,
         tracked_events_count,
-        tracked_media_bytes,
         wot_events_count,
-        wot_media_bytes,
         total_events,
         db_size_bytes,
+        media_disk_bytes,
     })
 }
 
@@ -2356,24 +2550,6 @@ pub struct TrackedProfileDetail {
     pub display_name: Option<String>,
     pub picture: Option<String>,
     pub event_count: u64,
-    pub media_bytes: u64,
-    pub media_count: u64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MediaBreakdown {
-    pub image_count: u64,
-    pub image_bytes: u64,
-    pub video_count: u64,
-    pub video_bytes: u64,
-    pub audio_count: u64,
-    pub audio_bytes: u64,
-    pub other_count: u64,
-    pub other_bytes: u64,
-    pub total_count: u64,
-    pub total_bytes: u64,
-    pub oldest_media: i64,
-    pub newest_media: i64,
 }
 
 #[tauri::command]
@@ -2660,8 +2836,6 @@ async fn save_settings(settings: Settings, app_handle: tauri::AppHandle, state: 
             state.sync_tier.clone(),
             state.sync_stats.clone(),
             app_handle.clone(),
-            config.storage_tracked_media_gb,
-            config.storage_wot_media_gb,
             sync_config,
             config.max_event_age_days,
         );
@@ -2758,8 +2932,6 @@ async fn get_tracked_profiles_detail(state: State<'_, AppState>) -> Result<Vec<T
     let mut result = Vec::new();
     for (pubkey, tracked_at, note) in profiles {
         let event_count = state.db().count_events_for_pubkey(&pubkey).unwrap_or(0);
-        let media_bytes = state.db().media_bytes_for_pubkey(&pubkey).unwrap_or(0);
-        let media_count = state.db().media_count_for_pubkey(&pubkey).unwrap_or(0);
         let info = profile_infos.iter().find(|p| p.pubkey == pubkey);
         result.push(TrackedProfileDetail {
             pubkey,
@@ -2769,8 +2941,6 @@ async fn get_tracked_profiles_detail(state: State<'_, AppState>) -> Result<Vec<T
             display_name: info.and_then(|p| p.display_name.clone()),
             picture: info.and_then(|p| p.picture.clone()),
             event_count,
-            media_bytes,
-            media_count,
         });
     }
     Ok(result)
@@ -2790,32 +2960,6 @@ async fn get_kind_counts_for_category(category: String, state: State<'_, AppStat
     }.map_err(|e| e.to_string())?;
 
     Ok(KindCounts { counts })
-}
-
-#[tauri::command]
-async fn get_media_breakdown_for_category(category: String, state: State<'_, AppState>) -> Result<MediaBreakdown, String> {
-    let config = state.config.read().await;
-    let own_pubkey = config.hex_pubkey.clone().unwrap_or_default();
-    drop(config);
-
-    let (ic, ib, vc, vb, ac, ab, oc, ob, tc, tb, oldest, newest) = state.db()
-        .media_breakdown_for_category(&own_pubkey, &category)
-        .map_err(|e| e.to_string())?;
-
-    Ok(MediaBreakdown {
-        image_count: ic,
-        image_bytes: ib,
-        video_count: vc,
-        video_bytes: vb,
-        audio_count: ac,
-        audio_bytes: ab,
-        other_count: oc,
-        other_bytes: ob,
-        total_count: tc,
-        total_bytes: tb,
-        oldest_media: oldest,
-        newest_media: newest,
-    })
 }
 
 #[tauri::command]
@@ -2840,37 +2984,6 @@ async fn get_events_for_category(
     Ok(rows_to_events(rows))
 }
 
-#[tauri::command]
-async fn get_media_for_category(
-    category: String,
-    state: State<'_, AppState>,
-) -> Result<Vec<OwnMediaItem>, String> {
-    let config = state.config.read().await;
-    let own_pubkey = config.hex_pubkey.clone().unwrap_or_default();
-    drop(config);
-
-    let records = state.db()
-        .get_media_for_category(&own_pubkey, &category)
-        .map_err(|e| e.to_string())?;
-
-    let home = dirs::home_dir().unwrap_or_default();
-    Ok(records.into_iter().map(|(hash, url, mime_type, size_bytes, downloaded_at)| {
-        let local_path = home.join(".nostrito/media")
-            .join(&hash[..2])
-            .join(&hash)
-            .to_string_lossy()
-            .to_string();
-        OwnMediaItem {
-            hash,
-            url,
-            local_path,
-            mime_type,
-            size_bytes,
-            downloaded_at: downloaded_at as u64,
-        }
-    }).collect())
-}
-
 /// A media reference extracted from a stored event, with optional local cache info.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventMediaRef {
@@ -2884,7 +2997,7 @@ pub struct EventMediaRef {
 }
 
 /// Scan stored events for a category and extract all media URLs,
-/// cross-referencing with media_cache for local copies.
+/// checking the filesystem for local copies.
 #[tauri::command]
 async fn get_event_media_for_category(
     category: String,
@@ -2944,7 +3057,7 @@ async fn get_event_media_for_category(
         }
     }
 
-    // Batch lookup which URLs have local copies
+    // Collect all URLs for filtering
     let all_urls: Vec<String> = items.iter().map(|(u, _, _)| u.clone()).collect();
 
     // Filter out URLs the user has explicitly deleted
@@ -2952,42 +3065,25 @@ async fn get_event_media_for_category(
     if !deleted_urls.is_empty() {
         items.retain(|(url, _, _)| !deleted_urls.contains(url));
     }
-    let all_urls: Vec<String> = items.iter().map(|(u, _, _)| u.clone()).collect();
-    let cache_map = db.media_cache_lookup_by_urls(&all_urls).map_err(|e| e.to_string())?;
 
-    let home = dirs::home_dir().unwrap_or_default();
     let result: Vec<EventMediaRef> = items.into_iter().map(|(url, pubkey, created_at)| {
-        if let Some((hash, mime, size, _downloaded_at)) = cache_map.get(&url) {
-            let local_path = home.join(".nostrito/media")
-                .join(&hash[..2])
-                .join(hash)
-                .to_string_lossy()
-                .to_string();
-            EventMediaRef {
-                url,
-                local_path: Some(local_path),
-                mime_type: mime.clone(),
-                size_bytes: *size,
-                downloaded: true,
-                pubkey,
-                created_at,
-            }
-        } else {
-            let mime = mime_type_from_url(&url)
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| {
-                    if is_nostr_media_cdn(&url) { "image/jpeg".to_string() }
-                    else { "image/jpeg".to_string() }
-                });
-            EventMediaRef {
-                url,
-                local_path: None,
-                mime_type: mime,
-                size_bytes: 0,
-                downloaded: false,
-                pubkey,
-                created_at,
-            }
+        let hash = crate::sync::media::sha256_of_string(&url);
+        let path = crate::sync::media::media_file_path(&hash);
+        let exists = path.exists();
+        let mime = mime_type_from_url(&url)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                if is_nostr_media_cdn(&url) { "image/jpeg".to_string() }
+                else { "image/jpeg".to_string() }
+            });
+        EventMediaRef {
+            local_path: if exists { Some(path.to_string_lossy().to_string()) } else { None },
+            mime_type: mime,
+            size_bytes: if exists { std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) } else { 0 },
+            downloaded: exists,
+            url,
+            pubkey,
+            created_at,
         }
     }).collect();
 
@@ -2997,51 +3093,6 @@ async fn get_event_media_for_category(
     );
 
     Ok(result)
-}
-
-#[tauri::command]
-async fn requeue_profile_media(pubkey: String, state: State<'_, AppState>) -> Result<u32, String> {
-    tracing::info!("[cmd:requeue_profile_media] pubkey={}...", &pubkey[..pubkey.len().min(12)]);
-    state.db().requeue_events_media(&pubkey).map_err(|e| e.to_string())
-}
-
-/// Download pending media for tracked profiles immediately (doesn't wait for sync cycle).
-#[tauri::command]
-async fn download_tracked_media(state: State<'_, AppState>) -> Result<u32, String> {
-    tracing::info!("[cmd:download_tracked_media] starting immediate download for tracked profiles");
-    let config = state.config.read().await;
-    let own_pubkey = config.hex_pubkey.clone().unwrap_or_default();
-    let tracked_media_gb = config.storage_tracked_media_gb;
-    let wot_media_gb = config.storage_wot_media_gb;
-    drop(config);
-
-    let db = state.db();
-
-    // Ensure tracked profiles' media is queued
-    let tracked_pks = db.get_tracked_pubkeys().unwrap_or_default();
-    for tpk in &tracked_pks {
-        if tpk != &own_pubkey {
-            db.requeue_events_media(tpk).ok();
-        }
-    }
-
-    // Run media downloader for queued items
-    let downloader = sync::media::MediaDownloader::new(
-        db.clone(),
-        own_pubkey,
-        tracked_media_gb,
-        wot_media_gb,
-    );
-    match downloader.run(200).await {
-        Ok(stats) => {
-            tracing::info!(
-                "[cmd:download_tracked_media] done: downloaded={}, skipped={}, failed={}",
-                stats.downloaded, stats.skipped, stats.failed
-            );
-            Ok(stats.downloaded)
-        }
-        Err(e) => Err(format!("Media download failed: {}", e)),
-    }
 }
 
 #[tauri::command]
@@ -3163,106 +3214,6 @@ async fn setup_browser_integration(app: tauri::AppHandle) -> Result<String, Stri
     app.emit("relay:restart_required", ()).ok();
 
     Ok(result)
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct MediaStats {
-    pub total_bytes: u64,
-    pub file_count: u64,
-    pub limit_bytes: u64,
-    pub tracked_bytes: u64,
-    pub tracked_limit_bytes: u64,
-    pub wot_bytes: u64,
-    pub wot_limit_bytes: u64,
-}
-
-#[tauri::command]
-async fn get_media_stats(state: State<'_, AppState>) -> Result<MediaStats, String> {
-    let db = state.db();
-    let config = state.config.read().await;
-    let own_pubkey = config.hex_pubkey.as_deref().unwrap_or("");
-    let total_bytes = db.media_total_bytes().map_err(|e| e.to_string())?;
-    let file_count = db.media_file_count().map_err(|e| e.to_string())?;
-    let tracked_bytes = db.media_tracked_bytes(own_pubkey).map_err(|e| e.to_string())?;
-    let wot_bytes = db.media_others_bytes(own_pubkey).map_err(|e| e.to_string())?;
-    let tracked_limit_bytes = (config.storage_tracked_media_gb * 1024.0 * 1024.0 * 1024.0) as u64;
-    let wot_limit_bytes = (config.storage_wot_media_gb * 1024.0 * 1024.0 * 1024.0) as u64;
-    Ok(MediaStats {
-        total_bytes,
-        file_count,
-        limit_bytes: tracked_limit_bytes + wot_limit_bytes,
-        tracked_bytes,
-        tracked_limit_bytes,
-        wot_bytes,
-        wot_limit_bytes,
-    })
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OwnMediaItem {
-    pub hash: String,
-    pub url: String,
-    pub local_path: String,
-    pub mime_type: String,
-    pub size_bytes: u64,
-    pub downloaded_at: u64,
-}
-
-#[tauri::command]
-async fn get_own_media(state: State<'_, AppState>) -> Result<Vec<OwnMediaItem>, String> {
-    tracing::debug!("[cmd:get_own_media] called");
-    let config = state.config.read().await;
-    let own_pubkey = config.hex_pubkey.clone().unwrap_or_default();
-    drop(config);
-
-    if own_pubkey.is_empty() {
-        return Err("Not initialized — no pubkey set".into());
-    }
-
-    let records = state.db().get_own_media(&own_pubkey).map_err(|e| e.to_string())?;
-    tracing::info!("[cmd:get_own_media] returning {} own media items", records.len());
-
-    let home = dirs::home_dir().unwrap_or_default();
-    Ok(records.into_iter().map(|(hash, url, mime_type, size_bytes, downloaded_at)| {
-        let local_path = home.join(".nostrito/media")
-            .join(&hash[..2])
-            .join(&hash)
-            .to_string_lossy()
-            .to_string();
-        OwnMediaItem {
-            hash,
-            url,
-            local_path,
-            mime_type,
-            size_bytes,
-            downloaded_at: downloaded_at as u64,
-        }
-    }).collect())
-}
-
-#[tauri::command]
-async fn get_profile_media(pubkey: String, state: State<'_, AppState>) -> Result<Vec<OwnMediaItem>, String> {
-    tracing::debug!("[cmd:get_profile_media] called for pubkey={}...", &pubkey[..pubkey.len().min(8)]);
-
-    let records = state.db().get_profile_media(&pubkey).map_err(|e| e.to_string())?;
-    tracing::info!("[cmd:get_profile_media] returning {} media items for {}...", records.len(), &pubkey[..pubkey.len().min(8)]);
-
-    let home = dirs::home_dir().unwrap_or_default();
-    Ok(records.into_iter().map(|(hash, url, mime_type, size_bytes, downloaded_at)| {
-        let local_path = home.join(".nostrito/media")
-            .join(&hash[..2])
-            .join(&hash)
-            .to_string_lossy()
-            .to_string();
-        OwnMediaItem {
-            hash,
-            url,
-            local_path,
-            mime_type,
-            size_bytes,
-            downloaded_at: downloaded_at as u64,
-        }
-    }).collect())
 }
 
 // ── Profile Fetch Types ────────────────────────────────────────────
@@ -3617,19 +3568,14 @@ async fn set_nsec(nsec: String, app_handle: tauri::AppHandle, state: State<'_, A
 
 #[tauri::command]
 async fn clear_nsec(app_handle: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    let config = state.config.read().await;
-    if let Some(ref npub) = config.npub {
-        delete_nsec_from_keychain(npub);
-    }
-    drop(config);
-
+    // Only clear in-memory nsec — keep keychain entry so it reloads on next launch
     {
         let mut config = state.config.write().await;
         config.nsec = None;
     }
 
     app_handle.emit("signing-mode-changed", "read-only").ok();
-    tracing::info!("[cmd:clear_nsec] nsec cleared");
+    tracing::info!("[cmd:clear_nsec] nsec cleared from memory (keychain preserved)");
     Ok(())
 }
 
@@ -4102,14 +4048,19 @@ fn wallet_decode_bolt11(invoice: String) -> Result<wallet::DecodedInvoice, Strin
 #[tauri::command]
 async fn wallet_provision(state: State<'_, AppState>) -> Result<wallet::WalletInfo, String> {
     let config = state.config.read().await;
-    let nsec = config.nsec.clone().ok_or("No nsec available — read-only mode")?;
+    let nsec = config.nsec.clone();
     let hex_pubkey = config.hex_pubkey.clone().ok_or("No pubkey set")?;
     let npub = config.npub.clone().ok_or("No npub set")?;
     drop(config);
 
-    // Auto-provision wallet
-    let (admin_key, _wallet_id, instance_url) =
-        wallet::provision::provision_wallet(None, &nsec, &hex_pubkey).await?;
+    // Auto-provision wallet — try nsec first, then NIP-46 signer
+    let (admin_key, _wallet_id, instance_url) = if let Some(nsec) = nsec {
+        wallet::provision::provision_wallet(None, &nsec, &hex_pubkey).await?
+    } else {
+        let signer_guard = state.nip46_signer.read().await;
+        let signer = signer_guard.as_ref().ok_or("No signing method available — read-only mode")?;
+        wallet::provision::provision_wallet_with_signer(None, signer, &hex_pubkey).await?
+    };
 
     // Connect using the same flow as wallet_connect_lnbits
     let (alias, _balance) = wallet::lnbits::get_info(&instance_url, &admin_key).await?;
@@ -4820,8 +4771,6 @@ pub fn run() {
                         tracing::info!("Auto-resuming sync for {}...", &hex[..8]);
 
                         let cfg2 = config.read().await;
-                        let tracked_media_gb = cfg2.storage_tracked_media_gb;
-                        let wot_media_gb = cfg2.storage_wot_media_gb;
                         let max_age_days = cfg2.max_event_age_days;
                         let sync_config = SyncConfig {
                             lookback_days: cfg2.sync_lookback_days,
@@ -4844,8 +4793,6 @@ pub fn run() {
                             sync_tier,
                             sync_stats,
                             app_handle.clone(),
-                            tracked_media_gb,
-                            wot_media_gb,
                             sync_config,
                             max_age_days,
                         );
@@ -4922,6 +4869,7 @@ pub fn run() {
             get_note_reactions,
             get_note_zaps,
             get_thread_events,
+            get_feed_thread_roots,
             get_interaction_counts,
             fetch_thread_from_relays,
             fetch_global_feed,
@@ -4933,6 +4881,8 @@ pub fn run() {
             get_bookmarked_media,
             find_event_for_media,
             delete_media_files,
+            download_media_url,
+            check_media_cached,
             fetch_events_by_ids,
             search_events,
             search_global,
@@ -4958,9 +4908,6 @@ pub fn run() {
             get_own_profile,
             setup_browser_integration,
             check_browser_integration,
-            get_media_stats,
-            get_own_media,
-            get_profile_media,
             restart_sync,
             reset_sync_cursors,
             get_followers,
@@ -4974,12 +4921,8 @@ pub fn run() {
             get_tracked_profiles,
             get_tracked_profiles_detail,
             get_kind_counts_for_category,
-            get_media_breakdown_for_category,
             get_events_for_category,
-            get_media_for_category,
             get_event_media_for_category,
-            requeue_profile_media,
-            download_tracked_media,
             fetch_profile,
             get_profile_with_refresh,
             nsec_to_npub,
