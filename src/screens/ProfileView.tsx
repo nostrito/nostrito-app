@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   IconCheck, IconBookOpen, IconFeed, IconZap,
   IconMoreVertical, IconCopy, IconShare, IconVolumeX, IconVolume,
-  IconExternalLink, IconDatabase,
+  IconExternalLink, IconDatabase, IconMessageCircle,
 } from "../components/Icon";
 import { Avatar } from "../components/Avatar";
 import { NoteCard } from "../components/NoteCard";
@@ -15,7 +15,10 @@ import { shortPubkey } from "../utils/format";
 import { profileDisplayName } from "../utils/profiles";
 import { initMediaViewer } from "../utils/media";
 import { invalidateInteractionCounts } from "../hooks/useInteractionCounts";
+import { markReacted } from "../hooks/useReactionStatus";
+import { useOnDemandFetch } from "../hooks/useOnDemandFetch";
 import { useProfileContext, useProfile } from "../context/ProfileContext";
+import { listen } from "@tauri-apps/api/event";
 import type { ProfileInfo } from "../utils/profiles";
 
 /* ------------------------------------------------------------------ */
@@ -81,6 +84,7 @@ export const ProfileView: React.FC = () => {
   const [zapTarget, setZapTarget] = useState<NostrEvent | null>(null);
 
   const handleLike = useCallback(async (event: NostrEvent) => {
+    markReacted(event.id);
     try {
       await invoke("publish_reaction", { eventId: event.id, eventPubkey: event.pubkey });
       invalidateInteractionCounts([event.id]);
@@ -103,6 +107,7 @@ export const ProfileView: React.FC = () => {
 
   /* --- profile context for batch operations ------------------------- */
   const { ensureProfiles, getProfile } = useProfileContext();
+  const { fetchIfStale } = useOnDemandFetch();
 
   /* --- init media viewer -------------------------------------------- */
   useEffect(() => {
@@ -226,10 +231,15 @@ export const ProfileView: React.FC = () => {
       }
 
       setProfileLoading(false);
+
+      // Trigger background relay fetch for fresh content
+      fetchIfStale(`profile:${pubkey}`, () =>
+        invoke("fetch_profile_content_from_relays", { pubkey })
+      );
     };
 
     load();
-  }, [pubkey, ensureProfiles]);
+  }, [pubkey, ensureProfiles, fetchIfStale]);
 
   /* --- load notes --------------------------------------------------- */
   const loadNotes = useCallback(async () => {
@@ -238,11 +248,17 @@ export const ProfileView: React.FC = () => {
     setHasMoreNotes(true);
     try {
       const events = await invoke<NostrEvent[]>("get_feed", {
-        filter: { kinds: [1], limit: 50, author: pubkey },
+        filter: { kinds: [1, 6], limit: 50, author: pubkey },
       });
       const sorted = events.sort((a, b) => b.created_at - a.created_at);
       setNotes(sorted);
-      ensureProfiles(events.map((e) => e.pubkey));
+      const pubkeys = new Set(events.map((e) => e.pubkey));
+      for (const e of events) {
+        if (e.kind === 6) {
+          try { const orig = JSON.parse(e.content); if (orig?.pubkey) pubkeys.add(orig.pubkey); } catch {}
+        }
+      }
+      ensureProfiles([...pubkeys]);
       if (events.length < 50) setHasMoreNotes(false);
     } catch (e) {
       console.error("[profile] Failed to load notes:", e);
@@ -258,14 +274,20 @@ export const ProfileView: React.FC = () => {
     try {
       const oldest = notes[notes.length - 1].created_at;
       const events = await invoke<NostrEvent[]>("get_feed", {
-        filter: { kinds: [1], limit: 50, author: pubkey, until: oldest - 1 },
+        filter: { kinds: [1, 6], limit: 50, author: pubkey, until: oldest - 1 },
       });
       if (events.length === 0) {
         setHasMoreNotes(false);
       } else {
         const sorted = events.sort((a, b) => b.created_at - a.created_at);
         setNotes((prev) => [...prev, ...sorted]);
-        ensureProfiles(events.map((e) => e.pubkey));
+        const pubkeys = new Set(events.map((e) => e.pubkey));
+        for (const e of events) {
+          if (e.kind === 6) {
+            try { const orig = JSON.parse(e.content); if (orig?.pubkey) pubkeys.add(orig.pubkey); } catch {}
+          }
+        }
+        ensureProfiles([...pubkeys]);
         if (events.length < 50) setHasMoreNotes(false);
       }
     } catch (e) {
@@ -309,6 +331,43 @@ export const ProfileView: React.FC = () => {
       loadNotes();
     }
   }, [pubkey, profileLoading]);
+
+  /* --- pick up own notes published from compose ---------------------- */
+  useEffect(() => {
+    if (!pubkey) return;
+    const handler = (e: Event) => {
+      const event = (e as CustomEvent).detail as NostrEvent;
+      if (event && event.pubkey === pubkey) {
+        setNotes((prev) => {
+          if (prev.some((n) => n.id === event.id)) return prev;
+          return [event, ...prev];
+        });
+      }
+    };
+    window.addEventListener("nostrito:note-published", handler);
+    return () => window.removeEventListener("nostrito:note-published", handler);
+  }, [pubkey]);
+
+  /* --- listen for relay content updates ------------------------------ */
+  useEffect(() => {
+    if (!pubkey) return;
+    const unlisten = listen<string>("profile-content-updated", async (ev) => {
+      if (ev.payload !== pubkey) return;
+      try {
+        const followList = await invoke<string[]>("get_follows", { pubkey });
+        setFollows(followList);
+        setFollowingCount(followList.length);
+      } catch (_) {}
+      try {
+        const followerList = await invoke<string[]>("get_followers", { pubkey });
+        setFollowers(followerList);
+        setFollowerCount(followerList.length);
+      } catch (_) {}
+      // Reload notes to pick up any new content from relays
+      loadNotes();
+    });
+    return () => { unlisten.then((fn) => fn()); };
+  }, [pubkey, loadNotes]);
 
   /* --- IntersectionObserver for notes pagination -------------------- */
   useEffect(() => {
@@ -449,6 +508,7 @@ export const ProfileView: React.FC = () => {
           <div className="profile-hero-info">
             <Avatar
               picture={profile?.picture ?? null}
+              pictureLocal={profile?.picture_local ?? null}
               pubkey={pubkey}
               className="profile-hero-avatar"
               fallbackClassName="profile-hero-avatar-fallback"
@@ -478,6 +538,18 @@ export const ProfileView: React.FC = () => {
                     </span>
                   )}
                 </div>
+
+                {/* Send message button */}
+                {!isOwn && (
+                  <button
+                    className="profile-dm-btn"
+                    onClick={() => navigate("/dms", { state: { partner: pubkey } })}
+                    title="send message"
+                  >
+                    <span className="icon"><IconMessageCircle /></span>
+                    message
+                  </button>
+                )}
 
                 {/* Three-dots menu */}
                 {!isOwn && (
@@ -597,7 +669,7 @@ export const ProfileView: React.FC = () => {
                         event={note}
                         profile={getProfile(note.pubkey) ?? profile ?? undefined}
                         compact
-                        onClick={() => navigate(`/note/${note.id}`)}
+                        onClick={() => { console.log("[profile] navigate to note:", note.id.slice(0, 12)); navigate(`/note/${note.id}`); }}
                         onZap={setZapTarget}
                         onLike={handleLike}
                       />
@@ -629,6 +701,7 @@ export const ProfileView: React.FC = () => {
                             key={article.id}
                             event={article}
                             profile={getProfile(article.pubkey) ?? profile ?? undefined}
+                            onClick={() => navigate(`/note/${article.id}`)}
                           />
                         ))}
                       </div>
@@ -681,6 +754,7 @@ export const ProfileView: React.FC = () => {
                   >
                     <Avatar
                       picture={fp?.picture ?? null}
+                      pictureLocal={fp?.picture_local ?? null}
                       pubkey={pk}
                       className="profile-follow-avatar"
                       fallbackClassName="profile-follow-avatar-fallback"

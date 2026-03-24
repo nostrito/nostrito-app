@@ -51,6 +51,9 @@ export const IconZap: React.FC<SvgProps> = (p) => (
 export const IconHeart: React.FC<SvgProps> = (p) => (
   <Svg {...p}><path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7z" /></Svg>
 );
+export const IconHeartFilled: React.FC<SvgProps> = (p) => (
+  <Svg {...p}><path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7z" fill="currentColor" /></Svg>
+);
 
 // Content
 export const IconBookOpen: React.FC<SvgProps> = (p) => (
@@ -184,6 +187,15 @@ export const IconFeather: React.FC<SvgProps> = (p) => (
 
 export const IconArchive: React.FC<SvgProps> = (p) => (
   <Svg {...p}><rect width="20" height="5" x="2" y="3" rx="1" /><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8" /><path d="M10 12h4" /></Svg>
+);
+
+// Compose
+export const IconPenSquare: React.FC<SvgProps> = (p) => (
+  <Svg {...p}><path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" /><path d="M18.375 2.625a1 1 0 0 1 3 3l-9.013 9.014a2 2 0 0 1-.853.505l-2.873.84a.5.5 0 0 1-.62-.62l.84-2.873a2 2 0 0 1 .506-.852z" /></Svg>
+);
+
+export const IconSend: React.FC<SvgProps> = (p) => (
+  <Svg {...p}><path d="M14.536 21.686a.5.5 0 0 0 .937-.024l6.5-19a.496.496 0 0 0-.635-.635l-19 6.5a.5.5 0 0 0-.024.937l7.93 3.18a2 2 0 0 1 1.112 1.11z" /><path d="m21.854 2.147-10.94 10.939" /></Svg>
 );
 
 // Brand

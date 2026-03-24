@@ -6,7 +6,42 @@ import { ProfileProvider } from "./context/ProfileContext";
 import { SigningProvider } from "./context/SigningContext";
 import { Titlebar } from "./components/Titlebar";
 import { Sidebar } from "./components/Sidebar";
-import { initMediaViewer } from "./utils/media";
+import { initMediaViewer, closeMediaViewer } from "./utils/media";
+
+class ErrorBoundary extends React.Component<
+  { children: React.ReactNode },
+  { hasError: boolean; error: Error | null }
+> {
+  state = { hasError: false, error: null as Error | null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: Error, info: React.ErrorInfo) {
+    console.error("[ErrorBoundary]", error, info.componentStack);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={{ padding: 40, color: "#ccc", fontFamily: "sans-serif" }}>
+          <h2 style={{ color: "#fff" }}>Something went wrong</h2>
+          <pre style={{ whiteSpace: "pre-wrap", opacity: 0.7, fontSize: 13 }}>
+            {this.state.error?.message}
+          </pre>
+          <button
+            onClick={() => { this.setState({ hasError: false, error: null }); window.location.hash = "/"; window.location.reload(); }}
+            style={{ marginTop: 16, padding: "8px 16px", cursor: "pointer", background: "#333", color: "#fff", border: "1px solid #555", borderRadius: 4 }}
+          >
+            Reload app
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 // Lazy load screens
 import { Dashboard } from "./screens/Dashboard";
@@ -80,15 +115,24 @@ const AppRoutes: React.FC = () => {
     };
   }, [navigate, setInitialized]);
 
+  // Close media viewer overlay on route change
+  const location = useLocation();
+  useEffect(() => {
+    console.log("[app] route changed to:", location.pathname);
+    closeMediaViewer();
+  }, [location.pathname]);
+
   // Click delegation for [data-pubkey], [data-note-id], [data-naddr] elements
   useEffect(() => {
     const handler = async (e: MouseEvent) => {
       const el = e.target as HTMLElement;
+      console.log("[app:click-delegation] click on:", el.tagName, el.className, "closest event-card:", !!el.closest(".event-card"));
 
       // Profile links
       const pubkeyEl = el.closest("[data-pubkey]") as HTMLElement | null;
       if (pubkeyEl) {
         const pubkey = pubkeyEl.dataset.pubkey;
+        console.log("[app:click-delegation] → profile navigation:", pubkey?.slice(0, 12));
         if (pubkey) navigate(`/profile/${pubkey}`);
         return;
       }
@@ -97,6 +141,7 @@ const AppRoutes: React.FC = () => {
       const noteEl = el.closest("[data-note-id]") as HTMLElement | null;
       if (noteEl) {
         const noteId = noteEl.dataset.noteId;
+        console.log("[app:click-delegation] → note navigation:", noteId?.slice(0, 12));
         if (noteId) navigate(`/note/${noteId}`);
         return;
       }
@@ -107,13 +152,21 @@ const AppRoutes: React.FC = () => {
         try {
           const data = JSON.parse(naddrEl.dataset.naddr || "{}");
           const { invoke } = await import("@tauri-apps/api/core");
-          const ev = await invoke<{ id: string } | null>("get_addressable_event", {
+          let ev = await invoke<{ id: string } | null>("get_addressable_event", {
             kind: data.kind,
             pubkey: data.pubkey,
             dTag: data.dTag,
           });
           if (ev) {
             navigate(`/note/${ev.id}`);
+          } else {
+            // Not in local DB — fetch from relays
+            const evId = await invoke<string | null>("fetch_addressable_event_from_relays", {
+              kind: data.kind,
+              pubkey: data.pubkey,
+              dTag: data.dTag,
+            });
+            if (evId) navigate(`/note/${evId}`);
           }
         } catch (err) {
           console.error("[naddr] Failed to resolve addressable event:", err);
@@ -125,7 +178,7 @@ const AppRoutes: React.FC = () => {
       const hashtagEl = el.closest("[data-hashtag]") as HTMLElement | null;
       if (hashtagEl) {
         const tag = hashtagEl.dataset.hashtag;
-        if (tag) navigate(`/feed?q=${encodeURIComponent("#" + tag)}`);
+        if (tag) navigate(`/?q=${encodeURIComponent("#" + tag)}`);
         return;
       }
     };
@@ -161,19 +214,22 @@ const AppRoutes: React.FC = () => {
         <Route path="/settings" element={<Settings />} />
         <Route path="/profile/:pubkey" element={<ProfileView />} />
         <Route path="/note/:noteId" element={<NoteDetail />} />
+        <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>
   );
 };
 
 export const App: React.FC = () => (
-  <AppProvider>
-    <SigningProvider>
-      <ProfileProvider>
-        <BrowserRouter>
-          <AppRoutes />
-        </BrowserRouter>
-      </ProfileProvider>
-    </SigningProvider>
-  </AppProvider>
+  <ErrorBoundary>
+    <AppProvider>
+      <SigningProvider>
+        <ProfileProvider>
+          <BrowserRouter>
+            <AppRoutes />
+          </BrowserRouter>
+        </ProfileProvider>
+      </SigningProvider>
+    </AppProvider>
+  </ErrorBoundary>
 );

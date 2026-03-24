@@ -1,12 +1,15 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import { QRCodeSVG } from "qrcode.react";
 import { RELAYS, resolveRelayUrl, urlToAlias } from "../relays";
-import { getProfiles, profileDisplayName } from "../utils/profiles";
-import type { ProfileInfo } from "../utils/profiles";
+import { profileDisplayName, type ProfileInfo } from "../utils/profiles";
+import { npubToHex, decodeEntity } from "../utils/mentions";
+import { useProfileContext } from "../context/ProfileContext";
 import { RelayCard } from "../components/RelayCard";
 import { Slider } from "../components/Slider";
-import { Badge } from "../components/Badge";
+// Badge unused after storage tab redesign but kept for potential future use
+// import { Badge } from "../components/Badge";
 import { Avatar } from "../components/Avatar";
 import {
   IconKey,
@@ -25,9 +28,13 @@ import {
   IconWifiOff,
   IconFeather,
   IconArchive,
+  IconSearch,
+  IconX,
 } from "../components/Icon";
 import {
   STORAGE_PRESETS,
+  STORAGE_PRESET_KEYS,
+  estimateStorage,
 } from "../utils/storagePresets";
 
 /* ------------------------------------------------------------------ */
@@ -72,6 +79,60 @@ type TabId = "identity" | "relays" | "storage" | "advanced" | "tracked";
 interface SaveFeedback {
   type: "success" | "error";
   message: string;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Input classification for tracked-profile input                     */
+/* ------------------------------------------------------------------ */
+
+type InputKind =
+  | { type: "empty" }
+  | { type: "hex"; pubkey: string }
+  | { type: "npub"; raw: string }
+  | { type: "nprofile"; pubkey: string }
+  | { type: "url"; pubkey: string }
+  | { type: "search"; query: string };
+
+function classifyInput(raw: string): InputKind {
+  const q = raw.trim();
+  if (!q) return { type: "empty" };
+
+  // Strip nostr: URI prefix and re-classify
+  if (q.startsWith("nostr:")) {
+    return classifyInput(q.slice(6));
+  }
+
+  // URL containing npub/nprofile
+  if (q.startsWith("http://") || q.startsWith("https://")) {
+    const npubMatch = q.match(/(npub1[a-z0-9]{58,})/);
+    if (npubMatch) {
+      const hex = npubToHex(npubMatch[1]);
+      if (hex) return { type: "url", pubkey: hex };
+    }
+    const nprofileMatch = q.match(/(nprofile1[a-z0-9]{20,})/);
+    if (nprofileMatch) {
+      const decoded = decodeEntity(nprofileMatch[1]);
+      if (decoded?.pubkey) return { type: "url", pubkey: decoded.pubkey };
+    }
+    // URL with no recognizable entity — fall through to search
+    return { type: "search", query: q };
+  }
+
+  // npub
+  if (q.startsWith("npub1")) return { type: "npub", raw: q };
+
+  // nprofile
+  if (q.startsWith("nprofile1")) {
+    const decoded = decodeEntity(q);
+    if (decoded?.pubkey) return { type: "nprofile", pubkey: decoded.pubkey };
+  }
+
+  // 64-char hex pubkey
+  if (q.length === 64 && /^[0-9a-f]{64}$/i.test(q)) {
+    return { type: "hex", pubkey: q };
+  }
+
+  return { type: "search", query: q };
 }
 
 /* ------------------------------------------------------------------ */
@@ -155,21 +216,7 @@ const TABS: { id: TabId; label: string; Icon: React.FC }[] = [
   { id: "advanced", label: "advanced", Icon: IconSettingsIcon },
 ];
 
-const WOT_PRESETS = [
-  { days: 7, label: "7d" },
-  { days: 14, label: "14d" },
-  { days: 30, label: "30d" },
-  { days: 90, label: "90d" },
-  { days: 365, label: "1yr" },
-];
-
-const THREAD_RETENTION_PRESETS = [
-  { days: 7, label: "1w" },
-  { days: 14, label: "2w" },
-  { days: 30, label: "30d" },
-  { days: 60, label: "60d" },
-  { days: 90, label: "90d" },
-];
+// Moved to advanced customize sliders — no longer need standalone preset buttons
 
 /* ------------------------------------------------------------------ */
 /*  Component                                                          */
@@ -233,6 +280,7 @@ const StorageEstimationPanel: React.FC = () => {
 };
 
 export const Settings: React.FC = () => {
+  const { getProfile, ensureProfiles } = useProfileContext();
 
   /* --- core state --------------------------------------------------- */
   const [activeTab, setActiveTab] = useState<TabId>("identity");
@@ -247,10 +295,14 @@ export const Settings: React.FC = () => {
   const [relayFeedback, setRelayFeedback] = useState<SaveFeedback | null>(null);
 
   /* --- storage ------------------------------------------------------ */
-  const [trackedMediaGb, setTrackedMediaGb] = useState(3);
-  const [wotRetentionDays, setWotRetentionDays] = useState(30);
-  const [threadRetentionDays, setThreadRetentionDays] = useState(30);
-  const [wotMediaGb, setWotMediaGb] = useState(2);
+  const [storagePreset, setStoragePreset] = useState<string>("balanced");
+  const [othersEventsGb, setOthersEventsGb] = useState(0);
+  const [trackedMediaGb, setTrackedMediaGb] = useState(0);
+  const [wotRetentionDays, setWotRetentionDays] = useState(0);
+  const [threadRetentionDays, setThreadRetentionDays] = useState(0);
+  const [wotMediaGb, setWotMediaGb] = useState(0);
+  const [maxEventAgeDays, setMaxEventAgeDays] = useState(0);
+  const [storageCustomMode, setStorageCustomMode] = useState(false);
   const [storageSaving, setStorageSaving] = useState(false);
   const [storageFeedback, setStorageFeedback] = useState<SaveFeedback | null>(null);
   const [pruning, setPruning] = useState(false);
@@ -272,6 +324,13 @@ export const Settings: React.FC = () => {
   const [advancedFeedback, setAdvancedFeedback] = useState<SaveFeedback | null>(null);
   const [resetDefaultsFeedback, setResetDefaultsFeedback] = useState<SaveFeedback | null>(null);
 
+  /* --- data directory ------------------------------------------------ */
+  const [dataDir, setDataDir] = useState("");
+  const [defaultDataDir, setDefaultDataDir] = useState("");
+  const [platform, setPlatform] = useState("macos");
+  const [dataDirChanging, setDataDirChanging] = useState(false);
+  const [dataDirFeedback, setDataDirFeedback] = useState<SaveFeedback | null>(null);
+
   /* --- browser integration ------------------------------------------ */
   const [browserEnabled, setBrowserEnabled] = useState<boolean | null>(null);
   const [browserBusy, setBrowserBusy] = useState(false);
@@ -279,9 +338,11 @@ export const Settings: React.FC = () => {
 
   /* --- tracked profiles --------------------------------------------- */
   const [trackedProfiles, setTrackedProfiles] = useState<TrackedProfile[]>([]);
-  const [trackedProfileMap, setTrackedProfileMap] = useState<Map<string, ProfileInfo>>(new Map());
   const [trackedLoading, setTrackedLoading] = useState(true);
   const [trackInput, setTrackInput] = useState("");
+  const [trackSearchResults, setTrackSearchResults] = useState<ProfileInfo[]>([]);
+  const [trackSearching, setTrackSearching] = useState(false);
+  const trackSearchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   /* --- offline mode -------------------------------------------------- */
   const [offlineMode, setOfflineMode] = useState(false);
@@ -308,6 +369,16 @@ export const Settings: React.FC = () => {
   /* --- load settings on mount --------------------------------------- */
   useEffect(() => {
     loadSettings();
+    // Fetch data directory info
+    Promise.all([
+      invoke<string>("get_data_dir"),
+      invoke<string>("get_default_data_dir"),
+      invoke<string>("get_platform"),
+    ]).then(([dir, defDir, plat]) => {
+      setDataDir(dir);
+      setDefaultDataDir(defDir);
+      setPlatform(plat);
+    }).catch(() => {});
   }, []);
 
   const loadSettings = useCallback(async () => {
@@ -331,10 +402,26 @@ export const Settings: React.FC = () => {
       setSelectedRelays(activeAliases);
 
       // Storage sliders
+      setOthersEventsGb(Math.round(s.storage_others_gb));
       setTrackedMediaGb(Math.round(s.storage_tracked_media_gb));
       setWotMediaGb(Math.round(s.storage_wot_media_gb));
       setWotRetentionDays(s.wot_event_retention_days);
       setThreadRetentionDays(s.thread_retention_days);
+      setMaxEventAgeDays(s.max_event_age_days);
+
+      // Detect active storage preset by matching values
+      for (const key of STORAGE_PRESET_KEYS) {
+        const p = STORAGE_PRESETS[key];
+        if (
+          Math.round(s.storage_others_gb) === p.othersEventsGb &&
+          Math.round(s.storage_tracked_media_gb) === p.trackedMediaGb &&
+          Math.round(s.storage_wot_media_gb) === p.wotMediaGb &&
+          s.wot_event_retention_days === p.wotRetentionDays
+        ) {
+          setStoragePreset(key);
+          break;
+        }
+      }
 
       // Advanced sync sliders
       setSyncLookback(s.sync_lookback_days);
@@ -380,17 +467,14 @@ export const Settings: React.FC = () => {
       setTrackedProfiles(tracked);
       if (tracked.length > 0) {
         const pubkeys = tracked.map((p) => p.pubkey);
-        const profileMap = await getProfiles(pubkeys);
-        setTrackedProfileMap(new Map(profileMap));
-      } else {
-        setTrackedProfileMap(new Map());
+        ensureProfiles(pubkeys);
       }
     } catch (e) {
       console.error("[settings] get_tracked_profiles failed:", e);
     } finally {
       setTrackedLoading(false);
     }
-  }, []);
+  }, [ensureProfiles]);
 
   /* --- relay toggle ------------------------------------------------- */
   const toggleRelay = useCallback((id: string) => {
@@ -439,12 +523,13 @@ export const Settings: React.FC = () => {
 
     const updated: Settings = {
       ...settings,
-      storage_own_media_gb: settings.storage_own_media_gb,
+      storage_others_gb: othersEventsGb,
       storage_tracked_media_gb: trackedMediaGb,
       storage_wot_media_gb: wotMediaGb,
       wot_event_retention_days: wotRetentionDays,
       thread_retention_days: threadRetentionDays,
-      max_event_age_days: wotRetentionDays,
+      max_event_age_days: maxEventAgeDays,
+      sync_wot_notes_per_cycle: syncWotNotes,
     };
 
     try {
@@ -456,7 +541,7 @@ export const Settings: React.FC = () => {
     } finally {
       setStorageSaving(false);
     }
-  }, [settings, trackedMediaGb, wotMediaGb, wotRetentionDays, threadRetentionDays]);
+  }, [settings, othersEventsGb, trackedMediaGb, wotMediaGb, wotRetentionDays, threadRetentionDays, maxEventAgeDays, syncWotNotes]);
 
   const handleSaveAdvanced = useCallback(async () => {
     if (!settings) return;
@@ -536,9 +621,12 @@ export const Settings: React.FC = () => {
   const applyStoragePreset = useCallback((presetKey: string) => {
     const p = STORAGE_PRESETS[presetKey];
     if (!p) return;
+    setStoragePreset(presetKey);
+    setOthersEventsGb(p.othersEventsGb);
     setTrackedMediaGb(p.trackedMediaGb);
     setWotMediaGb(p.wotMediaGb);
     setWotRetentionDays(p.wotRetentionDays);
+    setMaxEventAgeDays(p.maxEventAgeDays);
   }, []);
 
   /* --- danger zone -------------------------------------------------- */
@@ -725,17 +813,60 @@ export const Settings: React.FC = () => {
   }, [offlineMode, settings]);
 
   /* --- tracked profiles --------------------------------------------- */
-  const handleTrackProfile = useCallback(async () => {
-    if (!trackInput.trim()) return;
+  const doTrackPubkey = useCallback(async (pubkey: string) => {
     try {
-      await invoke("track_profile", { pubkey: trackInput.trim(), note: null });
+      await invoke("track_profile", { pubkey, note: null });
       setTrackInput("");
+      setTrackSearchResults([]);
       loadTrackedProfiles();
       try { await invoke("restart_sync"); } catch (e) { console.warn("[settings] restart_sync after track failed:", e); }
     } catch (e) {
       console.error("[settings] track_profile failed:", e);
     }
-  }, [trackInput, loadTrackedProfiles]);
+  }, [loadTrackedProfiles]);
+
+  const handleTrackProfile = useCallback(async () => {
+    const kind = classifyInput(trackInput);
+    switch (kind.type) {
+      case "npub": return doTrackPubkey(kind.raw);
+      case "hex": return doTrackPubkey(kind.pubkey);
+      case "nprofile": return doTrackPubkey(kind.pubkey);
+      case "url": return doTrackPubkey(kind.pubkey);
+      default: return; // search / empty — user must pick from dropdown
+    }
+  }, [trackInput, doTrackPubkey]);
+
+  const handleTrackInputChange = useCallback((value: string) => {
+    setTrackInput(value);
+    if (trackSearchTimer.current) clearTimeout(trackSearchTimer.current);
+
+    const kind = classifyInput(value.trim());
+    if (kind.type !== "search") {
+      setTrackSearchResults([]);
+      setTrackSearching(false);
+      return;
+    }
+
+    setTrackSearching(true);
+    trackSearchTimer.current = setTimeout(async () => {
+      try {
+        const results = await invoke<ProfileInfo[]>("search_profiles", {
+          query: kind.query,
+          limit: 10,
+        });
+        const trackedSet = new Set(trackedProfiles.map((p) => p.pubkey));
+        setTrackSearchResults(results.filter((r) => !trackedSet.has(r.pubkey)));
+      } catch (e) {
+        console.error("[settings] search_profiles failed:", e);
+        setTrackSearchResults([]);
+      }
+      setTrackSearching(false);
+    }, 300);
+  }, [trackedProfiles]);
+
+  const handleSelectTrackResult = useCallback((pubkey: string) => {
+    doTrackPubkey(pubkey);
+  }, [doTrackPubkey]);
 
   const handleUntrackProfile = useCallback(
     async (pubkey: string) => {
@@ -1256,254 +1387,261 @@ export const Settings: React.FC = () => {
             control what gets stored, organized by ownership.
           </div>
 
-          {/* Storage Presets */}
-          <div className="storage-category-section">
-            <div className="storage-category-header">
-              <span className="storage-category-title">quick presets</span>
-            </div>
-            <div className="sync-presets">
-              <button className="sync-preset-btn" onClick={() => applyStoragePreset("minimal")}>
-                <span className="icon"><IconFeather /></span> minimal
-              </button>
-              <button className="sync-preset-btn" onClick={() => applyStoragePreset("balanced")}>
-                <span className="icon"><IconScale /></span> balanced
-              </button>
-              <button className="sync-preset-btn" onClick={() => applyStoragePreset("archive")}>
-                <span className="icon"><IconArchive /></span> archive
-              </button>
-            </div>
-          </div>
-
-          {/* Own Events Section */}
-          <div className="storage-category-section">
-            <div className="storage-category-header">
-              <Badge text="you" className="storage-category-badge" variant="own" />
-              <span className="storage-category-title">own events</span>
-            </div>
-            <div className="storage-section">
-              <div className="storage-row locked">
-                <div className="storage-row-info">
-                  <span className="storage-row-label">event retention</span>
-                  <span className="storage-row-meta">
-                    <span className="icon">
-                      <IconLock />
-                    </span>{" "}
-                    own events are always kept
-                  </span>
-                </div>
+          {/* Data Location */}
+          {platform !== "android" && (
+            <div className="storage-category-section">
+              <div className="storage-category-header">
+                <span className="storage-category-title">data location</span>
               </div>
-            </div>
-            <div className="storage-section">
-              <div className="storage-row">
-                <div className="storage-row-info">
-                  <span className="storage-row-label">own media limit</span>
-                  <span className="storage-row-meta">
-                    media from your own events &mdash; always kept, never evicted
-                  </span>
-                </div>
-                <div className="storage-slider-wrap">
-                  <span
-                    className="storage-slider-value"
-                    style={{ color: "var(--green)", fontWeight: 600 }}
-                  >
-                    &infin; unlimited
-                  </span>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* Tracked Profiles Section */}
-          <div className="storage-category-section">
-            <div className="storage-category-header">
-              <Badge text="tracked" className="storage-category-badge" variant="tracked" />
-              <span className="storage-category-title">tracked profiles</span>
-            </div>
-            <div className="storage-section">
-              <div className="storage-row locked">
-                <div className="storage-row-info">
-                  <span className="storage-row-label">event retention</span>
-                  <span className="storage-row-meta">
-                    <span className="icon">
-                      <IconLock />
-                    </span>{" "}
-                    tracked profiles events are always kept
-                  </span>
-                </div>
-              </div>
-            </div>
-            <div className="storage-section">
-              <div className="storage-row">
-                <div className="storage-row-info">
-                  <span className="storage-row-label">tracked media limit</span>
-                  <span className="storage-row-meta">media from tracked profiles</span>
-                </div>
-                <Slider
-                  variant="storage"
-                  id="settings-tracked-media-slider"
-                  min={1}
-                  max={50}
-                  value={trackedMediaGb}
-                  suffix=" GB"
-                  onChange={setTrackedMediaGb}
-                />
-              </div>
-            </div>
-          </div>
-
-          {/* WoT Profiles Section */}
-          <div className="storage-category-section">
-            <div className="storage-category-header">
-              <Badge text="wot" className="storage-category-badge" variant="wot" />
-              <span className="storage-category-title">wot profiles</span>
-            </div>
-            <div className="storage-section">
-              <div className="storage-row">
-                <div className="storage-row-info">
-                  <span className="storage-row-label">event retention</span>
-                  <span className="storage-row-meta">
-                    how long to keep wot events before pruning
-                  </span>
-                </div>
-                <Slider
-                  variant="storage"
-                  id="storage-wot-retention"
-                  min={7}
-                  max={365}
-                  value={wotRetentionDays}
-                  suffix=" days"
-                  onChange={setWotRetentionDays}
-                />
-                <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-                  {WOT_PRESETS.map((preset) => (
+              <div className="storage-section">
+                <div className="storage-row">
+                  <div className="storage-row-info">
+                    <span className="storage-row-label">
+                      {dataDir && defaultDataDir && dataDir !== defaultDataDir ? "custom path" : "default path"}
+                    </span>
+                    <span className="storage-row-meta" style={{ wordBreak: "break-all" }}>
+                      {dataDir || "loading..."}
+                    </span>
+                  </div>
+                  <div style={{ display: "flex", gap: 8, alignItems: "center", flexShrink: 0 }}>
+                    {dataDir && defaultDataDir && dataDir !== defaultDataDir && (
+                      <button
+                        className="btn btn-secondary"
+                        disabled={dataDirChanging}
+                        onClick={async () => {
+                          if (!confirm("Reset to default path? You can choose to move your data or start fresh.")) return;
+                          setDataDirChanging(true);
+                          try {
+                            const shouldMigrate = confirm("Move existing data to the default location?\n\nOK = Move data\nCancel = Start fresh");
+                            await invoke("set_data_dir", { path: defaultDataDir, migrate: shouldMigrate });
+                            setDataDirFeedback({ type: "success", message: "Path updated. Restarting..." });
+                            const { relaunch } = await import("@tauri-apps/plugin-process");
+                            setTimeout(() => relaunch(), 500);
+                          } catch (e: any) {
+                            setDataDirFeedback({ type: "error", message: String(e) });
+                            setDataDirChanging(false);
+                          }
+                        }}
+                      >
+                        reset
+                      </button>
+                    )}
                     <button
-                      key={preset.days}
-                      className="btn btn-secondary wot-age-preset"
-                      style={{ fontSize: "0.75rem", padding: "4px 10px" }}
-                      onClick={() => setWotRetentionDays(preset.days)}
+                      className="btn btn-secondary"
+                      disabled={dataDirChanging}
+                      onClick={async () => {
+                        try {
+                          const selected = await open({ directory: true, multiple: false, title: "Choose data folder" });
+                          if (!selected || typeof selected !== "string") return;
+                          if (selected === dataDir) return;
+                          const shouldMigrate = confirm("Move existing data to the new location?\n\nOK = Move data\nCancel = Start fresh");
+                          setDataDirChanging(true);
+                          await invoke("set_data_dir", { path: selected, migrate: shouldMigrate });
+                          setDataDirFeedback({ type: "success", message: "Path updated. Restarting..." });
+                          const { relaunch } = await import("@tauri-apps/plugin-process");
+                          setTimeout(() => relaunch(), 500);
+                        } catch (e: any) {
+                          setDataDirFeedback({ type: "error", message: String(e) });
+                          setDataDirChanging(false);
+                        }
+                      }}
                     >
-                      {preset.label}
+                      {dataDirChanging ? "moving..." : "change..."}
                     </button>
-                  ))}
+                  </div>
                 </div>
+                {dataDirFeedback && (
+                  <p style={{ fontSize: 12, color: dataDirFeedback.type === "error" ? "var(--red)" : "var(--green)", marginTop: 4 }}>
+                    {dataDirFeedback.message}
+                  </p>
+                )}
               </div>
             </div>
-            <div className="storage-section">
-              <div className="storage-row">
-                <div className="storage-row-info">
-                  <span className="storage-row-label">wot media limit</span>
-                  <span className="storage-row-meta">media from wot profiles</span>
-                </div>
-                <Slider
-                  variant="storage"
-                  id="settings-wot-media-slider"
-                  min={1}
-                  max={50}
-                  value={wotMediaGb}
-                  suffix=" GB"
-                  onChange={setWotMediaGb}
-                />
+          )}
+
+          {/* Your events & media — always kept */}
+          <div className="storage-section">
+            <div className="storage-row locked">
+              <div className="storage-row-info">
+                <span className="storage-row-label">your events &amp; media</span>
+                <span className="storage-row-meta">
+                  <span className="icon"><IconLock /></span> always stored. no exceptions.
+                </span>
               </div>
             </div>
-            <div className="storage-section" style={{ marginTop: 12 }}>
-              <div className="storage-row">
-                <div className="storage-row-info">
-                  <span className="storage-row-label">wot notes per cycle</span>
-                  <span className="storage-row-meta">
-                    random notes fetched from wot peers each sync cycle (0 = disabled)
-                  </span>
-                </div>
-                <div style={{ display: "flex", alignItems: "center", gap: 12, minWidth: 200 }}>
-                  <input
-                    type="range"
-                    min={0}
-                    max={500}
-                    step={10}
-                    value={syncWotNotes}
-                    onChange={(e) => setSyncWotNotes(Number(e.target.value))}
-                    style={{ flex: 1 }}
-                  />
-                  <span style={{ fontSize: "0.82rem", color: "var(--text-secondary)", minWidth: 40, textAlign: "right" }}>
-                    {syncWotNotes}
-                  </span>
-                </div>
-              </div>
-            </div>
-            <div className="storage-section" style={{ marginTop: 12 }}>
-              <div className="storage-row" style={{ alignItems: "center" }}>
-                <div className="storage-row-info">
-                  <span className="storage-row-label">prune wot data</span>
-                  <span className="storage-row-meta">
-                    manually delete old events from wot peers based on retention settings
-                  </span>
-                </div>
-                <button
-                  className="btn btn-secondary"
-                  style={{ fontSize: "0.78rem", padding: "6px 14px", whiteSpace: "nowrap" }}
-                  disabled={pruning}
-                  onClick={async () => {
-                    setPruning(true);
-                    setPruneResult(null);
-                    try {
-                      const msg = await invoke<string>("prune_wot_data");
-                      setPruneResult({ type: "success", msg });
-                    } catch (e) {
-                      setPruneResult({ type: "error", msg: String(e) });
-                    } finally {
-                      setPruning(false);
-                    }
-                  }}
+          </div>
+
+          {/* Preset cards — same as wizard */}
+          <div className="storage-preset-grid">
+            {STORAGE_PRESET_KEYS.map((key) => {
+              const preset = STORAGE_PRESETS[key];
+              const isSelected = storagePreset === key;
+              const ICONS: Record<string, React.ReactNode> = {
+                personal: <IconUsers />, minimal: <IconFeather />,
+                balanced: <IconScale />, archive: <IconArchive />,
+              };
+              const DETAILS: Record<string, string[]> = {
+                personal: ["your own events only", "tracked profiles: full history", "no WoT sync, no media from others"],
+                minimal: ["last 3 days for follows only", "tracked profiles: full history", "images only, no WoT media"],
+                balanced: ["last 30 days for follows, 7 days for WoT", "tracked profiles: full history", "all media types, 2 GB WoT media"],
+                archive: ["last year for follows, 90 days for WoT", "tracked profiles: full history", "all media types, 10 GB WoT media"],
+              };
+              return (
+                <div
+                  key={key}
+                  className={`storage-preset-card${isSelected ? " selected" : ""}`}
+                  onClick={() => applyStoragePreset(key)}
                 >
-                  {pruning ? "pruning..." : "prune now"}
-                </button>
-              </div>
-              {pruneResult && (
-                <div style={{ fontSize: "0.75rem", marginTop: 6, color: pruneResult.type === "success" ? "#34d399" : "#ef4444" }}>
-                  {pruneResult.msg}
+                  <div className="storage-preset-card-header">
+                    <span className="icon">{ICONS[key]}</span>
+                    <span className="storage-preset-card-name">{preset.label}</span>
+                  </div>
+                  <span className="storage-preset-card-size">
+                    {preset.estimatedGb.typical < 1
+                      ? `~${Math.round(preset.estimatedGb.low * 1000)}-${Math.round(preset.estimatedGb.typical * 1000)} MB`
+                      : `~${preset.estimatedGb.low}-${preset.estimatedGb.typical} GB`}
+                  </span>
+                  <p className="storage-preset-card-desc">{preset.description}</p>
+                  <ul className="storage-preset-card-details">
+                    {(DETAILS[key] || []).map((d, i) => <li key={i}>{d}</li>)}
+                  </ul>
                 </div>
-              )}
-            </div>
+              );
+            })}
           </div>
 
-          {/* Thread Follow-up Section */}
-          <div className="storage-category-section">
-            <div className="storage-category-header">
-              <span className="storage-category-title">thread follow-up</span>
-            </div>
-            <div className="storage-section">
-              <div className="storage-row">
-                <div className="storage-row-info">
-                  <span className="storage-row-label">thread follow-up window</span>
-                  <span className="storage-row-meta">
-                    how long to keep re-fetching replies and reactions for threads you've interacted with.
-                    after this period, the app stops syncing those threads to save bandwidth and relay resources.
-                    you'll still see cached data &mdash; the app just won't check for new activity.
-                  </span>
-                </div>
-                <Slider
-                  variant="storage"
-                  id="storage-thread-retention"
-                  min={7}
-                  max={90}
-                  value={threadRetentionDays}
-                  suffix=" days"
-                  onChange={setThreadRetentionDays}
-                />
-                <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-                  {THREAD_RETENTION_PRESETS.map((preset) => (
-                    <button
-                      key={preset.days}
-                      className="btn btn-secondary wot-age-preset"
-                      style={{ fontSize: "0.75rem", padding: "4px 10px" }}
-                      onClick={() => setThreadRetentionDays(preset.days)}
-                    >
-                      {preset.label}
-                    </button>
-                  ))}
+          {/* Estimation summary */}
+          {(() => {
+            const estimate = estimateStorage(200, storagePreset);
+            return (
+              <div className="storage-estimate-summary" style={{ margin: "12px 0" }}>
+                {estimate.eventsPerDay === 0
+                  ? "only your own events will be stored locally"
+                  : `with ~200 follows: ~${estimate.eventsPerDay.toLocaleString()} events/day, ~${estimate.growthGbPerMonth} GB/month`}
+              </div>
+            );
+          })()}
+
+          {/* Customize toggle */}
+          <div className="storage-custom-toggle" onClick={() => setStorageCustomMode((p) => !p)}>
+            {storageCustomMode ? "hide" : "customize"} advanced settings
+          </div>
+
+          {/* Advanced sliders — shown when customize is on */}
+          {storageCustomMode && (
+            <>
+              {/* Others' events */}
+              <div className="storage-section">
+                <div className="storage-row">
+                  <div className="storage-row-info">
+                    <span className="storage-row-label">others' events</span>
+                    <span className="storage-row-meta">from your web of trust (0 = disabled)</span>
+                  </div>
+                  <Slider variant="storage" id="settings-others-events" min={0} max={50} value={othersEventsGb} suffix=" GB" onChange={setOthersEventsGb} />
                 </div>
               </div>
-            </div>
-          </div>
+
+              {/* Tracked profiles media */}
+              <div className="storage-section">
+                <div className="storage-row">
+                  <div className="storage-row-info">
+                    <span className="storage-row-label">tracked profiles media</span>
+                    <span className="storage-row-meta">media from profiles you track</span>
+                  </div>
+                  <Slider variant="storage" id="settings-tracked-media-slider" min={0} max={50} value={trackedMediaGb} suffix=" GB" onChange={setTrackedMediaGb} />
+                </div>
+              </div>
+
+              {/* WoT media */}
+              <div className="storage-section">
+                <div className="storage-row">
+                  <div className="storage-row-info">
+                    <span className="storage-row-label">WoT media</span>
+                    <span className="storage-row-meta">images, videos, audio from your network (0 = disabled)</span>
+                  </div>
+                  <Slider variant="storage" id="settings-wot-media-slider" min={0} max={50} value={wotMediaGb} suffix=" GB" onChange={setWotMediaGb} />
+                </div>
+              </div>
+
+              {/* WoT retention */}
+              <div className="storage-section">
+                <div className="storage-row">
+                  <div className="storage-row-info">
+                    <span className="storage-row-label">WoT event retention</span>
+                    <span className="storage-row-meta">how long to keep WoT events before pruning (0 = don't keep)</span>
+                  </div>
+                  <Slider variant="storage" id="storage-wot-retention" min={0} max={365} value={wotRetentionDays} suffix=" days" onChange={setWotRetentionDays} />
+                </div>
+              </div>
+
+              {/* Max event age */}
+              <div className="storage-section">
+                <div className="storage-row">
+                  <div className="storage-row-info">
+                    <span className="storage-row-label">max event age</span>
+                    <span className="storage-row-meta">global max age for non-own events (0 = no limit)</span>
+                  </div>
+                  <Slider variant="storage" id="storage-max-age" min={0} max={365} value={maxEventAgeDays} suffix=" days" onChange={setMaxEventAgeDays} />
+                </div>
+              </div>
+
+              {/* Thread follow-up */}
+              <div className="storage-section">
+                <div className="storage-row">
+                  <div className="storage-row-info">
+                    <span className="storage-row-label">thread follow-up window</span>
+                    <span className="storage-row-meta">how long to keep re-fetching replies for threads you've interacted with</span>
+                  </div>
+                  <Slider variant="storage" id="storage-thread-retention" min={0} max={90} value={threadRetentionDays} suffix=" days" onChange={setThreadRetentionDays} />
+                </div>
+              </div>
+
+              {/* WoT notes per cycle */}
+              <div className="storage-section">
+                <div className="storage-row">
+                  <div className="storage-row-info">
+                    <span className="storage-row-label">WoT notes per cycle</span>
+                    <span className="storage-row-meta">random notes fetched from WoT peers each sync cycle (0 = disabled)</span>
+                  </div>
+                  <Slider variant="storage" id="storage-wot-notes" min={0} max={500} value={syncWotNotes} suffix="" onChange={setSyncWotNotes} />
+                </div>
+              </div>
+
+              {/* Prune button */}
+              <div className="storage-section">
+                <div className="storage-row" style={{ alignItems: "center" }}>
+                  <div className="storage-row-info">
+                    <span className="storage-row-label">prune WoT data</span>
+                    <span className="storage-row-meta">manually delete old events based on retention settings</span>
+                  </div>
+                  <button
+                    className="btn btn-secondary"
+                    style={{ fontSize: "0.78rem", padding: "6px 14px", whiteSpace: "nowrap" }}
+                    disabled={pruning}
+                    onClick={async () => {
+                      setPruning(true);
+                      setPruneResult(null);
+                      try {
+                        const msg = await invoke<string>("prune_wot_data");
+                        setPruneResult({ type: "success", msg });
+                      } catch (e) {
+                        setPruneResult({ type: "error", msg: String(e) });
+                      } finally {
+                        setPruning(false);
+                      }
+                    }}
+                  >
+                    {pruning ? "pruning..." : "prune now"}
+                  </button>
+                </div>
+                {pruneResult && (
+                  <div style={{ fontSize: "0.75rem", marginTop: 6, color: pruneResult.type === "success" ? "#34d399" : "#ef4444" }}>
+                    {pruneResult.msg}
+                  </div>
+                )}
+              </div>
+            </>
+          )}
 
           <button
             className="btn btn-primary"
@@ -1943,7 +2081,7 @@ export const Settings: React.FC = () => {
               </div>
             ) : (
               trackedProfiles.map((p) => {
-                const profile = trackedProfileMap.get(p.pubkey);
+                const profile = getProfile(p.pubkey);
                 const hasName = !!(profile?.name || profile?.display_name);
                 const displayName = profileDisplayName(profile, p.pubkey);
                 const short = shortPubkey(p.pubkey);
@@ -1961,6 +2099,7 @@ export const Settings: React.FC = () => {
                   >
                     <Avatar
                       picture={profile?.picture}
+                      pictureLocal={profile?.picture_local}
                       pubkey={p.pubkey}
                       className="tracked-profile-avatar"
                     />
@@ -2016,33 +2155,112 @@ export const Settings: React.FC = () => {
             )}
           </div>
 
-          <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
-            <input
-              type="text"
-              placeholder="npub or hex pubkey"
-              value={trackInput}
-              onChange={(e) => setTrackInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") handleTrackProfile();
-              }}
-              style={{
-                flex: 1,
-                padding: "8px 12px",
-                borderRadius: 8,
-                border: "1px solid var(--border)",
-                background: "var(--bg)",
-                color: "var(--text)",
-                fontSize: "0.82rem",
-                fontFamily: "var(--mono)",
-              }}
-            />
-            <button
-              className="btn btn-primary"
-              style={{ fontSize: "0.82rem", padding: "8px 16px" }}
-              onClick={handleTrackProfile}
-            >
-              track
-            </button>
+          <div style={{ position: "relative", marginTop: 12 }}>
+            <div style={{ display: "flex", gap: 8 }}>
+              <div style={{ flex: 1, position: "relative" }}>
+                <span className="icon" style={{
+                  position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)",
+                  width: 14, height: 14, color: "var(--text-muted)", pointerEvents: "none",
+                }}><IconSearch /></span>
+                <input
+                  type="text"
+                  placeholder="search by name, npub, or nip-05"
+                  value={trackInput}
+                  onChange={(e) => handleTrackInputChange(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") handleTrackProfile(); }}
+                  style={{
+                    width: "100%",
+                    padding: "8px 32px 8px 32px",
+                    borderRadius: 8,
+                    border: "1px solid var(--border)",
+                    background: "var(--bg)",
+                    color: "var(--text)",
+                    fontSize: "0.82rem",
+                  }}
+                />
+                {trackInput && (
+                  <button
+                    onClick={() => { setTrackInput(""); setTrackSearchResults([]); }}
+                    style={{
+                      position: "absolute", right: 8, top: "50%", transform: "translateY(-50%)",
+                      background: "none", border: "none", color: "var(--text-muted)",
+                      cursor: "pointer", padding: "2px 4px",
+                    }}
+                  >
+                    <span className="icon" style={{ width: 12, height: 12 }}><IconX /></span>
+                  </button>
+                )}
+              </div>
+              {trackInput.trim() && classifyInput(trackInput.trim()).type !== "search" && classifyInput(trackInput.trim()).type !== "empty" && (
+                <button
+                  className="btn btn-primary"
+                  style={{ fontSize: "0.82rem", padding: "8px 16px" }}
+                  onClick={handleTrackProfile}
+                >
+                  track
+                </button>
+              )}
+            </div>
+
+            {trackInput.trim() && classifyInput(trackInput.trim()).type === "search" && (
+              <div style={{
+                position: "absolute", left: 0, right: 0, top: "100%",
+                zIndex: 50, maxHeight: 280, overflowY: "auto",
+                background: "var(--bg-card, var(--bg))", border: "1px solid var(--border)",
+                borderRadius: 8, marginTop: 4,
+                boxShadow: "0 4px 16px rgba(0,0,0,0.3)",
+              }}>
+                {trackSearching && (
+                  <div style={{ padding: "16px", textAlign: "center", fontSize: "0.78rem", color: "var(--text-muted)" }}>
+                    searching...
+                  </div>
+                )}
+                {!trackSearching && trackSearchResults.length === 0 && trackInput.trim() && (
+                  <div style={{ padding: "16px", textAlign: "center", fontSize: "0.78rem", color: "var(--text-muted)" }}>
+                    no profiles found
+                  </div>
+                )}
+                {trackSearchResults.map((p) => {
+                  const name = profileDisplayName(p, p.pubkey);
+                  return (
+                    <div
+                      key={p.pubkey}
+                      onClick={() => handleSelectTrackResult(p.pubkey)}
+                      style={{
+                        display: "flex", alignItems: "center", gap: 10,
+                        padding: "8px 12px", cursor: "pointer",
+                        borderBottom: "1px solid var(--border)",
+                      }}
+                      onMouseEnter={(e) => (e.currentTarget.style.background = "rgba(255,255,255,0.04)")}
+                      onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+                    >
+                      <Avatar
+                        picture={p.picture || null}
+                        pictureLocal={p.picture_local || null}
+                        pubkey={p.pubkey}
+                        className="tracked-profile-avatar"
+                      />
+                      <div style={{ flex: 1, minWidth: 0, overflow: "hidden" }}>
+                        <div style={{
+                          fontWeight: 600, fontSize: "0.84rem", color: "var(--text)",
+                          whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+                        }}>
+                          {name}
+                        </div>
+                        {p.nip05 && (
+                          <div style={{
+                            fontSize: "0.72rem", color: "var(--text-muted)",
+                            whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+                          }}>
+                            {p.nip05}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
         </div>
       </div>

@@ -1,16 +1,29 @@
-/** DMs -- Direct Messages screen. Shows NIP-04 DMs grouped by conversation.
+/** DMs -- Direct Messages screen. Shows NIP-04 + NIP-17 DMs grouped by conversation.
  *  When nsec is available, messages are decrypted; otherwise shown as encrypted. */
 
 import React, { useState, useEffect, useCallback, useRef } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useLocation } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
-import { IconMessageCircle, IconLock } from "../components/Icon";
+import { IconMessageCircle, IconLock, IconSearch, IconX } from "../components/Icon";
 import { Avatar } from "../components/Avatar";
 import { EmptyState } from "../components/EmptyState";
 import { formatTimestamp } from "../utils/format";
 import { profileDisplayName } from "../utils/profiles";
 import { useProfileContext } from "../context/ProfileContext";
 import type { NostrEvent, Settings, Conversation } from "../types/nostr";
+import type { ProfileInfo } from "../utils/profiles";
+
+/** Unwrapped gift wrap result from the backend */
+interface UnwrappedDm {
+  sender_pubkey: string;
+  recipient_pubkey: string | null;
+  content: string;
+  created_at: number;
+  rumor_kind: number;
+}
+
+// Session-level flag: only do the expensive 30-day relay scan once
+let hasFullScanned = false;
 
 function getPartner(event: NostrEvent, ownPk: string): string | null {
   if (event.pubkey === ownPk) {
@@ -22,6 +35,7 @@ function getPartner(event: NostrEvent, ownPk: string): string | null {
 
 export const Dms: React.FC = () => {
   const navigate = useNavigate();
+  const location = useLocation();
   const { getProfile, ensureProfiles, profileVersion } = useProfileContext();
   void profileVersion; // subscribe to profile cache updates
   const [loading, setLoading] = useState(true);
@@ -30,9 +44,23 @@ export const Dms: React.FC = () => {
   const [selectedPartner, setSelectedPartner] = useState<string | null>(null);
   const [signingMode, setSigningMode] = useState<"nsec" | "bunker" | "connect" | "read-only">("read-only");
   const [displayCount, setDisplayCount] = useState(30);
+  const [sendAsLegacy, setSendAsLegacy] = useState(false);
+
+  // Message input state
+  const [messageInput, setMessageInput] = useState("");
+
+  // Search state
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<ProfileInfo[]>([]);
+  const [isSearching, setIsSearching] = useState(false);
+  const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Cache for decrypted message content: eventId -> plaintext
   const decryptedCache = useRef<Map<string, string>>(new Map());
+  // Cache for unwrapped gift wraps: eventId -> UnwrappedDm
+  const giftWrapCache = useRef<Map<string, UnwrappedDm>>(new Map());
+  // Track which gift wrap event IDs map to which partner (for isSent detection)
+  const giftWrapSenderCache = useRef<Map<string, string>>(new Map());
   // Incremented to force re-render after async decryption
   const [, setDecryptTick] = useState(0);
 
@@ -46,6 +74,103 @@ export const Dms: React.FC = () => {
     | "error"
   >(null);
 
+  // ── Build conversations from local DB events ─────────────────
+  const buildConversations = useCallback(
+    async (pk: string, mode: string) => {
+      const events = await invoke<NostrEvent[]>("get_dm_events", {
+        ownPubkey: pk,
+        limit: 500,
+      });
+
+      if (!events || events.length === 0) {
+        try {
+          const kindCounts = await invoke<{ counts: Record<number, number> }>("get_kind_counts");
+          const dmCount = (kindCounts.counts[4] || 0) + (kindCounts.counts[1059] || 0);
+          if (dmCount > 0) return { convs: [] as Conversation[], empty: "read-only" as const };
+        } catch { /* */ }
+        return { convs: [] as Conversation[], empty: "no-dms" as const };
+      }
+
+      const nip04Events = events.filter((e) => e.kind === 4);
+      const giftWrapEvents = events.filter((e) => e.kind === 1059);
+
+      const gwCache = giftWrapCache.current;
+      const dCache = decryptedCache.current;
+      const senderCache = giftWrapSenderCache.current;
+
+      // Unwrap gift wraps — use cache for already-unwrapped ones
+      if (mode !== "read-only" && giftWrapEvents.length > 0) {
+        const toUnwrap = giftWrapEvents.filter((ev) => !gwCache.has(ev.id));
+        if (toUnwrap.length > 0) {
+          const results = await Promise.allSettled(
+            toUnwrap.map(async (ev) => {
+              const result = await invoke<UnwrappedDm>("unwrap_gift_wrap", {
+                eventId: ev.id,
+                eventPubkey: ev.pubkey,
+                eventContent: ev.content,
+                eventCreatedAt: ev.created_at,
+                eventTags: ev.tags,
+                eventSig: ev.sig,
+              });
+              return { eventId: ev.id, unwrapped: result };
+            }),
+          );
+          for (const r of results) {
+            if (r.status === "fulfilled") {
+              const { eventId, unwrapped } = r.value;
+              gwCache.set(eventId, unwrapped);
+              dCache.set(eventId, unwrapped.content);
+              senderCache.set(eventId, unwrapped.sender_pubkey);
+            }
+          }
+        }
+      }
+
+      // Group by conversation partner
+      const convMap = new Map<string, NostrEvent[]>();
+
+      for (const ev of nip04Events) {
+        const partner = getPartner(ev, pk);
+        if (!partner) continue;
+        if (!convMap.has(partner)) convMap.set(partner, []);
+        convMap.get(partner)!.push(ev);
+      }
+
+      for (const ev of giftWrapEvents) {
+        const unwrapped = gwCache.get(ev.id);
+        if (!unwrapped) continue;
+        let partner: string;
+        if (unwrapped.sender_pubkey === pk) {
+          partner = unwrapped.recipient_pubkey || "";
+        } else {
+          partner = unwrapped.sender_pubkey;
+        }
+        if (!partner) continue;
+        if (!convMap.has(partner)) convMap.set(partner, []);
+        convMap.get(partner)!.push(ev);
+      }
+
+      const getTimestamp = (m: NostrEvent) => {
+        const u = gwCache.get(m.id);
+        return u ? u.created_at : m.created_at;
+      };
+
+      const sorted = Array.from(convMap.entries())
+        .map(([partnerPubkey, messages]) => ({
+          partnerPubkey,
+          messages: messages.sort((a, b) => getTimestamp(b) - getTimestamp(a)),
+          lastTimestamp: Math.max(...messages.map(getTimestamp)),
+        }))
+        .sort((a, b) => b.lastTimestamp - a.lastTimestamp);
+
+      ensureProfiles(sorted.map((c) => c.partnerPubkey));
+
+      return { convs: sorted, empty: null };
+    },
+    [ensureProfiles],
+  );
+
+  // ── Main load: instant from local DB, then background sync ──
   const loadDms = useCallback(async () => {
     setLoading(true);
     setEmptyReason(null);
@@ -58,7 +183,6 @@ export const Dms: React.FC = () => {
         return;
       }
 
-      // Check signing mode
       let mode: string = "read-only";
       try {
         mode = await invoke<string>("get_signing_mode");
@@ -82,55 +206,43 @@ export const Dms: React.FC = () => {
       }
       setOwnPubkey(pk);
 
-      const events = await invoke<NostrEvent[]>("get_dm_events", {
-        ownPubkey: pk,
-        limit: 200,
-      });
+      // ── Phase A: load from local DB instantly ──
+      const { convs, empty } = await buildConversations(pk, mode);
+      if (empty) setEmptyReason(empty);
+      setConversations(convs);
+      prevTotalMessages.current = convs.reduce((sum, c) => sum + c.messages.length, 0);
+      setLoading(false); // user sees messages NOW
 
-      if (!events || events.length === 0) {
-        try {
-          const kindCounts = await invoke<{ counts: Record<number, number> }>("get_kind_counts");
-          const dmCount = kindCounts.counts[4] || 0;
-          if (dmCount > 0) {
-            setEmptyReason("read-only");
-            setLoading(false);
-            return;
-          }
-        } catch {
-          /* kind counts not critical */
-        }
-        setEmptyReason("no-dms");
-        setLoading(false);
-        return;
-      }
-
-      // Group by conversation partner
-      const convMap = new Map<string, NostrEvent[]>();
-      for (const ev of events) {
-        const partner = getPartner(ev, pk);
-        if (!partner) continue;
-        if (!convMap.has(partner)) convMap.set(partner, []);
-        convMap.get(partner)!.push(ev);
-      }
-
-      const sorted = Array.from(convMap.entries())
-        .map(([partnerPubkey, messages]) => ({
-          partnerPubkey,
-          messages: messages.sort((a, b) => b.created_at - a.created_at),
-          lastTimestamp: Math.max(...messages.map((m) => m.created_at)),
-        }))
-        .sort((a, b) => b.lastTimestamp - a.lastTimestamp);
-
-      // Fetch profiles for all partners
-      const partnerKeys = sorted.map((c) => c.partnerPubkey);
-      ensureProfiles(partnerKeys);
-
-      setConversations(sorted);
-      setLoading(false);
-
-      // Decrypt last message of each conversation for sidebar preview
+      // Decrypt NIP-04 previews in background (non-blocking)
       if (mode !== "read-only") {
-        decryptPreviews(sorted, pk);
+        decryptPreviews(convs, pk);
+      }
+
+      // ── Phase B: background relay sync (fire-and-forget) ──
+      if (mode !== "read-only") {
+        (async () => {
+          try {
+            // Publish inbox relays so others know where to send us gift wraps
+            invoke("publish_inbox_relays").catch(() => {});
+
+            // Full scan only once per session; short poll otherwise
+            const doFull = !hasFullScanned;
+            if (doFull) hasFullScanned = true;
+
+            const fetched = await invoke<number>("fetch_new_dms", { fullScan: doFull });
+            if (fetched > 0) {
+              console.log(`[dms] background sync: ${fetched} new DMs`);
+              // Silently rebuild conversations with new data
+              const { convs: updated, empty: updatedEmpty } = await buildConversations(pk, mode);
+              if (updatedEmpty) setEmptyReason(updatedEmpty);
+              else setEmptyReason(null);
+              setConversations(updated);
+              if (mode !== "read-only") decryptPreviews(updated, pk);
+            }
+          } catch (e) {
+            console.debug("[dms] background sync:", e);
+          }
+        })();
       }
     } catch (e) {
       console.error("[dms] Error loading DMs:", e);
@@ -138,13 +250,13 @@ export const Dms: React.FC = () => {
       setLoading(false);
     }
 
-    // Inner helper — uses closure over decryptedCache
     async function decryptPreviews(convs: Conversation[], pk: string) {
       const cache = decryptedCache.current;
       let updated = false;
       for (const conv of convs) {
-        const lastMsg = conv.messages[0]; // sorted desc, first = latest
+        const lastMsg = conv.messages[0];
         if (!lastMsg || cache.has(lastMsg.id)) continue;
+        if (lastMsg.kind === 1059) continue;
         const senderPk = lastMsg.pubkey === pk ? conv.partnerPubkey : lastMsg.pubkey;
         try {
           const plaintext = await invoke<string>("decrypt_dm", {
@@ -160,11 +272,37 @@ export const Dms: React.FC = () => {
       }
       if (updated) setDecryptTick((v) => v + 1);
     }
-  }, []);
+  }, [buildConversations]);
 
   useEffect(() => {
     loadDms();
   }, [loadDms]);
+
+  // Poll for new DMs — 5s when a chat is open (near-realtime feel), 60s on sidebar.
+  const prevTotalMessages = useRef<number>(0);
+  useEffect(() => {
+    if (!ownPubkey || signingMode === "read-only") return;
+    const pollMs = selectedPartner ? 5000 : 60000;
+    const interval = setInterval(async () => {
+      try {
+        await invoke("fetch_new_dms", { fullScan: false });
+        const { convs, empty } = await buildConversations(ownPubkey, signingMode);
+
+        const totalNow = convs.reduce((sum, c) => sum + c.messages.length, 0);
+        const prevTotal = prevTotalMessages.current;
+        prevTotalMessages.current = totalNow;
+
+        if (totalNow !== prevTotal) {
+          if (empty) setEmptyReason(empty);
+          else setEmptyReason(null);
+          setConversations(convs);
+        }
+      } catch (e) {
+        console.debug("[dms] poll error:", e);
+      }
+    }, pollMs);
+    return () => clearInterval(interval);
+  }, [selectedPartner, ownPubkey, signingMode, buildConversations]);
 
   // Decrypt messages for the selected thread
   const decryptThread = useCallback(async (messages: NostrEvent[], partnerPubkey: string) => {
@@ -174,6 +312,30 @@ export const Dms: React.FC = () => {
     for (const msg of messages) {
       if (cache.has(msg.id)) continue;
 
+      // NIP-17 gift wraps: try unwrapping if not already cached
+      if (msg.kind === 1059) {
+        try {
+          const unwrapped = await invoke<UnwrappedDm>("unwrap_gift_wrap", {
+            eventId: msg.id,
+            eventPubkey: msg.pubkey,
+            eventContent: msg.content,
+            eventCreatedAt: msg.created_at,
+            eventTags: msg.tags,
+            eventSig: msg.sig,
+          });
+          giftWrapCache.current.set(msg.id, unwrapped);
+          giftWrapSenderCache.current.set(msg.id, unwrapped.sender_pubkey);
+          cache.set(msg.id, unwrapped.content);
+          updated = true;
+        } catch (e) {
+          console.warn("[dms] Gift wrap unwrap failed for", msg.id, e);
+          cache.set(msg.id, "[Unwrap failed]");
+          updated = true;
+        }
+        continue;
+      }
+
+      // NIP-04: decrypt as before
       const senderPk = msg.pubkey === ownPubkey ? partnerPubkey : msg.pubkey;
 
       try {
@@ -205,19 +367,64 @@ export const Dms: React.FC = () => {
     decryptThread(conv.messages, selectedPartner);
   }, [selectedPartner, signingMode, conversations, decryptThread]);
 
-  // Auto-scroll thread to bottom on conversation change
+  // Track whether user is scrolled to the bottom of the thread
   const threadRef = useRef<HTMLDivElement>(null);
+  const isAtBottomRef = useRef(true);
+  const [hasNewMessages, setHasNewMessages] = useState(false);
+  const prevMessageCount = useRef<number>(0);
+
+  const scrollToBottom = useCallback((smooth = true) => {
+    const el = threadRef.current;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior: smooth ? "smooth" : "instant" });
+    setHasNewMessages(false);
+  }, []);
+
+  // Auto-scroll on conversation switch
   const prevPartnerRef = useRef<string | null>(null);
   useEffect(() => {
     if (selectedPartner && threadRef.current && selectedPartner !== prevPartnerRef.current) {
-      // Reset display count and scroll to bottom on new conversation
       setDisplayCount(30);
-      setTimeout(() => {
-        if (threadRef.current) threadRef.current.scrollTop = threadRef.current.scrollHeight;
-      }, 0);
+      setHasNewMessages(false);
+      prevMessageCount.current = 0;
+      setTimeout(() => scrollToBottom(false), 0);
     }
     prevPartnerRef.current = selectedPartner;
-  }, [selectedPartner, conversations]);
+  }, [selectedPartner, scrollToBottom]);
+
+  // When conversations update: auto-scroll if at bottom, show indicator if not.
+  // Uses isAtBottomRef (updated by scroll listener) instead of checking scroll position
+  // at render time, since the DOM hasn't updated yet when this effect fires.
+  useEffect(() => {
+    if (!selectedPartner) return;
+    const conv = conversations.find((c) => c.partnerPubkey === selectedPartner);
+    if (!conv) return;
+    const count = conv.messages.length;
+    if (prevMessageCount.current > 0 && count > prevMessageCount.current) {
+      if (isAtBottomRef.current) {
+        // User was at bottom — scroll to show new message after DOM paints
+        requestAnimationFrame(() => {
+          setTimeout(() => scrollToBottom(true), 0);
+        });
+      } else {
+        setHasNewMessages(true);
+      }
+    }
+    prevMessageCount.current = count;
+  }, [conversations, selectedPartner, scrollToBottom]);
+
+  // Track scroll position to detect if user is at bottom
+  useEffect(() => {
+    const el = threadRef.current;
+    if (!el) return;
+    const onScroll = () => {
+      const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+      isAtBottomRef.current = atBottom;
+      if (atBottom) setHasNewMessages(false);
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => el.removeEventListener("scroll", onScroll);
+  }, [selectedPartner]);
 
   // Sentinel observer to load older messages on scroll-up
   const sentinelRef = useRef<HTMLDivElement>(null);
@@ -234,6 +441,159 @@ export const Dms: React.FC = () => {
     observer.observe(sentinelRef.current);
     return () => observer.disconnect();
   }, [selectedPartner]);
+
+  // Pre-select partner from navigation state (e.g. from profile "message" button)
+  useEffect(() => {
+    const partner = (location.state as any)?.partner;
+    if (partner && !loading) {
+      ensureProfiles([partner]);
+      // Check if conversation exists, if not create temporary one
+      const existing = conversations.find((c) => c.partnerPubkey === partner);
+      if (!existing) {
+        setConversations((prev) => [{
+          partnerPubkey: partner,
+          messages: [],
+          lastTimestamp: Math.floor(Date.now() / 1000),
+        }, ...prev]);
+      }
+      setSelectedPartner(partner);
+      // Clear the state so refreshes don't re-trigger
+      window.history.replaceState({}, document.title);
+    }
+  }, [location.state, loading, conversations, ensureProfiles]);
+
+  // Debounced profile search
+  const handleSearchInput = useCallback((value: string) => {
+    setSearchQuery(value);
+    if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
+
+    if (!value.trim()) {
+      setSearchResults([]);
+      setIsSearching(false);
+      return;
+    }
+
+    setIsSearching(true);
+    searchTimerRef.current = setTimeout(async () => {
+      try {
+        const results = await invoke<ProfileInfo[]>("search_profiles", {
+          query: value.trim(),
+          limit: 15,
+        });
+        setSearchResults(results.filter((r) => r.pubkey !== ownPubkey));
+      } catch (e) {
+        console.error("[dms] Profile search failed:", e);
+        setSearchResults([]);
+      }
+      setIsSearching(false);
+    }, 300);
+  }, [ownPubkey]);
+
+  // Handle selecting a search result
+  const handleSelectSearchResult = useCallback((pubkey: string) => {
+    setSearchQuery("");
+    setSearchResults([]);
+
+    const existing = conversations.find((c) => c.partnerPubkey === pubkey);
+    if (existing) {
+      setSelectedPartner(pubkey);
+    } else {
+      const newConv: Conversation = {
+        partnerPubkey: pubkey,
+        messages: [],
+        lastTimestamp: Math.floor(Date.now() / 1000),
+      };
+      setConversations((prev) => [newConv, ...prev]);
+      setSelectedPartner(pubkey);
+      ensureProfiles([pubkey]);
+    }
+  }, [conversations, ensureProfiles]);
+
+  // Send a DM — optimistic: message appears instantly, publish happens in background
+  const pendingIdCounter = useRef(0);
+  const handleSendDm = useCallback(() => {
+    const text = messageInput.trim();
+    if (!text || !selectedPartner || signingMode === "read-only") return;
+
+    // Generate a temporary optimistic ID
+    pendingIdCounter.current += 1;
+    const optimisticId = `pending-${Date.now()}-${pendingIdCounter.current}`;
+    const now = Math.floor(Date.now() / 1000);
+
+    // Create an optimistic message event
+    const optimisticMsg: NostrEvent = {
+      id: optimisticId,
+      pubkey: ownPubkey,
+      created_at: now,
+      kind: sendAsLegacy ? 4 : 1059,
+      tags: [["p", selectedPartner]],
+      content: "",
+      sig: "",
+    };
+
+    // Cache the plaintext so it renders immediately
+    decryptedCache.current.set(optimisticId, text);
+    // For gift wraps, also mark as sent by us
+    if (!sendAsLegacy) {
+      giftWrapSenderCache.current.set(optimisticId, ownPubkey);
+    }
+
+    // Insert into conversations optimistically
+    setConversations((prev) => {
+      const updated = prev.map((conv) => {
+        if (conv.partnerPubkey !== selectedPartner) return conv;
+        return {
+          ...conv,
+          messages: [optimisticMsg, ...conv.messages],
+          lastTimestamp: now,
+        };
+      });
+      // If no conversation existed yet, create one
+      if (!updated.find((c) => c.partnerPubkey === selectedPartner)) {
+        updated.unshift({
+          partnerPubkey: selectedPartner,
+          messages: [optimisticMsg],
+          lastTimestamp: now,
+        });
+      }
+      return updated;
+    });
+    setDecryptTick((v) => v + 1);
+    // Bump message count so the new-message effect doesn't trigger for our own send
+    prevMessageCount.current += 1;
+    prevTotalMessages.current += 1;
+    // Ensure we're "at bottom" so the scroll works
+    isAtBottomRef.current = true;
+
+    // Clear input immediately — user can keep typing
+    setMessageInput("");
+
+    // Scroll to bottom
+    setTimeout(() => {
+      if (threadRef.current) threadRef.current.scrollTop = threadRef.current.scrollHeight;
+    }, 50);
+
+    // Publish in background — no await, no blocking
+    const partner = selectedPartner;
+    const legacy = sendAsLegacy;
+    (async () => {
+      try {
+        if (legacy) {
+          await invoke("publish_dm", { content: text, recipientPubkey: partner });
+        } else {
+          await invoke("publish_gift_wrap_dm", { content: text, recipientPubkey: partner });
+        }
+        // After publish succeeds, rebuild from local DB to replace optimistic message
+        const { convs } = await buildConversations(ownPubkey, signingMode);
+        setConversations(convs);
+      } catch (e) {
+        console.error("[dms] Background publish failed:", e);
+        // Mark the optimistic message as failed
+        decryptedCache.current.set(optimisticId, `[send failed] ${text}`);
+        setDecryptTick((v) => v + 1);
+      }
+    })();
+  }, [messageInput, selectedPartner, signingMode, sendAsLegacy, ownPubkey, buildConversations]);
 
   // Loading state
   if (loading) {
@@ -286,6 +646,22 @@ export const Dms: React.FC = () => {
     : null;
   const cache = decryptedCache.current;
 
+  // Determine if a message was sent by us
+  function isSentByUs(msg: NostrEvent): boolean {
+    if (msg.kind === 1059) {
+      // Gift wrap: check the unwrapped sender
+      const sender = giftWrapSenderCache.current.get(msg.id);
+      return sender === ownPubkey;
+    }
+    return msg.pubkey === ownPubkey;
+  }
+
+  // Get the effective timestamp for sorting (rumor's created_at for gift wraps)
+  function effectiveTimestamp(msg: NostrEvent): number {
+    const unwrapped = giftWrapCache.current.get(msg.id);
+    return unwrapped ? unwrapped.created_at : msg.created_at;
+  }
+
   // Truncate preview text
   function previewText(conv: Conversation): React.ReactNode {
     if (signingMode === "read-only") {
@@ -297,6 +673,14 @@ export const Dms: React.FC = () => {
     if (!decrypted) return "...";
     const maxLen = 40;
     return decrypted.length > maxLen ? decrypted.slice(0, maxLen) + "\u2026" : decrypted;
+  }
+
+  // Protocol label for a message
+  function protocolTag(msg: NostrEvent): React.ReactNode {
+    if (msg.kind === 1059) {
+      return <span className="dms-msg-protocol dms-msg-nip17" title="NIP-17 (private)">nip-17</span>;
+    }
+    return <span className="dms-msg-protocol dms-msg-nip04" title="NIP-04 (legacy)">nip-04</span>;
   }
 
   // Render right panel
@@ -348,7 +732,8 @@ export const Dms: React.FC = () => {
     const profile = getProfile(selectedPartner!);
     const name = profileDisplayName(profile, selectedPartner!);
     const avatar = profile?.picture || "";
-    const sorted = [...selectedConv.messages].sort((a, b) => a.created_at - b.created_at);
+    const avatarLocal = profile?.picture_local || null;
+    const sorted = [...selectedConv.messages].sort((a, b) => effectiveTimestamp(a) - effectiveTimestamp(b));
     const visible = sorted.slice(Math.max(0, sorted.length - displayCount));
     const hasMore = sorted.length > displayCount;
 
@@ -362,6 +747,7 @@ export const Dms: React.FC = () => {
           >
             <Avatar
               picture={avatar || null}
+              pictureLocal={avatarLocal}
               pubkey={selectedPartner!}
               className="dms-thread-avatar"
               fallbackClassName="dms-thread-avatar-fallback"
@@ -375,34 +761,62 @@ export const Dms: React.FC = () => {
             <span className="icon"><IconLock /></span> messages are encrypted. connect a signer in settings to decrypt.
           </div>
         )}
-        <div className="dms-thread-messages" ref={threadRef}>
-          <div className="dms-thread-messages-inner">
-            {hasMore && <div ref={sentinelRef} className="dms-scroll-sentinel" />}
-            {visible.map((msg) => {
-              const isSent = msg.pubkey === ownPubkey;
-              const timeStr = formatTimestamp(msg.created_at);
-              const decrypted = cache.get(msg.id);
+        <div className="dms-thread-messages-wrap">
+          <div className="dms-thread-messages" ref={threadRef}>
+            <div className="dms-thread-messages-inner">
+              {hasMore && <div ref={sentinelRef} className="dms-scroll-sentinel" />}
+              {visible.map((msg) => {
+                const sent = isSentByUs(msg);
+                const timeStr = formatTimestamp(effectiveTimestamp(msg));
+                const decrypted = cache.get(msg.id);
 
-              return (
-                <div key={msg.id} className={`dms-msg ${isSent ? "dms-msg-sent" : "dms-msg-received"}`}>
-                  <div className="dms-msg-bubble">
-                    <div className="dms-msg-content">
-                      {decrypted
-                        ? decrypted
-                        : <><span className="icon"><IconLock /></span> encrypted message</>
-                      }
+                return (
+                  <div key={msg.id} className={`dms-msg ${sent ? "dms-msg-sent" : "dms-msg-received"}`}>
+                    <div className="dms-msg-bubble">
+                      <div className="dms-msg-content">
+                        {decrypted
+                          ? decrypted
+                          : <><span className="icon"><IconLock /></span> encrypted message</>
+                        }
+                      </div>
+                      <div className="dms-msg-meta">
+                        {protocolTag(msg)}
+                        <span className="dms-msg-time">{timeStr}</span>
+                      </div>
                     </div>
-                    <div className="dms-msg-time">{timeStr}</div>
                   </div>
-                </div>
-              );
-            })}
+                );
+              })}
+            </div>
           </div>
+          {hasNewMessages && (
+            <button className="dms-new-msg-indicator" onClick={() => scrollToBottom(true)}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="6 9 12 15 18 9" />
+              </svg>
+              new messages
+            </button>
+          )}
         </div>
         {signingMode !== "read-only" ? (
           <div className="dms-input-bar">
-            <input type="text" placeholder="coming soon..." disabled />
-            <button disabled>send</button>
+            <input
+              type="text"
+              placeholder="type a message..."
+              value={messageInput}
+              onChange={(e) => setMessageInput(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSendDm(); } }}
+            />
+            <button
+              className="dms-protocol-toggle"
+              onClick={() => setSendAsLegacy(!sendAsLegacy)}
+              title={sendAsLegacy ? "Sending as NIP-04 (legacy). Click for NIP-17." : "Sending as NIP-17 (private). Click for NIP-04."}
+            >
+              {sendAsLegacy ? "04" : "17"}
+            </button>
+            <button onClick={handleSendDm} disabled={!messageInput.trim()}>
+              send
+            </button>
           </div>
         ) : (
           <div className="dms-input-readonly">
@@ -426,7 +840,53 @@ export const Dms: React.FC = () => {
           <span>conversations</span>
           <span className="dms-sidebar-count">{conversations.length}</span>
         </div>
-        {conversations.length === 0 ? (
+        <div className="dms-search-wrap">
+          <span className="icon dms-search-icon"><IconSearch /></span>
+          <input
+            type="text"
+            className="dms-search-input"
+            placeholder="search people..."
+            value={searchQuery}
+            onChange={(e) => handleSearchInput(e.target.value)}
+          />
+          {searchQuery && (
+            <button className="dms-search-clear" onClick={() => { setSearchQuery(""); setSearchResults([]); }}>
+              <span className="icon"><IconX /></span>
+            </button>
+          )}
+        </div>
+        {searchQuery.trim() ? (
+          <div className="dms-search-results">
+            {isSearching && <div className="dms-search-loading">searching...</div>}
+            {!isSearching && searchResults.length === 0 && searchQuery.trim() && (
+              <div className="dms-search-empty">no profiles found</div>
+            )}
+            {searchResults.map((p) => {
+              const name = profileDisplayName(p, p.pubkey);
+              return (
+                <div
+                  key={p.pubkey}
+                  className="dms-conv-item"
+                  onClick={() => handleSelectSearchResult(p.pubkey)}
+                >
+                  <div className="dms-conv-avatar">
+                    <Avatar
+                      picture={p.picture || null}
+                      pictureLocal={p.picture_local || null}
+                      pubkey={p.pubkey}
+                      className="dms-conv-avatar-img"
+                      fallbackClassName="dms-conv-avatar-fallback"
+                    />
+                  </div>
+                  <div className="dms-conv-info">
+                    <div className="dms-conv-name">{name}</div>
+                    {p.nip05 && <div className="dms-conv-preview">{p.nip05}</div>}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ) : conversations.length === 0 ? (
           <div className="dms-sidebar-empty">no conversations yet</div>
         ) : (
           <div className="dms-conversation-list">
@@ -448,6 +908,7 @@ export const Dms: React.FC = () => {
                   <div className="dms-conv-avatar">
                     <Avatar
                       picture={avatar || null}
+                      pictureLocal={profile?.picture_local || null}
                       pubkey={conv.partnerPubkey}
                       className="dms-conv-avatar-img"
                       fallbackClassName="dms-conv-avatar-fallback"

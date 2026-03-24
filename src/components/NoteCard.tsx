@@ -1,17 +1,65 @@
 /** Shared note/repost card used in Feed and ProfileView */
-import React, { useMemo, useState, useEffect } from "react";
+import React, { useMemo, useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { IconMessageCircle, IconRepeat, IconZap, IconBookmark, IconHeart } from "./Icon";
+import { IconMessageCircle, IconRepeat, IconZap, IconBookmark, IconHeart, IconHeartFilled } from "./Icon";
 import { Avatar } from "./Avatar";
 import { timeAgo } from "../utils/format";
 import { kindLabel } from "../utils/ui";
 import { renderMediaHtml, stripMediaUrls, type MediaContext } from "../utils/media";
 import { profileDisplayName, type ProfileInfo } from "../utils/profiles";
-import { extractMentionedPubkeys, replaceMentions, normalizeBareEntities } from "../utils/mentions";
+import { extractMentionedPubkeys, replaceMentions, normalizeBareEntities, decodeEntity } from "../utils/mentions";
 import { useProfileContext } from "../context/ProfileContext";
-import { useCanWrite } from "../context/SigningContext";
+import { useSigningContext } from "../context/SigningContext";
 import { useInteractionCounts } from "../hooks/useInteractionCounts";
+import { useEnrichment } from "../hooks/useEnrichment";
+import { useReactionStatus } from "../hooks/useReactionStatus";
+import { useRepostStatus } from "../hooks/useRepostStatus";
 import type { NostrEvent } from "../types/nostr";
+
+/** Hook to show a transient toast when user clicks a disabled action. */
+function useActionToast() {
+  const [message, setMessage] = useState<"signing" | "zap" | null>(null);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const show = useCallback((kind: "signing" | "zap") => {
+    if (timerRef.current) clearTimeout(timerRef.current);
+    setMessage(kind);
+    timerRef.current = setTimeout(() => setMessage(null), 4000);
+  }, []);
+
+  useEffect(() => () => { if (timerRef.current) clearTimeout(timerRef.current); }, []);
+
+  return { message, show };
+}
+
+const ActionToast: React.FC<{ message: "signing" | "zap" | null }> = ({ message }) => {
+  if (!message) return null;
+  return (
+    <div className="signing-toast" onClick={(e) => e.stopPropagation()}>
+      {message === "signing" ? (
+        <>
+          <strong>Signing not available</strong>
+          <br />
+          Add your nsec or connect a remote signer (bunker) in Settings.
+          <br />
+          <span style={{ color: "var(--text-muted)", fontSize: "0.74rem" }}>
+            If you're using a remote signer, make sure it allows this type of event — some signing apps restrict which event kinds can be signed.
+          </span>
+        </>
+      ) : (
+        <>
+          <strong>Wallet not configured</strong>
+          <br />
+          Zaps require a signing key and a connected wallet. Go to Settings to add your nsec and configure a wallet (NWC or LNbits).
+          <br />
+          <span style={{ color: "var(--text-muted)", fontSize: "0.74rem" }}>
+            If you're using a remote signer, check that it allows kind 9734 (zap request) events.
+          </span>
+        </>
+      )}
+    </div>
+  );
+};
 
 export function parseRepostContent(event: NostrEvent): { content: string; pubkey: string; id: string | null; created_at: number | null } | null {
   if (event.kind !== 6 || !event.content.trim()) return null;
@@ -61,6 +109,84 @@ function getReplyParentId(event: NostrEvent): string | null {
   if (rootTag && eTags.length === 1) return rootTag[1];
   return eTags[eTags.length - 1][1];
 }
+
+/** Extract the quoted event ID from a kind:1 note's q-tag (NIP-18 quote repost). */
+function getQuotedEventId(event: NostrEvent): string | null {
+  if (event.kind !== 1) return null;
+  const qTag = event.tags.find((t) => t[0] === "q");
+  if (qTag?.[1]) return qTag[1];
+  // Fallback: if no q-tag, check for a lone nostr:note1/nevent1 that isn't a reply context
+  // (some clients embed quotes without a q-tag)
+  return null;
+}
+
+/** Strip the nostr: entity reference for the quoted note from displayed text. */
+function stripQuotedEntity(content: string, quotedId: string): string {
+  // Remove nostr:note1.../nostr:nevent1... that resolves to the quoted event ID
+  return content.replace(
+    /nostr:((note|nevent)1[a-z0-9]+)/g,
+    (match, bech32str) => {
+      const entity = decodeEntity(bech32str);
+      if (entity?.eventId === quotedId) return "";
+      return match;
+    }
+  ).trim();
+}
+
+/** Shows an embedded quoted note for quote reposts. */
+const QuotedNote: React.FC<{ quotedId: string }> = ({ quotedId }) => {
+  const [quoted, setQuoted] = useState<NostrEvent | null>(null);
+  const [status, setStatus] = useState<"loading" | "loaded" | "not-found">("loading");
+  const { getProfile, ensureProfiles } = useProfileContext();
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const ev = await invoke<NostrEvent | null>("get_event", { id: quotedId });
+        if (cancelled) return;
+        if (ev) {
+          setQuoted(ev);
+          setStatus("loaded");
+          ensureProfiles([ev.pubkey]);
+        } else {
+          const fetched = await invoke<NostrEvent[]>("fetch_events_by_ids", { ids: [quotedId] });
+          if (cancelled) return;
+          if (fetched.length > 0) {
+            setQuoted(fetched[0]);
+            setStatus("loaded");
+            ensureProfiles([fetched[0].pubkey]);
+          } else {
+            setStatus("not-found");
+          }
+        }
+      } catch {
+        if (!cancelled) setStatus("not-found");
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [quotedId, ensureProfiles]);
+
+  if (status === "loading") {
+    return <div className="quoted-note quoted-note-loading">Loading quoted note...</div>;
+  }
+  if (status === "not-found" || !quoted) {
+    return <div className="quoted-note quoted-note-missing">Quoted note not found</div>;
+  }
+  const profile = getProfile(quoted.pubkey);
+  const name = profileDisplayName(profile, quoted.pubkey);
+  const preview = quoted.content.slice(0, 200) + (quoted.content.length > 200 ? "\u2026" : "");
+  return (
+    <div className="quoted-note" data-note-id={quoted.id} style={{ cursor: "pointer" }}>
+      <div className="quoted-note-header">
+        <Avatar picture={profile?.picture} pictureLocal={profile?.picture_local} pubkey={quoted.pubkey} className="quoted-note-avatar" clickable />
+        <span className="quoted-note-name" data-pubkey={quoted.pubkey} style={{ cursor: "pointer" }}>{name}</span>
+        <span className="quoted-note-time">{timeAgo(quoted.created_at, false)}</span>
+      </div>
+      <div className="quoted-note-text">{preview}</div>
+    </div>
+  );
+};
 
 /** Shows parent note context for reply notes. */
 const ReplyContext: React.FC<{ parentId: string }> = ({ parentId }) => {
@@ -165,6 +291,8 @@ interface NoteCardProps {
   onClick?: () => void;
   onZap?: (event: NostrEvent) => void;
   onLike?: (event: NostrEvent) => void;
+  onReply?: (event: NostrEvent) => void;
+  onRepost?: (event: NostrEvent) => void;
 }
 
 /** Grouped repost: multiple people reposted the same original note */
@@ -290,11 +418,20 @@ const NoteCardInner: React.FC<{
   saved?: boolean;
   onLike?: (event: NostrEvent) => void;
   onZap?: (event: NostrEvent) => void;
-}> = ({ event, profile, compact, full, onSave, saved, onLike, onZap }) => {
+  onReply?: (event: NostrEvent) => void;
+  onRepost?: (event: NostrEvent) => void;
+}> = ({ event, profile, compact, full, onSave, saved, onLike, onZap, onReply, onRepost }) => {
   const { ensureProfiles, getProfile } = useProfileContext();
   const counts = useInteractionCounts(event.id);
-  const canWrite = useCanWrite();
+  useEnrichment(event.id);
+  const liked = useReactionStatus(event.id);
+  const reposted = useRepostStatus(event.id);
+  const { canWrite } = useSigningContext();
+  const toast = useActionToast();
   const displayName = profileDisplayName(profile, event.pubkey);
+
+  const handleSigningClick = (e: React.MouseEvent) => { e.stopPropagation(); toast.show("signing"); };
+  const handleZapClick = (e: React.MouseEvent) => { e.stopPropagation(); toast.show("zap"); };
 
   const mentionedPubkeys = useMemo(() => {
     const pks = extractMentionedPubkeys(event.content);
@@ -314,7 +451,7 @@ const NoteCardInner: React.FC<{
 
   return (
     <div className="repost-original">
-      <Avatar picture={profile?.picture} pubkey={event.pubkey} className="ev-avatar" clickable />
+      <Avatar picture={profile?.picture} pictureLocal={profile?.picture_local} pubkey={event.pubkey} className="ev-avatar" clickable />
       <div className="ev-content">
         <div className="ev-meta">
           <span className="ev-npub" data-pubkey={event.pubkey} style={{ cursor: "pointer" }}>
@@ -327,11 +464,12 @@ const NoteCardInner: React.FC<{
           <div dangerouslySetInnerHTML={{ __html: eventContent.mediaHtml }} />
         )}
         {!compact && (
-          <div className="ev-actions">
-            <button className="ev-action"><span className="icon"><IconMessageCircle /></span>{counts?.replies ? ` ${counts.replies}` : ""}</button>
-            <button className="ev-action"><span className="icon"><IconRepeat /></span>{counts?.reposts ? ` ${counts.reposts}` : ""}</button>
-            <button className={`ev-action${counts?.reactions ? " ev-action-liked" : ""}${!canWrite ? " ev-action-disabled" : ""}`} onClick={canWrite ? (e) => { e.stopPropagation(); onLike?.(event); } : undefined} title={!canWrite ? "Add nsec in settings to react" : undefined}><span className="icon"><IconHeart /></span>{counts?.reactions ? ` ${counts.reactions}` : ""}</button>
-            <button className={`ev-action${!canWrite ? " ev-action-disabled" : ""}`} onClick={canWrite ? (e) => { e.stopPropagation(); onZap?.(event); } : undefined} title={!canWrite ? "Add nsec in settings to zap" : undefined}><span className="icon"><IconZap /></span>{counts?.zaps ? ` ${counts.zaps}` : ""}</button>
+          <div className="ev-actions" style={{ position: "relative" }}>
+            <ActionToast message={toast.message} />
+            <button className={`ev-action${!canWrite || !onReply ? " ev-action-disabled" : ""}`} onClick={canWrite && onReply ? (e) => { e.stopPropagation(); onReply(event); } : !canWrite ? handleSigningClick : undefined}><span className="icon"><IconMessageCircle /></span>{counts?.replies ? ` ${counts.replies}` : ""}</button>
+            <button className={`ev-action${reposted ? " ev-action-reposted" : ""}${!canWrite || reposted || !onRepost ? " ev-action-disabled" : ""}`} onClick={canWrite && !reposted && onRepost ? (e) => { e.stopPropagation(); onRepost(event); } : !canWrite ? handleSigningClick : undefined}><span className="icon"><IconRepeat /></span>{counts?.reposts ? ` ${counts.reposts}` : ""}</button>
+            <button className={`ev-action${liked ? " ev-action-liked" : ""}${!canWrite || liked ? " ev-action-disabled" : ""}`} onClick={canWrite && !liked ? (e) => { e.stopPropagation(); onLike?.(event); } : !canWrite && !liked ? handleSigningClick : undefined}><span className="icon">{liked ? <IconHeartFilled /> : <IconHeart />}</span>{counts?.reactions ? ` ${counts.reactions}` : ""}</button>
+            <button className={`ev-action${!canWrite ? " ev-action-disabled" : ""}`} onClick={canWrite ? (e) => { e.stopPropagation(); onZap?.(event); } : handleZapClick}><span className="icon"><IconZap /></span>{counts?.zaps ? ` ${counts.zaps}` : ""}</button>
             {onSave && (
               <button
                 className={`ev-action${saved ? " ev-action-saved" : ""}`}
@@ -348,12 +486,19 @@ const NoteCardInner: React.FC<{
   );
 };
 
-export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, full, onSave, saved, onClick, onZap, onLike }) => {
+export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, full, onSave, saved, onClick, onZap, onLike, onReply, onRepost }) => {
   const k = kindLabel(event.kind);
   const displayName = profileDisplayName(profile, event.pubkey);
   const { ensureProfiles, getProfile } = useProfileContext();
   const counts = useInteractionCounts(event.id);
-  const canWrite = useCanWrite();
+  useEnrichment(event.id);
+  const liked = useReactionStatus(event.id);
+  const reposted = useRepostStatus(event.id);
+  const { canWrite } = useSigningContext();
+  const toast = useActionToast();
+
+  const handleSigningClick = (e: React.MouseEvent) => { e.stopPropagation(); toast.show("signing"); };
+  const handleZapClick = (e: React.MouseEvent) => { e.stopPropagation(); toast.show("zap"); };
 
   // Extract and ensure profiles for mentioned pubkeys (+ original author for reposts)
   const mentionedPubkeys = useMemo(() => {
@@ -402,7 +547,7 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, ful
           </span>
         </div>
         <div className="repost-original">
-          <Avatar picture={originalProfile?.picture} pubkey={original.pubkey} className="ev-avatar" clickable />
+          <Avatar picture={originalProfile?.picture} pictureLocal={originalProfile?.picture_local} pubkey={original.pubkey} className="ev-avatar" clickable />
           <div className="ev-content">
             <div className="ev-meta">
               <span className="ev-npub" data-pubkey={original.pubkey} style={{ cursor: "pointer" }}>
@@ -415,11 +560,12 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, ful
               <div dangerouslySetInnerHTML={{ __html: repostContent.mediaHtml }} />
             )}
             {!compact && (
-              <div className="ev-actions">
-                <button className="ev-action"><span className="icon"><IconMessageCircle /></span>{counts?.replies ? ` ${counts.replies}` : ""}</button>
-                <button className="ev-action"><span className="icon"><IconRepeat /></span>{counts?.reposts ? ` ${counts.reposts}` : ""}</button>
-                <button className={`ev-action${counts?.reactions ? " ev-action-liked" : ""}${!canWrite ? " ev-action-disabled" : ""}`} onClick={canWrite ? (e) => { e.stopPropagation(); onLike?.(event); } : undefined} title={!canWrite ? "Add nsec in settings to react" : undefined}><span className="icon"><IconHeart /></span>{counts?.reactions ? ` ${counts.reactions}` : ""}</button>
-                <button className={`ev-action${!canWrite ? " ev-action-disabled" : ""}`} onClick={canWrite ? (e) => { e.stopPropagation(); onZap?.(event); } : undefined} title={!canWrite ? "Add nsec in settings to zap" : undefined}><span className="icon"><IconZap /></span>{counts?.zaps ? ` ${counts.zaps}` : ""}</button>
+              <div className="ev-actions" style={{ position: "relative" }}>
+                <ActionToast message={toast.message} />
+                <button className={`ev-action${!canWrite || !onReply ? " ev-action-disabled" : ""}`} onClick={canWrite && onReply ? (e) => { e.stopPropagation(); onReply(event); } : !canWrite ? handleSigningClick : undefined}><span className="icon"><IconMessageCircle /></span>{counts?.replies ? ` ${counts.replies}` : ""}</button>
+                <button className={`ev-action${reposted ? " ev-action-reposted" : ""}${!canWrite || reposted || !onRepost ? " ev-action-disabled" : ""}`} onClick={canWrite && !reposted && onRepost ? (e) => { e.stopPropagation(); onRepost(event); } : !canWrite ? handleSigningClick : undefined}><span className="icon"><IconRepeat /></span>{counts?.reposts ? ` ${counts.reposts}` : ""}</button>
+                <button className={`ev-action${liked ? " ev-action-liked" : ""}${!canWrite || liked ? " ev-action-disabled" : ""}`} onClick={canWrite && !liked ? (e) => { e.stopPropagation(); onLike?.(event); } : !canWrite && !liked ? handleSigningClick : undefined}><span className="icon">{liked ? <IconHeartFilled /> : <IconHeart />}</span>{counts?.reactions ? ` ${counts.reactions}` : ""}</button>
+                <button className={`ev-action${!canWrite ? " ev-action-disabled" : ""}`} onClick={canWrite ? (e) => { e.stopPropagation(); onZap?.(event); } : handleZapClick}><span className="icon"><IconZap /></span>{counts?.zaps ? ` ${counts.zaps}` : ""}</button>
                 {onSave && (
                   <button
                     className={`ev-action${saved ? " ev-action-saved" : ""}`}
@@ -437,41 +583,56 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, ful
     );
   }
 
-  const eventContent = renderEventContent(event.content, mentionProfiles, full, { eventId: event.id, pubkey: event.pubkey });
   const replyParentId = useMemo(() => getReplyParentId(event), [event.id, event.tags]);
+  const quotedEventId = useMemo(() => getQuotedEventId(event), [event.id, event.tags]);
+
+  // For quote reposts, strip the embedded nostr: entity from displayed text
+  const displayContent = useMemo(() => {
+    if (quotedEventId) return stripQuotedEntity(event.content, quotedEventId);
+    return event.content;
+  }, [event.content, quotedEventId]);
+
+  const eventContent = renderEventContent(displayContent, mentionProfiles, full, { eventId: event.id, pubkey: event.pubkey });
 
   const handleClick = (e: React.MouseEvent) => {
-    if ((e.target as HTMLElement).closest("[data-pubkey]")) return;
-    if ((e.target as HTMLElement).closest("[data-note-id]")) return;
-    if ((e.target as HTMLElement).closest("[data-naddr]")) return;
-    if ((e.target as HTMLElement).closest("[data-media-url]")) return;
-    if ((e.target as HTMLElement).closest("a")) return;
-    if ((e.target as HTMLElement).closest(".ev-actions")) return;
+    const target = e.target as HTMLElement;
+    if (target.closest("[data-pubkey]")) { console.log("[notecard] click blocked: data-pubkey"); return; }
+    if (target.closest("[data-note-id]")) { console.log("[notecard] click blocked: data-note-id"); return; }
+    if (target.closest("[data-naddr]")) { console.log("[notecard] click blocked: data-naddr"); return; }
+    if (target.closest("[data-media-url]")) { console.log("[notecard] click blocked: data-media-url"); return; }
+    if (target.closest("a")) { console.log("[notecard] click blocked: anchor"); return; }
+    if (target.closest(".ev-actions")) { console.log("[notecard] click blocked: ev-actions"); return; }
+    console.log("[notecard] click → onClick(), event.id:", event.id.slice(0, 12), "target:", target.tagName, target.className);
     onClick?.();
   };
 
+  const kindTag = quotedEventId ? "quote" : replyParentId ? "reply" : k.tag;
+  const kindCls = quotedEventId ? "ev-kind-quote" : replyParentId ? "ev-kind-reply" : k.cls;
+
   return (
-    <div className="event-card" data-kind={k.tag} onClick={handleClick} style={onClick ? { cursor: "pointer" } : undefined}>
-      <Avatar picture={profile?.picture} pubkey={event.pubkey} className="ev-avatar" clickable />
+    <div className="event-card" data-kind={kindTag} onClick={handleClick} style={onClick ? { cursor: "pointer" } : undefined}>
+      <Avatar picture={profile?.picture} pictureLocal={profile?.picture_local} pubkey={event.pubkey} className="ev-avatar" clickable />
       <div className="ev-content">
         <div className="ev-meta">
           <span className="ev-npub" data-pubkey={event.pubkey} style={{ cursor: "pointer" }}>
             {displayName}
           </span>
-          <span className={`ev-kind-tag ${k.cls}`}>{k.tag}</span>
+          <span className={`ev-kind-tag ${kindCls}`}>{kindTag}</span>
           <span className="ev-time">{timeAgo(event.created_at, false)}</span>
         </div>
-        {replyParentId && <ReplyContext parentId={replyParentId} />}
+        {replyParentId && !quotedEventId && <ReplyContext parentId={replyParentId} />}
         <div className="ev-text" dangerouslySetInnerHTML={{ __html: eventContent.cleanedHtml }} />
         {eventContent.mediaHtml && (
           <div dangerouslySetInnerHTML={{ __html: eventContent.mediaHtml }} />
         )}
+        {quotedEventId && <QuotedNote quotedId={quotedEventId} />}
         {!compact && (
-          <div className="ev-actions">
-            <button className="ev-action"><span className="icon"><IconMessageCircle /></span>{counts?.replies ? ` ${counts.replies}` : ""}</button>
-            <button className="ev-action"><span className="icon"><IconRepeat /></span>{counts?.reposts ? ` ${counts.reposts}` : ""}</button>
-            <button className={`ev-action${counts?.reactions ? " ev-action-liked" : ""}${!canWrite ? " ev-action-disabled" : ""}`} onClick={canWrite ? (e) => { e.stopPropagation(); onLike?.(event); } : undefined} title={!canWrite ? "Add nsec in settings to react" : undefined}><span className="icon"><IconHeart /></span>{counts?.reactions ? ` ${counts.reactions}` : ""}</button>
-            <button className={`ev-action${!canWrite ? " ev-action-disabled" : ""}`} onClick={canWrite ? (e) => { e.stopPropagation(); onZap?.(event); } : undefined} title={!canWrite ? "Add nsec in settings to zap" : undefined}><span className="icon"><IconZap /></span>{counts?.zaps ? ` ${counts.zaps}` : ""}</button>
+          <div className="ev-actions" style={{ position: "relative" }}>
+            <ActionToast message={toast.message} />
+            <button className={`ev-action${!canWrite || !onReply ? " ev-action-disabled" : ""}`} onClick={canWrite && onReply ? (e) => { e.stopPropagation(); onReply(event); } : !canWrite ? handleSigningClick : undefined}><span className="icon"><IconMessageCircle /></span>{counts?.replies ? ` ${counts.replies}` : ""}</button>
+            <button className={`ev-action${reposted ? " ev-action-reposted" : ""}${!canWrite || reposted || !onRepost ? " ev-action-disabled" : ""}`} onClick={canWrite && !reposted && onRepost ? (e) => { e.stopPropagation(); onRepost(event); } : !canWrite ? handleSigningClick : undefined}><span className="icon"><IconRepeat /></span>{counts?.reposts ? ` ${counts.reposts}` : ""}</button>
+            <button className={`ev-action${liked ? " ev-action-liked" : ""}${!canWrite || liked ? " ev-action-disabled" : ""}`} onClick={canWrite && !liked ? (e) => { e.stopPropagation(); onLike?.(event); } : !canWrite && !liked ? handleSigningClick : undefined}><span className="icon">{liked ? <IconHeartFilled /> : <IconHeart />}</span>{counts?.reactions ? ` ${counts.reactions}` : ""}</button>
+            <button className={`ev-action${!canWrite ? " ev-action-disabled" : ""}`} onClick={canWrite ? (e) => { e.stopPropagation(); onZap?.(event); } : handleZapClick}><span className="icon"><IconZap /></span>{counts?.zaps ? ` ${counts.zaps}` : ""}</button>
             {onSave && (
               <button
                 className={`ev-action${saved ? " ev-action-saved" : ""}`}

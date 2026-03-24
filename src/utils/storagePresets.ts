@@ -74,21 +74,38 @@ export interface StorageEstimate {
 // ── Presets ──────────────────────────────────────────────────────
 
 export const STORAGE_PRESETS: Record<string, StoragePreset> = {
+  personal: {
+    label: "personal",
+    description: "only your own events & tracked profiles. no WoT storage.",
+    estimatedGb: { low: 0.1, typical: 0.5 },
+    othersEventsGb: 0,
+    trackedMediaGb: 1,
+    wotMediaGb: 0,
+    wotRetentionDays: 0,
+    maxEventAgeDays: 0,
+    mediaTypes: { images: false, videos: false, audio: false },
+    retentionOverrides: {
+      follows: { minEvents: 0, windowDays: 0 },
+      fof: { minEvents: 0, windowDays: 0 },
+      hop3: { minEvents: 0, windowDays: 0 },
+      others: { minEvents: 0, windowDays: 0 },
+    },
+  },
   minimal: {
     label: "minimal",
-    description: "your data + close follows only. low disk usage.",
-    estimatedGb: { low: 1, typical: 2 },
+    description: "your follows for a few days. very low disk usage.",
+    estimatedGb: { low: 0.5, typical: 1 },
     othersEventsGb: 1,
     trackedMediaGb: 1,
     wotMediaGb: 0,
-    wotRetentionDays: 7,
-    maxEventAgeDays: 7,
+    wotRetentionDays: 3,
+    maxEventAgeDays: 3,
     mediaTypes: { images: true, videos: false, audio: false },
     retentionOverrides: {
-      follows: { minEvents: 20, windowDays: 7 },
-      fof: { minEvents: 5, windowDays: 3 },
-      hop3: { minEvents: 2, windowDays: 1 },
-      others: { minEvents: 3, windowDays: 1 },
+      follows: { minEvents: 10, windowDays: 3 },
+      fof: { minEvents: 0, windowDays: 0 },
+      hop3: { minEvents: 0, windowDays: 0 },
+      others: { minEvents: 0, windowDays: 0 },
     },
   },
   balanced: {

@@ -641,7 +641,7 @@ pub mod provision {
     /// Returns (admin_key, wallet_id, instance_url).
     pub async fn provision_wallet_with_signer(
         instance_url: Option<&str>,
-        signer: &crate::nip46::Nip46Client,
+        signer: &mut crate::nip46::Nip46Client,
         hex_pubkey: &str,
     ) -> Result<(String, String, String), String> {
         let url = instance_url.unwrap_or(DEFAULT_PROVISION_URL).trim_end_matches('/');

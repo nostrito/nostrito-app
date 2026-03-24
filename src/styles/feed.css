@@ -159,6 +159,12 @@
 .ev-action:hover { color: var(--accent-light); }
 .ev-action .icon { font-size: 0.85rem; }
 
+/* Reply kind tag */
+.ev-kind-reply {
+  background: rgba(251, 191, 36, 0.1);
+  color: var(--yellow, #fbbf24);
+}
+
 /* Repost kind tag */
 .ev-kind-repost {
   background: rgba(52, 211, 153, 0.1);
@@ -682,6 +688,62 @@
   font-style: italic;
 }
 
+/* Quoted note embed (quote reposts) */
+.quoted-note {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-top: 8px;
+  font-size: 0.82rem;
+  background: var(--bg-hover, rgba(255,255,255,0.03));
+  transition: background 0.15s;
+}
+.quoted-note:hover {
+  background: var(--bg-elevated, rgba(255,255,255,0.06));
+}
+.quoted-note-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+.quoted-note-avatar {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.quoted-note-name {
+  font-weight: 600;
+  font-size: 0.78rem;
+  color: var(--text);
+}
+.quoted-note-time {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  margin-left: auto;
+}
+.quoted-note-text {
+  color: var(--text-dim, #aaa);
+  line-height: 1.45;
+  word-break: break-word;
+}
+.quoted-note-loading,
+.quoted-note-missing {
+  font-style: italic;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-top: 8px;
+}
+
+/* Quote kind tag */
+.ev-kind-quote {
+  color: var(--accent-light, var(--accent));
+}
+
 /* Infinite scroll sentinel */
 .feed-sentinel {
   display: flex;
@@ -848,8 +910,46 @@
 /* Disabled write actions (read-only mode) */
 .ev-action-disabled {
   opacity: 0.35;
+  cursor: pointer !important;
+}
+.ev-action-liked.ev-action-disabled {
   cursor: default !important;
-  pointer-events: none;
+}
+
+/* Signing toast popup */
+.signing-toast {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--bg-elevated, #1e1e2e);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 0.78rem;
+  color: var(--text);
+  line-height: 1.5;
+  width: 280px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  z-index: 100;
+  animation: signing-toast-in 0.2s ease-out;
+  pointer-events: auto;
+}
+.signing-toast::after {
+  content: "";
+  position: absolute;
+  bottom: -6px;
+  left: 50%;
+  transform: translateX(-50%) rotate(45deg);
+  width: 10px;
+  height: 10px;
+  background: var(--bg-elevated, #1e1e2e);
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+@keyframes signing-toast-in {
+  from { opacity: 0; transform: translateX(-50%) translateY(4px); }
+  to { opacity: 1; transform: translateX(-50%) translateY(0); }
 }
 
 /* ── Mentions ─────────────────────────────────────────── */
@@ -1037,7 +1137,10 @@
 }
 
 /* ── Like button active state ────────────────────────── */
-.ev-action-liked { color: #f43f5e; }
+.ev-action-liked { color: #f43f5e; opacity: 0.85; }
+.ev-action-liked.ev-action-disabled { color: #f43f5e; opacity: 0.85; cursor: default !important; }
+.ev-action-reposted { color: #22c55e; opacity: 0.85; }
+.ev-action-reposted.ev-action-disabled { color: #22c55e; opacity: 0.85; cursor: default !important; }
 
 /* ── Article card counts ─────────────────────────────── */
 .article-card-counts {
@@ -1161,9 +1264,14 @@
   width: 16px;
   height: 16px;
 }
-.sidebar-like-btn:hover {
+.sidebar-like-btn:hover:not(:disabled) {
   background: rgba(244, 63, 94, 0.1);
   color: #f43f5e;
+}
+.sidebar-like-btn-liked {
+  color: #f43f5e;
+  cursor: default;
+  opacity: 0.85;
 }
 .sidebar-zap-btn:hover {
   background: rgba(250, 204, 21, 0.1);

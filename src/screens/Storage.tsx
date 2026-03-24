@@ -36,6 +36,7 @@ interface KindCountsResult {
 interface TrackedProfileSummary {
   pubkey: string;
   picture: string | null;
+  picture_local: string | null;
 }
 
 /* ------------------------------------------------------------------ */
@@ -76,9 +77,9 @@ export const Storage: React.FC = () => {
       });
 
     // Fetch tracked profiles for avatar display
-    invoke<{ pubkey: string; picture: string | null }[]>("get_tracked_profiles_detail")
+    invoke<{ pubkey: string; picture: string | null; picture_local: string | null }[]>("get_tracked_profiles_detail")
       .then((profiles) => {
-        setTrackedAvatars(profiles.slice(0, 3).map((p) => ({ pubkey: p.pubkey, picture: p.picture })));
+        setTrackedAvatars(profiles.slice(0, 3).map((p) => ({ pubkey: p.pubkey, picture: p.picture, picture_local: p.picture_local ?? null })));
       })
       .catch((e) => {
         console.error("[storage] get_tracked_profiles_detail failed:", e);
@@ -189,6 +190,7 @@ export const Storage: React.FC = () => {
               {ownProfile && (
                 <Avatar
                   picture={ownProfile.picture}
+                  pictureLocal={ownProfile.picture_local}
                   pubkey={ownProfile.pubkey}
                   className="ownership-avatar"
                   fallbackClassName="ownership-avatar-fallback"
@@ -221,6 +223,7 @@ export const Storage: React.FC = () => {
                     <Avatar
                       key={p.pubkey}
                       picture={p.picture}
+                      pictureLocal={p.picture_local}
                       pubkey={p.pubkey}
                       className="ownership-avatar-sm"
                       fallbackClassName="ownership-avatar-sm-fallback"
@@ -257,6 +260,7 @@ export const Storage: React.FC = () => {
                       <Avatar
                         key={pk}
                         picture={p?.picture}
+                        pictureLocal={p?.picture_local}
                         pubkey={pk}
                         className={`ownership-avatar-sm ownership-avatar-bubble ownership-avatar-bubble-${i}`}
                         fallbackClassName="ownership-avatar-sm-fallback"

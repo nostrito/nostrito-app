@@ -4,6 +4,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { NoteCard } from "../components/NoteCard";
 import { ZapModal } from "../components/ZapModal";
+import { ComposeModal } from "../components/ComposeModal";
+import { IconMessageCircle, IconRepeat, IconX } from "../components/Icon";
+import { useCanWrite } from "../context/SigningContext";
 import { Avatar } from "../components/Avatar";
 import { EmptyState } from "../components/EmptyState";
 import { useProfileContext } from "../context/ProfileContext";
@@ -12,17 +15,13 @@ import { getArticleTitle, getArticleImage, getArticleTimestamp } from "../compon
 import { formatDate, timeAgo } from "../utils/format";
 import { profileDisplayName } from "../utils/profiles";
 import { invalidateInteractionCounts } from "../hooks/useInteractionCounts";
+import { markReacted } from "../hooks/useReactionStatus";
+import { markReposted } from "../hooks/useRepostStatus";
+import { useOnDemandFetch } from "../hooks/useOnDemandFetch";
 import type { NostrEvent } from "../types/nostr";
 
 // ── Thread fetch cache (module-level, survives re-renders) ──────
 const threadFetchCache = new Map<string, number>(); // rootId → timestamp
-const THREAD_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
-
-function shouldFetchThread(rootId: string): boolean {
-  const lastFetch = threadFetchCache.get(rootId);
-  if (!lastFetch) return true;
-  return Date.now() - lastFetch > THREAD_CACHE_TTL;
-}
 
 function markThreadFetched(rootId: string): void {
   threadFetchCache.set(rootId, Date.now());
@@ -194,18 +193,23 @@ export const NoteDetail: React.FC = () => {
   const { noteId } = useParams<{ noteId: string }>();
   const navigate = useNavigate();
   const { ensureProfiles, getProfile } = useProfileContext();
+  const { fetchIfStale } = useOnDemandFetch();
 
   const [event, setEvent] = useState<NostrEvent | null>(null);
   const [threadData, setThreadData] = useState<ThreadData | null>(null);
   const [loading, setLoading] = useState(true);
   const [fetchingRelays, setFetchingRelays] = useState(false);
+  const [relayFetchDone, setRelayFetchDone] = useState(false);
   const [wotDistances, setWotDistances] = useState<Record<string, number>>({});
   const [showNonWot, setShowNonWot] = useState(false);
   const [showNonWotReactions, setShowNonWotReactions] = useState(false);
   const [showNonWotZaps, setShowNonWotZaps] = useState(false);
   const [zapTarget, setZapTarget] = useState<NostrEvent | null>(null);
+  const [showReplyModal, setShowReplyModal] = useState(false);
+  const canWrite = useCanWrite();
 
   const handleLike = useCallback(async (event: NostrEvent) => {
+    markReacted(event.id);
     try {
       await invoke("publish_reaction", { eventId: event.id, eventPubkey: event.pubkey });
       invalidateInteractionCounts([event.id]);
@@ -213,6 +217,27 @@ export const NoteDetail: React.FC = () => {
       console.warn("[note-detail] Failed to publish reaction:", err);
     }
   }, []);
+
+  const [repostConfirm, setRepostConfirm] = useState<NostrEvent | null>(null);
+  const handleRepost = useCallback((event: NostrEvent) => {
+    setRepostConfirm(event);
+  }, []);
+  const confirmRepost = useCallback(async () => {
+    if (!repostConfirm) return;
+    const ev = repostConfirm;
+    setRepostConfirm(null);
+    markReposted(ev.id);
+    try {
+      const eventJson = JSON.stringify({
+        id: ev.id, pubkey: ev.pubkey, created_at: ev.created_at,
+        kind: ev.kind, tags: ev.tags, content: ev.content, sig: ev.sig,
+      });
+      await invoke("publish_repost", { eventId: ev.id, eventPubkey: ev.pubkey, eventJson });
+      invalidateInteractionCounts([ev.id]);
+    } catch (err) {
+      console.warn("[note-detail] Failed to publish repost:", err);
+    }
+  }, [repostConfirm]);
 
   // Determine root ID for thread fetching
   const rootId = useMemo(() => {
@@ -224,53 +249,71 @@ export const NoteDetail: React.FC = () => {
   // Load the main event first, then thread data
   useEffect(() => {
     if (!noteId) return;
+    console.log("[note-detail] loading noteId:", noteId);
     setLoading(true);
     setThreadData(null);
     setShowNonWot(false);
+    setRelayFetchDone(false);
 
     const load = async () => {
-      // Load the main event
+      // Load the main event — show it immediately
       let mainEvent: NostrEvent | null = null;
       try {
+        console.log("[note-detail] calling get_event...");
         mainEvent = await invoke<NostrEvent | null>("get_event", { id: noteId });
+        console.log("[note-detail] get_event result:", mainEvent ? `kind=${mainEvent.kind}` : "null");
         setEvent(mainEvent);
         if (mainEvent) ensureProfiles([mainEvent.pubkey]);
       } catch (e) {
         console.error("[note-detail] Failed to load event:", e);
       }
 
+      // If event not in local DB, fetch from relays
+      if (!mainEvent) {
+        console.log("[note-detail] event not found locally, fetching from relays...");
+        try {
+          await invoke("fetch_note_context_from_relays", { noteId });
+          mainEvent = await invoke<NostrEvent | null>("get_event", { id: noteId });
+          console.log("[note-detail] relay fetch result:", mainEvent ? `kind=${mainEvent.kind}` : "null");
+          if (mainEvent) {
+            setEvent(mainEvent);
+            ensureProfiles([mainEvent.pubkey]);
+          }
+        } catch (e) {
+          console.error("[note-detail] Relay fetch for missing event failed:", e);
+        }
+      }
+
+      console.log("[note-detail] setLoading(false), displayEvent:", mainEvent ? "found" : "NOT FOUND");
+      setLoading(false);
+
       // Determine root for thread fetch
       const effectiveRootId = mainEvent ? (findRootTag(mainEvent) ?? mainEvent.id) : noteId;
 
-      // Load thread data
-      try {
-        const data = await invoke<ThreadData>("get_thread_events", { rootId: effectiveRootId });
-        setThreadData(data);
+      // Load thread data + WoT distances in parallel (non-blocking)
+      const threadPromise = invoke<ThreadData>("get_thread_events", { rootId: effectiveRootId })
+        .then((data) => {
+          setThreadData(data);
+          const pubkeys = new Set<string>();
+          if (data.root) pubkeys.add(data.root.pubkey);
+          for (const r of data.replies) pubkeys.add(r.pubkey);
+          for (const r of data.reactions) pubkeys.add(r.pubkey);
+          for (const z of data.zaps) pubkeys.add(z.pubkey);
+          if (pubkeys.size > 0) ensureProfiles(Array.from(pubkeys));
+        })
+        .catch((e) => console.error("[note-detail] Failed to load thread:", e));
 
-        // Ensure profiles for all participants
-        const pubkeys = new Set<string>();
-        if (data.root) pubkeys.add(data.root.pubkey);
-        for (const r of data.replies) pubkeys.add(r.pubkey);
-        for (const r of data.reactions) pubkeys.add(r.pubkey);
-        for (const z of data.zaps) pubkeys.add(z.pubkey);
-        if (pubkeys.size > 0) ensureProfiles(Array.from(pubkeys));
-      } catch (e) {
-        console.error("[note-detail] Failed to load thread:", e);
-      }
+      const wotPromise = invoke<Record<string, number>>("get_wot_hop_distances", { maxHops: 3 })
+        .then((distances) => setWotDistances(distances))
+        .catch((e) => console.error("[note-detail] Failed to load WoT distances:", e));
 
-      // Load WoT distances for thread participants
-      try {
-        const distances = await invoke<Record<string, number>>("get_wot_hop_distances", { maxHops: 3 });
-        setWotDistances(distances);
-      } catch (e) {
-        console.error("[note-detail] Failed to load WoT distances:", e);
-      }
+      await Promise.all([threadPromise, wotPromise]);
 
       // If not found locally, fetch from relays before showing "not found"
       if (!mainEvent) {
         setFetchingRelays(true);
         try {
-          const count = await invoke<number>("fetch_thread_from_relays", { rootId: effectiveRootId });
+          const count = await invoke<number>("fetch_thread_from_relays", { rootId: effectiveRootId, skipRoot: false });
           markThreadFetched(effectiveRootId);
           if (count > 0) {
             // Re-fetch the event and thread from local DB after relay fetch
@@ -286,19 +329,28 @@ export const NoteDetail: React.FC = () => {
           console.error("[note-detail] Relay fetch failed:", e);
         } finally {
           setFetchingRelays(false);
+          setRelayFetchDone(true);
         }
-      } else if (shouldFetchThread(effectiveRootId)) {
-        // Already found locally — background relay fetch (respects 5-min cache)
-        invoke("fetch_thread_from_relays", { rootId: effectiveRootId })
-          .then(() => markThreadFetched(effectiveRootId))
-          .catch(() => {});
+      } else if (effectiveRootId) {
+        // Already found locally — background relay fetch (rate-limited via fetchIfStale)
+        let fetchFired = false;
+        fetchIfStale(`thread:${effectiveRootId}`, () => {
+          fetchFired = true;
+          return invoke("fetch_thread_from_relays", {
+            rootId: effectiveRootId,
+            skipRoot: true,
+          }).then(() => markThreadFetched(effectiveRootId)).finally(() => setRelayFetchDone(true));
+        }, 30);
+        if (!fetchFired) setRelayFetchDone(true);
+      } else {
+        setRelayFetchDone(true);
       }
 
       setLoading(false);
     };
 
     load();
-  }, [noteId, ensureProfiles]);
+  }, [noteId, ensureProfiles, fetchIfStale]);
 
   // Listen for thread-updated events from relay fetch
   useEffect(() => {
@@ -333,8 +385,12 @@ export const NoteDetail: React.FC = () => {
   const fetchFromRelays = useCallback(async () => {
     if (!rootId || fetchingRelays) return;
     setFetchingRelays(true);
+    setRelayFetchDone(false);
     try {
-      const count = await invoke<number>("fetch_thread_from_relays", { rootId });
+      const count = await invoke<number>("fetch_thread_from_relays", {
+        rootId,
+        skipRoot: false,
+      });
       if (count > 0) {
         const data = await invoke<ThreadData>("get_thread_events", { rootId });
         setThreadData(data);
@@ -344,6 +400,7 @@ export const NoteDetail: React.FC = () => {
       console.error("[note-detail] Relay fetch failed:", e);
     } finally {
       setFetchingRelays(false);
+      setRelayFetchDone(true);
     }
   }, [rootId, fetchingRelays]);
 
@@ -404,6 +461,7 @@ export const NoteDetail: React.FC = () => {
 
   // Determine the display event (root event if available, otherwise the clicked event)
   const displayEvent = threadData?.root ?? event;
+  console.log("[note-detail] render: noteId=", noteId?.slice(0, 12), "loading=", loading, "displayEvent=", displayEvent ? `kind=${displayEvent.kind}` : "null", "event=", event ? "yes" : "no", "threadData=", threadData ? "yes" : "no");
 
   return (
     <div className="screen-page note-detail-page">
@@ -445,6 +503,7 @@ export const NoteDetail: React.FC = () => {
                     <div className="reader-author">
                       <Avatar
                         picture={getProfile(displayEvent.pubkey)?.picture}
+                        pictureLocal={getProfile(displayEvent.pubkey)?.picture_local}
                         pubkey={displayEvent.pubkey}
                         className="reader-author-avatar"
                         fallbackClassName="reader-author-avatar reader-author-avatar-fallback"
@@ -466,11 +525,26 @@ export const NoteDetail: React.FC = () => {
                 full
                 onZap={setZapTarget}
                 onLike={handleLike}
+                onRepost={handleRepost}
               />
             )}
           </div>
 
+          {canWrite && displayEvent && (
+            <div className="note-detail-reply-row">
+              <button className="note-detail-reply-btn" onClick={() => setShowReplyModal(true)}>
+                <span className="icon"><IconMessageCircle /></span> reply to this note
+              </button>
+            </div>
+          )}
+
           {/* Reactions */}
+          {!threadData && (
+            <div className="note-detail-reactions">
+              <div className="note-detail-section-title">reactions</div>
+              <div style={{ color: "var(--text-muted)", padding: "8px 0 0", fontSize: "0.85rem" }}>loading...</div>
+            </div>
+          )}
           {threadData && threadData.reactions.length === 0 && (
             <div className="note-detail-reactions">
               <div className="note-detail-section-title">reactions</div>
@@ -496,6 +570,7 @@ export const NoteDetail: React.FC = () => {
                     <Avatar
                       key={r.id}
                       picture={rProfile?.picture ?? null}
+                      pictureLocal={rProfile?.picture_local ?? null}
                       pubkey={r.pubkey}
                       className="note-detail-reactor-avatar"
                       clickable
@@ -532,6 +607,7 @@ export const NoteDetail: React.FC = () => {
                     <div key={zap.id} className="note-detail-zap-item">
                       <Avatar
                         picture={zapProfile?.picture ?? null}
+                        pictureLocal={zapProfile?.picture_local ?? null}
                         pubkey={zap.pubkey}
                         className="note-detail-zap-avatar"
                         clickable
@@ -559,10 +635,21 @@ export const NoteDetail: React.FC = () => {
           {/* Threaded Replies */}
           <div className="note-detail-replies">
             <div className="note-detail-section-title">
-              replies ({threadData?.replies.length ?? 0})
+              replies {threadData ? `(${threadData.replies.length})` : ""}
             </div>
 
-            {threadData && threadData.replies.length === 0 && (
+            {!threadData && (
+              <div style={{ color: "var(--text-muted)", padding: "8px 0", fontSize: "0.85rem" }}>
+                loading...
+              </div>
+            )}
+            {threadData && threadData.replies.length === 0 && !relayFetchDone && (
+              <div style={{ color: "var(--text-muted)", padding: "8px 0", fontSize: "0.85rem" }}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" width="14" height="14" style={{ marginRight: 6, verticalAlign: "middle" }}><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+                checking relays for replies...
+              </div>
+            )}
+            {threadData && threadData.replies.length === 0 && relayFetchDone && (
               <div style={{ color: "var(--text-muted)", padding: "8px 0", fontSize: "0.85rem" }}>
                 no replies found for this note.
               </div>
@@ -597,6 +684,52 @@ export const NoteDetail: React.FC = () => {
           recipientLud16={getProfile(zapTarget.pubkey)?.lud16 ?? null}
           onClose={() => setZapTarget(null)}
         />
+      )}
+      {showReplyModal && displayEvent && (
+        <ComposeModal
+          replyTo={displayEvent}
+          replyToProfile={getProfile(displayEvent.pubkey)}
+          onClose={() => {
+            setShowReplyModal(false);
+            if (rootId) {
+              invoke<ThreadData>("get_thread_events", { rootId })
+                .then((data) => {
+                  setThreadData(data);
+                  invalidateInteractionCounts();
+                  const pubkeys = new Set<string>();
+                  if (data.root) pubkeys.add(data.root.pubkey);
+                  for (const r of data.replies) pubkeys.add(r.pubkey);
+                  if (pubkeys.size > 0) ensureProfiles(Array.from(pubkeys));
+                })
+                .catch(() => {});
+            }
+          }}
+        />
+      )}
+      {repostConfirm && (
+        <div className="wallet-modal-overlay" onClick={() => setRepostConfirm(null)}>
+          <div className="wallet-modal" onClick={(e) => e.stopPropagation()} style={{ width: 380 }}>
+            <div className="wallet-modal-header">
+              <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span className="icon"><IconRepeat /></span>
+                repost
+              </span>
+              <button className="wallet-modal-close" onClick={() => setRepostConfirm(null)}><IconX /></button>
+            </div>
+            <div className="wallet-modal-body">
+              <p style={{ fontSize: "0.88rem", color: "var(--text-dim)", marginBottom: 12 }}>
+                Repost this note by <strong style={{ color: "var(--text)" }}>{profileDisplayName(getProfile(repostConfirm.pubkey), repostConfirm.pubkey)}</strong>?
+              </p>
+              <div style={{ fontSize: "0.82rem", color: "var(--text-muted)", borderLeft: "2px solid var(--border)", paddingLeft: 10, marginBottom: 16, maxHeight: 120, overflow: "hidden" }}>
+                {repostConfirm.content.slice(0, 200)}{repostConfirm.content.length > 200 ? "\u2026" : ""}
+              </div>
+              <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+                <button className="wallet-setup-connect-btn" style={{ background: "transparent", color: "var(--text-dim)", border: "1px solid var(--border)" }} onClick={() => setRepostConfirm(null)}>cancel</button>
+                <button className="wallet-setup-connect-btn" onClick={confirmRepost}>repost</button>
+              </div>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

@@ -1,4 +1,5 @@
 mod nip46;
+mod paths;
 mod relay;
 mod search;
 mod storage;
@@ -7,7 +8,7 @@ mod wallet;
 mod wot;
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
@@ -20,7 +21,8 @@ use wot::WotGraph;
 
 // ── Helpers ────────────────────────────────────────────────────────
 
-/// Show a native macOS error dialog and exit gracefully instead of panicking.
+/// Show an error and exit gracefully instead of panicking.
+#[cfg(desktop)]
 fn fatal_exit(msg: &str) -> ! {
     tracing::error!("[fatal] {}", msg);
     let escaped = msg.replace('\\', "\\\\").replace('"', "\\\"");
@@ -32,6 +34,127 @@ fn fatal_exit(msg: &str) -> ! {
         ))
         .output();
     std::process::exit(1);
+}
+
+#[cfg(mobile)]
+fn fatal_exit(msg: &str) -> ! {
+    tracing::error!("[fatal] {}", msg);
+    std::process::exit(1);
+}
+
+/// Spawn a background task that receives events from the relay and:
+/// 1. Broadcasts them to all configured outbound relays
+/// 2. Shows a native macOS notification (via tauri-plugin-notification)
+fn spawn_outbound_broadcaster(
+    config: Arc<RwLock<AppConfig>>,
+    app_handle: tauri::AppHandle,
+) -> relay::OutboundEventSender {
+    use tauri_plugin_notification::NotificationExt;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    tokio::spawn(async move {
+        while let Some(event_json) = rx.recv().await {
+            let config = config.read().await;
+            let relays = config.outbound_relays.clone();
+            drop(config);
+
+            if relays.is_empty() {
+                tracing::warn!("[outbound] No outbound relays configured, skipping broadcast");
+                continue;
+            }
+
+            // Parse event JSON for notification details
+            let event_value: serde_json::Value = match serde_json::from_str(&event_json) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!("[outbound] Failed to parse event JSON: {}", e);
+                    continue;
+                }
+            };
+
+            let kind = event_value["kind"].as_u64().unwrap_or(0);
+            let event_id = event_value["id"].as_str().unwrap_or("unknown");
+            let short_id = &event_id[..event_id.len().min(12)];
+
+            // Send native macOS notification via Tauri
+            {
+                let notif_body = match kind {
+                    1 => {
+                        let content = event_value["content"].as_str().unwrap_or("");
+                        let preview = if content.len() > 80 {
+                            format!("{}...", &content[..80])
+                        } else {
+                            content.to_string()
+                        };
+                        format!("New note: {}", preview)
+                    }
+                    0 => "Profile metadata updated".to_string(),
+                    3 => "Contact list updated".to_string(),
+                    5 => "Deletion event published".to_string(),
+                    7 => "Reaction published".to_string(),
+                    _ => format!("New event (kind {})", kind),
+                };
+                if let Err(e) = app_handle.notification()
+                    .builder()
+                    .title("Nostrito")
+                    .body(&notif_body)
+                    .show()
+                {
+                    tracing::warn!("[outbound] Failed to show notification: {}", e);
+                }
+            }
+
+            // Broadcast to all outbound relays
+            let relay_count = relays.len();
+            tracing::info!("[outbound] Broadcasting event {}… (kind {}) to {} relays", short_id, kind, relay_count);
+
+            let event_json_clone = event_json.clone();
+            tokio::spawn(async move {
+                use nostr_sdk::prelude::*;
+
+                let event = match Event::from_json(&event_json_clone) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        tracing::error!("[outbound] Failed to reconstruct nostr event: {}", e);
+                        return;
+                    }
+                };
+
+                let client = Client::default();
+                let mut connected = 0u32;
+                for url in &relays {
+                    if let Ok(_) = client.add_relay(url.as_str()).await {
+                        if client.connect_relay(url.as_str()).await.is_ok() {
+                            connected += 1;
+                        }
+                    }
+                }
+
+                if connected == 0 {
+                    tracing::warn!("[outbound] Could not connect to any outbound relay");
+                    return;
+                }
+
+                match client.send_event(event).await {
+                    Ok(output) => {
+                        tracing::info!(
+                            "[outbound] Event broadcast complete: sent to {} relay(s), failed on {}",
+                            output.success.len(),
+                            output.failed.len()
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!("[outbound] Failed to broadcast event: {}", e);
+                    }
+                }
+
+                client.disconnect().await.ok();
+            });
+        }
+    });
+
+    tx
 }
 
 /// Per-npub database path: `{data_dir}/{npub_prefix}.db`
@@ -128,21 +251,21 @@ impl Default for AppConfig {
                 "wss://nostr.wine".into(),
             ],
             auto_start: true,
-            storage_others_gb: 5.0,
-            storage_media_gb: 2.0,
-            storage_own_media_gb: 5.0,
-            storage_tracked_media_gb: 3.0,
-            storage_wot_media_gb: 2.0,
-            wot_event_retention_days: 30,
-            thread_retention_days: 30,
-            sync_lookback_days: 30,
+            storage_others_gb: 0.0,
+            storage_media_gb: 0.0,
+            storage_own_media_gb: 0.0,
+            storage_tracked_media_gb: 0.0,
+            storage_wot_media_gb: 0.0,
+            wot_event_retention_days: 0,
+            thread_retention_days: 0,
+            sync_lookback_days: 7,
             sync_batch_size: 50,
             sync_events_per_batch: 50,
             sync_batch_pause_secs: 7,
             sync_relay_min_interval_secs: 3,
             sync_wot_batch_size: 5,
             sync_wot_events_per_batch: 15,
-            max_event_age_days: 30,
+            max_event_age_days: 0,
             sync_wot_notes_per_cycle: 50,
             offline_mode: false,
             nsec: None,
@@ -447,9 +570,10 @@ async fn init_nostrito(
             .map_err(|e| format!("Failed to save relays: {}", e))?;
     }
 
-    // Persist per-category media limits
+    // Persist per-category storage limits
     {
         let config = state.config.read().await;
+        state.db().set_config("storage_others_gb", &config.storage_others_gb.to_string()).ok();
         state.db().set_config("storage_tracked_media_gb", &config.storage_tracked_media_gb.to_string()).ok();
         state.db().set_config("storage_wot_media_gb", &config.storage_wot_media_gb.to_string()).ok();
         state.db().set_config("wot_event_retention_days", &config.wot_event_retention_days.to_string()).ok();
@@ -518,15 +642,15 @@ async fn init_nostrito(
         *state.sync_cancel.write().await = Some(cancel);
     }
 
-    // Auto-setup mkcert if certs don't exist (first launch)
+    // Auto-setup mkcert (desktop only — needs OS trust store)
+    #[cfg(desktop)]
     {
-        let cert_path = dirs::home_dir()
-            .unwrap_or_default()
-            .join(".nostrito/certs/localhost.pem");
-        if !cert_path.exists() {
+        let cp = paths::cert_path(&state.data_dir);
+        if !cp.exists() {
             tracing::info!("[mkcert] First launch — setting up browser integration automatically");
             let app_clone = app_handle.clone();
-            match tokio::task::spawn_blocking(move || run_mkcert_setup(&app_clone)).await {
+            let data_dir_for_mkcert = state.data_dir.clone();
+            match tokio::task::spawn_blocking(move || run_mkcert_setup(&app_clone, &data_dir_for_mkcert)).await {
                 Ok(Ok(_)) => tracing::info!("[mkcert] Browser integration ready"),
                 Ok(Err(e)) => tracing::warn!("[mkcert] Setup failed (non-fatal): {}", e),
                 Err(e) => tracing::warn!("[mkcert] Task panicked (non-fatal): {}", e),
@@ -534,7 +658,7 @@ async fn init_nostrito(
         }
     }
 
-    // Auto-start relay (TLS if certs available)
+    // Auto-start relay (TLS on desktop if certs available, plain WS everywhere)
     {
         let config = state.config.read().await;
         let port = config.relay_port;
@@ -544,28 +668,36 @@ async fn init_nostrito(
         let db_relay = state.db();
         let relay_cancel = CancellationToken::new();
         let relay_cancel_clone = relay_cancel.clone();
+        let outbound_tx = spawn_outbound_broadcaster(state.config.clone(), app_handle.clone());
 
-        let cert_path = dirs::home_dir()
-            .unwrap_or_default()
-            .join(".nostrito/certs/localhost.pem");
-        let key_path = dirs::home_dir()
-            .unwrap_or_default()
-            .join(".nostrito/certs/localhost-key.pem");
+        let cert_path = paths::cert_path(&state.data_dir);
+        let key_path = paths::key_path(&state.data_dir);
 
         if cert_path.exists() && key_path.exists() {
+            let tls_cancel = relay_cancel_clone.clone();
+            let tls_db = db_relay.clone();
+            let tls_allowed = allowed.clone();
+            let tls_outbound = outbound_tx.clone();
             tracing::info!("[relay] Starting TLS relay on wss://127.0.0.1:{}", port);
             tokio::spawn(async move {
                 if let Err(e) =
-                    relay::run_relay_tls(port, cert_path, key_path, db_relay, allowed, relay_cancel_clone)
+                    relay::run_relay_tls(port, cert_path, key_path, tls_db, tls_allowed, tls_cancel, Some(tls_outbound))
                         .await
                 {
                     tracing::error!("TLS relay error: {}", e);
                 }
             });
+            let plain_port = port + 1;
+            tracing::info!("[relay] Starting plain relay on ws://127.0.0.1:{} (browser fallback)", plain_port);
+            tokio::spawn(async move {
+                if let Err(e) = relay::run_relay(plain_port, db_relay, allowed, relay_cancel_clone, Some(outbound_tx)).await {
+                    tracing::error!("Plain relay error: {}", e);
+                }
+            });
         } else {
             tracing::info!("[relay] Starting plain relay on ws://127.0.0.1:{}", port);
             tokio::spawn(async move {
-                if let Err(e) = relay::run_relay(port, db_relay, allowed, relay_cancel_clone).await {
+                if let Err(e) = relay::run_relay(port, db_relay, allowed, relay_cancel_clone, Some(outbound_tx)).await {
                     tracing::error!("Relay server error: {}", e);
                 }
             });
@@ -600,9 +732,10 @@ async fn get_profiles_batch(pubkeys: Vec<String>, state: State<'_, AppState>) ->
                 "name": p.name,
                 "display_name": p.display_name,
                 "picture": p.picture,
+                "picture_local": p.picture_local,
             })
         } else {
-            serde_json::json!({ "pubkey": pk, "name": null, "display_name": null, "picture": null })
+            serde_json::json!({ "pubkey": pk, "name": null, "display_name": null, "picture": null, "picture_local": null })
         }
     }).collect();
     Ok(result)
@@ -1202,8 +1335,31 @@ async fn get_interaction_counts(
 }
 
 #[tauri::command]
+async fn get_reacted_event_ids(
+    event_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    let own_pk = state.config.read().await.hex_pubkey.clone()
+        .ok_or_else(|| "No pubkey configured".to_string())?;
+    state.db().get_reacted_event_ids(&event_ids, &own_pk)
+        .map_err(|e| format!("Failed to get reacted event IDs: {}", e))
+}
+
+#[tauri::command]
+async fn get_reposted_event_ids(
+    event_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    let own_pk = state.config.read().await.hex_pubkey.clone()
+        .ok_or_else(|| "No pubkey configured".to_string())?;
+    state.db().get_reposted_event_ids(&event_ids, &own_pk)
+        .map_err(|e| format!("Failed to get reposted event IDs: {}", e))
+}
+
+#[tauri::command]
 async fn fetch_thread_from_relays(
     root_id: String,
+    skip_root: bool,
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<u32, String> {
@@ -1222,15 +1378,19 @@ async fn fetch_thread_from_relays(
     let event_id = EventId::from_hex(&root_id)
         .map_err(|e| format!("Invalid event ID: {}", e))?;
 
-    // ── Phase 1: Fetch from user's own relays ──
-    let root_filter = Filter::new().id(event_id).limit(1);
-    let replies_filter = Filter::new().event(event_id).kinds(vec![Kind::TextNote]).limit(500);
-    let interactions_filter = Filter::new().event(event_id).kinds(vec![Kind::Reaction, Kind::from(9735)]).limit(500);
+    // Fetch replies/reactions/zaps (and optionally the root event)
+    let mut filters = vec![
+        Filter::new().event(event_id).kinds(vec![Kind::TextNote]).limit(500),
+        Filter::new().event(event_id).kinds(vec![Kind::Reaction, Kind::from(9735)]).limit(500),
+    ];
+    if !skip_root {
+        filters.insert(0, Filter::new().id(event_id).limit(1));
+    }
 
     let pool = crate::sync::pool::RelayPool::new();
     let events = pool.subscribe_and_collect(
         &relay_urls,
-        vec![root_filter, replies_filter, interactions_filter],
+        filters,
         15,
     ).await.map_err(|e| format!("Relay fetch failed: {}", e))?;
 
@@ -1319,6 +1479,295 @@ async fn fetch_thread_from_relays(
     }
 
     Ok(total_stored)
+}
+
+#[tauri::command]
+async fn fetch_profile_content_from_relays(
+    pubkey: String,
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<u32, String> {
+    use nostr_sdk::prelude::*;
+
+    let cfg = state.config.read().await;
+    let hex_pubkey = cfg.hex_pubkey.clone().unwrap_or_default();
+    let fallback_relays = cfg.outbound_relays.clone();
+    drop(cfg);
+
+    let relay_urls = resolve_sync_relays(&state.db(), &hex_pubkey, &fallback_relays);
+    if relay_urls.is_empty() {
+        return Err("No relays available".into());
+    }
+
+    let pk = PublicKey::from_hex(&pubkey)
+        .map_err(|e| format!("Invalid pubkey: {}", e))?;
+
+    // Recent notes, reposts, articles by this author
+    let notes_filter = Filter::new()
+        .authors(vec![pk])
+        .kinds(vec![Kind::TextNote, Kind::Repost, Kind::LongFormTextNote])
+        .limit(100);
+
+    // Metadata + contact list + relay list
+    let meta_filter = Filter::new()
+        .authors(vec![pk])
+        .kinds(vec![Kind::Metadata, Kind::ContactList, Kind::from(10002u16)])
+        .limit(5);
+
+    // Followers: kind:3 events that tag this pubkey in a "p" tag
+    let followers_filter = Filter::new()
+        .kind(Kind::ContactList)
+        .custom_tag(SingleLetterTag::lowercase(Alphabet::P), vec![pubkey.clone()])
+        .limit(500);
+
+    let pool = crate::sync::pool::RelayPool::new();
+    let events = pool.subscribe_and_collect(
+        &relay_urls,
+        vec![notes_filter, meta_filter, followers_filter],
+        15,
+    ).await.map_err(|e| format!("Relay fetch failed: {}", e))?;
+
+    if events.is_empty() {
+        app_handle.emit("profile-content-updated", &pubkey).ok();
+        return Ok(0);
+    }
+
+    let db = state.db();
+    let graph = Arc::clone(&state.wot_graph);
+    let (stored, _) = crate::sync::processing::process_events(
+        &events,
+        &db,
+        &graph,
+        &hex_pubkey,
+        crate::sync::types::EventSource::Sync,
+        None,
+        "profile-fetch",
+    );
+
+    // Update profile fetched_at timestamp
+    let now = chrono::Utc::now().timestamp();
+    db.set_profile_fetched_at(&pubkey, now).ok();
+
+    // Emit event so frontend can refresh
+    app_handle.emit("profile-content-updated", &pubkey).ok();
+
+    tracing::info!(
+        "[cmd:fetch_profile_content] pubkey={}… stored {} events from {} relay events",
+        &pubkey[..pubkey.len().min(12)],
+        stored,
+        events.len()
+    );
+
+    Ok(stored)
+}
+
+#[tauri::command]
+async fn fetch_note_context_from_relays(
+    note_id: String,
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<u32, String> {
+    use nostr_sdk::prelude::*;
+
+    let cfg = state.config.read().await;
+    let hex_pubkey = cfg.hex_pubkey.clone().unwrap_or_default();
+    let fallback_relays = cfg.outbound_relays.clone();
+    drop(cfg);
+
+    let relay_urls = resolve_sync_relays(&state.db(), &hex_pubkey, &fallback_relays);
+    if relay_urls.is_empty() {
+        return Err("No relays available".into());
+    }
+
+    let event_id = EventId::from_hex(&note_id)
+        .map_err(|e| format!("Invalid event ID: {}", e))?;
+
+    // Fetch the event itself + replies + reactions + zaps
+    let filters = vec![
+        Filter::new().id(event_id).limit(1),
+        Filter::new().event(event_id).kinds(vec![Kind::TextNote]).limit(500),
+        Filter::new().event(event_id).kinds(vec![Kind::Reaction, Kind::from(9735u16)]).limit(500),
+    ];
+
+    let pool = crate::sync::pool::RelayPool::new();
+    let events = pool.subscribe_and_collect(
+        &relay_urls,
+        filters,
+        15,
+    ).await.map_err(|e| format!("Relay fetch failed: {}", e))?;
+
+    if events.is_empty() {
+        return Ok(0);
+    }
+
+    let db = state.db();
+    let graph = Arc::clone(&state.wot_graph);
+    let (stored, _) = crate::sync::processing::process_events(
+        &events,
+        &db,
+        &graph,
+        &hex_pubkey,
+        crate::sync::types::EventSource::ThreadContext,
+        None,
+        "note-context",
+    );
+
+    // Emit thread-updated so frontend can refresh
+    app_handle.emit("thread-updated", &note_id).ok();
+
+    tracing::info!(
+        "[cmd:fetch_note_context] note={}… stored {} events",
+        &note_id[..note_id.len().min(12)],
+        stored
+    );
+
+    Ok(stored)
+}
+
+#[tauri::command]
+async fn fetch_enrichment_from_relays(
+    event_ids: Vec<String>,
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<u32, String> {
+    use nostr_sdk::prelude::*;
+
+    if event_ids.is_empty() {
+        return Ok(0);
+    }
+
+    // Filter to only stale IDs (not fetched in last 10 minutes)
+    let stale_ids = state.db().get_stale_enrichment_ids(&event_ids, 600)
+        .map_err(|e| format!("Failed to check enrichment staleness: {}", e))?;
+
+    if stale_ids.is_empty() {
+        return Ok(0);
+    }
+
+    // Cap batch size to avoid relay overload
+    let batch: Vec<String> = stale_ids.into_iter().take(50).collect();
+
+    let cfg = state.config.read().await;
+    let hex_pubkey = cfg.hex_pubkey.clone().unwrap_or_default();
+    let fallback_relays = cfg.outbound_relays.clone();
+    drop(cfg);
+
+    let relay_urls = resolve_sync_relays(&state.db(), &hex_pubkey, &fallback_relays);
+    if relay_urls.is_empty() {
+        return Err("No relays available".into());
+    }
+
+    // Build filters: reactions + zaps for each event
+    let mut filters = Vec::new();
+    for id_hex in &batch {
+        if let Ok(event_id) = EventId::from_hex(id_hex) {
+            filters.push(
+                Filter::new()
+                    .event(event_id)
+                    .kinds(vec![Kind::Reaction, Kind::from(9735u16)])
+                    .limit(200),
+            );
+        }
+    }
+
+    if filters.is_empty() {
+        return Ok(0);
+    }
+
+    let pool = crate::sync::pool::RelayPool::new();
+    let events = pool.subscribe_and_collect(
+        &relay_urls,
+        filters,
+        15,
+    ).await.map_err(|e| format!("Enrichment relay fetch failed: {}", e))?;
+
+    let stored = if events.is_empty() {
+        0u32
+    } else {
+        let db = state.db();
+        let graph = Arc::clone(&state.wot_graph);
+        let (s, _) = crate::sync::processing::process_events(
+            &events,
+            &db,
+            &graph,
+            &hex_pubkey,
+            crate::sync::types::EventSource::ThreadContext,
+            None,
+            "enrichment",
+        );
+        s
+    };
+
+    // Mark all batch IDs as enriched (even if 0 results — we checked)
+    state.db().set_enrichment_timestamps(&batch)
+        .map_err(|e| format!("Failed to update enrichment timestamps: {}", e))?;
+
+    // Notify frontend
+    app_handle.emit("enrichment-updated", &batch).ok();
+
+    tracing::info!(
+        "[cmd:fetch_enrichment] enriched {} events, stored {} from relays",
+        batch.len(),
+        stored
+    );
+
+    Ok(stored)
+}
+
+#[tauri::command]
+async fn fetch_addressable_event_from_relays(
+    kind: u16,
+    pubkey: String,
+    d_tag: String,
+    state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    use nostr_sdk::prelude::*;
+
+    let cfg = state.config.read().await;
+    let hex_pubkey = cfg.hex_pubkey.clone().unwrap_or_default();
+    let fallback_relays = cfg.outbound_relays.clone();
+    drop(cfg);
+
+    let relay_urls = resolve_sync_relays(&state.db(), &hex_pubkey, &fallback_relays);
+    if relay_urls.is_empty() {
+        return Err("No relays available".into());
+    }
+
+    let pk = PublicKey::from_hex(&pubkey)
+        .map_err(|e| format!("Invalid pubkey: {}", e))?;
+
+    let filter = Filter::new()
+        .kind(Kind::from(kind))
+        .authors(vec![pk])
+        .custom_tag(SingleLetterTag::lowercase(Alphabet::D), vec![d_tag])
+        .limit(1);
+
+    let pool = crate::sync::pool::RelayPool::new();
+    let events = pool.subscribe_and_collect(
+        &relay_urls,
+        vec![filter],
+        10,
+    ).await.map_err(|e| format!("Relay fetch failed: {}", e))?;
+
+    if events.is_empty() {
+        return Ok(None);
+    }
+
+    let event_id = events[0].id.to_hex();
+
+    let db = state.db();
+    let graph = Arc::clone(&state.wot_graph);
+    crate::sync::processing::process_events(
+        &events,
+        &db,
+        &graph,
+        &hex_pubkey,
+        crate::sync::types::EventSource::Search,
+        None,
+        "naddr-fetch",
+    );
+
+    Ok(Some(event_id))
 }
 
 #[tauri::command]
@@ -1782,6 +2231,7 @@ async fn bookmark_media(
         name: None,
         display_name: None,
         picture: None,
+        picture_local: None,
         nip05: None,
         about: None,
         banner: None,
@@ -2337,7 +2787,7 @@ async fn get_storage_estimate(state: State<'_, AppState>) -> Result<StorageEstim
 }
 
 #[tauri::command]
-async fn start_relay(state: State<'_, AppState>) -> Result<(), String> {
+async fn start_relay(app_handle: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     tracing::info!("[cmd:start_relay] called");
     let existing = state.relay_cancel.read().await;
     if existing.is_some() {
@@ -2354,28 +2804,36 @@ async fn start_relay(state: State<'_, AppState>) -> Result<(), String> {
     let db = state.db();
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
+    let outbound_tx = spawn_outbound_broadcaster(state.config.clone(), app_handle);
 
-    let cert_path = dirs::home_dir()
-        .unwrap_or_default()
-        .join(".nostrito/certs/localhost.pem");
-    let key_path = dirs::home_dir()
-        .unwrap_or_default()
-        .join(".nostrito/certs/localhost-key.pem");
+    let cp = paths::cert_path(&state.data_dir);
+    let kp = paths::key_path(&state.data_dir);
 
-    if cert_path.exists() && key_path.exists() {
+    if cp.exists() && kp.exists() {
+        let tls_cancel = cancel_clone.clone();
+        let tls_db = db.clone();
+        let tls_allowed = allowed_pubkey.clone();
+        let tls_outbound = outbound_tx.clone();
         tracing::info!("[relay] Starting TLS relay on wss://127.0.0.1:{}", port);
         tokio::spawn(async move {
             if let Err(e) =
-                relay::run_relay_tls(port, cert_path, key_path, db, allowed_pubkey, cancel_clone)
+                relay::run_relay_tls(port, cp, kp, tls_db, tls_allowed, tls_cancel, Some(tls_outbound))
                     .await
             {
                 tracing::error!("TLS relay error: {}", e);
             }
         });
+        let plain_port = port + 1;
+        tracing::info!("[relay] Starting plain relay on ws://127.0.0.1:{} (browser fallback)", plain_port);
+        tokio::spawn(async move {
+            if let Err(e) = relay::run_relay(plain_port, db, allowed_pubkey, cancel_clone, Some(outbound_tx)).await {
+                tracing::error!("Plain relay error: {}", e);
+            }
+        });
     } else {
         tracing::info!("[relay] Starting plain relay on ws://127.0.0.1:{}", port);
         tokio::spawn(async move {
-            if let Err(e) = relay::run_relay(port, db, allowed_pubkey, cancel_clone).await {
+            if let Err(e) = relay::run_relay(port, db, allowed_pubkey, cancel_clone, Some(outbound_tx)).await {
                 tracing::error!("Relay server error: {}", e);
             }
         });
@@ -2549,6 +3007,7 @@ pub struct TrackedProfileDetail {
     pub name: Option<String>,
     pub display_name: Option<String>,
     pub picture: Option<String>,
+    pub picture_local: Option<String>,
     pub event_count: u64,
 }
 
@@ -2940,6 +3399,7 @@ async fn get_tracked_profiles_detail(state: State<'_, AppState>) -> Result<Vec<T
             name: info.and_then(|p| p.name.clone()),
             display_name: info.and_then(|p| p.display_name.clone()),
             picture: info.and_then(|p| p.picture.clone()),
+            picture_local: info.and_then(|p| p.picture_local.clone()),
             event_count,
         });
     }
@@ -2982,6 +3442,34 @@ async fn get_events_for_category(
         .map_err(|e| e.to_string())?;
 
     Ok(rows_to_events(rows))
+}
+
+#[tauri::command]
+async fn get_media_for_category(
+    category: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<OwnMediaItem>, String> {
+    let config = state.config.read().await;
+    let own_pubkey = config.hex_pubkey.clone().unwrap_or_default();
+    drop(config);
+
+    let records = state.db()
+        .get_media_for_category(&own_pubkey, &category)
+        .map_err(|e| e.to_string())?;
+
+    Ok(records.into_iter().map(|(hash, url, mime_type, size_bytes, downloaded_at)| {
+        let local_path = paths::media_file_path(&state.data_dir, &hash)
+            .to_string_lossy()
+            .to_string();
+        OwnMediaItem {
+            hash,
+            url,
+            local_path,
+            mime_type,
+            size_bytes,
+            downloaded_at: downloaded_at as u64,
+        }
+    }).collect())
 }
 
 /// A media reference extracted from a stored event, with optional local cache info.
@@ -3096,6 +3584,52 @@ async fn get_event_media_for_category(
 }
 
 #[tauri::command]
+async fn requeue_profile_media(pubkey: String, state: State<'_, AppState>) -> Result<u32, String> {
+    tracing::info!("[cmd:requeue_profile_media] pubkey={}...", &pubkey[..pubkey.len().min(12)]);
+    state.db().requeue_events_media(&pubkey).map_err(|e| e.to_string())
+}
+
+/// Download pending media for tracked profiles immediately (doesn't wait for sync cycle).
+#[tauri::command]
+async fn download_tracked_media(state: State<'_, AppState>) -> Result<u32, String> {
+    tracing::info!("[cmd:download_tracked_media] starting immediate download for tracked profiles");
+    let config = state.config.read().await;
+    let own_pubkey = config.hex_pubkey.clone().unwrap_or_default();
+    let tracked_media_gb = config.storage_tracked_media_gb;
+    let wot_media_gb = config.storage_wot_media_gb;
+    drop(config);
+
+    let db = state.db();
+
+    // Ensure tracked profiles' media is queued
+    let tracked_pks = db.get_tracked_pubkeys().unwrap_or_default();
+    for tpk in &tracked_pks {
+        if tpk != &own_pubkey {
+            db.requeue_events_media(tpk).ok();
+        }
+    }
+
+    // Run media downloader for queued items
+    let downloader = sync::media::MediaDownloader::new(
+        db.clone(),
+        own_pubkey,
+        tracked_media_gb,
+        wot_media_gb,
+        state.data_dir.clone(),
+    );
+    match downloader.run(200).await {
+        Ok(stats) => {
+            tracing::info!(
+                "[cmd:download_tracked_media] done: downloaded={}, skipped={}, failed={}",
+                stats.downloaded, stats.skipped, stats.failed
+            );
+            Ok(stats.downloaded)
+        }
+        Err(e) => Err(format!("Media download failed: {}", e)),
+    }
+}
+
+#[tauri::command]
 async fn get_profiles(
     pubkeys: Vec<String>,
     state: State<'_, AppState>,
@@ -3104,6 +3638,19 @@ async fn get_profiles(
     state.db()
         .get_profiles(&pubkeys)
         .map_err(|e| format!("Failed to get profiles: {}", e))
+}
+
+#[tauri::command]
+async fn search_profiles(
+    query: String,
+    limit: Option<u32>,
+    state: State<'_, AppState>,
+) -> Result<Vec<ProfileInfo>, String> {
+    let lim = limit.unwrap_or(20);
+    tracing::debug!("[cmd:search_profiles] query={:?}, limit={}", query, lim);
+    state.db()
+        .search_profiles(&query, lim)
+        .map_err(|e| format!("Failed to search profiles: {}", e))
 }
 
 #[tauri::command]
@@ -3126,7 +3673,8 @@ async fn get_own_profile(state: State<'_, AppState>) -> Result<Option<ProfileInf
 // ── Browser Integration (mkcert TLS) ───────────────────────────────
 
 /// Core mkcert setup logic — synchronous, reusable by both auto-setup and manual command.
-fn run_mkcert_setup(app: &tauri::AppHandle) -> Result<String, String> {
+#[cfg(desktop)]
+fn run_mkcert_setup(app: &tauri::AppHandle, data_dir: &Path) -> Result<String, String> {
     use std::process::Command;
 
     // Find bundled mkcert
@@ -3174,9 +3722,7 @@ fn run_mkcert_setup(app: &tauri::AppHandle) -> Result<String, String> {
     }
 
     // Generate cert
-    let cert_dir = dirs::home_dir()
-        .ok_or("no home dir")?
-        .join(".nostrito/certs");
+    let cert_dir = paths::certs_dir(data_dir);
     std::fs::create_dir_all(&cert_dir).map_err(|e| e.to_string())?;
 
     let gen = Command::new(&mkcert_path)
@@ -3204,16 +3750,220 @@ fn run_mkcert_setup(app: &tauri::AppHandle) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn setup_browser_integration(app: tauri::AppHandle) -> Result<String, String> {
-    let app_clone = app.clone();
-    let result = tokio::task::spawn_blocking(move || run_mkcert_setup(&app_clone))
-        .await
-        .map_err(|e| format!("Task failed: {}", e))??;
+async fn setup_browser_integration(#[allow(unused)] app: tauri::AppHandle, #[allow(unused)] state: State<'_, AppState>) -> Result<String, String> {
+    #[cfg(desktop)]
+    {
+        let app_clone = app.clone();
+        let data_dir = state.data_dir.clone();
+        let result = tokio::task::spawn_blocking(move || run_mkcert_setup(&app_clone, &data_dir))
+            .await
+            .map_err(|e| format!("Task failed: {}", e))??;
+        app.emit("relay:restart_required", ()).ok();
+        return Ok(result);
+    }
+    #[cfg(mobile)]
+    Err("Browser integration is not available on mobile".to_string())
+}
 
-    // Signal frontend to restart relay with TLS
-    app.emit("relay:restart_required", ()).ok();
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MediaStats {
+    pub total_bytes: u64,
+    pub file_count: u64,
+    pub limit_bytes: u64,
+    pub tracked_bytes: u64,
+    pub tracked_limit_bytes: u64,
+    pub wot_bytes: u64,
+    pub wot_limit_bytes: u64,
+}
 
-    Ok(result)
+#[tauri::command]
+async fn get_media_stats(state: State<'_, AppState>) -> Result<MediaStats, String> {
+    let db = state.db();
+    let config = state.config.read().await;
+    let own_pubkey = config.hex_pubkey.as_deref().unwrap_or("");
+    let total_bytes = db.media_total_bytes().map_err(|e| e.to_string())?;
+    let file_count = db.media_file_count().map_err(|e| e.to_string())?;
+    let tracked_bytes = db.media_tracked_bytes(own_pubkey).map_err(|e| e.to_string())?;
+    let wot_bytes = db.media_others_bytes(own_pubkey).map_err(|e| e.to_string())?;
+    let tracked_limit_bytes = (config.storage_tracked_media_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+    let wot_limit_bytes = (config.storage_wot_media_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+    Ok(MediaStats {
+        total_bytes,
+        file_count,
+        limit_bytes: tracked_limit_bytes + wot_limit_bytes,
+        tracked_bytes,
+        tracked_limit_bytes,
+        wot_bytes,
+        wot_limit_bytes,
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OwnMediaItem {
+    pub hash: String,
+    pub url: String,
+    pub local_path: String,
+    pub mime_type: String,
+    pub size_bytes: u64,
+    pub downloaded_at: u64,
+}
+
+#[tauri::command]
+async fn get_own_media(state: State<'_, AppState>) -> Result<Vec<OwnMediaItem>, String> {
+    tracing::debug!("[cmd:get_own_media] called");
+    let config = state.config.read().await;
+    let own_pubkey = config.hex_pubkey.clone().unwrap_or_default();
+    drop(config);
+
+    if own_pubkey.is_empty() {
+        return Err("Not initialized — no pubkey set".into());
+    }
+
+    let records = state.db().get_own_media(&own_pubkey).map_err(|e| e.to_string())?;
+    tracing::info!("[cmd:get_own_media] returning {} own media items", records.len());
+
+    Ok(records.into_iter().map(|(hash, url, mime_type, size_bytes, downloaded_at)| {
+        let local_path = paths::media_file_path(&state.data_dir, &hash)
+            .to_string_lossy()
+            .to_string();
+        OwnMediaItem {
+            hash,
+            url,
+            local_path,
+            mime_type,
+            size_bytes,
+            downloaded_at: downloaded_at as u64,
+        }
+    }).collect())
+}
+
+#[tauri::command]
+async fn get_profile_media(pubkey: String, state: State<'_, AppState>) -> Result<Vec<OwnMediaItem>, String> {
+    tracing::debug!("[cmd:get_profile_media] called for pubkey={}...", &pubkey[..pubkey.len().min(8)]);
+
+    let records = state.db().get_profile_media(&pubkey).map_err(|e| e.to_string())?;
+    tracing::info!("[cmd:get_profile_media] returning {} media items for {}...", records.len(), &pubkey[..pubkey.len().min(8)]);
+
+    Ok(records.into_iter().map(|(hash, url, mime_type, size_bytes, downloaded_at)| {
+        let local_path = paths::media_file_path(&state.data_dir, &hash)
+            .to_string_lossy()
+            .to_string();
+        OwnMediaItem {
+            hash,
+            url,
+            local_path,
+            mime_type,
+            size_bytes,
+            downloaded_at: downloaded_at as u64,
+        }
+    }).collect())
+}
+
+/// On-demand download of a profile's media. Queues URLs from their events,
+/// then downloads in batches, emitting `profile-media-batch` events for
+/// progressive UI updates. Media is cached for at least 1 hour before
+/// becoming eligible for LRU eviction.
+#[tauri::command]
+async fn fetch_profile_media(
+    pubkey: String,
+    app_handle: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<u32, String> {
+    tracing::info!("[cmd:fetch_profile_media] pubkey={}...", &pubkey[..pubkey.len().min(12)]);
+
+    let config = state.config.read().await;
+    let own_pubkey = config.hex_pubkey.clone().unwrap_or_default();
+    let tracked_media_gb = config.storage_tracked_media_gb;
+    let wot_media_gb = config.storage_wot_media_gb;
+    drop(config);
+
+    let db = state.db();
+
+    // Step 1: queue all media URLs from this profile's events
+    let queued = db.requeue_events_media(&pubkey).unwrap_or(0);
+    tracing::info!("[cmd:fetch_profile_media] queued {} URLs for {}...", queued, &pubkey[..pubkey.len().min(12)]);
+
+    if queued == 0 {
+        // Nothing new to download — check if there's already queued items
+        let pending = db.media_queue_count_for_pubkey(&pubkey).unwrap_or(0);
+        if pending == 0 {
+            return Ok(0);
+        }
+    }
+
+    // Step 2: download in batches of 10, emitting progress events
+    let downloader = sync::media::MediaDownloader::new(
+        db.clone(),
+        own_pubkey,
+        tracked_media_gb,
+        wot_media_gb,
+        state.data_dir.clone(),
+    );
+
+    let data_dir = state.data_dir.clone();
+    let mut total_downloaded: u32 = 0;
+    const BATCH_SIZE: usize = 10;
+
+    loop {
+        let urls = db.dequeue_media_urls_for_pubkey(&pubkey, BATCH_SIZE)
+            .unwrap_or_default();
+        if urls.is_empty() {
+            break;
+        }
+
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| e.to_string())?;
+
+        let mut batch_items: Vec<OwnMediaItem> = Vec::new();
+
+        for (url, pk) in &urls {
+            let hash = sync::media::extract_sha256_from_url(url)
+                .unwrap_or_else(|| sync::media::sha256_of_string(url));
+
+            if db.media_exists(&hash) {
+                continue;
+            }
+
+            match downloader.download_one(&http_client, url, &hash, pk).await {
+                Ok(Some((mime, size))) => {
+                    let local_path = paths::media_file_path(&data_dir, &hash)
+                        .to_string_lossy()
+                        .to_string();
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    batch_items.push(OwnMediaItem {
+                        hash,
+                        url: url.clone(),
+                        local_path,
+                        mime_type: mime,
+                        size_bytes: size,
+                        downloaded_at: now,
+                    });
+                    total_downloaded += 1;
+                }
+                Ok(None) => {} // skipped
+                Err(e) => {
+                    tracing::debug!("[cmd:fetch_profile_media] failed {}: {}", url, e);
+                }
+            }
+        }
+
+        // Emit batch of newly downloaded items so the UI can update progressively
+        if !batch_items.is_empty() {
+            app_handle.emit("profile-media-batch", &batch_items).ok();
+        }
+    }
+
+    tracing::info!(
+        "[cmd:fetch_profile_media] done: {} items downloaded for {}...",
+        total_downloaded,
+        &pubkey[..pubkey.len().min(12)]
+    );
+    Ok(total_downloaded)
 }
 
 // ── Profile Fetch Types ────────────────────────────────────────────
@@ -3461,33 +4211,198 @@ async fn get_profile_with_refresh(
 }
 
 #[tauri::command]
-async fn check_browser_integration() -> Result<bool, String> {
-    let cert_path = dirs::home_dir()
-        .ok_or("no home")?
-        .join(".nostrito/certs/localhost.pem");
-    Ok(cert_path.exists())
+async fn check_browser_integration(state: State<'_, AppState>) -> Result<bool, String> {
+    #[cfg(desktop)]
+    {
+        let cp = paths::cert_path(&state.data_dir);
+        return Ok(cp.exists());
+    }
+    #[cfg(mobile)]
+    Ok(false)
+}
+
+// ── Data Directory Management ──────────────────────────────────────
+
+#[tauri::command]
+fn get_data_dir(state: State<'_, AppState>) -> String {
+    state.data_dir.to_string_lossy().to_string()
+}
+
+#[tauri::command]
+fn get_default_data_dir() -> String {
+    paths::default_data_root().to_string_lossy().to_string()
+}
+
+#[tauri::command]
+fn get_platform() -> String {
+    paths::platform().to_string()
+}
+
+#[tauri::command]
+async fn set_data_dir(
+    path: String,
+    migrate: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let new_root = PathBuf::from(&path);
+
+    // Validate the path is writable
+    std::fs::create_dir_all(&new_root)
+        .map_err(|e| format!("Cannot create directory {}: {}", path, e))?;
+
+    // Test write access
+    let test_file = new_root.join(".nostrito_write_test");
+    std::fs::write(&test_file, b"test")
+        .map_err(|e| format!("Directory is not writable: {}", e))?;
+    std::fs::remove_file(&test_file).ok();
+
+    if migrate {
+        let old_root = state.data_dir.clone();
+        if old_root != new_root {
+            tracing::info!(
+                "[set_data_dir] Migrating data from {} → {}",
+                old_root.display(),
+                new_root.display()
+            );
+
+            // Copy all files from old root to new root
+            copy_data_dir_contents(&old_root, &new_root)
+                .map_err(|e| format!("Migration failed: {}", e))?;
+
+            tracing::info!("[set_data_dir] Migration complete");
+        }
+    }
+
+    // Write the bootstrap config
+    paths::write_data_root(&new_root)?;
+
+    tracing::info!("[set_data_dir] Bootstrap config updated to {}", new_root.display());
+    Ok(())
+}
+
+/// Copy all data files from one root to another (databases, media, certs, logs).
+fn copy_data_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dst).map_err(|e| format!("create dst: {}", e))?;
+
+    for entry in std::fs::read_dir(src).map_err(|e| format!("read src: {}", e))? {
+        let entry = entry.map_err(|e| format!("read entry: {}", e))?;
+        let dest_path = dst.join(entry.file_name());
+
+        if dest_path.exists() {
+            continue; // Don't overwrite existing files in destination
+        }
+
+        if entry.file_type().map_err(|e| format!("file type: {}", e))?.is_dir() {
+            copy_dir_recursive_fallible(&entry.path(), &dest_path)?;
+        } else {
+            std::fs::copy(entry.path(), &dest_path)
+                .map_err(|e| format!("copy {:?}: {}", entry.file_name(), e))?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_dir_recursive_fallible(src: &Path, dst: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dst).map_err(|e| format!("create dir {:?}: {}", dst, e))?;
+    for entry in std::fs::read_dir(src).map_err(|e| format!("read dir: {}", e))? {
+        let entry = entry.map_err(|e| format!("entry: {}", e))?;
+        let dest_path = dst.join(entry.file_name());
+        if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+            copy_dir_recursive_fallible(&entry.path(), &dest_path)?;
+        } else {
+            std::fs::copy(entry.path(), &dest_path)
+                .map_err(|e| format!("copy {:?}: {}", entry.file_name(), e))?;
+        }
+    }
+    Ok(())
+}
+
+// ── Mobile secret storage (file-based, app-private sandbox) ─────────
+
+#[cfg(mobile)]
+mod mobile_secrets {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    fn secrets_path() -> PathBuf {
+        crate::paths::default_data_root()
+            .join(".secrets.json")
+    }
+
+    fn load_all() -> HashMap<String, String> {
+        std::fs::read_to_string(secrets_path())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn save_all(secrets: &HashMap<String, String>) {
+        let path = secrets_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        if let Ok(json) = serde_json::to_string(secrets) {
+            std::fs::write(&path, json).ok();
+        }
+    }
+
+    pub fn set(service: &str, key: &str, value: &str) -> Result<(), String> {
+        let mut m = load_all();
+        m.insert(format!("{}:{}", service, key), value.to_string());
+        save_all(&m);
+        Ok(())
+    }
+
+    pub fn get(service: &str, key: &str) -> Option<String> {
+        load_all().get(&format!("{}:{}", service, key)).cloned()
+    }
+
+    pub fn delete(service: &str, key: &str) {
+        let mut m = load_all();
+        m.remove(&format!("{}:{}", service, key));
+        save_all(&m);
+    }
 }
 
 // ── nsec Keychain Helpers ────────────────────────────────────────────
 
+#[cfg(desktop)]
 fn save_nsec_to_keychain(npub: &str, nsec: &str) -> Result<(), String> {
     let entry = keyring::Entry::new("nostrito", npub).map_err(|e| format!("Keychain error: {}", e))?;
     entry.set_password(nsec).map_err(|e| format!("Failed to save to keychain: {}", e))
 }
 
+#[cfg(mobile)]
+fn save_nsec_to_keychain(npub: &str, nsec: &str) -> Result<(), String> {
+    mobile_secrets::set("nostrito", npub, nsec)
+}
+
+#[cfg(desktop)]
 fn load_nsec_from_keychain(npub: &str) -> Option<String> {
     let entry = keyring::Entry::new("nostrito", npub).ok()?;
     entry.get_password().ok()
 }
 
+#[cfg(mobile)]
+fn load_nsec_from_keychain(npub: &str) -> Option<String> {
+    mobile_secrets::get("nostrito", npub)
+}
+
+#[cfg(desktop)]
 fn delete_nsec_from_keychain(npub: &str) {
     if let Ok(entry) = keyring::Entry::new("nostrito", npub) {
         entry.delete_credential().ok();
     }
 }
 
+#[cfg(mobile)]
+fn delete_nsec_from_keychain(npub: &str) {
+    mobile_secrets::delete("nostrito", npub);
+}
+
 // ── NIP-46 Bunker Keychain Helpers ─────────────────────────────────
 
+#[cfg(desktop)]
 fn save_bunker_to_keychain(npub: &str, bunker_uri: &str, app_keys_nsec: &str) -> Result<(), String> {
     let uri_entry = keyring::Entry::new("nostrito-bunker-uri", npub)
         .map_err(|e| format!("Keychain error: {}", e))?;
@@ -3502,6 +4417,13 @@ fn save_bunker_to_keychain(npub: &str, bunker_uri: &str, app_keys_nsec: &str) ->
     Ok(())
 }
 
+#[cfg(mobile)]
+fn save_bunker_to_keychain(npub: &str, bunker_uri: &str, app_keys_nsec: &str) -> Result<(), String> {
+    mobile_secrets::set("nostrito-bunker-uri", npub, bunker_uri)?;
+    mobile_secrets::set("nostrito-app-keys", npub, app_keys_nsec)
+}
+
+#[cfg(desktop)]
 fn load_bunker_from_keychain(npub: &str) -> Option<(String, String)> {
     let uri_entry = keyring::Entry::new("nostrito-bunker-uri", npub).ok()?;
     let uri = uri_entry.get_password().ok()?;
@@ -3510,6 +4432,14 @@ fn load_bunker_from_keychain(npub: &str) -> Option<(String, String)> {
     Some((uri, keys_nsec))
 }
 
+#[cfg(mobile)]
+fn load_bunker_from_keychain(npub: &str) -> Option<(String, String)> {
+    let uri = mobile_secrets::get("nostrito-bunker-uri", npub)?;
+    let keys_nsec = mobile_secrets::get("nostrito-app-keys", npub)?;
+    Some((uri, keys_nsec))
+}
+
+#[cfg(desktop)]
 fn delete_bunker_from_keychain(npub: &str) {
     if let Ok(entry) = keyring::Entry::new("nostrito-bunker-uri", npub) {
         entry.delete_credential().ok();
@@ -3519,6 +4449,12 @@ fn delete_bunker_from_keychain(npub: &str) {
     }
 }
 
+#[cfg(mobile)]
+fn delete_bunker_from_keychain(npub: &str) {
+    mobile_secrets::delete("nostrito-bunker-uri", npub);
+    mobile_secrets::delete("nostrito-app-keys", npub);
+}
+
 #[tauri::command]
 fn nsec_to_npub(nsec: String) -> Result<String, String> {
     use nostr_sdk::prelude::*;
@@ -3526,6 +4462,44 @@ fn nsec_to_npub(nsec: String) -> Result<String, String> {
         .map_err(|e| format!("Invalid nsec: {}", e))?;
     let keys = Keys::new(secret_key);
     keys.public_key().to_bech32().map_err(|e| format!("Failed to encode npub: {}", e))
+}
+
+#[tauri::command]
+fn generate_keypair() -> Result<serde_json::Value, String> {
+    use nostr_sdk::prelude::*;
+    let keys = Keys::generate();
+    let nsec = keys.secret_key().to_bech32()
+        .map_err(|e| format!("Failed to encode nsec: {}", e))?;
+    let npub = keys.public_key().to_bech32()
+        .map_err(|e| format!("Failed to encode npub: {}", e))?;
+    Ok(serde_json::json!({ "nsec": nsec, "npub": npub }))
+}
+
+#[tauri::command]
+async fn publish_metadata(
+    name: Option<String>,
+    about: Option<String>,
+    picture: Option<String>,
+    nip05: Option<String>,
+    lud16: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    use nostr_sdk::prelude::*;
+
+    let mut metadata = Metadata::new();
+    if let Some(v) = name { metadata = metadata.name(v); }
+    if let Some(v) = about { metadata = metadata.about(v); }
+    if let Some(v) = picture {
+        if let Ok(url) = nostr_sdk::prelude::Url::parse(&v) {
+            metadata = metadata.picture(url);
+        }
+    }
+    if let Some(v) = nip05 { metadata = metadata.nip05(v); }
+    if let Some(v) = lud16 { metadata = metadata.lud16(v); }
+
+    let builder = EventBuilder::metadata(&metadata);
+    let event = sign_build_publish_store(builder, &state).await?;
+    Ok(event.id.to_hex())
 }
 
 #[tauri::command]
@@ -3559,6 +4533,7 @@ async fn set_nsec(nsec: String, app_handle: tauri::AppHandle, state: State<'_, A
     {
         let mut config = state.config.write().await;
         config.nsec = Some(nsec_trimmed.to_string());
+        config.signing_mode = "nsec".to_string();
     }
 
     app_handle.emit("signing-mode-changed", "nsec").ok();
@@ -3599,6 +4574,63 @@ async fn get_signing_mode(state: State<'_, AppState>) -> Result<String, String> 
 }
 
 #[tauri::command]
+async fn publish_dm(
+    content: String,
+    recipient_pubkey: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    use nostr_sdk::prelude::*;
+
+    tracing::info!("[cmd:publish_dm] sending DM to {}...", &recipient_pubkey[..12.min(recipient_pubkey.len())]);
+
+    let recipient_pk = PublicKey::from_hex(&recipient_pubkey)
+        .map_err(|e| format!("Invalid recipient pubkey: {}", e))?;
+    tracing::info!("[cmd:publish_dm] step 1: parsed recipient pk");
+
+    // Encrypt content with NIP-04
+    let config = state.config.read().await;
+    let nsec = config.nsec.clone();
+    let signing_mode = config.signing_mode.clone();
+    drop(config);
+    tracing::info!("[cmd:publish_dm] step 2: got config, signing_mode={}, has_nsec={}", signing_mode, nsec.is_some());
+
+    let use_nsec = nsec.is_some();
+    let encrypted = if use_nsec {
+        tracing::info!("[cmd:publish_dm] step 3a: encrypting locally with nsec");
+        let secret_key = SecretKey::from_bech32(nsec.as_ref().unwrap())
+            .map_err(|e| format!("Invalid nsec: {}", e))?;
+        let enc = nip04::encrypt(&secret_key, &recipient_pk, &content)
+            .map_err(|e| format!("NIP-04 encryption failed: {}", e))?;
+        tracing::info!("[cmd:publish_dm] step 3a: encrypted OK, len={}", enc.len());
+        enc
+    } else {
+        tracing::info!("[cmd:publish_dm] step 3b: encrypting via NIP-46");
+        let signer_opt = {
+            let guard = state.nip46_signer.read().await;
+            guard.clone()
+        };
+        match signer_opt {
+            Some(signer) => {
+                signer.nip04_encrypt(recipient_pk, content.clone())
+                    .await
+                    .map_err(|e| format!("Remote NIP-04 encryption failed: {}", e))?
+            }
+            None => return Err("No signer available — cannot send DMs in read-only mode".into()),
+        }
+    };
+    tracing::info!("[cmd:publish_dm] step 4: content encrypted, building event");
+
+    let tags = vec![
+        Tag::public_key(recipient_pk),
+    ];
+    let builder = EventBuilder::new(Kind::EncryptedDirectMessage, &encrypted, tags);
+    let signed = sign_build_publish_store(builder, &state).await?;
+    let dm_id = signed.id.to_hex();
+    tracing::info!("[cmd:publish_dm] published DM {}", &dm_id[..12.min(dm_id.len())]);
+    Ok(dm_id)
+}
+
+#[tauri::command]
 async fn decrypt_dm(content: String, sender_pubkey: String, state: State<'_, AppState>) -> Result<String, String> {
     use nostr_sdk::prelude::*;
 
@@ -3623,6 +4655,8 @@ async fn decrypt_dm(content: String, sender_pubkey: String, state: State<'_, App
         guard.clone()
     };
     if let Some(signer) = signer_opt {
+        tracing::debug!("[decrypt_dm] using NIP-46 signer (encryption={:?}, signer_pk={}...)",
+            signer.encryption(), &signer.signer_public_key().to_hex()[..12]);
         let decrypted = signer.nip04_decrypt(sender_pk, content)
             .await
             .map_err(|e| format!("Remote decryption failed: {}", e))?;
@@ -3632,11 +4666,541 @@ async fn decrypt_dm(content: String, sender_pubkey: String, state: State<'_, App
     Err("No signer available — read-only mode".into())
 }
 
+/// Publish a kind 10050 inbox relay list so other clients know where to send gift wraps.
+#[tauri::command]
+async fn publish_inbox_relays(
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    use nostr_sdk::prelude::*;
+
+    let config = state.config.read().await;
+    let outbound_relays = config.outbound_relays.clone();
+    drop(config);
+
+    // Use a subset of outbound relays as inbox relays, plus well-known DM relays
+    let mut inbox: Vec<String> = Vec::new();
+    for url in &[
+        "wss://auth.nostr1.com",
+        "wss://relay.0xchat.com",
+        "wss://nos.lol",
+        "wss://relay.damus.io",
+        "wss://relay.primal.net",
+    ] {
+        inbox.push(url.to_string());
+    }
+    // Add some of the user's outbound relays too
+    for url in outbound_relays.iter().take(3) {
+        if !inbox.contains(url) {
+            inbox.push(url.clone());
+        }
+    }
+
+    let tags: Vec<nostr_sdk::prelude::Tag> = inbox.iter()
+        .map(|url| Tag::custom(TagKind::Custom(std::borrow::Cow::Borrowed("relay")), vec![url.clone()]))
+        .collect();
+
+    tracing::info!("[cmd:publish_inbox_relays] publishing kind 10050 with {} relays: {:?}", tags.len(), inbox);
+
+    let builder = EventBuilder::new(Kind::from(10050), "", tags);
+    let signed = sign_build_publish_store(builder, &state).await?;
+    let id = signed.id.to_hex();
+    tracing::info!("[cmd:publish_inbox_relays] published kind 10050: {}", &id[..12]);
+    Ok(id)
+}
+
+/// Fetch new DMs from relays on-demand (called by frontend when a chat is open).
+/// Queries inbox relays for recent kind 4 + kind 1059 events addressed to the user.
+/// Pass `full_scan: true` on first load to go back 30 days instead of 5 minutes.
+#[tauri::command]
+async fn fetch_new_dms(
+    full_scan: Option<bool>,
+    state: State<'_, AppState>,
+) -> Result<u32, String> {
+    use nostr_sdk::prelude::*;
+
+    let config = state.config.read().await;
+    let hex_pubkey = config.hex_pubkey.clone().ok_or("No pubkey")?;
+    let outbound_relays = config.outbound_relays.clone();
+    drop(config);
+
+    let pk = PublicKey::from_hex(&hex_pubkey)
+        .map_err(|e| format!("Invalid pubkey: {}", e))?;
+
+    let inbox_relays = resolve_inbox_relays(&state.db(), &hex_pubkey, &outbound_relays);
+
+    let is_full = full_scan.unwrap_or(false);
+    tracing::info!("[cmd:fetch_new_dms] querying {} relays (full_scan={})", inbox_relays.len(), is_full);
+
+    // For polling: 5 minutes + 2 days for gift wrap timestamp fuzz
+    // For full scan: 30 days back
+    let since = if is_full {
+        chrono::Utc::now().timestamp() - (30 * 86400)
+    } else {
+        chrono::Utc::now().timestamp() - 300 - 172800 // 2 days + 5 min
+    };
+
+    let limit = if is_full { 500 } else { 50 };
+
+    let nip04_filter = Filter::new()
+        .pubkey(pk)
+        .kind(Kind::EncryptedDirectMessage)
+        .since(Timestamp::from(since.max(0) as u64))
+        .limit(limit);
+
+    let gw_filter = Filter::new()
+        .pubkey(pk)
+        .kind(Kind::GiftWrap)
+        .since(Timestamp::from(since.max(0) as u64))
+        .limit(limit);
+
+    let client = Client::default();
+    for url in &inbox_relays {
+        client.add_relay(url.as_str()).await.ok();
+    }
+    client.connect().await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let mut stored = 0u32;
+    let timeout_secs = if is_full { 15 } else { 8 };
+
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        client.get_events_of(
+            vec![nip04_filter, gw_filter],
+            nostr_sdk::EventSource::both(Some(std::time::Duration::from_secs(6))),
+        ),
+    ).await {
+        Ok(Ok(events)) => {
+            tracing::info!("[cmd:fetch_new_dms] fetched {} events", events.len());
+            for event in &events {
+                let event_id = event.id.to_hex();
+                let pubkey = event.pubkey.to_hex();
+                let kind = event.kind.as_u16() as u32;
+                let created_at = event.created_at.as_u64() as i64;
+                let tags_json = serde_json::to_string(
+                    &event.tags.iter()
+                        .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect::<Vec<String>>())
+                        .collect::<Vec<Vec<String>>>()
+                ).unwrap_or_else(|_| "[]".to_string());
+
+                if state.db().store_event(
+                    &event_id, &pubkey, created_at, kind,
+                    &tags_json, &event.content.to_string(), &event.sig.to_string(),
+                ).unwrap_or(false) {
+                    stored += 1;
+                }
+            }
+        }
+        Ok(Err(e)) => tracing::warn!("[cmd:fetch_new_dms] fetch error: {}", e),
+        Err(_) => tracing::debug!("[cmd:fetch_new_dms] fetch timed out"),
+    }
+
+    client.disconnect().await.ok();
+    tracing::info!("[cmd:fetch_new_dms] {} new DMs stored", stored);
+
+    Ok(stored)
+}
+
+/// Check for new DMs stored locally since `since_ts` (unix epoch) and show a native notification.
+/// Returns the count of new DMs found.
+#[tauri::command]
+async fn check_new_dms_notify(
+    since_ts: i64,
+    app_handle: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<i64, String> {
+    use tauri_plugin_notification::NotificationExt;
+
+    let config = state.config.read().await;
+    let hex_pubkey = config.hex_pubkey.clone().ok_or("No pubkey")?;
+    drop(config);
+
+    let count = state.db().count_new_dms_since(&hex_pubkey, since_ts)
+        .map_err(|e| format!("DB error: {}", e))?;
+
+    if count > 0 {
+        let label = if count == 1 { "new message" } else { "new messages" };
+        if let Err(e) = app_handle.notification()
+            .builder()
+            .title("Nostrito")
+            .body(&format!("{} {}", count, label))
+            .show()
+        {
+            tracing::debug!("[check_new_dms_notify] notification error: {}", e);
+        }
+    }
+
+    Ok(count)
+}
+
+/// Result of unwrapping a NIP-17 gift-wrapped DM.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnwrappedDm {
+    pub sender_pubkey: String,
+    pub recipient_pubkey: Option<String>,
+    pub content: String,
+    pub created_at: u64,
+    pub rumor_kind: u32,
+}
+
+#[tauri::command]
+async fn unwrap_gift_wrap(
+    event_id: String,
+    event_pubkey: String,
+    event_content: String,
+    event_created_at: u64,
+    event_tags: Vec<Vec<String>>,
+    event_sig: String,
+    state: State<'_, AppState>,
+) -> Result<UnwrappedDm, String> {
+    use nostr_sdk::prelude::*;
+
+    tracing::info!("[cmd:unwrap_gift_wrap] unwrapping event {}...", &event_id[..12.min(event_id.len())]);
+
+    // Try local nsec first (fast path — can use nip59::extract_rumor directly)
+    {
+        let config = state.config.read().await;
+        if let Some(ref nsec_str) = config.nsec {
+            if config.signing_mode == "nsec" {
+                let secret_key = SecretKey::from_bech32(nsec_str)
+                    .map_err(|e| format!("Invalid nsec: {}", e))?;
+                let receiver_keys = Keys::new(secret_key);
+
+                // Reconstruct the Event from components
+                let gift_wrap_event = reconstruct_event(
+                    &event_id, &event_pubkey, event_created_at,
+                    1059, &event_tags, &event_content, &event_sig,
+                )?;
+
+                let unwrapped = nip59::extract_rumor(&receiver_keys, &gift_wrap_event)
+                    .map_err(|e| format!("Gift wrap extraction failed: {}", e))?;
+
+                let content = unwrapped.rumor.content.clone();
+                let created_at = unwrapped.rumor.created_at.as_u64();
+                let kind = unwrapped.rumor.kind.as_u16() as u32;
+                let sender = unwrapped.sender.to_hex();
+
+                // Extract recipient from rumor's p-tag
+                let recipient = unwrapped.rumor.tags.iter()
+                    .find(|t| t.kind() == nostr_sdk::prelude::TagKind::SingleLetter(nostr_sdk::prelude::SingleLetterTag::lowercase(nostr_sdk::prelude::Alphabet::P)))
+                    .and_then(|t| t.content().map(|pk| pk.to_string()));
+
+                tracing::info!("[cmd:unwrap_gift_wrap] unwrapped: sender={}..., kind={}, content_len={}",
+                    &sender[..12], kind, content.len());
+
+                return Ok(UnwrappedDm {
+                    sender_pubkey: sender,
+                    recipient_pubkey: recipient,
+                    content,
+                    created_at,
+                    rumor_kind: kind,
+                });
+            }
+        }
+    }
+
+    // NIP-46 path: manually decrypt each layer using the remote signer's nip44_decrypt
+    let signer_opt = {
+        let guard = state.nip46_signer.read().await;
+        guard.clone()
+    };
+    if let Some(signer) = signer_opt {
+        tracing::info!("[cmd:unwrap_gift_wrap] using NIP-46 signer for unwrapping");
+
+        // Layer 1: decrypt gift wrap content to get the seal
+        let seal_json = signer.nip44_decrypt(
+            PublicKey::from_hex(&event_pubkey)
+                .map_err(|e| format!("Invalid gift wrap pubkey: {}", e))?,
+            event_content,
+        ).await.map_err(|e| format!("Gift wrap NIP-44 decrypt failed: {}", e))?;
+
+        let seal: Event = Event::from_json(&seal_json)
+            .map_err(|e| format!("Failed to parse seal event: {}", e))?;
+
+        // Layer 2: decrypt seal content to get the rumor
+        let rumor_json = signer.nip44_decrypt(
+            seal.pubkey,
+            seal.content.to_string(),
+        ).await.map_err(|e| format!("Seal NIP-44 decrypt failed: {}", e))?;
+
+        let rumor: UnsignedEvent = UnsignedEvent::from_json(&rumor_json)
+            .map_err(|e| format!("Failed to parse rumor event: {}", e))?;
+
+        let sender = seal.pubkey.to_hex();
+
+        // Extract recipient from rumor's p-tag
+        let recipient = rumor.tags.iter()
+            .find(|t| t.kind() == nostr_sdk::prelude::TagKind::SingleLetter(nostr_sdk::prelude::SingleLetterTag::lowercase(nostr_sdk::prelude::Alphabet::P)))
+            .and_then(|t| t.content().map(|pk| pk.to_string()));
+
+        tracing::info!("[cmd:unwrap_gift_wrap] NIP-46 unwrapped: sender={}..., kind={}, content_len={}",
+            &sender[..12], rumor.kind.as_u16(), rumor.content.len());
+
+        return Ok(UnwrappedDm {
+            sender_pubkey: sender,
+            recipient_pubkey: recipient,
+            content: rumor.content.clone(),
+            created_at: rumor.created_at.as_u64(),
+            rumor_kind: rumor.kind.as_u16() as u32,
+        });
+    }
+
+    Err("No signer available — cannot unwrap gift wrap in read-only mode".into())
+}
+
+/// Reconstruct a nostr_sdk Event from its component parts.
+fn reconstruct_event(
+    id: &str, pubkey: &str, created_at: u64,
+    kind: u16, tags: &[Vec<String>], content: &str, sig: &str,
+) -> Result<nostr_sdk::prelude::Event, String> {
+    use nostr_sdk::prelude::*;
+    let json = serde_json::json!({
+        "id": id,
+        "pubkey": pubkey,
+        "created_at": created_at,
+        "kind": kind,
+        "tags": tags,
+        "content": content,
+        "sig": sig,
+    });
+    Event::from_json(json.to_string())
+        .map_err(|e| format!("Failed to reconstruct event: {}", e))
+}
+
+/// Resolve inbox relays for a pubkey: kind 10050 → NIP-65 read → outbound + well-known DM relays.
+fn resolve_inbox_relays(db: &crate::storage::db::Database, pubkey: &str, fallback_relays: &[String]) -> Vec<String> {
+    use std::collections::HashSet;
+    let mut set: HashSet<String> = HashSet::new();
+
+    // 1. Kind 10050 (NIP-17 DM relay list) — highest priority
+    if let Ok(events) = db.query_events(
+        None,
+        Some(&[pubkey.to_string()]),
+        Some(&[10050]),
+        None,
+        None,
+        1,
+    ) {
+        for (_, _, _, _, tags_json, _, _) in &events {
+            if let Ok(tags) = serde_json::from_str::<Vec<Vec<String>>>(tags_json) {
+                for tag in &tags {
+                    if tag.len() >= 2 && tag[0] == "relay" {
+                        set.insert(tag[1].trim_end_matches('/').to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. NIP-65 read relays
+    if let Ok(nip65) = db.get_read_relays(pubkey) {
+        for (url, _) in nip65 {
+            set.insert(url);
+        }
+    }
+
+    // 3. Always include well-known DM relays and fallback outbound relays
+    for url in &[
+        "wss://auth.nostr1.com",
+        "wss://relay.0xchat.com",
+        "wss://nos.lol",
+        "wss://relay.damus.io",
+        "wss://relay.primal.net",
+    ] {
+        set.insert(url.to_string());
+    }
+    for url in fallback_relays {
+        set.insert(url.clone());
+    }
+
+    set.into_iter().collect()
+}
+
+/// Publish an event to a set of relays (fire-and-forget with timeout).
+async fn publish_to_relays(event: &nostr_sdk::prelude::Event, relays: &[String], label: &str) {
+    let client = nostr_sdk::Client::default();
+    for url in relays {
+        client.add_relay(url.as_str()).await.ok();
+    }
+    client.connect().await;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.send_event(event.clone()),
+    ).await {
+        Ok(Ok(output)) => {
+            tracing::info!("[publish_to_relays] {} sent (ok={}, fail={})",
+                label, output.success.len(), output.failed.len());
+            for (url, err) in &output.failed {
+                tracing::debug!("[publish_to_relays] {} rejected by {}: {:?}", label, url, err);
+            }
+        }
+        Ok(Err(e)) => tracing::warn!("[publish_to_relays] {} broadcast error: {}", label, e),
+        Err(_) => tracing::warn!("[publish_to_relays] {} broadcast timed out", label),
+    }
+    client.disconnect().await.ok();
+}
+
+#[tauri::command]
+async fn publish_gift_wrap_dm(
+    content: String,
+    recipient_pubkey: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    use nostr_sdk::prelude::*;
+
+    tracing::info!("[cmd:publish_gift_wrap_dm] sending NIP-17 DM to {}...",
+        &recipient_pubkey[..12.min(recipient_pubkey.len())]);
+
+    let recipient_pk = PublicKey::from_hex(&recipient_pubkey)
+        .map_err(|e| format!("Invalid recipient pubkey: {}", e))?;
+
+    let config = state.config.read().await;
+    let nsec = config.nsec.clone();
+    let signing_mode = config.signing_mode.clone();
+    let hex_pubkey = config.hex_pubkey.clone();
+    let outbound_relays = config.outbound_relays.clone();
+    drop(config);
+
+    let sender_pk = PublicKey::from_hex(
+        hex_pubkey.as_deref().ok_or("No pubkey configured")?
+    ).map_err(|e| format!("Invalid own pubkey: {}", e))?;
+
+    // Resolve recipient's inbox relays (kind 10050), falling back to NIP-65 read relays,
+    // then our outbound relays + well-known DM relays.
+    let recipient_relays = resolve_inbox_relays(&state.db(), &recipient_pubkey, &outbound_relays);
+    // For self-copy: use our own inbox/outbound relays
+    let own_hex = hex_pubkey.as_deref().unwrap_or("");
+    let self_relays = resolve_inbox_relays(&state.db(), own_hex, &outbound_relays);
+
+    tracing::info!("[cmd:publish_gift_wrap_dm] recipient relays: {:?}, self relays: {:?}",
+        recipient_relays, self_relays);
+
+    // Create the rumor (kind 14 private direct message)
+    let rumor = EventBuilder::private_msg_rumor(recipient_pk, &content, None)
+        .to_unsigned_event(sender_pk);
+
+    let use_nsec = signing_mode == "nsec" && nsec.is_some();
+
+    if use_nsec {
+        tracing::info!("[cmd:publish_gift_wrap_dm] creating gift wraps with local nsec");
+        let secret_key = SecretKey::from_bech32(nsec.as_ref().unwrap())
+            .map_err(|e| format!("Invalid nsec: {}", e))?;
+        let sender_keys = Keys::new(secret_key);
+
+        // Gift wrap to recipient
+        let gw_to_recipient = EventBuilder::gift_wrap(
+            &sender_keys, &recipient_pk, rumor.clone(), None,
+        ).map_err(|e| format!("Gift wrap to recipient failed: {}", e))?;
+
+        // Gift wrap self-copy (so we can see our sent messages)
+        let gw_to_self = EventBuilder::gift_wrap(
+            &sender_keys, &sender_pk, rumor, None,
+        ).map_err(|e| format!("Gift wrap to self failed: {}", e))?;
+
+        // Publish recipient copy to recipient's inbox relays
+        publish_to_relays(&gw_to_recipient, &recipient_relays, "recipient").await;
+        // Publish self-copy to our own relays
+        publish_to_relays(&gw_to_self, &self_relays, "self").await;
+
+        // Store both locally
+        for gw in [&gw_to_recipient, &gw_to_self] {
+            let tags_json = serde_json::to_string(
+                &gw.tags.iter()
+                    .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect::<Vec<String>>())
+                    .collect::<Vec<Vec<String>>>()
+            ).unwrap_or_else(|_| "[]".to_string());
+
+            state.db().store_event(
+                &gw.id.to_hex(),
+                &gw.pubkey.to_hex(),
+                gw.created_at.as_u64() as i64,
+                gw.kind.as_u16() as u32,
+                &tags_json,
+                &gw.content.to_string(),
+                &gw.sig.to_string(),
+            ).ok();
+        }
+
+        let id = gw_to_recipient.id.to_hex();
+        tracing::info!("[cmd:publish_gift_wrap_dm] published NIP-17 DM {}", &id[..12]);
+        return Ok(id);
+    }
+
+    // NIP-46 path: build seal + gift wrap using remote signer
+    tracing::info!("[cmd:publish_gift_wrap_dm] creating gift wraps via NIP-46");
+
+    let signer_opt = {
+        let guard = state.nip46_signer.read().await;
+        guard.clone()
+    };
+    let mut signer = signer_opt
+        .ok_or("No signer available — cannot send DMs in read-only mode")?;
+
+    // For each target (recipient + self), create seal + gift wrap
+    let mut first_id = String::new();
+    for (label, target_pk) in [("recipient", recipient_pk), ("self", sender_pk)] {
+        // Step 1: NIP-44 encrypt the rumor to create seal content
+        let mut rumor_copy = rumor.clone();
+        rumor_copy.ensure_id();
+        let sealed_content = signer.nip44_encrypt(target_pk, rumor_copy.as_json())
+            .await
+            .map_err(|e| format!("NIP-44 encrypt for {} seal failed: {}", label, e))?;
+
+        // Step 2: Build and sign the seal event (kind 13)
+        let seal_builder = EventBuilder::new(Kind::Seal, sealed_content, [])
+            .custom_created_at(Timestamp::tweaked(nip59::RANGE_RANDOM_TIMESTAMP_TWEAK));
+        let seal_unsigned = seal_builder.to_unsigned_event(sender_pk);
+        let seal = signer.sign_event(seal_unsigned).await
+            .map_err(|e| format!("Remote signing of {} seal failed: {}", label, e))?;
+
+        // Step 3: Gift wrap the seal with a random key (local operation)
+        let gw = EventBuilder::gift_wrap_from_seal(&target_pk, &seal, None)
+            .map_err(|e| format!("Gift wrap for {} failed: {}", label, e))?;
+
+        // Publish to the target's inbox relays
+        let target_relays = if label == "recipient" { &recipient_relays } else { &self_relays };
+        publish_to_relays(&gw, target_relays, label).await;
+
+        // Store locally
+        let tags_json = serde_json::to_string(
+            &gw.tags.iter()
+                .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect::<Vec<String>>())
+                .collect::<Vec<Vec<String>>>()
+        ).unwrap_or_else(|_| "[]".to_string());
+
+        state.db().store_event(
+            &gw.id.to_hex(),
+            &gw.pubkey.to_hex(),
+            gw.created_at.as_u64() as i64,
+            gw.kind.as_u16() as u32,
+            &tags_json,
+            &gw.content.to_string(),
+            &gw.sig.to_string(),
+        ).ok();
+
+        if label == "recipient" {
+            first_id = gw.id.to_hex();
+        }
+    }
+
+    // Write back the signer with updated encryption preference
+    {
+        let mut guard = state.nip46_signer.write().await;
+        *guard = Some(signer);
+    }
+
+    tracing::info!("[cmd:publish_gift_wrap_dm] NIP-46 NIP-17 DM published {}", &first_id[..12.min(first_id.len())]);
+    Ok(first_id)
+}
+
 // ── NIP-46 Commands ────────────────────────────────────────────────
 
 #[tauri::command]
 async fn connect_bunker(
     bunker_uri: String,
+    app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     use nostr_sdk::prelude::*;
@@ -3667,9 +5231,19 @@ async fn connect_bunker(
 
     // Get bunker URI for reconnection (may differ from input if relays changed)
     let reconnect_uri = signer.bunker_uri().await.to_string();
+    let encryption = signer.encryption();
+
+    tracing::info!("[cmd:connect_bunker] saving to keychain: npub={}, uri={}..., encryption={:?}",
+        &npub[..npub.len().min(16)], &reconnect_uri[..reconnect_uri.len().min(60)], encryption);
 
     // Save to keychain for reconnection on restart
     save_bunker_to_keychain(&npub, &reconnect_uri, &app_keys_nsec)?;
+    // Save encryption preference
+    {
+        let db = state.db();
+        let enc_str = match encryption { crate::nip46::Nip46Encryption::Nip44 => "nip44", _ => "nip04" };
+        db.set_config("nip46_encryption", enc_str).ok();
+    }
 
     // Store signer in app state
     {
@@ -3681,10 +5255,10 @@ async fn connect_bunker(
     {
         let mut config = state.config.write().await;
         config.signing_mode = "bunker".to_string();
-        // Clear nsec — bunker and nsec are mutually exclusive
         config.nsec = None;
     }
 
+    app_handle.emit("signing-mode-changed", "bunker").ok();
     tracing::info!("[cmd:connect_bunker] Connected to bunker, npub={}", &npub[..npub.len().min(16)]);
     Ok(npub)
 }
@@ -3719,6 +5293,7 @@ async fn generate_nostr_connect_uri(
 async fn await_nostr_connect(
     nostr_connect_uri: String,
     app_keys_nsec: String,
+    app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     use nostr_sdk::prelude::*;
@@ -3743,9 +5318,19 @@ async fn await_nostr_connect(
 
     // Get bunker URI for reconnection
     let reconnect_uri = signer.bunker_uri().await.to_string();
+    let encryption = signer.encryption();
+
+    tracing::info!("[cmd:await_nostr_connect] saving to keychain: npub={}, uri={}..., encryption={:?}",
+        &npub[..npub.len().min(16)], &reconnect_uri[..reconnect_uri.len().min(60)], encryption);
 
     // Save to keychain
     save_bunker_to_keychain(&npub, &reconnect_uri, &app_keys_nsec)?;
+    // Save encryption preference
+    {
+        let db = state.db();
+        let enc_str = match encryption { crate::nip46::Nip46Encryption::Nip44 => "nip44", _ => "nip04" };
+        db.set_config("nip46_encryption", enc_str).ok();
+    }
 
     // Store signer
     {
@@ -3760,12 +5345,13 @@ async fn await_nostr_connect(
         config.nsec = None;
     }
 
+    app_handle.emit("signing-mode-changed", "connect").ok();
     tracing::info!("[cmd:await_nostr_connect] Connected via Nostr Connect, npub={}", &npub[..npub.len().min(16)]);
     Ok(npub)
 }
 
 #[tauri::command]
-async fn disconnect_bunker(state: State<'_, AppState>) -> Result<(), String> {
+async fn disconnect_bunker(app_handle: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     // Take signer from state and shut it down
     {
         let mut nip46 = state.nip46_signer.write().await;
@@ -3790,12 +5376,14 @@ async fn disconnect_bunker(state: State<'_, AppState>) -> Result<(), String> {
         config.signing_mode = "read-only".to_string();
     }
 
+    app_handle.emit("signing-mode-changed", "read-only").ok();
     tracing::info!("[cmd:disconnect_bunker] Remote signer disconnected");
     Ok(())
 }
 
 // ── Wallet Keychain Helpers ───────────────────────────────────────────
 
+#[cfg(desktop)]
 fn save_wallet_to_keychain(npub: &str, data: &str) -> Result<(), String> {
     let entry = keyring::Entry::new("nostrito-wallet", npub)
         .map_err(|e| format!("Keychain error: {}", e))?;
@@ -3804,15 +5392,32 @@ fn save_wallet_to_keychain(npub: &str, data: &str) -> Result<(), String> {
         .map_err(|e| format!("Failed to save wallet to keychain: {}", e))
 }
 
+#[cfg(mobile)]
+fn save_wallet_to_keychain(npub: &str, data: &str) -> Result<(), String> {
+    mobile_secrets::set("nostrito-wallet", npub, data)
+}
+
+#[cfg(desktop)]
 fn load_wallet_from_keychain(npub: &str) -> Option<String> {
     let entry = keyring::Entry::new("nostrito-wallet", npub).ok()?;
     entry.get_password().ok()
 }
 
+#[cfg(mobile)]
+fn load_wallet_from_keychain(npub: &str) -> Option<String> {
+    mobile_secrets::get("nostrito-wallet", npub)
+}
+
+#[cfg(desktop)]
 fn delete_wallet_from_keychain(npub: &str) {
     if let Ok(entry) = keyring::Entry::new("nostrito-wallet", npub) {
         entry.delete_credential().ok();
     }
+}
+
+#[cfg(mobile)]
+fn delete_wallet_from_keychain(npub: &str) {
+    mobile_secrets::delete("nostrito-wallet", npub);
 }
 
 // ── Wallet Tauri Commands ────────────────────────────────────────────
@@ -4057,8 +5662,8 @@ async fn wallet_provision(state: State<'_, AppState>) -> Result<wallet::WalletIn
     let (admin_key, _wallet_id, instance_url) = if let Some(nsec) = nsec {
         wallet::provision::provision_wallet(None, &nsec, &hex_pubkey).await?
     } else {
-        let signer_guard = state.nip46_signer.read().await;
-        let signer = signer_guard.as_ref().ok_or("No signing method available — read-only mode")?;
+        let mut signer_guard = state.nip46_signer.write().await;
+        let signer = signer_guard.as_mut().ok_or("No signing method available — read-only mode")?;
         wallet::provision::provision_wallet_with_signer(None, signer, &hex_pubkey).await?
     };
 
@@ -4098,7 +5703,145 @@ async fn wallet_provision(state: State<'_, AppState>) -> Result<wallet::WalletIn
     })
 }
 
-// ── Reaction / Author Articles / Profile Relay Fetch ─────────────
+// ── Signing helper / Reaction / Author Articles / Profile Relay Fetch ─────────────
+
+async fn sign_build_publish_store(
+    builder: nostr_sdk::prelude::EventBuilder,
+    state: &State<'_, AppState>,
+) -> Result<nostr_sdk::prelude::Event, String> {
+    use nostr_sdk::prelude::*;
+
+    let config = state.config.read().await;
+    let nsec = config.nsec.clone();
+    let relays = config.outbound_relays.clone();
+    let hex_pubkey = config.hex_pubkey.clone();
+    let signing_mode = config.signing_mode.clone();
+    drop(config);
+
+    tracing::info!("[publish] signing_mode={}, has_nsec={}, has_pubkey={}, outbound_relays={}",
+        signing_mode, nsec.is_some(), hex_pubkey.is_some(), relays.len());
+
+    // Use signing_mode to decide path, NOT nsec.is_some() — nsec may linger
+    // in keychain even after switching to bunker/connect.
+    let use_nsec = signing_mode == "nsec" && nsec.is_some();
+
+    let signed = if use_nsec {
+        let nsec_str = nsec.unwrap();
+        tracing::info!("[publish] signing with local nsec");
+        let secret_key = SecretKey::from_bech32(&nsec_str)
+            .map_err(|e| format!("Invalid nsec: {}", e))?;
+        let keys = Keys::new(secret_key);
+        let event = builder.to_event(&keys)
+            .map_err(|e| format!("Failed to sign event: {}", e))?;
+        tracing::info!("[publish] signed locally: kind={}, id={}", event.kind.as_u16(), &event.id.to_hex()[..12]);
+        event
+    } else {
+        let pubkey_hex = hex_pubkey.ok_or("No signing key configured (no nsec, no pubkey)")?;
+        tracing::info!("[publish] using NIP-46 remote signing (mode={}) for pubkey={}...",
+            signing_mode, &pubkey_hex[..12.min(pubkey_hex.len())]);
+
+        let pubkey = PublicKey::from_hex(&pubkey_hex)
+            .map_err(|e| format!("Invalid hex pubkey: {}", e))?;
+        let unsigned = builder.to_unsigned_event(pubkey);
+
+        // Log the full unsigned event for debugging
+        let unsigned_json = serde_json::json!({
+            "id": unsigned.id.map(|id| id.to_hex()),
+            "pubkey": unsigned.pubkey.to_hex(),
+            "created_at": unsigned.created_at.as_u64(),
+            "kind": unsigned.kind.as_u16(),
+            "tags": unsigned.tags.iter().map(|t| t.as_slice().iter().map(|s| s.to_string()).collect::<Vec<String>>()).collect::<Vec<Vec<String>>>(),
+            "content": &unsigned.content[..unsigned.content.len().min(100)],
+        });
+        tracing::info!("[publish] unsigned event: {}", unsigned_json);
+
+        // Clone signer and drop lock (same pattern as working decrypt_dm)
+        let mut signer = {
+            let guard = state.nip46_signer.read().await;
+            match guard.clone() {
+                Some(s) => {
+                    tracing::info!("[publish] NIP-46 signer cloned (encryption={:?}), sending sign_event...",
+                        s.encryption());
+                    s
+                }
+                None => {
+                    tracing::error!("[publish] NIP-46 signer is None! signing_mode={}", signing_mode);
+                    return Err("NIP-46 signer not connected. Reconnect your bunker in settings.".to_string());
+                }
+            }
+        };
+        // Lock is now dropped
+
+        match signer.sign_event(unsigned).await {
+            Ok(event) => {
+                tracing::info!("[publish] NIP-46 signed successfully: kind={}, id={}, final_encryption={:?}",
+                    event.kind.as_u16(), &event.id.to_hex()[..12], signer.encryption());
+                // Write back the signer with updated encryption preference
+                {
+                    let mut guard = state.nip46_signer.write().await;
+                    *guard = Some(signer);
+                }
+                event
+            }
+            Err(e) => {
+                tracing::error!("[publish] NIP-46 sign_event failed: {}", e);
+                return Err(format!("Remote signer failed: {}", e));
+            }
+        }
+    };
+
+    // Store locally FIRST — event is available instantly in the local relay
+    let tags_json = serde_json::to_string(
+        &signed.tags.iter()
+            .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect::<Vec<String>>())
+            .collect::<Vec<Vec<String>>>()
+    ).unwrap_or_else(|_| "[]".to_string());
+
+    match state.db().store_event(
+        &signed.id.to_hex(),
+        &signed.pubkey.to_hex(),
+        signed.created_at.as_u64() as i64,
+        signed.kind.as_u16() as u32,
+        &tags_json,
+        &signed.content.to_string(),
+        &signed.sig.to_string(),
+    ) {
+        Ok(stored) => tracing::info!("[publish] stored locally: new={}", stored),
+        Err(e) => tracing::warn!("[publish] local store failed (non-fatal): {}", e),
+    }
+
+    // Broadcast to outbound relays in the background — don't block the caller
+    let signed_clone = signed.clone();
+    tokio::spawn(async move {
+        tracing::info!("[publish] broadcasting to {} outbound relays (background)...", relays.len());
+        let client = Client::default();
+        for url in &relays {
+            client.add_relay(url.as_str()).await.ok();
+        }
+        client.connect().await;
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.send_event(signed_clone.clone())
+        ).await {
+            Ok(Ok(output)) => {
+                tracing::info!("[publish] broadcast complete: event {} sent (success={}, failed={})",
+                    &signed_clone.id.to_hex()[..12], output.success.len(), output.failed.len());
+            }
+            Ok(Err(e)) => {
+                tracing::error!("[publish] broadcast failed: {}", e);
+                tracing::warn!("[publish] event stored locally, will retry broadcast on next sync");
+            }
+            Err(_) => {
+                tracing::warn!("[publish] broadcast timed out after 10s, event stored locally");
+            }
+        }
+        client.disconnect().await.ok();
+    });
+
+    Ok(signed)
+}
 
 #[tauri::command]
 async fn publish_reaction(
@@ -4108,55 +5851,143 @@ async fn publish_reaction(
 ) -> Result<String, String> {
     use nostr_sdk::prelude::*;
 
-    let config = state.config.read().await;
-    let nsec = config.nsec.clone().ok_or("nsec required to react")?;
-    let relays = config.outbound_relays.clone();
-    drop(config);
+    let tags = vec![
+        Tag::parse(&["e", &event_id]).map_err(|e| format!("bad e-tag: {}", e))?,
+        Tag::parse(&["p", &event_pubkey]).map_err(|e| format!("bad p-tag: {}", e))?,
+    ];
+    let builder = EventBuilder::new(Kind::Reaction, "+", tags);
+    let signed = sign_build_publish_store(builder, &state).await?;
+    let reaction_id = signed.id.to_hex();
+    tracing::info!("[cmd:publish_reaction] published reaction {} for event {}", &reaction_id[..12.min(reaction_id.len())], &event_id[..12.min(event_id.len())]);
+    Ok(reaction_id)
+}
 
-    let secret_key = SecretKey::from_bech32(&nsec)
-        .map_err(|e| format!("Invalid nsec: {}", e))?;
-    let keys = Keys::new(secret_key);
+#[tauri::command]
+async fn publish_repost(
+    event_id: String,
+    event_pubkey: String,
+    event_json: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    use nostr_sdk::prelude::*;
 
     let tags = vec![
         Tag::parse(&["e", &event_id]).map_err(|e| format!("bad e-tag: {}", e))?,
         Tag::parse(&["p", &event_pubkey]).map_err(|e| format!("bad p-tag: {}", e))?,
     ];
-    let signed = EventBuilder::new(Kind::Reaction, "+", tags)
-        .to_event(&keys)
-        .map_err(|e| format!("Failed to sign reaction: {}", e))?;
+    let builder = EventBuilder::new(Kind::Repost, &event_json, tags);
+    let signed = sign_build_publish_store(builder, &state).await?;
+    let repost_id = signed.id.to_hex();
+    tracing::info!("[cmd:publish_repost] published repost {} for event {}", &repost_id[..12.min(repost_id.len())], &event_id[..12.min(event_id.len())]);
+    Ok(repost_id)
+}
 
-    let reaction_id = signed.id.to_hex();
+#[tauri::command]
+async fn publish_note(
+    content: String,
+    reply_to: Option<String>,
+    reply_to_pubkey: Option<String>,
+    root_id: Option<String>,
+    root_pubkey: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<NostrEvent, String> {
+    use nostr_sdk::prelude::*;
 
-    // Publish to outbound relays
-    let client = Client::default();
-    for url in &relays {
-        if let Ok(_) = client.add_relay(url.as_str()).await {
-            client.connect_relay(url.as_str()).await.ok();
+    if content.trim().is_empty() {
+        return Err("Note content cannot be empty".to_string());
+    }
+
+    let mut tags: Vec<Tag> = Vec::new();
+
+    if let Some(ref reply_id) = reply_to {
+        if let Some(ref rid) = root_id {
+            tags.push(Tag::parse(&["e", rid, "", "root"]).map_err(|e| format!("bad root e-tag: {}", e))?);
+            tags.push(Tag::parse(&["e", reply_id, "", "reply"]).map_err(|e| format!("bad reply e-tag: {}", e))?);
+        } else {
+            tags.push(Tag::parse(&["e", reply_id, "", "root"]).map_err(|e| format!("bad e-tag: {}", e))?);
+        }
+        if let Some(ref rp) = root_pubkey {
+            tags.push(Tag::parse(&["p", rp]).map_err(|e| format!("bad p-tag: {}", e))?);
+        }
+        if let Some(ref rp) = reply_to_pubkey {
+            if root_pubkey.as_deref() != Some(rp.as_str()) {
+                tags.push(Tag::parse(&["p", rp]).map_err(|e| format!("bad p-tag: {}", e))?);
+            }
         }
     }
-    client.send_event(signed.clone()).await
-        .map_err(|e| format!("Failed to publish reaction: {}", e))?;
-    client.disconnect().await.ok();
 
-    // Save locally so counts update immediately
-    let tags_json = serde_json::to_string(
-        &signed.tags.iter()
-            .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect::<Vec<String>>())
-            .collect::<Vec<Vec<String>>>()
-    ).unwrap_or_else(|_| "[]".to_string());
+    let builder = EventBuilder::new(Kind::TextNote, &content, tags);
+    let signed = sign_build_publish_store(builder, &state).await?;
+    let note_id = signed.id.to_hex();
+    tracing::info!("[cmd:publish_note] published note {}", &note_id[..12.min(note_id.len())]);
 
-    state.db().store_event(
-        &reaction_id,
-        &signed.pubkey.to_hex(),
-        signed.created_at.as_u64() as i64,
-        signed.kind.as_u16() as u32,
-        &tags_json,
-        &signed.content.to_string(),
-        &signed.sig.to_string(),
-    ).ok();
+    let tags_vec: Vec<Vec<String>> = signed.tags.iter()
+        .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
+        .collect();
 
-    tracing::info!("[cmd:publish_reaction] published reaction {} for event {}", &reaction_id[..12.min(reaction_id.len())], &event_id[..12.min(event_id.len())]);
-    Ok(reaction_id)
+    Ok(NostrEvent {
+        id: note_id,
+        pubkey: signed.pubkey.to_hex(),
+        created_at: signed.created_at.as_u64(),
+        kind: signed.kind.as_u16() as u32,
+        tags: tags_vec,
+        content: signed.content.to_string(),
+        sig: signed.sig.to_string(),
+    })
+}
+
+#[tauri::command]
+async fn publish_article(
+    title: String,
+    content: String,
+    summary: Option<String>,
+    d_tag: Option<String>,
+    image: Option<String>,
+    hashtags: Option<Vec<String>>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    use nostr_sdk::prelude::*;
+
+    if title.trim().is_empty() || content.trim().is_empty() {
+        return Err("Title and content are required".to_string());
+    }
+
+    let slug = d_tag.unwrap_or_else(|| {
+        title.to_lowercase()
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '-' })
+            .collect::<String>()
+            .trim_matches('-')
+            .to_string()
+    });
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let mut tags: Vec<Tag> = vec![
+        Tag::parse(&["d", &slug]).unwrap(),
+        Tag::parse(&["title", &title]).unwrap(),
+        Tag::parse(&["published_at", &now.to_string()]).unwrap(),
+    ];
+    if let Some(ref s) = summary {
+        tags.push(Tag::parse(&["summary", s]).unwrap());
+    }
+    if let Some(ref img) = image {
+        tags.push(Tag::parse(&["image", img]).unwrap());
+    }
+    if let Some(ref ht) = hashtags {
+        for t in ht {
+            tags.push(Tag::parse(&["t", t]).unwrap());
+        }
+    }
+
+    let builder = EventBuilder::new(Kind::from(30023), &content, tags);
+    let signed = sign_build_publish_store(builder, &state).await?;
+    let article_id = signed.id.to_hex();
+    tracing::info!("[cmd:publish_article] published article '{}' ({})", &title, &article_id[..12.min(article_id.len())]);
+    Ok(article_id)
 }
 
 #[tauri::command]
@@ -4410,50 +6241,61 @@ async fn send_zap(
 
 // ── App Entry ──────────────────────────────────────────────────────
 
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Set up dual logging: console (INFO+) and rotating file (~/.nostrito/nostrito.log, max ~10MB)
+    // Set up dual logging: console (INFO+) and rotating file (nostrito.log)
     {
         use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-        let log_dir = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".nostrito");
-        std::fs::create_dir_all(&log_dir).ok();
-
-        // Rotating file appender: daily rotation, keep up to 3 files (~10MB effective cap)
-        let file_appender = tracing_appender::rolling::daily(&log_dir, "nostrito.log");
-        let (file_writer, _guard) = tracing_appender::non_blocking(file_appender);
-        // Leak the guard so it lives for the entire process lifetime
-        std::mem::forget(_guard);
+        let log_dir = paths::read_data_root();
 
         let env_filter = EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| EnvFilter::new("info,nostrito_lib=info,nostrito_lib::sync=debug"));
 
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(
-                fmt::layer()
-                    .with_target(true)
-                    .with_ansi(true),
-            )
-            .with(
-                fmt::layer()
-                    .with_target(true)
-                    .with_ansi(false)
-                    .with_writer(file_writer),
-            )
-            .init();
+        // Try to set up file logging; skip if directory can't be created (e.g. sandboxed mobile)
+        if std::fs::create_dir_all(&log_dir).is_ok() {
+            let file_appender = tracing_appender::rolling::daily(&log_dir, "nostrito.log");
+            let (file_writer, _guard) = tracing_appender::non_blocking(file_appender);
+            std::mem::forget(_guard);
+
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(
+                    fmt::layer()
+                        .with_target(true)
+                        .with_ansi(true),
+                )
+                .with(
+                    fmt::layer()
+                        .with_target(true)
+                        .with_ansi(false)
+                        .with_writer(file_writer),
+                )
+                .init();
+        } else {
+            // Console-only logging (mobile fallback)
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(
+                    fmt::layer()
+                        .with_target(true)
+                        .with_ansi(false),
+                )
+                .init();
+        }
     }
 
     tracing::info!("[init] Starting nostrito");
 
-    // Determine data directory
-    let data_dir = dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("nostrito");
+    // Determine data directory (reads bootstrap config or falls back to OS default)
+    let data_dir = paths::read_data_root();
     if let Err(e) = std::fs::create_dir_all(&data_dir) {
         fatal_exit(&format!("Failed to create data directory {}: {}", data_dir.display(), e));
     }
+    tracing::info!("[init] data_dir={}", data_dir.display());
+
+    // One-time migration: consolidate old ~/.nostrito/ layout into data_dir
+    paths::migrate_old_layout_if_needed(&data_dir);
 
     // Open lobby DB to check for saved npub
     let lobby_path = lobby_db_path(&data_dir);
@@ -4565,13 +6407,34 @@ pub fn run() {
     if let Ok(Some(v)) = db.get_config("storage_media_gb") { if let Ok(n) = v.parse::<f64>() { config.storage_media_gb = n; } }
     if let Ok(Some(v)) = db.get_config("wot_max_depth") { if let Ok(n) = v.parse::<u32>() { config.wot_max_depth = n; } }
     if let Ok(Some(v)) = db.get_config("sync_interval_secs") { if let Ok(n) = v.parse::<u32>() { config.sync_interval_secs = n; } }
-    // Load nsec from system keychain
+    // Load signing credentials from system keychain.
+    // If a bunker is stored, prefer it over nsec (bunker setup clears nsec
+    // from in-memory config but the old nsec may still be in the keychain).
     if let Some(ref npub) = config.npub {
-        if let Some(nsec) = load_nsec_from_keychain(npub) {
-            tracing::info!("[init] Loaded nsec from keychain");
-            config.nsec = Some(nsec);
-            config.signing_mode = "nsec".to_string();
+        tracing::info!("[init] Checking keychain for npub={}", npub);
+        let bunker_data = load_bunker_from_keychain(npub);
+        let has_bunker = bunker_data.is_some();
+        if let Some((ref uri, _)) = bunker_data {
+            tracing::info!("[init] Found bunker in keychain: uri={}...", &uri[..uri.len().min(60)]);
+        } else {
+            tracing::info!("[init] No bunker found in keychain for this npub");
         }
+        let has_nsec = load_nsec_from_keychain(npub).is_some();
+        tracing::info!("[init] Keychain: has_bunker={}, has_nsec={}", has_bunker, has_nsec);
+
+        if !has_bunker {
+            if let Some(nsec) = load_nsec_from_keychain(npub) {
+                tracing::info!("[init] Using nsec from keychain");
+                config.nsec = Some(nsec);
+                config.signing_mode = "nsec".to_string();
+            }
+        } else {
+            tracing::info!("[init] Bunker credentials found, skipping nsec (will reconnect bunker)");
+            config.nsec = None;
+            config.signing_mode = "read-only".to_string(); // will be updated after bunker reconnect
+        }
+    } else {
+        tracing::info!("[init] No npub configured, skipping keychain checks");
     }
 
     tracing::info!("[init] Config: npub={:?}, relays={:?}, port={}, signing={}", config.npub, config.outbound_relays, config.relay_port, if config.nsec.is_some() { "nsec" } else { "read-only" });
@@ -4630,6 +6493,9 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_process::init())
         .manage(app_state)
         .setup(|app| {
             let state = app.state::<AppState>();
@@ -4640,6 +6506,14 @@ pub fn run() {
             let sync_stats = state.sync_stats.clone();
             let sync_cancel = state.sync_cancel.clone();
             let app_handle = app.handle().clone();
+
+            // Register custom data_dir media path with the asset protocol scope
+            {
+                let media_path = paths::media_dir(&state.data_dir);
+                if let Err(e) = app.asset_protocol_scope().allow_directory(&media_path, true) {
+                    tracing::warn!("[init] Failed to add media dir to asset scope: {}", e);
+                }
+            }
 
             // Restore wallet connection from keychain
             {
@@ -4701,18 +6575,27 @@ pub fn run() {
 
                 tauri::async_runtime::spawn(async move {
                     let cfg = config_for_reconnect.read().await;
-                    if cfg.nsec.is_some() {
-                        return; // Using local nsec, no need for bunker
+                    tracing::info!("[init:bunker-reconnect] signing_mode={}, npub={:?}",
+                        cfg.signing_mode, cfg.npub.as_deref().map(|s| &s[..s.len().min(16)]));
+                    if cfg.signing_mode == "nsec" {
+                        tracing::info!("[init:bunker-reconnect] skipping — using local nsec");
+                        return;
                     }
                     let npub = match cfg.npub.as_ref() {
                         Some(n) => n.clone(),
-                        None => return,
+                        None => {
+                            tracing::info!("[init:bunker-reconnect] skipping — no npub");
+                            return;
+                        }
                     };
                     drop(cfg);
 
-                    if let Some((bunker_uri_str, app_keys_nsec)) = load_bunker_from_keychain(&npub) {
+                    let bunker_data = load_bunker_from_keychain(&npub);
+                    tracing::info!("[init:bunker-reconnect] keychain lookup for {}: found={}",
+                        &npub[..npub.len().min(16)], bunker_data.is_some());
+                    if let Some((bunker_uri_str, app_keys_nsec)) = bunker_data {
                         use nostr_sdk::prelude::*;
-                        tracing::info!("[init] Attempting NIP-46 bunker reconnection...");
+                        tracing::info!("[init] Attempting NIP-46 reconnection: uri={}...", &bunker_uri_str[..bunker_uri_str.len().min(60)]);
 
                         let parse_result = (|| -> Result<(NostrConnectURI, Keys), String> {
                             let uri = NostrConnectURI::parse(&bunker_uri_str)
@@ -4724,8 +6607,24 @@ pub fn run() {
 
                         match parse_result {
                             Ok((uri, app_keys)) => {
-                                // Reconnection always uses bunker:// flow (stored as bunker URI)
-                                match crate::nip46::Nip46Client::connect_bunker(&uri, app_keys, std::time::Duration::from_secs(30)).await {
+                                let signer_pk = match uri.signer_public_key() {
+                                    Some(pk) => pk,
+                                    None => {
+                                        tracing::warn!("[init] Bunker URI has no signer public key");
+                                        return;
+                                    }
+                                };
+                                let secret = uri.secret();
+                                let relays = uri.relays();
+
+                                // Load stored encryption preference (default NIP-04)
+                                let encryption = crate::nip46::Nip46Encryption::Nip04; // default
+                                // Note: we can't access db here easily since it's in a spawned task
+                                // The encryption is re-detected on first failed request anyway
+
+                                tracing::info!("[init] reconnecting: signer_pk={}..., encryption={:?}, relays={}, has_secret={}",
+                                    &signer_pk.to_hex()[..12], encryption, relays.len(), secret.is_some());
+                                match crate::nip46::Nip46Client::reconnect(signer_pk, relays, app_keys, secret, encryption, std::time::Duration::from_secs(60)).await {
                                     Ok(signer) => {
                                         let mode = if bunker_uri_str.starts_with("bunker://") { "bunker" } else { "connect" };
                                         {
@@ -4754,6 +6653,7 @@ pub fn run() {
             // Auto-resume sync and relay if previously configured
             let relay_cancel_setup = state.relay_cancel.clone();
             let db_relay = state.db();
+            let data_dir_for_setup = state.data_dir.clone();
 
             tauri::async_runtime::spawn(async move {
                 let cfg = config.read().await;
@@ -4799,15 +6699,15 @@ pub fn run() {
                         *sync_cancel.write().await = Some(cancel);
                     }
 
-                    // Auto-setup mkcert if certs don't exist
+                    // Auto-setup mkcert (desktop only — needs OS trust store)
+                    #[cfg(desktop)]
                     {
-                        let cert_check = dirs::home_dir()
-                            .unwrap_or_default()
-                            .join(".nostrito/certs/localhost.pem");
+                        let cert_check = paths::cert_path(&data_dir_for_setup);
                         if !cert_check.exists() {
                             tracing::info!("[mkcert] Certs missing — setting up browser integration automatically");
                             let app_clone = app_handle.clone();
-                            match tokio::task::spawn_blocking(move || run_mkcert_setup(&app_clone)).await {
+                            let dd = data_dir_for_setup.clone();
+                            match tokio::task::spawn_blocking(move || run_mkcert_setup(&app_clone, &dd)).await {
                                 Ok(Ok(_)) => tracing::info!("[mkcert] Browser integration ready"),
                                 Ok(Err(e)) => tracing::warn!("[mkcert] Setup failed (non-fatal): {}", e),
                                 Err(e) => tracing::warn!("[mkcert] Task panicked (non-fatal): {}", e),
@@ -4815,33 +6715,43 @@ pub fn run() {
                         }
                     }
 
-                    // Auto-start relay (TLS if certs available)
+                    // Auto-start relay (TLS on desktop if certs available, plain WS everywhere)
                     let relay_ct = CancellationToken::new();
                     let relay_ct_clone = relay_ct.clone();
+                    let outbound_tx = spawn_outbound_broadcaster(config.clone(), app_handle.clone());
 
-                    let cert_path = dirs::home_dir()
-                        .unwrap_or_default()
-                        .join(".nostrito/certs/localhost.pem");
-                    let key_path = dirs::home_dir()
-                        .unwrap_or_default()
-                        .join(".nostrito/certs/localhost-key.pem");
+                    let cert_path = paths::cert_path(&data_dir_for_setup);
+                    let key_path = paths::key_path(&data_dir_for_setup);
 
                     if cert_path.exists() && key_path.exists() {
+                        let tls_cancel = relay_ct_clone.clone();
+                        let tls_db = db_relay.clone();
+                        let tls_allowed = allowed.clone();
+                        let tls_outbound = outbound_tx.clone();
                         tracing::info!("[relay] Auto-starting TLS relay on wss://127.0.0.1:{}", port);
                         tokio::spawn(async move {
                             if let Err(e) = relay::run_relay_tls(
-                                port, cert_path, key_path, db_relay, allowed, relay_ct_clone,
+                                port, cert_path, key_path, tls_db, tls_allowed, tls_cancel, Some(tls_outbound),
                             )
                             .await
                             {
                                 tracing::error!("TLS relay auto-start error: {}", e);
                             }
                         });
+                        let plain_port = port + 1;
+                        tracing::info!("[relay] Auto-starting plain relay on ws://127.0.0.1:{} (browser fallback)", plain_port);
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                relay::run_relay(plain_port, db_relay, allowed, relay_ct_clone, Some(outbound_tx)).await
+                            {
+                                tracing::error!("Plain relay auto-start error: {}", e);
+                            }
+                        });
                     } else {
                         tracing::info!("[relay] Auto-starting plain relay on ws://127.0.0.1:{}", port);
                         tokio::spawn(async move {
                             if let Err(e) =
-                                relay::run_relay(port, db_relay, allowed, relay_ct_clone).await
+                                relay::run_relay(port, db_relay, allowed, relay_ct_clone, Some(outbound_tx)).await
                             {
                                 tracing::error!("Relay auto-start error: {}", e);
                             }
@@ -4849,7 +6759,7 @@ pub fn run() {
                     }
                     *relay_cancel_setup.write().await = Some(relay_ct);
 
-                    tracing::info!("Sync and relay auto-resumed successfully");
+                    tracing::info!("Sync auto-resumed successfully");
                 }
             });
 
@@ -4871,6 +6781,8 @@ pub fn run() {
             get_thread_events,
             get_feed_thread_roots,
             get_interaction_counts,
+            get_reacted_event_ids,
+            get_reposted_event_ids,
             fetch_thread_from_relays,
             fetch_global_feed,
             fetch_wot_articles,
@@ -4905,9 +6817,14 @@ pub fn run() {
             get_kind_counts,
             get_dm_events,
             get_profiles,
+            search_profiles,
             get_own_profile,
             setup_browser_integration,
             check_browser_integration,
+            get_media_stats,
+            get_own_media,
+            get_profile_media,
+            fetch_profile_media,
             restart_sync,
             reset_sync_cursors,
             get_followers,
@@ -4923,13 +6840,23 @@ pub fn run() {
             get_kind_counts_for_category,
             get_events_for_category,
             get_event_media_for_category,
+            get_media_for_category,
+            requeue_profile_media,
+            download_tracked_media,
             fetch_profile,
             get_profile_with_refresh,
             nsec_to_npub,
+            generate_keypair,
+            publish_metadata,
             set_nsec,
             clear_nsec,
             get_signing_mode,
             decrypt_dm,
+            unwrap_gift_wrap,
+            publish_gift_wrap_dm,
+            fetch_new_dms,
+            check_new_dms_notify,
+            publish_inbox_relays,
             connect_bunker,
             generate_nostr_connect_uri,
             await_nostr_connect,
@@ -4947,8 +6874,20 @@ pub fn run() {
             wallet_provision,
             send_zap,
             publish_reaction,
+            publish_repost,
+            publish_note,
+            publish_dm,
+            publish_article,
             get_author_articles,
             fetch_profiles_from_relay,
+            fetch_profile_content_from_relays,
+            fetch_note_context_from_relays,
+            fetch_enrichment_from_relays,
+            fetch_addressable_event_from_relays,
+            get_data_dir,
+            get_default_data_dir,
+            set_data_dir,
+            get_platform,
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|e| {

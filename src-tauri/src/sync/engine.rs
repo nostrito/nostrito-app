@@ -218,6 +218,55 @@ impl SyncEngine {
         set.into_iter().collect()
     }
 
+    /// Build a relay set for fetching NIP-17 gift wraps (inbox relays).
+    /// Sources: own kind 10050 relay list, NIP-65 read relays, well-known DM relays.
+    fn build_inbox_relay_set(&self) -> Vec<String> {
+        let mut set: HashSet<String> = HashSet::new();
+
+        // Kind 10050 inbox relays (NIP-17 DM relay list)
+        if let Ok(events) = self.db.query_events(
+            None,
+            Some(&[self.hex_pubkey.clone()]),
+            Some(&[10050]),
+            None,
+            None,
+            1,
+        ) {
+            for (_, _, _, _, tags_json, _, _) in &events {
+                if let Ok(tags) = serde_json::from_str::<Vec<Vec<String>>>(tags_json) {
+                    for tag in &tags {
+                        if tag.len() >= 2 && tag[0] == "relay" {
+                            set.insert(tag[1].trim_end_matches('/').to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        // NIP-65 read relays as fallback
+        if let Ok(nip65) = self.db.get_read_relays(&self.hex_pubkey) {
+            for (url, _) in nip65 {
+                set.insert(url);
+            }
+        }
+
+        // Well-known DM-capable relays
+        for url in &[
+            "wss://auth.nostr1.com",
+            "wss://relay.0xchat.com",
+            "wss://nos.lol",
+            "wss://relay.damus.io",
+            "wss://relay.primal.net",
+            "wss://relay.nostr.band",
+        ] {
+            set.insert(url.to_string());
+        }
+
+        // Remove relays already in the comprehensive set to avoid double-querying
+        let comprehensive: HashSet<String> = self.build_comprehensive_relay_set().into_iter().collect();
+        set.difference(&comprehensive).cloned().collect()
+    }
+
     /// Phase 1: Fetch own profile, contact list, and all own events.
     async fn phase_own_data(&self) -> Result<()> {
         {
@@ -256,12 +305,47 @@ impl SyncEngine {
             .since(Timestamp::from(since as u64))
             .limit(1000);
 
-        // Fetch DMs addressed to us since last cursor
+        // Fetch DMs addressed to us since last cursor (NIP-04 kind:4 + NIP-17 kind:1059)
         let received_dms_filter = Filter::new()
             .pubkey(pk)
             .kind(Kind::EncryptedDirectMessage)
             .since(Timestamp::from(since as u64))
             .limit(500);
+
+        // Gift wraps have randomized timestamps (±2 days per NIP-59), so look back
+        // further than the cursor to avoid missing events whose created_at was tweaked
+        // to before our last sync.
+        let gift_wrap_since = since - 172800; // 2 days extra lookback
+        let received_gift_wraps_filter = Filter::new()
+            .pubkey(pk)
+            .kind(Kind::GiftWrap)
+            .since(Timestamp::from(gift_wrap_since.max(0) as u64))
+            .limit(500);
+
+        // NIP-17: also fetch gift wraps from DM inbox relays (kind 10050) and
+        // well-known DM relays, since gift wraps are published to the recipient's
+        // inbox relays — not the general relay set.
+        let inbox_relays = self.build_inbox_relay_set();
+        if !inbox_relays.is_empty() {
+            let inbox_gw_filter = Filter::new()
+                .pubkey(pk)
+                .kind(Kind::GiftWrap)
+                .since(Timestamp::from(gift_wrap_since.max(0) as u64))
+                .limit(500);
+            let inbox_events = self.pool.subscribe_and_collect(
+                &inbox_relays,
+                vec![inbox_gw_filter],
+                15,
+            ).await.unwrap_or_default();
+            if !inbox_events.is_empty() {
+                info!("Phase 1: fetched {} gift wraps from inbox relays", inbox_events.len());
+                processing::process_events(
+                    &inbox_events, &self.db, &self.graph, &self.hex_pubkey,
+                    EventSource::OwnBackup,
+                    Some(&self.app_handle), "0",
+                );
+            }
+        }
 
         // Mentions of us (kind:1 notes with #p tag pointing to us)
         let mentions_filter = Filter::new()
@@ -292,6 +376,7 @@ impl SyncEngine {
                 meta_filter,
                 events_filter,
                 received_dms_filter,
+                received_gift_wraps_filter,
                 mentions_filter,
                 reactions_to_own_filter,
                 zaps_to_own_filter,

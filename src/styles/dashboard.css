@@ -523,6 +523,7 @@
   margin-left: 8px;
 }
 .ev-kind-note { background: rgba(124,58,237,0.1); color: var(--accent-light); }
+.ev-kind-reply { background: rgba(251,191,36,0.1); color: var(--yellow, #fbbf24); }
 .ev-kind-long { background: rgba(96,165,250,0.1); color: var(--blue); }
 .ev-kind-repost { background: rgba(52,211,153,0.1); color: var(--green); }
 
@@ -1366,6 +1367,29 @@
   background: rgba(239, 68, 68, 0.15);
   color: #ef4444;
 }
+
+/* ── Send message button ── */
+.profile-dm-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--accent);
+  background: rgba(124, 58, 237, 0.1);
+  color: var(--accent-light);
+  font-size: 0.78rem;
+  font-weight: 600;
+  font-family: var(--font);
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+.profile-dm-btn:hover {
+  background: rgba(124, 58, 237, 0.2);
+}
+.profile-dm-btn .icon { display: flex; }
+.profile-dm-btn .icon svg { width: 14px; height: 14px; }
 
 /* ── Three-dots menu ── */
 .profile-menu-container {

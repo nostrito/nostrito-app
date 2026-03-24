@@ -77,11 +77,16 @@ export function useInteractionCounts(eventId: string): InteractionCounts | null 
   return cache.get(eventId) ?? null;
 }
 
-/** Invalidate cache for specific IDs (e.g. after thread refresh). */
+/** Invalidate cache for specific IDs and trigger a re-fetch. */
 export function invalidateInteractionCounts(ids?: string[]) {
   if (ids) {
-    for (const id of ids) cache.delete(id);
+    for (const id of ids) {
+      cache.delete(id);
+      pendingIds.add(id);
+    }
   } else {
+    for (const id of cache.keys()) pendingIds.add(id);
     cache.clear();
   }
+  scheduleFlush();
 }

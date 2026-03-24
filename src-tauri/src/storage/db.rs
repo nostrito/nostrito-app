@@ -15,6 +15,7 @@ pub struct ProfileInfo {
     pub name: Option<String>,
     pub display_name: Option<String>,
     pub picture: Option<String>,
+    pub picture_local: Option<String>,
     pub nip05: Option<String>,
     pub about: Option<String>,
     pub banner: Option<String>,
@@ -24,6 +25,7 @@ pub struct ProfileInfo {
 
 pub struct Database {
     conn: Mutex<Connection>,
+    pub data_dir: std::path::PathBuf,
 }
 
 /// Batch update item for efficient multi-event persistence
@@ -44,11 +46,16 @@ pub struct SyncState {
 
 impl Database {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let conn = Connection::open(path)?;
+        let db_path = path.as_ref();
+        let data_dir = db_path.parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let conn = Connection::open(db_path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
 
         let db = Self {
             conn: Mutex::new(conn),
+            data_dir,
         };
         db.init_schema()?;
         Ok(db)
@@ -105,9 +112,28 @@ impl Database {
                 value TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS media_cache (
+                hash        TEXT PRIMARY KEY,
+                url         TEXT NOT NULL,
+                mime_type   TEXT NOT NULL,
+                size_bytes  INTEGER NOT NULL,
+                pubkey      TEXT NOT NULL,
+                downloaded_at INTEGER NOT NULL,
+                last_accessed INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_media_lru ON media_cache(last_accessed);
+            CREATE INDEX IF NOT EXISTS idx_media_pubkey ON media_cache(pubkey);
+
             CREATE TABLE IF NOT EXISTS media_deleted (
                 url TEXT PRIMARY KEY,
                 deleted_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS media_queue (
+                url TEXT PRIMARY KEY,
+                pubkey TEXT NOT NULL,
+                queued_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                priority INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS tracked_profiles (
@@ -1205,38 +1231,114 @@ impl Database {
 
     /// Get profile info (kind:0 metadata) for given pubkeys.
     /// Parses the JSON content of the most recent kind:0 event per pubkey.
+    /// Resolves profile picture URLs to local cached paths when available.
     pub fn get_profiles(&self, pubkeys: &[String]) -> Result<Vec<ProfileInfo>> {
         if pubkeys.is_empty() {
             return Ok(vec![]);
         }
 
-        let conn = self.conn.lock();
         let mut profiles = Vec::new();
 
-        // Process in chunks to avoid SQLite variable limits
-        for chunk in pubkeys.chunks(500) {
-            let placeholders: Vec<String> = (0..chunk.len())
-                .map(|i| format!("?{}", i + 1))
-                .collect();
-            let sql = format!(
-                "SELECT pubkey, content FROM nostr_events \
-                 WHERE kind = 0 AND pubkey IN ({}) \
-                 ORDER BY created_at DESC",
-                placeholders.join(",")
-            );
+        {
+            let conn = self.conn.lock();
 
-            let mut stmt = conn.prepare(&sql)?;
-            let params_vec: Vec<&dyn rusqlite::ToSql> =
-                chunk.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+            // Process in chunks to avoid SQLite variable limits
+            for chunk in pubkeys.chunks(500) {
+                let placeholders: Vec<String> = (0..chunk.len())
+                    .map(|i| format!("?{}", i + 1))
+                    .collect();
+                let sql = format!(
+                    "SELECT pubkey, content FROM nostr_events \
+                     WHERE kind = 0 AND pubkey IN ({}) \
+                     ORDER BY created_at DESC",
+                    placeholders.join(",")
+                );
 
-            let rows = stmt.query_map(params_vec.as_slice(), |row| {
+                let mut stmt = conn.prepare(&sql)?;
+                let params_vec: Vec<&dyn rusqlite::ToSql> =
+                    chunk.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+
+                let rows = stmt.query_map(params_vec.as_slice(), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+
+                let mut seen = std::collections::HashSet::new();
+                for row in rows {
+                    if let Ok((pubkey, content)) = row {
+                        // Only take the first (most recent) per pubkey
+                        if !seen.insert(pubkey.clone()) {
+                            continue;
+                        }
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
+                            profiles.push(ProfileInfo {
+                                pubkey,
+                                name: parsed.get("name").and_then(|v| v.as_str()).map(String::from),
+                                display_name: parsed.get("display_name").and_then(|v| v.as_str()).map(String::from),
+                                picture: parsed.get("picture").and_then(|v| v.as_str()).map(String::from),
+                                picture_local: None,
+                                nip05: parsed.get("nip05").and_then(|v| v.as_str()).map(String::from),
+                                about: parsed.get("about").and_then(|v| v.as_str()).map(String::from),
+                                banner: parsed.get("banner").and_then(|v| v.as_str()).map(String::from),
+                                website: parsed.get("website").and_then(|v| v.as_str()).map(String::from),
+                                lud16: parsed.get("lud16").and_then(|v| v.as_str()).map(String::from),
+                            });
+                        }
+                    }
+                }
+            }
+        } // conn lock dropped here
+
+        // Resolve local media paths for profile pictures
+        let picture_urls: Vec<String> = profiles.iter()
+            .filter_map(|p| p.picture.clone())
+            .collect();
+
+        if !picture_urls.is_empty() {
+            if let Ok(cache_map) = self.media_cache_lookup_by_urls(&picture_urls) {
+                for profile in &mut profiles {
+                    if let Some(ref pic_url) = profile.picture {
+                        if let Some((hash, _mime, _size, _dl)) = cache_map.get(pic_url) {
+                            let local_path = crate::paths::media_file_path(&self.data_dir, hash)
+                                .to_string_lossy()
+                                .to_string();
+                            if std::path::Path::new(&local_path).exists() {
+                                profile.picture_local = Some(local_path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        debug!("[db] get_profiles: requested={}, found={}", pubkeys.len(), profiles.len());
+        Ok(profiles)
+    }
+
+    /// Search profiles by name, display_name, or nip05 in kind-0 metadata events.
+    pub fn search_profiles(&self, query: &str, limit: u32) -> Result<Vec<ProfileInfo>> {
+        let pattern = format!("%{}%", query.to_lowercase());
+        let mut profiles = Vec::new();
+
+        {
+            let conn = self.conn.lock();
+            let sql = "SELECT pubkey, content FROM nostr_events \
+                        WHERE kind = 0 \
+                        AND ( \
+                          LOWER(json_extract(content, '$.name')) LIKE ?1 \
+                          OR LOWER(json_extract(content, '$.display_name')) LIKE ?1 \
+                          OR LOWER(json_extract(content, '$.nip05')) LIKE ?1 \
+                        ) \
+                        ORDER BY created_at DESC \
+                        LIMIT ?2";
+
+            let mut stmt = conn.prepare(sql)?;
+            let rows = stmt.query_map(rusqlite::params![pattern, limit], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?;
 
             let mut seen = std::collections::HashSet::new();
             for row in rows {
                 if let Ok((pubkey, content)) = row {
-                    // Only take the first (most recent) per pubkey
                     if !seen.insert(pubkey.clone()) {
                         continue;
                     }
@@ -1246,6 +1348,7 @@ impl Database {
                             name: parsed.get("name").and_then(|v| v.as_str()).map(String::from),
                             display_name: parsed.get("display_name").and_then(|v| v.as_str()).map(String::from),
                             picture: parsed.get("picture").and_then(|v| v.as_str()).map(String::from),
+                            picture_local: None,
                             nip05: parsed.get("nip05").and_then(|v| v.as_str()).map(String::from),
                             about: parsed.get("about").and_then(|v| v.as_str()).map(String::from),
                             banner: parsed.get("banner").and_then(|v| v.as_str()).map(String::from),
@@ -1257,7 +1360,29 @@ impl Database {
             }
         }
 
-        debug!("[db] get_profiles: requested={}, found={}", pubkeys.len(), profiles.len());
+        // Resolve local media paths for profile pictures
+        let picture_urls: Vec<String> = profiles.iter()
+            .filter_map(|p| p.picture.clone())
+            .collect();
+
+        if !picture_urls.is_empty() {
+            if let Ok(cache_map) = self.media_cache_lookup_by_urls(&picture_urls) {
+                for profile in &mut profiles {
+                    if let Some(ref pic_url) = profile.picture {
+                        if let Some((hash, _mime, _size, _dl)) = cache_map.get(pic_url) {
+                            let local_path = crate::paths::media_file_path(&self.data_dir, hash)
+                                .to_string_lossy()
+                                .to_string();
+                            if std::path::Path::new(&local_path).exists() {
+                                profile.picture_local = Some(local_path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        debug!("[db] search_profiles: query={:?}, found={}", query, profiles.len());
         Ok(profiles)
     }
 
@@ -1287,7 +1412,21 @@ impl Database {
         Ok(())
     }
 
-    /// Get DM events (kind:4) involving a specific pubkey (as sender or recipient).
+    /// Count DM events stored locally since a given timestamp (uses stored_at, not created_at).
+    /// Detects new DMs from ANY source (sync engine, relay WebSocket, fetch_new_dms).
+    pub fn count_new_dms_since(&self, own_pubkey: &str, since_stored_at: i64) -> Result<i64> {
+        let conn = self.conn.lock();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM nostr_events \
+             WHERE kind IN (4, 1059) AND stored_at > ?1 \
+             AND (pubkey = ?2 OR tags LIKE '%' || ?2 || '%')",
+            params![since_stored_at, own_pubkey],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Get DM events (kind:4 NIP-04 + kind:1059 NIP-17 gift wrap) involving a specific pubkey.
     /// Returns (id, pubkey, created_at, kind, tags_json, content, sig).
     pub fn get_dm_events(
         &self,
@@ -1298,7 +1437,7 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT id, pubkey, created_at, kind, tags, content, sig \
              FROM nostr_events \
-             WHERE kind = 4 AND (pubkey = ?1 OR tags LIKE '%' || ?1 || '%') \
+             WHERE kind IN (4, 1059) AND (pubkey = ?1 OR tags LIKE '%' || ?1 || '%') \
              ORDER BY created_at DESC \
              LIMIT ?2",
         )?;
@@ -1436,6 +1575,226 @@ impl Database {
         Ok(deleted as u64)
     }
 
+    // ── Media Cache Methods ────────────────────────────────────────
+
+    /// Batch lookup media_cache records by URL.
+    /// Returns a map: url → (hash, mime_type, size_bytes, downloaded_at).
+    pub fn media_cache_lookup_by_urls(&self, urls: &[String]) -> Result<HashMap<String, (String, String, u64, i64)>> {
+        if urls.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let conn = self.conn.lock();
+        let mut map = HashMap::new();
+
+        // Process in batches of 200 to stay within SQLite parameter limits
+        for chunk in urls.chunks(200) {
+            let placeholders: Vec<String> = (0..chunk.len()).map(|i| format!("?{}", i + 1)).collect();
+            let sql = format!(
+                "SELECT url, hash, mime_type, size_bytes, downloaded_at FROM media_cache WHERE url IN ({})",
+                placeholders.join(",")
+            );
+            let params_refs: Vec<&dyn rusqlite::ToSql> = chunk.iter().map(|u| u as &dyn rusqlite::ToSql).collect();
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_refs.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? as u64,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?;
+            for row in rows.flatten() {
+                map.insert(row.0, (row.1, row.2, row.3, row.4));
+            }
+        }
+        Ok(map)
+    }
+
+    /// Check if a media blob is already cached
+    pub fn media_exists(&self, hash: &str) -> bool {
+        let conn = self.conn.lock();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM media_cache WHERE hash = ?1",
+                params![hash],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        count > 0
+    }
+
+    /// Reassign a media record's pubkey if the new pubkey has higher ownership priority.
+    /// Priority: own_pubkey > tracked > everything else.
+    pub fn media_reassign_if_higher_priority(
+        &self,
+        hash: &str,
+        new_pubkey: &str,
+        own_pubkey: &str,
+        tracked_pubkeys: &std::collections::HashSet<String>,
+    ) -> Result<bool> {
+        let conn = self.conn.lock();
+        let existing_pubkey: String = conn.query_row(
+            "SELECT pubkey FROM media_cache WHERE hash = ?1",
+            params![hash],
+            |row| row.get(0),
+        )?;
+
+        if existing_pubkey == new_pubkey {
+            return Ok(false);
+        }
+
+        let priority = |pk: &str| -> u8 {
+            if pk == own_pubkey { 2 }
+            else if tracked_pubkeys.contains(pk) { 1 }
+            else { 0 }
+        };
+
+        if priority(new_pubkey) > priority(&existing_pubkey) {
+            conn.execute(
+                "UPDATE media_cache SET pubkey = ?1 WHERE hash = ?2",
+                params![new_pubkey, hash],
+            )?;
+            debug!(
+                "[db] media_reassign: {}… {} → {} (priority {} > {})",
+                &hash[..hash.len().min(12)],
+                &existing_pubkey[..existing_pubkey.len().min(8)],
+                &new_pubkey[..new_pubkey.len().min(8)],
+                priority(new_pubkey),
+                priority(&existing_pubkey),
+            );
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    /// Record a downloaded media item (file already written to disk)
+    pub fn store_media_record(
+        &self,
+        hash: &str,
+        url: &str,
+        mime_type: &str,
+        size_bytes: u64,
+        pubkey: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT OR REPLACE INTO media_cache (hash, url, mime_type, size_bytes, pubkey, downloaded_at, last_accessed) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![hash, url, mime_type, size_bytes as i64, pubkey, now, now],
+        )?;
+        debug!("[db] store_media_record: hash={}… size={}", &hash[..std::cmp::min(12, hash.len())], size_bytes);
+        Ok(())
+    }
+
+    /// Delete media_cache records by hash (used during eviction).
+    pub fn media_delete_records(&self, hashes: &[String]) -> Result<()> {
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock();
+        for hash in hashes {
+            conn.execute(
+                "DELETE FROM media_cache WHERE hash = ?1",
+                params![hash],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Number of cached media files
+    pub fn media_file_count(&self) -> Result<u64> {
+        let conn = self.conn.lock();
+        let count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM media_cache", [], |row| row.get(0))?;
+        Ok(count as u64)
+    }
+
+    /// Total bytes used by cached media
+    pub fn media_total_bytes(&self) -> Result<u64> {
+        let conn = self.conn.lock();
+        let total: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(size_bytes), 0) FROM media_cache",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(total as u64)
+    }
+
+    /// List media ordered by last_accessed ASC (oldest first = evict first), limited to `limit` rows
+    /// Returns Vec<(hash, size_bytes)>
+    pub fn media_list_lru(&self, limit: usize) -> Result<Vec<(String, u64)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT hash, size_bytes FROM media_cache ORDER BY last_accessed ASC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// List media ordered by last_accessed ASC, EXCLUDING items from a specific pubkey (never evict own media)
+    pub fn media_list_lru_excluding_pubkey(&self, limit: usize, exclude_pubkey: &str) -> Result<Vec<(String, u64)>> {
+        let conn = self.conn.lock();
+        let one_hour_ago = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64 - 3600;
+        let mut stmt = conn.prepare(
+            "SELECT hash, size_bytes FROM media_cache WHERE pubkey != ?1 AND pubkey NOT IN (SELECT pubkey FROM tracked_profiles) AND downloaded_at < ?3 ORDER BY last_accessed ASC LIMIT ?2"
+        )?;
+        let rows = stmt
+            .query_map(params![exclude_pubkey, limit as i64, one_hour_ago], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Total bytes used by evictable media (excluding own pubkey and tracked profiles)
+    pub fn media_others_bytes(&self, exclude_pubkey: &str) -> Result<u64> {
+        let conn = self.conn.lock();
+        let total: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(size_bytes), 0) FROM media_cache WHERE pubkey != ?1 AND pubkey NOT IN (SELECT pubkey FROM tracked_profiles)",
+            params![exclude_pubkey],
+            |row| row.get(0),
+        )?;
+        Ok(total as u64)
+    }
+
+    /// Total bytes used by tracked profiles' media (excluding own pubkey)
+    pub fn media_tracked_bytes(&self, exclude_pubkey: &str) -> Result<u64> {
+        let conn = self.conn.lock();
+        let total: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(size_bytes), 0) FROM media_cache WHERE pubkey != ?1 AND pubkey IN (SELECT pubkey FROM tracked_profiles)",
+            params![exclude_pubkey],
+            |row| row.get(0),
+        )?;
+        Ok(total as u64)
+    }
+
+    /// List tracked-profile media ordered by last_accessed ASC (oldest first), excluding own pubkey
+    pub fn media_list_lru_tracked(&self, limit: usize, exclude_pubkey: &str) -> Result<Vec<(String, u64)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT hash, size_bytes FROM media_cache WHERE pubkey != ?1 AND pubkey IN (SELECT pubkey FROM tracked_profiles) ORDER BY last_accessed ASC LIMIT ?2"
+        )?;
+        let rows = stmt
+            .query_map(params![exclude_pubkey, limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
     /// Delete oldest events from others (NOT from own pubkey) — used for storage enforcement
     pub fn delete_oldest_others_events(&self, own_pubkey: &str, count: u32) -> Result<u64> {
         let conn = self.conn.lock();
@@ -1549,6 +1908,210 @@ impl Database {
             }
         }
         Ok(deleted)
+    }
+
+    // ── Media queue ─────────────────────────────────────────────
+
+    /// Queue a media URL for later download. Higher priority upgrades existing entries.
+    /// Also updates the pubkey if the new pubkey is a tracked profile (higher ownership priority).
+    pub fn queue_media_url(&self, url: &str, pubkey: &str, priority: i32) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO media_queue (url, pubkey, priority) VALUES (?1, ?2, ?3)
+             ON CONFLICT(url) DO UPDATE SET
+               priority = MAX(priority, excluded.priority),
+               pubkey = CASE
+                 WHEN excluded.pubkey IN (SELECT pubkey FROM tracked_profiles) THEN excluded.pubkey
+                 ELSE media_queue.pubkey
+               END",
+            params![url, pubkey, priority],
+        )?;
+        Ok(())
+    }
+
+    /// Dequeue up to `limit` media URLs (FIFO by queued_at). Deletes them from the queue.
+    pub fn dequeue_media_urls(&self, limit: usize) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT url, pubkey FROM media_queue ORDER BY priority DESC, queued_at ASC LIMIT ?1",
+        )?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if !rows.is_empty() {
+            let placeholders: Vec<String> = rows.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+            let sql = format!("DELETE FROM media_queue WHERE url IN ({})", placeholders.join(","));
+            let param_refs: Vec<&dyn rusqlite::ToSql> = rows.iter().map(|(u, _)| u as &dyn rusqlite::ToSql).collect();
+            conn.execute(&sql, param_refs.as_slice())?;
+        }
+
+        Ok(rows)
+    }
+
+    /// Dequeue up to `limit` media URLs for a specific pubkey. Deletes them from the queue.
+    pub fn dequeue_media_urls_for_pubkey(&self, pubkey: &str, limit: usize) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT url, pubkey FROM media_queue WHERE pubkey = ?1 ORDER BY priority DESC, queued_at ASC LIMIT ?2",
+        )?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map(params![pubkey, limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if !rows.is_empty() {
+            let placeholders: Vec<String> = rows.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+            let sql = format!("DELETE FROM media_queue WHERE url IN ({})", placeholders.join(","));
+            let param_refs: Vec<&dyn rusqlite::ToSql> = rows.iter().map(|(u, _)| u as &dyn rusqlite::ToSql).collect();
+            conn.execute(&sql, param_refs.as_slice())?;
+        }
+
+        Ok(rows)
+    }
+
+    /// Count pending media queue items for a specific pubkey.
+    pub fn media_queue_count_for_pubkey(&self, pubkey: &str) -> Result<u64> {
+        let conn = self.conn.lock();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM media_queue WHERE pubkey = ?1",
+            params![pubkey],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Get all own media records for the media explorer.
+    /// Returns (hash, url, mime_type, size_bytes, downloaded_at) sorted by downloaded_at DESC.
+    pub fn get_own_media(&self, own_pubkey: &str) -> Result<Vec<(String, String, String, u64, i64)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT hash, url, mime_type, size_bytes, downloaded_at FROM media_cache \
+             WHERE pubkey = ?1 ORDER BY downloaded_at DESC"
+        )?;
+        let rows = stmt
+            .query_map(params![own_pubkey], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? as u64,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Get cached media for any pubkey (profile media explorer).
+    /// Returns (hash, url, mime_type, size_bytes, downloaded_at) sorted by downloaded_at DESC.
+    pub fn get_profile_media(&self, pubkey: &str) -> Result<Vec<(String, String, String, u64, i64)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT hash, url, mime_type, size_bytes, downloaded_at FROM media_cache \
+             WHERE pubkey = ?1 ORDER BY downloaded_at DESC"
+        )?;
+        let rows = stmt
+            .query_map(params![pubkey], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? as u64,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Get media for a storage category ("own", "tracked", "wot").
+    /// Returns (hash, url, mime_type, size_bytes, downloaded_at) sorted by downloaded_at DESC.
+    pub fn get_media_for_category(&self, own_pubkey: &str, category: &str) -> Result<Vec<(String, String, String, u64, i64)>> {
+        let conn = self.conn.lock();
+        let sql = match category {
+            "own" => "SELECT hash, url, mime_type, size_bytes, downloaded_at FROM media_cache WHERE pubkey = ?1 ORDER BY downloaded_at DESC",
+            "tracked" => "SELECT hash, url, mime_type, size_bytes, downloaded_at FROM media_cache WHERE pubkey != ?1 AND pubkey IN (SELECT pubkey FROM tracked_profiles) ORDER BY downloaded_at DESC",
+            _ => "SELECT hash, url, mime_type, size_bytes, downloaded_at FROM media_cache WHERE pubkey != ?1 AND pubkey NOT IN (SELECT pubkey FROM tracked_profiles) ORDER BY downloaded_at DESC",
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt
+            .query_map(params![own_pubkey], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? as u64,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Re-queue media URLs from a pubkey's events into the media_queue for download.
+    /// Scans events for media URLs and inserts them into the queue if not already cached.
+    pub fn requeue_events_media(&self, pubkey: &str) -> Result<u32> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT tags FROM nostr_events WHERE pubkey = ?1 AND kind IN (1, 6, 30023)"
+        )?;
+        let tag_rows: Vec<String> = stmt
+            .query_map(params![pubkey], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut queued = 0u32;
+        for tags_json in &tag_rows {
+            let urls = crate::sync::media::extract_urls_from_tags(tags_json);
+            for url in urls {
+                // Skip if already cached or deleted
+                let cached: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM media_cache WHERE url = ?1)",
+                    params![url],
+                    |row| row.get(0),
+                ).unwrap_or(false);
+                let deleted: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM media_deleted WHERE url = ?1)",
+                    params![url],
+                    |row| row.get(0),
+                ).unwrap_or(false);
+                if !cached && !deleted {
+                    conn.execute(
+                        "INSERT OR IGNORE INTO media_queue (url, pubkey, priority) VALUES (?1, ?2, 0)",
+                        params![url, pubkey],
+                    ).ok();
+                    queued += 1;
+                }
+            }
+        }
+        Ok(queued)
+    }
+
+    /// Count own media files.
+    pub fn own_media_count(&self, own_pubkey: &str) -> Result<u64> {
+        let conn = self.conn.lock();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM media_cache WHERE pubkey = ?1",
+            params![own_pubkey],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Count pending items in media queue.
+    pub fn media_queue_count(&self) -> Result<u64> {
+        let conn = self.conn.lock();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM media_queue", [], |row| row.get(0))?;
+        Ok(count as u64)
     }
 
     // ── Ownership-based storage stats ─────────────────────────────
@@ -2576,6 +3139,74 @@ impl Database {
         Ok(result)
     }
 
+    /// Given a list of target event IDs and the user's pubkey, return those IDs
+    /// that the user has already reacted to (kind 7 with an e-tag referencing the target).
+    pub fn get_reacted_event_ids(&self, event_ids: &[String], user_pubkey: &str) -> Result<Vec<String>> {
+        if event_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.conn.lock();
+
+        let placeholders: Vec<String> = (1..=event_ids.len()).map(|i| format!("?{}", i)).collect();
+        let pk_idx = event_ids.len() + 1;
+        let sql = format!(
+            "SELECT DISTINCT json_extract(j.value, '$[1]') as ref_id
+             FROM nostr_events e, json_each(e.tags) j
+             WHERE e.kind = 7
+               AND e.pubkey = ?{}
+               AND json_extract(j.value, '$[0]') = 'e'
+               AND json_extract(j.value, '$[1]') IN ({})",
+            pk_idx,
+            placeholders.join(",")
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = event_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let user_pk = user_pubkey.to_string();
+        params.push(&user_pk);
+
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            row.get::<_, String>(0)
+        })?;
+
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Given a list of target event IDs and the user's pubkey, return those IDs
+    /// that the user has already reposted (kind 6 with an e-tag referencing the target).
+    pub fn get_reposted_event_ids(&self, event_ids: &[String], user_pubkey: &str) -> Result<Vec<String>> {
+        if event_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.conn.lock();
+
+        let placeholders: Vec<String> = (1..=event_ids.len()).map(|i| format!("?{}", i)).collect();
+        let pk_idx = event_ids.len() + 1;
+        let sql = format!(
+            "SELECT DISTINCT json_extract(j.value, '$[1]') as ref_id
+             FROM nostr_events e, json_each(e.tags) j
+             WHERE e.kind = 6
+               AND e.pubkey = ?{}
+               AND json_extract(j.value, '$[0]') = 'e'
+               AND json_extract(j.value, '$[1]') IN ({})",
+            pk_idx,
+            placeholders.join(",")
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = event_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let user_pk = user_pubkey.to_string();
+        params.push(&user_pk);
+
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            row.get::<_, String>(0)
+        })?;
+
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
     /// Get all thread events for a given root ID (the root itself + all events referencing it).
     pub fn get_thread_events(&self, root_id: &str) -> Result<(
         Option<(String, String, i64, i64, String, String, String)>,
@@ -2636,6 +3267,74 @@ impl Database {
         }
 
         Ok((root, replies, reactions, zaps))
+    }
+
+    // ── Enrichment cache ─────────────────────────────────────────────
+
+    /// Return event IDs that have no enrichment_cache entry or whose
+    /// last_fetched_at is older than `now - max_age_secs`.
+    pub fn get_stale_enrichment_ids(&self, event_ids: &[String], max_age_secs: i64) -> Result<Vec<String>> {
+        if event_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.conn.lock();
+        let now = chrono::Utc::now().timestamp();
+        let cutoff = now - max_age_secs;
+
+        let placeholders: Vec<String> = (1..=event_ids.len()).map(|i| format!("?{}", i)).collect();
+        let sql = format!(
+            "SELECT eid FROM (
+                SELECT value AS eid FROM json_each(json_array({}))
+             ) AS requested
+             WHERE eid NOT IN (
+                SELECT event_id FROM enrichment_cache WHERE last_fetched_at > ?{}
+             )",
+            placeholders.join(","),
+            event_ids.len() + 1,
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = event_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        params.push(&cutoff);
+
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            row.get::<_, String>(0)
+        })?;
+
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Batch upsert enrichment timestamps for event IDs.
+    pub fn set_enrichment_timestamps(&self, event_ids: &[String]) -> Result<()> {
+        if event_ids.is_empty() {
+            return Ok(());
+        }
+
+        let conn = self.conn.lock();
+        let now = chrono::Utc::now().timestamp();
+
+        let mut stmt = conn.prepare(
+            "INSERT INTO enrichment_cache (event_id, last_fetched_at) VALUES (?1, ?2)
+             ON CONFLICT(event_id) DO UPDATE SET last_fetched_at = ?2"
+        )?;
+
+        for id in event_ids {
+            stmt.execute(rusqlite::params![id, now])?;
+        }
+
+        Ok(())
+    }
+
+    /// Delete enrichment_cache entries older than `max_age_secs` to prevent unbounded growth.
+    pub fn cleanup_old_enrichment(&self, max_age_secs: i64) -> Result<u64> {
+        let conn = self.conn.lock();
+        let cutoff = chrono::Utc::now().timestamp() - max_age_secs;
+        let deleted = conn.execute(
+            "DELETE FROM enrichment_cache WHERE last_fetched_at < ?1",
+            rusqlite::params![cutoff],
+        )?;
+        Ok(deleted as u64)
     }
 }
 

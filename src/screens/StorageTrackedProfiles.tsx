@@ -18,6 +18,7 @@ interface TrackedProfileDetail {
   name: string | null;
   display_name: string | null;
   picture: string | null;
+  picture_local: string | null;
   event_count: number;
 }
 
@@ -210,6 +211,7 @@ export const StorageTrackedProfiles: React.FC = () => {
                     <div className="tracked-profile-info">
                       <Avatar
                         picture={p.picture}
+                        pictureLocal={p.picture_local}
                         pubkey={p.pubkey}
                         className="tracked-profile-avatar"
                       />
