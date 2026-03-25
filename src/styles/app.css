@@ -209,6 +209,17 @@
   animation: pulse-live 2s ease-in-out infinite;
 }
 
+.sidebar-status.offline {
+  color: var(--text-muted);
+}
+
+.sidebar-status .status-dot-offline {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #ef4444;
+}
+
 /* Main content */
 .main-content {
   flex: 1;
