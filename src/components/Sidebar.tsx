@@ -7,7 +7,7 @@ import { useCanWrite } from "../context/SigningContext";
 import { ComposeModal } from "./ComposeModal";
 
 export const Sidebar: React.FC = () => {
-  const { ownProfile } = useAppContext();
+  const { ownProfile, appStatus } = useAppContext();
   const canWrite = useCanWrite();
   const navigate = useNavigate();
   const [showCompose, setShowCompose] = useState(false);
@@ -69,7 +69,12 @@ export const Sidebar: React.FC = () => {
           <span className="own-profile-name">{ownProfile.name || ownProfile.display_name || "me"}</span>
         </NavLink>
       )}
-      <div className="sidebar-status"><span className="pulse-dot" /> live · wss://localhost:4869</div>
+      <div className={`sidebar-status${appStatus?.relay_running === false ? " offline" : ""}`}>
+        <span className={appStatus?.relay_running === false ? "status-dot-offline" : "pulse-dot"} />
+        {appStatus?.relay_running === false
+          ? "offline · sync unavailable"
+          : `live · wss://localhost:${appStatus?.relay_port ?? 4869}`}
+      </div>
       {showCompose && (
         <ComposeModal
           onClose={() => setShowCompose(false)}
