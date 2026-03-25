@@ -1,6 +1,6 @@
 # Nostrito Feature Audit
 
-Last updated: 2026-03-21
+Last updated: 2026-03-24
 
 ---
 
@@ -12,17 +12,25 @@ Last updated: 2026-03-21
 - **Compose Modal** — create notes (kind 1) and articles (kind 30023) with reply context
 - **Profile View** — metadata, notes/articles/media tabs, follow/follower lists, on-demand relay fetch
 - **Search** — full-text search on events, profile search by name, DM search, global relay search
+- **Global / Explore Feed** — consent-gated global feed from relays, integrated into Feed screen
 
 ### Identity & Signing
 - **4 signing modes** — nsec (keychain), NIP-46 bunker, Nostr Connect, read-only
 - **Setup Wizard** — identity selection, relay config, storage presets
+- **Profile editing** — edit name, about, picture, banner, NIP-05, lightning address, website from own profile
+- **Event deletion** (kind 5) — delete own events with confirmation; best-effort request to relays
 - **Change account** — switch to a different npub (destructive: clears keychain, returns to wizard). Not true multi-account yet — see Future Decisions below
 
 ### Social
-- **Direct Messages (NIP-04 + NIP-17)** — encrypted DMs grouped by conversation; NIP-17 gift wrap (default) + NIP-04 legacy with toggle
+- **Direct Messages (NIP-04 + NIP-17)** — encrypted DMs grouped by conversation; NIP-17 gift wrap (default) + NIP-04 legacy with toggle. NIP-04 messages show danger badge (open-lock icon with tooltip)
+- **DM notifications** — native macOS notification when a new DM arrives (`check_new_dms_notify`)
 - **Follow/Unfollow** — contact lists (kind 3)
 - **Mute/Unmute** — mute pubkeys (kind 10000)
 - **Track/Untrack Profiles** — persistent tracking with dedicated sync priority
+- **Reactions (kind 7)** — like button with filled-heart toggle state, optimistic UI. Unlike/unreact via kind 5 deletion.
+- **Reposts (kind 6)** — repost button in NoteCard, count display, disable-after-repost, grouped repost rendering
+- **Quote reposts** — renders quoted notes via `q` tag with embedded author/preview
+- **NIP-05 verified badge** — checkmark + identifier shown on profiles when present
 
 ### Content & Media
 - **Markdown rendering** — custom zero-dependency renderer for articles
@@ -44,7 +52,7 @@ Last updated: 2026-03-21
 - **WoT graph** — visualization, hop distance, BFS traversal, trust-based filtering
 - **Analytics dashboard** — live event stream, kind breakdown, sync progress, uptime
 - **Storage management** — per-category breakdown, retention policies, media quotas
-- **Relay management** — 14 preconfigured relays, add/remove, status monitoring
+- **Relay management** — 14 preconfigured relays + custom relay URLs, add/remove, status monitoring
 - **Offline mode** — toggle to stop all outbound sync
 - **Native macOS notifications** — for new events via tauri-plugin-notification
 - **NIP-65 relay routing** — discover and prefer user's read relays
@@ -53,167 +61,238 @@ Last updated: 2026-03-21
 
 ## Broken / Incomplete
 
-### Reactions (kind 7)
-- Backend `publish_reaction` exists and creates kind 7 events
-- Counts display via `useInteractionCounts`
-- **No visual feedback** that you've already reacted — no toggle state, no "liked" indicator
-- **No unlike support** — can like the same note multiple times
-- Fire-and-forget with no optimistic UI update
+### NIP-51 Bookmarks (kind 10003/30001)
+- Fully implemented: toggle, sync, dedicated screen, sidebar nav, batched queries
+- **UI disabled** pending interop fixes with other clients (see commit d312f9d)
+- Backend functional — ready to re-enable once interop is resolved
 
-### Reposts (kind 6)
-- Repost display works (including grouped reposts)
-- **No repost button** in NoteCard — can't create reposts from the UI
+### Event Deletion Request (kind 5)
+- Full-stack: tombstone backend + `publish_deletion` command + delete button in NoteCard + confirmation modal
+- Available on own events in Feed, ProfileView, and NoteDetail
+- **Important**: Nostr deletion is best-effort. Kind 5 is a *request* — our local relay hard-deletes, well-behaved outbound relays may stop serving it, but there is no guarantee. Events already fetched by other clients or stored on non-compliant relays persist indefinitely. This is a "hide from your view + politely ask the network" feature, not true deletion.
 
-### Event Deletion (kind 5)
-- Backend handles deletion tombstones and strips deleted events
-- **No delete button** in the UI — can't delete your own events
+### Profile Editing (kind 0)
+- Full-stack: `publish_metadata` command (name, about, picture, banner, NIP-05, LN address, website) + edit profile modal on own ProfileView
+- Also available during wizard (initial setup)
 
 ---
 
-## Missing Entirely
+## Prioritized Backlog
 
-### Core Social
-- [ ] **Profile editing** — no way to update your own kind 0 metadata after initial setup (name, bio, picture, banner, NIP-05, LN address). Backend `publish_metadata` command exists.
-- [ ] **Repost button** — can view reposts but can't create them
-- [ ] **Unlike / unreact** — no toggle for reactions
-- [ ] **Quote reposts** (kind 1 with `q` tag) — not supported
-- [ ] **Mentions autocomplete** — no @-mention suggestions when composing
-- [ ] **Notifications screen** — no aggregated view of reactions, replies, zaps, reposts, new followers directed at you
-- [ ] **Bookmark lists** (NIP-51 kind 30001/10003) — media bookmarks exist but no event/note bookmarking
+### P0 — Quick Wins (small effort, high polish)
 
-### Content
-- [ ] **Media upload service** — need a real upload integration (default provider configurable in settings). Required for:
-  1. **Profile pictures** — upload during setup wizard and profile editing
-  2. **Banners** — upload during profile editing
-  3. **Article covers** — upload when composing/editing kind 30023 articles
-  4. **Notes** — media uploader in compose modal for attaching images/videos to kind 1 notes
-  - Candidate services: nostr.build, blossom (NIP-96), void.cat, nostrimg.com
-  - Should support at minimum image upload; video/audio as stretch goals
-  - Provider selection in Settings with a sensible default (e.g. nostr.build)
-- [ ] **Image/video preview in compose** — no preview when pasting media URLs
-- [ ] **Content warnings** (NIP-36) — no support for `content-warning` tag
-- [ ] **Custom emoji** (NIP-30) — no custom emoji reactions or display
-- [ ] **Polls** (NIP-1078) — not supported
-- [ ] **Highlights** (kind 9802) — not supported
-- [ ] **Labels** (NIP-32) — not supported
+| # | Feature | Status |
+|---|---------|--------|
+| 1 | **NIP-04 danger badge on DMs** | **Done** — open-lock icon on NIP-04 messages, no badge on NIP-17 (clean = secure). |
+| 2 | **Delete request for own events** (kind 5) | **Done** — trash button + confirmation modal on own events in Feed/Profile/NoteDetail. |
+| 3 | **Profile editing screen** | **Done** — edit profile modal on own ProfileView with all metadata fields. |
+| 4 | **Re-enable NIP-51 bookmarks** | Pending — code is complete, fix interop issues and flip the switch. |
+| 5 | **Unlike / unreact** | **Done** — heart toggles off, publishes kind 5 deletion targeting the kind 7 reaction. |
 
-### Messaging
-- [x] **NIP-17 private DMs** (kind 14/1059 gift wrap) — send & receive NIP-17 gift-wrapped DMs with NIP-44 encryption
-- [x] **NIP-04 legacy DMs** (kind 4) — full send/receive/decrypt, toggleable from compose bar
-- [ ] **Group DMs** — not supported
-- [ ] **DM notifications** — native macOS notification when a new DM is received
+### P1 — Core Missing Features (medium effort, high impact)
 
-#### DM Protocol Architecture: NIP-04 vs NIP-17
+| # | Feature | Notes |
+|---|---------|-------|
+| 6 | **DM compatibility detection + soft warning** | Passive per-contact `dm_protocol_hint` based on received message kinds. Conversation header hint for likely-NIP-04 contacts with one-tap fallback. Per-conversation protocol memory. See DM Strategy section. |
+| 7 | **Notifications screen** | Aggregated view of reactions, replies, zaps, reposts, new followers directed at you. No backend or UI yet. |
+| 8 | **Media upload** | Upload integration (nostr.build / blossom). Unlocks profile picture editing, article covers, image notes. |
+| 9 | **Mentions autocomplete** | @-mention suggestions when composing. Need profile search-as-you-type in ComposeModal. |
+| 10 | **Image/video preview in compose** | Show preview when pasting media URLs before publishing. |
 
-Nostrito supports both the legacy NIP-04 and the modern NIP-17 direct messaging
-standards. NIP-17 is the default for sending; NIP-04 is available as a toggle
-for backward compatibility with older clients.
+### P2 — Ecosystem & Discovery (medium effort, differentiating)
+
+| # | Feature | Notes |
+|---|---------|-------|
+| 11 | **Trending / popular content** | Trending notes, hashtags, profiles. Could use relay aggregation or local heuristics. |
+| 12 | **Suggested follows** | WoT-based recommendations — graph is already there, need ranking + UI. |
+| 13 | **Lists** (NIP-51 kind 30000) | Categorized people lists (friends, devs, news, etc.). |
+| 14 | **Event rebroadcasting** | Re-publish tracked users' events that fell off relays. Signed events are immutable — any relay will accept them. |
+| 15 | **Content warnings** (NIP-36) | Support `content-warning` tag — blur/collapse with reveal button. |
+
+### P3 — Nice to Have (lower urgency)
+
+| # | Feature | Notes |
+|---|---------|-------|
+| 16 | **Drafts** | Auto-save compose state. |
+| 17 | **Keyboard shortcuts** | Navigation, compose, search. |
+| 18 | **Per-relay read/write preferences** | Backend supports directions, UI doesn't expose it. |
+| 19 | **Relay NIP-11 info display** | Show relay capabilities, software, limitations in relay management. |
+| 20 | **Export / import** | Export events to JSON, import from backup. |
+| 21 | **Client tag** (NIP-89) | Tag events with Nostrito client identifier. Also useful as a signal for DM compatibility detection. |
+| 22 | **Theme customization** | Light/dark toggle. CSS variables exist, needs runtime switcher. |
+
+### P4 — Long Tail
+
+| # | Feature | Notes |
+|---|---------|-------|
+| 23 | **Group DMs** | Multi-party encrypted conversations. |
+| 24 | **Custom emoji** (NIP-30) | Custom emoji reactions and display. |
+| 25 | **Polls** (NIP-1078) | Create and vote on polls. |
+| 26 | **Highlights** (kind 9802) | Highlight text passages from articles. |
+| 27 | **Labels** (NIP-32) | Content labeling/categorization. |
+| 28 | **Communities** (NIP-72) | Moderated community groups. |
+| 29 | **Scheduled posts** | Publish notes at a future time. |
+| 30 | **Auto-zaps / recurring zaps** | Automatic zapping. |
+| 31 | **Split zaps** (NIP-57) | Zap multiple recipients. |
+| 32 | **Lightning address verification** | Verify lud16 before zapping. |
+| 33 | **Media rebroadcasting** | Re-upload dead media from cache. Partially solvable (see Data Preservation notes below). |
+| 34 | **Event signature verification UI** | Verify event authenticity in the UI. |
+| 35 | **Browser extension integration** | Setup exists but incomplete. |
+
+---
+
+## DM Strategy: NIP-17 Default + NIP-04 Compatibility
+
+### The Problem
+
+NIP-17 is the right default — better encryption, hidden metadata, proper privacy.
+But Nostr is fragmented: some contacts use clients that only speak NIP-04. Sending
+NIP-17 to someone whose client can't unwrap gift wraps means they **never see your
+message**, with no error on either side. Users shouldn't need to know or care about
+protocol versions.
+
+### Design Principles
+
+1. **NIP-17 is always the default** — never downgrade silently
+2. **NIP-04 messages are visible but marked as insecure** — users learn over time
+3. **Detection is passive, not blocking** — don't interrupt the send flow
+4. **Per-conversation, not global** — legacy fallback is contextual
+
+### UX Design
+
+#### NIP-04 Danger Badge
+
+Every NIP-04 message (sent or received) shows a small warning icon inline:
+
+- **Icon**: small open-lock or caution triangle next to the message bubble
+- **Tooltip on hover**: "legacy encryption — who you're talking to and when is
+  publicly visible on relays"
+- **Applies to both sides**: your old sent NIP-04 messages *and* incoming NIP-04
+  from others — makes it clear this is a protocol property, not a sender's fault
+- **No badge on NIP-17** — clean bubbles = secure, badge = legacy. Users learn
+  the difference without reading docs.
+
+#### Passive NIP-17 Compatibility Detection
+
+We can infer whether a contact likely supports NIP-17 by observing their behavior
+**over time** — no instant detection, no blocking:
+
+| Signal | Meaning |
+|--------|---------|
+| We've received NIP-17 (kind 1059) from them | They support NIP-17. No action needed. |
+| We've only ever received NIP-04 (kind 4) from them | Likely on a legacy client. |
+| We've never exchanged DMs with them | Unknown — default to NIP-17 (optimistic). |
+| Their client tag (kind 10002 / NIP-89) names a known NIP-17 client | Likely supports it. Low confidence but useful signal. |
+
+**Storage**: per-contact `dm_protocol_hint` field — `"nip17"`, `"nip04_only"`, or
+`null` (unknown). Updated passively whenever we decrypt a DM from them.
+
+#### Soft Warning for Likely-NIP-04 Contacts
+
+When opening a conversation with a contact flagged as `nip04_only`:
+
+- **Conversation header hint** (not a modal, not a blocker): subtle banner like
+  "this contact may be using a legacy client — your messages might not be visible
+  to them"
+- **One-tap fallback**: banner includes a link: "send as legacy instead?" which
+  switches the conversation to NIP-04 mode (same as the existing compose bar
+  toggle, but surfaced contextually)
+- **Dismissable**: user can dismiss the banner; it won't reappear for that contact
+  unless the hint resets
+
+#### No Instant Send-Time Warning
+
+Deliberately **not** showing a warning at the moment you hit send:
+
+- It would interrupt the natural flow for a problem that *might not exist*
+- The passive detection can be wrong (contact may have upgraded clients)
+- NIP-17 is the right default — we shouldn't second-guess it on every message
+- If the contact truly can't read NIP-17, the conversation header hint already
+  told the user before they started typing
+
+#### Per-Conversation Protocol Memory
+
+- Once a user manually switches to NIP-04 for a conversation, **remember it** for
+  that contact — don't reset to NIP-17 on next session
+- If we later receive a NIP-17 message from that contact (they upgraded), auto-clear
+  the `nip04_only` flag and switch back to NIP-17 default
+- Show a small toast: "this contact now supports modern encryption" — positive
+  reinforcement
+
+### Protocol Reference
 
 **NIP-04 (legacy, kind 4)**
-- Simple: sender publishes a kind 4 event with NIP-04 (AES-CBC + ECDH) encrypted
-  content and a `p` tag naming the recipient.
-- The **event metadata is fully public**: anyone can see who is messaging whom, how
-  often, and the exact timestamps. Only the message body is encrypted.
-- Encryption uses AES-CBC which lacks modern authenticated-encryption guarantees.
-- Supported by every Nostr client since the beginning.
+- AES-CBC + ECDH encrypted content, `p` tag names recipient
+- **Metadata is fully public**: who, when, how often — only body is encrypted
+- Supported by every Nostr client since the beginning
 
 **NIP-17 (modern, kinds 13 / 14 / 1059)**
-- Three-layer envelope: **rumor → seal → gift wrap**.
-  1. **Rumor (kind 14)** — the actual message. Unsigned, contains the `p` tag
-     pointing to the recipient, and the plaintext content.
-  2. **Seal (kind 13)** — the rumor encrypted with NIP-44 (XChaCha20-Poly1305)
-     to the *recipient's* key, signed by the sender. Has a **randomised
-     timestamp** (±2 days) so observers cannot correlate events by time.
-  3. **Gift Wrap (kind 1059)** — the seal encrypted with NIP-44 to the
-     recipient's key, signed by a **random throwaway key**. The only public
-     metadata is the `p` tag (recipient) and another randomised timestamp.
-- Because the outer event is signed by a random key, **observers cannot
-  determine the sender**. Combined with the fuzzy timestamps, message frequency
-  and timing are also hidden.
-- Encryption uses NIP-44 (XChaCha20-Poly1305 + HKDF) — authenticated encryption
-  with a proper KDF, replacing NIP-04's weaker AES-CBC.
-- Sender creates **two** gift wraps per message: one addressed to the recipient
-  and one addressed to themselves (the "self-copy"), so sent messages appear in
-  the sender's conversation view.
+- Three-layer envelope: **rumor (kind 14) → seal (kind 13) → gift wrap (kind 1059)**
+- Sender hidden (random signing key), timestamps randomized (±2 days)
+- NIP-44 (XChaCha20-Poly1305 + HKDF) — authenticated encryption
+- Two gift wraps per message: one for recipient, one self-copy
 
 **How we maintain seamless compatibility**
 
 | Concern | Approach |
 |---|---|
-| **Receiving** | The sync engine fetches both kind 4 and kind 1059 events addressed to the user. The DB query returns both kinds in a single call. |
-| **Decryption** | Kind 4 → `nip04::decrypt`. Kind 1059 → three-layer unwrap (`gift_wrap → seal → rumor`) using `nip44::decrypt` at each layer. Both paths work with local nsec *and* NIP-46 remote signers. |
-| **Conversation grouping** | Kind 4 messages identify the partner from `pubkey` / `p` tag directly. Kind 1059 messages are unwrapped first to extract the real sender and recipient from the inner rumor, then merged into the same conversation map. |
-| **Sending (default NIP-17)** | New messages are sent as NIP-17 gift wraps by default. A toggle in the compose bar lets the user switch to NIP-04 for specific conversations (e.g. when messaging someone whose client only supports NIP-04). |
-| **Timestamps** | Gift wrap timestamps are intentionally randomised (±2 days). For display and sorting we use the rumor's `created_at` which reflects the actual send time. |
-| **NIP-46 remote signers** | Gift wrap creation requires NIP-44 encrypt + event signing. For NIP-46: the seal content is encrypted via `nip44_encrypt` on the remote signer, the seal is signed via `sign_event`, and the outer gift wrap uses a locally-generated random key (no remote call needed). Unwrapping mirrors this with `nip44_decrypt`. |
-
-### Discovery & Social Graph
-- [ ] **Trending / popular content** — no trending notes, hashtags, or profiles
-- [ ] **Global / explore feed UI** — backend `fetch_global_feed` exists but no dedicated screen
-- [ ] **Suggested follows** — no recommendations based on WoT
-- [ ] **Lists** (NIP-51 kind 30000) — no categorized people lists
-- [ ] **Communities** (NIP-72) — not supported
-
-### Publishing
-- [ ] **Drafts** — no draft saving
-- [ ] **Scheduled posts** — not supported
-
-### Settings & Management
-- [ ] **Relay NIP-11 info display** — relay info fetched but not shown in UI
-- [ ] **Per-relay read/write preferences** — backend supports directions but UI doesn't expose it
-- [ ] **Export / import** — no way to export events or import from backup
-- [ ] **Client tag** (NIP-89) — events don't include client identification
-
-### Security & Verification
-- [ ] **NIP-05 verified badge** — NIP-05 data is parsed but no badge shown on profiles
-- [ ] **Event signature verification UI** — no way to verify event authenticity in the UI
-
-### Wallet
-- [ ] **Auto-zaps / recurring zaps** — not supported
-- [ ] **Split zaps** (NIP-57) — not supported
-- [ ] **Lightning address verification** — no verification of lud16 before zapping
-
-### Data Preservation & Rebroadcasting
-- [ ] **Event rebroadcasting** — detect when tracked users' events have fallen off relays and re-publish them from the local cache. Fully feasible: signed events are immutable, any relay will accept a valid signature regardless of age.
-- [ ] **Media rebroadcasting / dead-link recovery** — detect when cached media files are no longer available at their original URLs (blossom servers down, nostr.build purged, etc.) and re-upload from local cache to a working media service.
-  - **Limitation**: re-uploading to a *different* service produces a new URL, but **existing notes cannot be rewritten** — the event id is a hash of the content, so changing the URL would invalidate the signature. The original links in published notes stay broken.
-  - **Blossom (content-addressed)**: URLs are `https://server/<sha256>.<ext>`. If re-uploaded to the *same* server the URL works again. If to a different blossom server, the hash matches but the domain differs — would require clients to support multi-server hash lookup (not widely adopted yet).
-  - **Possible mitigations**:
-    1. Publish **NIP-94 file metadata events (kind 1063)** mapping the original URL / file hash → new URL. Smart clients could use these as fallback resolution. Ecosystem support is still nascent.
-    2. For the user's *own* notes: offer to publish a **new event** (delete old + repost with updated links). Destructive but functional.
-    3. Proactive redundancy: at upload time, push to multiple media services simultaneously so if one dies the others still serve the file.
-  - **Bottom line**: event rebroadcasting is a clear win. Media recovery is partially solvable today and will improve as blossom and NIP-94 adoption grows.
-
-### Platform
-- [ ] **Keyboard shortcuts** — none implemented
-- [ ] **Theme customization** — no light/dark theme toggle
-- [ ] **Browser extension integration** — setup exists but incomplete
+| **Receiving** | Sync engine fetches both kind 4 and kind 1059. DB returns both in a single call. |
+| **Decryption** | Kind 4 → `nip04::decrypt`. Kind 1059 → three-layer unwrap with `nip44::decrypt`. Both work with nsec and NIP-46 signers. |
+| **Conversation grouping** | Kind 4: partner from `pubkey`/`p` tag. Kind 1059: unwrap to extract real sender/recipient, merge into same conversation. |
+| **Sending** | NIP-17 by default. Per-conversation NIP-04 fallback via compose bar toggle or conversation header hint. |
+| **Timestamps** | Gift wrap timestamps randomized. Display uses rumor's `created_at` for actual send time. |
+| **NIP-46 signers** | Seal encrypted via remote `nip44_encrypt`, signed via `sign_event`. Gift wrap uses local random key. |
 
 ---
 
-## Suggested Priorities
+## Data Preservation Notes
 
-### Quick Wins
-1. Fix **reactions** — add toggle state, prevent double-liking, show "liked" indicator
-2. Add **repost button** to NoteCard
-3. Add **delete own event** button (kind 5)
-4. Add **profile editing** screen (kind 0)
-5. Show **NIP-05 verified badge** on profiles
+### Event Rebroadcasting (P2)
+Detect when tracked users' events have fallen off relays and re-publish from local cache. Signed events are immutable — any relay will accept a valid signature regardless of age. Clear win.
 
-### Medium Effort, High Impact
-6. Add **notifications screen** (reactions/replies/zaps/follows about you)
-7. ~~Upgrade DMs to **NIP-44** (kind 14/1059)~~ ✅ Done — NIP-17 gift wrap DMs with NIP-44 encryption
-8. Add **media upload** (nostr.build or blossom)
-9. Add **global / explore feed** UI
-10. Add **quote reposts**
+### Media Rebroadcasting / Dead-Link Recovery (P4)
+- **Limitation**: re-uploading to a *different* service produces a new URL, but **existing notes cannot be rewritten** — the event id is a hash of the content.
+- **Blossom (content-addressed)**: re-upload to the *same* server restores the URL. Different blossom server = different domain.
+- **Mitigations**: NIP-94 file metadata events, publish new event (delete old + repost), proactive multi-service redundancy at upload time.
+- **Bottom line**: partially solvable today, improves as blossom and NIP-94 adoption grows.
 
 ---
 
 ## Future Decisions
 
+### Nostrito Mobile as Remote Signer
+
+The mobile app (iOS/Android) acts as the **key custodian and remote signer** for
+the desktop client — similar to how WhatsApp Web delegates to the phone. The phone
+holds the nsec; the desktop never sees it.
+
+**How it works**:
+1. Desktop shows a QR code (NIP-46 `nostrconnect://` URI)
+2. Phone scans it, establishing an encrypted session over relays
+3. Desktop sends signing requests (publish note, react, zap, DM encrypt/decrypt)
+4. Phone prompts for approval (or auto-approves trusted event kinds) and returns signatures
+5. Desktop publishes the signed event — never touches the private key
+
+**UX goals**:
+- **Pair once, stay connected** — persistent session like WhatsApp Web, not per-action QR scans
+- **Push-notification approval** — signing requests arrive as push notifications; tap to approve/reject
+- **Selective auto-sign** — user configures which kinds auto-approve (e.g. kind 1, 7) vs. require tap (e.g. kind 4 DMs, NWC wallet ops)
+- **Multi-device** — phone can authorize multiple desktops; revoke any session from the phone
+- **Offline grace** — desktop queues requests if phone is temporarily unreachable; phone processes the queue on reconnect
+
+**Built on**: NIP-46 (Nostr Connect / remote signer protocol) — already supported as a signing mode in the desktop app. Mobile side needs a NIP-46 **bunker service** (respond to requests) rather than the current client role.
+
+**Status**: Future — requires Nostrito Mobile to exist first
+
+---
+
 ### Multi-Account Support
 
-Full analysis in `MULTI_ACCOUNT_ANALYSIS.md`. Key decisions to make:
+Full analysis in `MULTI_ACCOUNT_ANALYSIS.md`.
+
+**TL;DR**: Manage multiple Nostr identities (main, alts, project accounts) from one app. Proposed path: **Cold Switch** (2-5 sec swap, ~5 commands to modify) + **separate DBs per account** (already how it works) + **no password** (rely on macOS keychain). An account registry in the lobby DB, a non-destructive `switch_account` command, and a sidebar account picker are the main deliverables. Can evolve to hybrid active/dormant model with cross-account DM notifications later.
+
+Key decisions to make:
 
 #### 1. Switching Model — How do we switch between accounts?
 

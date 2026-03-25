@@ -4,18 +4,21 @@ import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import {
   IconCheck, IconImage, IconBookOpen, IconFeed, IconZap,
   IconMoreVertical, IconCopy, IconShare, IconVolumeX, IconVolume,
-  IconExternalLink, IconDatabase, IconMessageCircle,
+  IconExternalLink, IconDatabase, IconMessageCircle, IconTrash,
+  IconPenSquare, IconX, IconKey,
 } from "../components/Icon";
 import { Avatar } from "../components/Avatar";
 import { NoteCard } from "../components/NoteCard";
 import { ZapModal } from "../components/ZapModal";
 import { ArticleCard } from "../components/ArticleCard";
 import { EmptyState } from "../components/EmptyState";
+import { ImageUploadField } from "../components/ImageUploadField";
 import { formatBytes, shortPubkey } from "../utils/format";
 import { profileDisplayName } from "../utils/profiles";
 import { initMediaViewer } from "../utils/media";
 import { invalidateInteractionCounts } from "../hooks/useInteractionCounts";
-import { markReacted } from "../hooks/useReactionStatus";
+import { markReacted, markUnreacted } from "../hooks/useReactionStatus";
+import { useSigningContext } from "../context/SigningContext";
 import { useOnDemandFetch } from "../hooks/useOnDemandFetch";
 import { useProfileContext, useProfile } from "../context/ProfileContext";
 import { listen } from "@tauri-apps/api/event";
@@ -66,6 +69,7 @@ export const ProfileView: React.FC = () => {
 
   /* --- profile from context ----------------------------------------- */
   const profile = useProfile(pubkey);
+  const { canWrite } = useSigningContext();
 
   /* --- state -------------------------------------------------------- */
   const [isOwn, setIsOwn] = useState(false);
@@ -93,6 +97,15 @@ export const ProfileView: React.FC = () => {
   // Zap modal
   const [zapTarget, setZapTarget] = useState<NostrEvent | null>(null);
 
+  // Delete confirmation
+  const [deleteConfirm, setDeleteConfirm] = useState<NostrEvent | null>(null);
+
+  // Edit profile
+  const [editing, setEditing] = useState(false);
+  const [editForm, setEditForm] = useState({ name: "", about: "", picture: "", banner: "", nip05: "", lud16: "", website: "" });
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+
   const handleLike = useCallback(async (event: NostrEvent) => {
     markReacted(event.id);
     try {
@@ -102,6 +115,72 @@ export const ProfileView: React.FC = () => {
       console.warn("[profile] Failed to publish reaction:", err);
     }
   }, []);
+
+  const handleUnlike = useCallback(async (event: NostrEvent) => {
+    markUnreacted(event.id);
+    try {
+      await invoke("publish_unreaction", { eventId: event.id });
+      invalidateInteractionCounts([event.id]);
+    } catch (err) {
+      console.warn("[profile] Failed to publish unreaction:", err);
+      markReacted(event.id);
+    }
+  }, []);
+
+  const handleDelete = useCallback((event: NostrEvent) => {
+    setDeleteConfirm(event);
+  }, []);
+
+  const confirmDelete = useCallback(async () => {
+    if (!deleteConfirm) return;
+    const event = deleteConfirm;
+    setDeleteConfirm(null);
+    try {
+      await invoke("publish_deletion", { eventId: event.id });
+      setNotes((prev) => prev.filter((e) => e.id !== event.id));
+    } catch (err) {
+      console.warn("[profile] Failed to delete event:", err);
+    }
+  }, [deleteConfirm]);
+
+  const handleStartEdit = useCallback(() => {
+    setSaveError(null);
+    setEditForm({
+      name: profile?.name ?? "",
+      about: profile?.about ?? "",
+      picture: profile?.picture ?? "",
+      banner: profile?.banner ?? "",
+      nip05: profile?.nip05 ?? "",
+      lud16: profile?.lud16 ?? "",
+      website: profile?.website ?? "",
+    });
+    setEditing(true);
+  }, [profile]);
+
+  const handleSaveProfile = useCallback(async () => {
+    setSaveError(null);
+    setSaving(true);
+    try {
+      await invoke("publish_metadata", {
+        name: editForm.name.trim() || null,
+        about: editForm.about.trim() || null,
+        picture: editForm.picture.trim() || null,
+        nip05: editForm.nip05.trim() || null,
+        lud16: editForm.lud16.trim() || null,
+        banner: editForm.banner.trim() || null,
+        website: editForm.website.trim() || null,
+      });
+      setEditing(false);
+      // Refresh profile
+      try { await invoke("get_profile_with_refresh", { pubkey }); } catch (_) {}
+    } catch (err) {
+      const msg = typeof err === "string" ? err : (err as any)?.message || "Failed to save";
+      setSaveError(msg);
+      console.warn("[profile] Failed to save profile:", err);
+    } finally {
+      setSaving(false);
+    }
+  }, [editForm, pubkey]);
 
   // Tab data
   const [notes, setNotes] = useState<NostrEvent[]>([]);
@@ -623,6 +702,20 @@ export const ProfileView: React.FC = () => {
                   )}
                 </div>
 
+                {/* Edit profile button (own) or connect key prompt */}
+                {isOwn && canWrite && (
+                  <button className="profile-edit-btn" onClick={handleStartEdit} title="edit profile">
+                    <span className="icon"><IconPenSquare /></span>
+                    edit profile
+                  </button>
+                )}
+                {isOwn && !canWrite && (
+                  <button className="profile-edit-btn" onClick={() => navigate("/settings")} title="connect signing key to edit profile">
+                    <span className="icon"><IconKey /></span>
+                    connect key to edit
+                  </button>
+                )}
+
                 {/* Send message button */}
                 {!isOwn && (
                   <button
@@ -756,6 +849,8 @@ export const ProfileView: React.FC = () => {
                         onClick={() => { console.log("[profile] navigate to note:", note.id.slice(0, 12)); navigate(`/note/${note.id}`); }}
                         onZap={setZapTarget}
                         onLike={handleLike}
+                        onUnlike={handleUnlike}
+                        onDelete={isOwn ? handleDelete : undefined}
                       />
                     ))}
                     {hasMoreNotes && notes.length > 0 && (
@@ -944,6 +1039,100 @@ export const ProfileView: React.FC = () => {
           recipientLud16={getProfile(zapTarget.pubkey)?.lud16 ?? profile?.lud16 ?? null}
           onClose={() => setZapTarget(null)}
         />
+      )}
+
+      {deleteConfirm && (
+        <div className="wallet-modal-overlay" onClick={() => setDeleteConfirm(null)}>
+          <div className="wallet-modal" onClick={(e) => e.stopPropagation()} style={{ width: 380 }}>
+            <div className="wallet-modal-header">
+              <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span className="icon"><IconTrash /></span>
+                delete note
+              </span>
+              <button className="wallet-modal-close" onClick={() => setDeleteConfirm(null)}><IconX /></button>
+            </div>
+            <div className="wallet-modal-body">
+              <p style={{ fontSize: "0.88rem", color: "var(--text-dim)", marginBottom: 12 }}>
+                Delete this note? A deletion request will be published to relays. Other relays may not honor the request.
+              </p>
+              <div style={{ fontSize: "0.82rem", color: "var(--text-muted)", borderLeft: "2px solid var(--border)", paddingLeft: 10, marginBottom: 16, maxHeight: 120, overflow: "hidden" }}>
+                {deleteConfirm.content.slice(0, 200)}{deleteConfirm.content.length > 200 ? "\u2026" : ""}
+              </div>
+              <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+                <button className="wallet-setup-connect-btn" style={{ background: "transparent", color: "var(--text-dim)", border: "1px solid var(--border)" }} onClick={() => setDeleteConfirm(null)}>cancel</button>
+                <button className="wallet-setup-connect-btn" style={{ background: "#dc2626" }} onClick={confirmDelete}>delete</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {editing && (
+        <div className="wallet-modal-overlay" onClick={() => setEditing(false)}>
+          <div className="wallet-modal" onClick={(e) => e.stopPropagation()} style={{ width: 480 }}>
+            <div className="wallet-modal-header">
+              <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span className="icon"><IconPenSquare /></span>
+                edit profile
+              </span>
+              <button className="wallet-modal-close" onClick={() => setEditing(false)}><IconX /></button>
+            </div>
+            <div className="wallet-modal-body" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              <label className="profile-edit-label">
+                name
+                <input type="text" className="profile-edit-input" value={editForm.name}
+                  onChange={(e) => setEditForm(f => ({ ...f, name: e.target.value }))} />
+              </label>
+              <label className="profile-edit-label">
+                about
+                <textarea className="profile-edit-textarea" rows={3} value={editForm.about}
+                  onChange={(e) => setEditForm(f => ({ ...f, about: e.target.value }))} />
+              </label>
+              <ImageUploadField
+                label="picture"
+                value={editForm.picture}
+                onChange={(url) => setEditForm(f => ({ ...f, picture: url }))}
+              />
+              <ImageUploadField
+                label="banner"
+                value={editForm.banner}
+                onChange={(url) => setEditForm(f => ({ ...f, banner: url }))}
+              />
+              <label className="profile-edit-label">
+                NIP-05 identifier
+                <input type="text" className="profile-edit-input" value={editForm.nip05}
+                  onChange={(e) => setEditForm(f => ({ ...f, nip05: e.target.value }))}
+                  placeholder="name@domain.com" />
+              </label>
+              <label className="profile-edit-label">
+                lightning address
+                <input type="text" className="profile-edit-input" value={editForm.lud16}
+                  onChange={(e) => setEditForm(f => ({ ...f, lud16: e.target.value }))}
+                  placeholder="name@walletprovider.com" />
+              </label>
+              <label className="profile-edit-label">
+                website
+                <input type="text" className="profile-edit-input" value={editForm.website}
+                  onChange={(e) => setEditForm(f => ({ ...f, website: e.target.value }))}
+                  placeholder="https://..." />
+              </label>
+              {saveError && (
+                <div style={{ fontSize: "0.82rem", color: "#e55", padding: "8px 10px", background: "rgba(255,60,60,0.08)", borderRadius: 6 }}>
+                  {saveError.includes("signer") || saveError.includes("nsec") || saveError.includes("signing")
+                    ? <>no signing method configured — <span style={{ color: "var(--accent)", cursor: "pointer", textDecoration: "underline" }} onClick={() => { setEditing(false); navigate("/settings"); }}>go to settings</span> to connect your key</>
+                    : saveError
+                  }
+                </div>
+              )}
+              <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 4 }}>
+                <button className="wallet-setup-connect-btn" style={{ background: "transparent", color: "var(--text-dim)", border: "1px solid var(--border)" }} onClick={() => setEditing(false)}>cancel</button>
+                <button className="wallet-setup-connect-btn" onClick={handleSaveProfile} disabled={saving}>
+                  {saving ? "saving..." : "save"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

@@ -3,7 +3,7 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
-import { IconX, IconHeart, IconHeartFilled, IconMessageCircle, IconZap, IconRepeat } from "../components/Icon";
+import { IconX, IconHeart, IconHeartFilled, IconMessageCircle, IconZap, IconRepeat, IconTrash } from "../components/Icon";
 import { NoteCard, GroupedRepostCard, getRepostOriginalId, type GroupedRepost } from "../components/NoteCard";
 import { ZapModal } from "../components/ZapModal";
 import { ComposeModal } from "../components/ComposeModal";
@@ -16,7 +16,7 @@ import { useProfileContext } from "../context/ProfileContext";
 import { useSigningContext } from "../context/SigningContext";
 import { profileDisplayName } from "../utils/profiles";
 import { useInteractionCounts, invalidateInteractionCounts } from "../hooks/useInteractionCounts";
-import { useReactionStatus, markReacted } from "../hooks/useReactionStatus";
+import { useReactionStatus, markReacted, markUnreacted } from "../hooks/useReactionStatus";
 import { markReposted } from "../hooks/useRepostStatus";
 import { useTauriEvent } from "../hooks/useTauriEvent";
 import { useInterval } from "../hooks/useInterval";
@@ -285,6 +285,14 @@ export const Feed: React.FC = () => {
 
   const [zapTarget, setZapTarget] = useState<NostrEvent | null>(null);
   const [replyTarget, setReplyTarget] = useState<NostrEvent | null>(null);
+  const [deleteConfirm, setDeleteConfirm] = useState<NostrEvent | null>(null);
+  const [ownPubkey, setOwnPubkey] = useState<string | null>(null);
+
+  useEffect(() => {
+    invoke<{ pubkey: string } | null>("get_own_profile").then((p) => {
+      if (p) setOwnPubkey(p.pubkey);
+    }).catch(() => {});
+  }, []);
 
   const handleLike = useCallback(async (event: NostrEvent) => {
     markReacted(event.id);
@@ -295,6 +303,33 @@ export const Feed: React.FC = () => {
       console.warn("[feed] Failed to publish reaction:", err);
     }
   }, []);
+
+  const handleUnlike = useCallback(async (event: NostrEvent) => {
+    markUnreacted(event.id);
+    try {
+      await invoke("publish_unreaction", { eventId: event.id });
+      invalidateInteractionCounts([event.id]);
+    } catch (err) {
+      console.warn("[feed] Failed to publish unreaction:", err);
+      markReacted(event.id);
+    }
+  }, []);
+
+  const handleDelete = useCallback((event: NostrEvent) => {
+    setDeleteConfirm(event);
+  }, []);
+
+  const confirmDelete = useCallback(async () => {
+    if (!deleteConfirm) return;
+    const event = deleteConfirm;
+    setDeleteConfirm(null);
+    try {
+      await invoke("publish_deletion", { eventId: event.id });
+      setFeedEvents((prev) => prev.filter((e) => e.id !== event.id));
+    } catch (err) {
+      console.warn("[feed] Failed to delete event:", err);
+    }
+  }, [deleteConfirm]);
 
   const [repostConfirm, setRepostConfirm] = useState<NostrEvent | null>(null);
   const handleRepost = useCallback((event: NostrEvent) => {
@@ -1126,8 +1161,10 @@ export const Feed: React.FC = () => {
                 onClick={() => navigate(`/note/${event.id}`)}
                 onZap={setZapTarget}
                 onLike={handleLike}
+                onUnlike={handleUnlike}
                 onReply={setReplyTarget}
                 onRepost={handleRepost}
+                onDelete={event.pubkey === ownPubkey ? handleDelete : undefined}
               />
             ))}
 
@@ -1285,6 +1322,31 @@ export const Feed: React.FC = () => {
               <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
                 <button className="wallet-setup-connect-btn" style={{ background: "transparent", color: "var(--text-dim)", border: "1px solid var(--border)" }} onClick={() => setRepostConfirm(null)}>cancel</button>
                 <button className="wallet-setup-connect-btn" onClick={confirmRepost}>repost</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+      {deleteConfirm && (
+        <div className="wallet-modal-overlay" onClick={() => setDeleteConfirm(null)}>
+          <div className="wallet-modal" onClick={(e) => e.stopPropagation()} style={{ width: 380 }}>
+            <div className="wallet-modal-header">
+              <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span className="icon"><IconTrash /></span>
+                delete note
+              </span>
+              <button className="wallet-modal-close" onClick={() => setDeleteConfirm(null)}><IconX /></button>
+            </div>
+            <div className="wallet-modal-body">
+              <p style={{ fontSize: "0.88rem", color: "var(--text-dim)", marginBottom: 12 }}>
+                Delete this note? A deletion request will be published to relays. Other relays may not honor the request.
+              </p>
+              <div style={{ fontSize: "0.82rem", color: "var(--text-muted)", borderLeft: "2px solid var(--border)", paddingLeft: 10, marginBottom: 16, maxHeight: 120, overflow: "hidden" }}>
+                {deleteConfirm.content.slice(0, 200)}{deleteConfirm.content.length > 200 ? "\u2026" : ""}
+              </div>
+              <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+                <button className="wallet-setup-connect-btn" style={{ background: "transparent", color: "var(--text-dim)", border: "1px solid var(--border)" }} onClick={() => setDeleteConfirm(null)}>cancel</button>
+                <button className="wallet-setup-connect-btn" style={{ background: "#dc2626" }} onClick={confirmDelete}>delete</button>
               </div>
             </div>
           </div>

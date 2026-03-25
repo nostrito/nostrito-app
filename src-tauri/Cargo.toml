@@ -36,7 +36,9 @@ chrono = { version = "0.4", features = ["serde"] }
 dirs = "5"
 tokio-util = { version = "0.7", features = ["rt"] }
 futures-util = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "multipart"] }
+sha2 = "0.10"
+base64 = "0.22"
 # keyring is desktop-only (see target section below)
 tokio-rustls = { version = "0.26", features = ["ring"] }
 rustls-pemfile = "2"

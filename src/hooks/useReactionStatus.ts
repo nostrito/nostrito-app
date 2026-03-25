@@ -78,6 +78,12 @@ export function markReacted(eventId: string) {
   notifyListeners();
 }
 
+/** Mark an event as unreacted (optimistic update after unlike). */
+export function markUnreacted(eventId: string) {
+  cache.set(eventId, false);
+  notifyListeners();
+}
+
 /** Invalidate cache for specific IDs (e.g. after refresh). */
 export function invalidateReactionStatus(ids?: string[]) {
   if (ids) {

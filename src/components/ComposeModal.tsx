@@ -122,16 +122,23 @@ export const ComposeModal: React.FC<ComposeModalProps> = ({ onClose, onPublished
                 </div>
               )}
 
-              {replyTo && (
-                <div className="compose-reply-context">
-                  <span className="compose-reply-author">
-                    replying to {profileDisplayName(replyToProfile, replyTo.pubkey)}
-                  </span>
-                  <div className="compose-reply-preview">
-                    {replyTo.content.slice(0, 120)}{replyTo.content.length > 120 ? "\u2026" : ""}
+              {replyTo && (() => {
+                // Kind 6 reposts store the original event as JSON in content
+                let preview = replyTo.content;
+                if (replyTo.kind === 6) {
+                  try { preview = JSON.parse(replyTo.content)?.content ?? preview; } catch {}
+                }
+                return (
+                  <div className="compose-reply-context">
+                    <span className="compose-reply-author">
+                      replying to {profileDisplayName(replyToProfile, replyTo.pubkey)}
+                    </span>
+                    <div className="compose-reply-preview">
+                      {preview.slice(0, 120)}{preview.length > 120 ? "\u2026" : ""}
+                    </div>
                   </div>
-                </div>
-              )}
+                );
+              })()}
 
               {mode === "article" && !replyTo && (
                 <>
