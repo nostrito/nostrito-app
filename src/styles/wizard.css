@@ -366,6 +366,12 @@
   font-family: var(--font);
 }
 
+.wiz-upload-label {
+  display: flex; flex-direction: column; gap: 4px;
+  font-size: 0.78rem; color: var(--text-muted); font-family: var(--font);
+  width: 100%;
+}
+
 /* Relay grid */
 .relay-grid {
   display: grid;
@@ -430,6 +436,81 @@
   background: var(--accent);
   border-color: var(--accent);
   color: #fff;
+}
+
+.relay-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.relay-remove-btn {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 2px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 0.15s, background 0.15s;
+}
+
+.relay-remove-btn:hover {
+  color: #ef4444;
+  background: rgba(239, 68, 68, 0.1);
+}
+
+.custom-relay-input-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.custom-relay-input-row input {
+  flex: 1;
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-card);
+  color: var(--text-primary);
+  font-size: 0.85rem;
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.custom-relay-input-row input:focus {
+  border-color: var(--accent);
+}
+
+.custom-relay-input-row input::placeholder {
+  color: var(--text-muted);
+  opacity: 0.6;
+}
+
+.custom-relay-input-row button {
+  padding: 8px 16px;
+  border-radius: 8px;
+  border: 1px solid var(--accent);
+  background: transparent;
+  color: var(--accent);
+  font-size: 0.82rem;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s;
+}
+
+.custom-relay-input-row button:hover {
+  background: rgba(124, 58, 237, 0.08);
+}
+
+.custom-relay-error {
+  color: #ef4444;
+  font-size: 0.75rem;
+  margin-top: 4px;
 }
 
 /* Storage preset cards */

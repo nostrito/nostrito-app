@@ -3,7 +3,7 @@ import { useNavigate, useLocation } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { QRCodeSVG } from "qrcode.react";
-import { RELAYS, resolveRelayUrl, urlToAlias } from "../relays";
+import { RELAYS, resolveRelayUrl, urlToAlias, isKnownRelay, isValidRelayUrl } from "../relays";
 import { profileDisplayName, type ProfileInfo } from "../utils/profiles";
 import { npubToHex, decodeEntity } from "../utils/mentions";
 import { useProfileContext } from "../context/ProfileContext";
@@ -301,6 +301,9 @@ export const Settings: React.FC = () => {
 
   /* --- relays ------------------------------------------------------- */
   const [selectedRelays, setSelectedRelays] = useState<Set<string>>(new Set());
+  const [customRelays, setCustomRelays] = useState<string[]>([]);
+  const [customRelayInput, setCustomRelayInput] = useState("");
+  const [customRelayError, setCustomRelayError] = useState("");
   const [relaySaving, setRelaySaving] = useState(false);
   const [relayFeedback, setRelayFeedback] = useState<SaveFeedback | null>(null);
 
@@ -398,18 +401,26 @@ export const Settings: React.FC = () => {
       console.log("[settings] get_settings response:", JSON.stringify(s));
       setSettings(s);
 
-      // Initialize relay selection
+      // Initialize relay selection — preserve custom URLs
       const activeAliases = new Set<string>();
+      const loadedCustomRelays: string[] = [];
       for (const relay of s.outbound_relays) {
         const isAlias = RELAYS.some((r) => r.id === relay);
         if (isAlias) {
           activeAliases.add(relay);
         } else {
           const alias = urlToAlias(relay);
-          if (alias) activeAliases.add(alias);
+          if (alias) {
+            activeAliases.add(alias);
+          } else {
+            // Custom relay URL — not in our built-in list
+            loadedCustomRelays.push(relay);
+            activeAliases.add(relay);
+          }
         }
       }
       setSelectedRelays(activeAliases);
+      setCustomRelays(loadedCustomRelays);
 
       // Storage sliders
       setOthersEventsGb(Math.round(s.storage_others_gb));
@@ -499,6 +510,39 @@ export const Settings: React.FC = () => {
       } else {
         next.add(id);
       }
+      return next;
+    });
+  }, []);
+
+  /* --- custom relay handlers ---------------------------------------- */
+  const addCustomRelay = useCallback(() => {
+    const url = customRelayInput.trim().toLowerCase();
+    setCustomRelayError("");
+
+    if (!url) return;
+    if (!isValidRelayUrl(url)) {
+      setCustomRelayError("must start with wss:// or ws://");
+      return;
+    }
+    if (isKnownRelay(url)) {
+      setCustomRelayError("this is a built-in relay — toggle it above");
+      return;
+    }
+    if (customRelays.includes(url)) {
+      setCustomRelayError("already added");
+      return;
+    }
+
+    setCustomRelays((prev) => [...prev, url]);
+    setSelectedRelays((prev) => new Set(prev).add(url));
+    setCustomRelayInput("");
+  }, [customRelayInput, customRelays]);
+
+  const removeCustomRelay = useCallback((url: string) => {
+    setCustomRelays((prev) => prev.filter((r) => r !== url));
+    setSelectedRelays((prev) => {
+      const next = new Set(prev);
+      next.delete(url);
       return next;
     });
   }, []);
@@ -1091,7 +1135,7 @@ export const Settings: React.FC = () => {
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 24 }}>
             <div
-              onClick={() => setNsecExpanded(!nsecExpanded)}
+              onClick={() => { setNsecExpanded(!nsecExpanded); setBunkerExpanded(false); setConnectExpanded(false); }}
               style={{
                 display: "flex",
                 alignItems: "center",
@@ -1172,7 +1216,7 @@ export const Settings: React.FC = () => {
               </div>
             )}
             <div
-              onClick={() => { setBunkerExpanded(!bunkerExpanded); setConnectExpanded(false); }}
+              onClick={() => { setBunkerExpanded(!bunkerExpanded); setNsecExpanded(false); setConnectExpanded(false); }}
               style={{
                 display: "flex",
                 alignItems: "center",
@@ -1247,7 +1291,7 @@ export const Settings: React.FC = () => {
               </div>
             )}
             <div
-              onClick={() => { setConnectExpanded(!connectExpanded); setBunkerExpanded(false); }}
+              onClick={() => { setConnectExpanded(!connectExpanded); setNsecExpanded(false); setBunkerExpanded(false); }}
               style={{
                 display: "flex",
                 alignItems: "center",
@@ -1386,7 +1430,7 @@ export const Settings: React.FC = () => {
             pick which relays to sync from. changes take effect after saving.
           </div>
 
-          <div className="relay-grid" style={{ marginBottom: 16 }}>
+          <div className="relay-grid">
             {RELAYS.map((relay) => (
               <RelayCard
                 key={relay.id}
@@ -1395,11 +1439,32 @@ export const Settings: React.FC = () => {
                 onToggle={toggleRelay}
               />
             ))}
+            {customRelays.map((url) => (
+              <RelayCard
+                key={url}
+                relay={{ id: url, name: url.replace(/^wss?:\/\//, ""), description: "custom relay", defaultOn: false }}
+                selected={selectedRelays.has(url)}
+                onToggle={toggleRelay}
+                onRemove={removeCustomRelay}
+              />
+            ))}
           </div>
+
+          <div className="custom-relay-input-row">
+            <input
+              type="text"
+              placeholder="wss://my-relay.example.com"
+              value={customRelayInput}
+              onChange={(e) => { setCustomRelayInput(e.target.value); setCustomRelayError(""); }}
+              onKeyDown={(e) => { if (e.key === "Enter") addCustomRelay(); }}
+            />
+            <button type="button" onClick={addCustomRelay}>add relay</button>
+          </div>
+          {customRelayError && <div className="custom-relay-error">{customRelayError}</div>}
 
           <button
             className="btn btn-primary"
-            style={{ width: "100%" }}
+            style={{ width: "100%", marginTop: 16 }}
             disabled={relaySaving}
             onClick={handleSaveRelays}
           >

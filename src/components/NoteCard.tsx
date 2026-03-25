@@ -1,7 +1,7 @@
 /** Shared note/repost card used in Feed and ProfileView */
 import React, { useMemo, useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { IconMessageCircle, IconRepeat, IconZap, IconHeart, IconHeartFilled } from "./Icon";
+import { IconMessageCircle, IconRepeat, IconZap, IconHeart, IconHeartFilled, IconTrash } from "./Icon";
 import { Avatar } from "./Avatar";
 import { timeAgo } from "../utils/format";
 import { kindLabel } from "../utils/ui";
@@ -290,8 +290,10 @@ interface NoteCardProps {
   onClick?: () => void;
   onZap?: (event: NostrEvent) => void;
   onLike?: (event: NostrEvent) => void;
+  onUnlike?: (event: NostrEvent) => void;
   onReply?: (event: NostrEvent) => void;
   onRepost?: (event: NostrEvent) => void;
+  onDelete?: (event: NostrEvent) => void;
 }
 
 /** Grouped repost: multiple people reposted the same original note */
@@ -410,10 +412,11 @@ const NoteCardInner: React.FC<{
   compact?: boolean;
   full?: boolean;
   onLike?: (event: NostrEvent) => void;
+  onUnlike?: (event: NostrEvent) => void;
   onZap?: (event: NostrEvent) => void;
   onReply?: (event: NostrEvent) => void;
   onRepost?: (event: NostrEvent) => void;
-}> = ({ event, profile, compact, full, onLike, onZap, onReply, onRepost }) => {
+}> = ({ event, profile, compact, full, onLike, onUnlike, onZap, onReply, onRepost }) => {
   const { ensureProfiles, getProfile } = useProfileContext();
   const counts = useInteractionCounts(event.id);
   useEnrichment(event.id);
@@ -462,7 +465,7 @@ const NoteCardInner: React.FC<{
             <ActionToast message={toast.message} />
             <button className={`ev-action${!canWrite || !onReply ? " ev-action-disabled" : ""}`} onClick={canWrite && onReply ? (e) => { e.stopPropagation(); onReply(event); } : !canWrite ? handleSigningClick : undefined}><span className="icon"><IconMessageCircle /></span>{counts?.replies ? ` ${counts.replies}` : ""}</button>
             <button className={`ev-action${reposted ? " ev-action-reposted" : ""}${!canWrite || reposted || !onRepost ? " ev-action-disabled" : ""}`} onClick={canWrite && !reposted && onRepost ? (e) => { e.stopPropagation(); onRepost(event); } : !canWrite ? handleSigningClick : undefined}><span className="icon"><IconRepeat /></span>{counts?.reposts ? ` ${counts.reposts}` : ""}</button>
-            <button className={`ev-action${liked ? " ev-action-liked" : ""}${!canWrite || liked ? " ev-action-disabled" : ""}`} onClick={canWrite && !liked ? (e) => { e.stopPropagation(); onLike?.(event); } : !canWrite && !liked ? handleSigningClick : undefined}><span className="icon">{liked ? <IconHeartFilled /> : <IconHeart />}</span>{counts?.reactions ? ` ${counts.reactions}` : ""}</button>
+            <button className={`ev-action${liked ? " ev-action-liked" : ""}${!canWrite ? " ev-action-disabled" : ""}`} onClick={canWrite ? (e) => { e.stopPropagation(); if (liked) { onUnlike?.(event); } else { onLike?.(event); } } : handleSigningClick}><span className="icon">{liked ? <IconHeartFilled /> : <IconHeart />}</span>{counts?.reactions ? ` ${counts.reactions}` : ""}</button>
             <button className={`ev-action${!canWrite ? " ev-action-disabled" : ""}`} onClick={canWrite ? (e) => { e.stopPropagation(); onZap?.(event); } : handleZapClick}><span className="icon"><IconZap /></span>{counts?.zaps ? ` ${counts.zaps}` : ""}</button>
             {/* bookmark button disabled — TODO: NIP-51 bookmarks pending interop fixes */}
           </div>
@@ -472,7 +475,7 @@ const NoteCardInner: React.FC<{
   );
 };
 
-export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, full, onClick, onZap, onLike, onReply, onRepost }) => {
+export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, full, onClick, onZap, onLike, onUnlike, onReply, onRepost, onDelete }) => {
   const k = kindLabel(event.kind);
   const displayName = profileDisplayName(profile, event.pubkey);
   const { ensureProfiles, getProfile } = useProfileContext();
@@ -610,9 +613,10 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, ful
             <ActionToast message={toast.message} />
             <button className={`ev-action${!canWrite || !onReply ? " ev-action-disabled" : ""}`} onClick={canWrite && onReply ? (e) => { e.stopPropagation(); onReply(event); } : !canWrite ? handleSigningClick : undefined}><span className="icon"><IconMessageCircle /></span>{counts?.replies ? ` ${counts.replies}` : ""}</button>
             <button className={`ev-action${reposted ? " ev-action-reposted" : ""}${!canWrite || reposted || !onRepost ? " ev-action-disabled" : ""}`} onClick={canWrite && !reposted && onRepost ? (e) => { e.stopPropagation(); onRepost(event); } : !canWrite ? handleSigningClick : undefined}><span className="icon"><IconRepeat /></span>{counts?.reposts ? ` ${counts.reposts}` : ""}</button>
-            <button className={`ev-action${liked ? " ev-action-liked" : ""}${!canWrite || liked ? " ev-action-disabled" : ""}`} onClick={canWrite && !liked ? (e) => { e.stopPropagation(); onLike?.(event); } : !canWrite && !liked ? handleSigningClick : undefined}><span className="icon">{liked ? <IconHeartFilled /> : <IconHeart />}</span>{counts?.reactions ? ` ${counts.reactions}` : ""}</button>
+            <button className={`ev-action${liked ? " ev-action-liked" : ""}${!canWrite ? " ev-action-disabled" : ""}`} onClick={canWrite ? (e) => { e.stopPropagation(); if (liked) { onUnlike?.(event); } else { onLike?.(event); } } : handleSigningClick}><span className="icon">{liked ? <IconHeartFilled /> : <IconHeart />}</span>{counts?.reactions ? ` ${counts.reactions}` : ""}</button>
             <button className={`ev-action${!canWrite ? " ev-action-disabled" : ""}`} onClick={canWrite ? (e) => { e.stopPropagation(); onZap?.(event); } : handleZapClick}><span className="icon"><IconZap /></span>{counts?.zaps ? ` ${counts.zaps}` : ""}</button>
             {/* bookmark button disabled — TODO: NIP-51 bookmarks pending interop fixes */}
+            {onDelete && <button className="ev-action ev-action-delete" onClick={(e) => { e.stopPropagation(); onDelete(event); }} title="delete note"><span className="icon"><IconTrash /></span></button>}
           </div>
         )}
       </div>

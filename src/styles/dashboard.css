@@ -1391,6 +1391,63 @@
 .profile-dm-btn .icon { display: flex; }
 .profile-dm-btn .icon svg { width: 14px; height: 14px; }
 
+/* ── Edit profile button ── */
+.profile-edit-btn {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 5px 14px; border-radius: 8px;
+  border: 1px solid var(--border); background: transparent;
+  color: var(--text-dim); font-size: 0.8rem; font-family: var(--font);
+  cursor: pointer; transition: all 0.15s;
+}
+.profile-edit-btn:hover { border-color: var(--accent); color: var(--accent); }
+.profile-edit-btn .icon { display: flex; }
+.profile-edit-btn .icon svg { width: 14px; height: 14px; }
+
+/* ── Edit profile form ── */
+.profile-edit-label {
+  display: flex; flex-direction: column; gap: 4px;
+  font-size: 0.78rem; color: var(--text-muted); font-family: var(--font);
+}
+.profile-edit-input {
+  padding: 8px 10px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--bg);
+  color: var(--text); font-size: 0.84rem; font-family: var(--font);
+}
+.profile-edit-input:focus { border-color: var(--accent); outline: none; }
+.profile-edit-textarea {
+  padding: 8px 10px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--bg);
+  color: var(--text); font-size: 0.84rem; font-family: var(--font);
+  resize: vertical;
+}
+.profile-edit-textarea:focus { border-color: var(--accent); outline: none; }
+
+/* ── Image upload field ── */
+.image-upload-row {
+  display: flex; gap: 6px; align-items: stretch;
+}
+.image-upload-input { flex: 1; min-width: 0; }
+.image-upload-btn {
+  display: flex; align-items: center; justify-content: center;
+  padding: 0 10px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--bg);
+  color: var(--text-dim); cursor: pointer; transition: all 0.15s;
+  flex-shrink: 0;
+}
+.image-upload-btn:hover { border-color: var(--accent); color: var(--accent); }
+.image-upload-btn:disabled { opacity: 0.5; cursor: default; }
+.image-upload-btn .icon { width: 16px; height: 16px; display: flex; }
+.image-upload-btn .icon svg { width: 16px; height: 16px; }
+.image-upload-spinner {
+  width: 14px; height: 14px; border: 2px solid var(--border);
+  border-top-color: var(--accent); border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.image-upload-error {
+  font-size: 0.72rem; color: #e55; margin-top: 2px;
+}
+
 /* ── Three-dots menu ── */
 .profile-menu-container {
   position: relative;

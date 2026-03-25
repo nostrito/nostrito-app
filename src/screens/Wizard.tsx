@@ -25,6 +25,7 @@ import {
   IconAlertTriangle,
   IconCopy,
 } from "../components/Icon";
+import { ImageUploadField } from "../components/ImageUploadField";
 import {
   STORAGE_PRESETS,
   STORAGE_PRESET_KEYS,
@@ -33,7 +34,7 @@ import {
 import { RelayCard } from "../components/RelayCard";
 import { Slider } from "../components/Slider";
 import { useAppContext } from "../context/AppContext";
-import { RELAYS, resolveRelayUrl } from "../relays";
+import { RELAYS, resolveRelayUrl, isKnownRelay, isValidRelayUrl } from "../relays";
 /* escapeHtml not needed — React auto-escapes JSX expressions */
 
 /* ------------------------------------------------------------------ */
@@ -103,6 +104,7 @@ export const Wizard: React.FC = () => {
   const [selectedRelays, setSelectedRelays] = useState<Set<string>>(
     () => new Set(RELAYS.filter((r) => r.defaultOn).map((r) => r.id))
   );
+  const [customRelays, setCustomRelays] = useState<string[]>([]);
   const [storagePreset, setStoragePreset] = useState<string>("balanced");
   const [customMode, setCustomMode] = useState(false);
   const [othersEventsGb, setOthersEventsGb] = useState(5);
@@ -195,6 +197,20 @@ export const Wizard: React.FC = () => {
       } else {
         next.add(id);
       }
+      return next;
+    });
+  }, []);
+
+  const addCustomRelay = useCallback((url: string) => {
+    setCustomRelays((prev) => [...prev, url]);
+    setSelectedRelays((prev) => new Set(prev).add(url));
+  }, []);
+
+  const removeCustomRelay = useCallback((url: string) => {
+    setCustomRelays((prev) => prev.filter((r) => r !== url));
+    setSelectedRelays((prev) => {
+      const next = new Set(prev);
+      next.delete(url);
       return next;
     });
   }, []);
@@ -597,6 +613,9 @@ export const Wizard: React.FC = () => {
               <StepRelays
                 selectedRelays={selectedRelays}
                 onToggle={toggleRelay}
+                customRelays={customRelays}
+                onAddCustomRelay={addCustomRelay}
+                onRemoveCustomRelay={removeCustomRelay}
               />
             )}
             {step === 3 && (
@@ -911,12 +930,12 @@ const StepIdentity: React.FC<StepIdentityProps> = ({
                     onChange={(e) => onProfileDataChange({ ...profileData, about: e.target.value })}
                     rows={3}
                   />
-                  <input
-                    type="url"
-                    className="wiz-input wiz-input-sm"
-                    placeholder="profile picture URL"
+                  <ImageUploadField
+                    label="profile picture"
                     value={profileData.picture}
-                    onChange={(e) => onProfileDataChange({ ...profileData, picture: e.target.value })}
+                    onChange={(url) => onProfileDataChange({ ...profileData, picture: url })}
+                    inputClassName="wiz-input wiz-input-sm"
+                    labelClassName="wiz-upload-label"
                   />
                   <input
                     type="text"
@@ -1013,25 +1032,65 @@ const StepIdentity: React.FC<StepIdentityProps> = ({
 interface StepRelaysProps {
   selectedRelays: Set<string>;
   onToggle: (id: string) => void;
+  customRelays: string[];
+  onAddCustomRelay: (url: string) => void;
+  onRemoveCustomRelay: (url: string) => void;
 }
 
-const StepRelays: React.FC<StepRelaysProps> = ({ selectedRelays, onToggle }) => (
-  <>
-    <h3 className="wiz-title">where do you want to sync from?</h3>
-    <p className="wiz-subtitle">pick by name. we handle the rest.</p>
+const StepRelays: React.FC<StepRelaysProps> = ({ selectedRelays, onToggle, customRelays, onAddCustomRelay, onRemoveCustomRelay }) => {
+  const [input, setInput] = useState("");
+  const [error, setError] = useState("");
 
-    <div className="relay-grid">
-      {RELAYS.map((relay) => (
-        <RelayCard
-          key={relay.id}
-          relay={relay}
-          selected={selectedRelays.has(relay.id)}
-          onToggle={onToggle}
+  const handleAdd = () => {
+    const url = input.trim().toLowerCase();
+    setError("");
+    if (!url) return;
+    if (!isValidRelayUrl(url)) { setError("must start with wss:// or ws://"); return; }
+    if (isKnownRelay(url)) { setError("this is a built-in relay — toggle it above"); return; }
+    if (customRelays.includes(url)) { setError("already added"); return; }
+    onAddCustomRelay(url);
+    setInput("");
+  };
+
+  return (
+    <>
+      <h3 className="wiz-title">where do you want to sync from?</h3>
+      <p className="wiz-subtitle">pick by name or add your own relay.</p>
+
+      <div className="relay-grid">
+        {RELAYS.map((relay) => (
+          <RelayCard
+            key={relay.id}
+            relay={relay}
+            selected={selectedRelays.has(relay.id)}
+            onToggle={onToggle}
+          />
+        ))}
+        {customRelays.map((url) => (
+          <RelayCard
+            key={url}
+            relay={{ id: url, name: url.replace(/^wss?:\/\//, ""), description: "custom relay", defaultOn: false }}
+            selected={selectedRelays.has(url)}
+            onToggle={onToggle}
+            onRemove={onRemoveCustomRelay}
+          />
+        ))}
+      </div>
+
+      <div className="custom-relay-input-row">
+        <input
+          type="text"
+          placeholder="wss://my-relay.example.com"
+          value={input}
+          onChange={(e) => { setInput(e.target.value); setError(""); }}
+          onKeyDown={(e) => { if (e.key === "Enter") handleAdd(); }}
         />
-      ))}
-    </div>
-  </>
-);
+        <button type="button" onClick={handleAdd}>add relay</button>
+      </div>
+      {error && <div className="custom-relay-error">{error}</div>}
+    </>
+  );
+};
 
 /* ================================================================== */
 /*  Step 3: Storage                                                    */

@@ -5008,6 +5008,8 @@ async fn publish_metadata(
     picture: Option<String>,
     nip05: Option<String>,
     lud16: Option<String>,
+    banner: Option<String>,
+    website: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     use nostr_sdk::prelude::*;
@@ -5022,6 +5024,16 @@ async fn publish_metadata(
     }
     if let Some(v) = nip05 { metadata = metadata.nip05(v); }
     if let Some(v) = lud16 { metadata = metadata.lud16(v); }
+    if let Some(v) = banner {
+        if let Ok(url) = nostr_sdk::prelude::Url::parse(&v) {
+            metadata = metadata.banner(url);
+        }
+    }
+    if let Some(v) = website {
+        if let Ok(url) = nostr_sdk::prelude::Url::parse(&v) {
+            metadata = metadata.website(url);
+        }
+    }
 
     let builder = EventBuilder::metadata(&metadata);
     let event = sign_build_publish_store(builder, &state).await?;
@@ -6369,6 +6381,138 @@ async fn sign_build_publish_store(
     Ok(signed)
 }
 
+/// Sign an event without publishing or storing it (for auth headers etc.)
+async fn sign_event_only(
+    builder: nostr_sdk::prelude::EventBuilder,
+    state: &State<'_, AppState>,
+) -> Result<nostr_sdk::prelude::Event, String> {
+    use nostr_sdk::prelude::*;
+
+    let config = state.config.read().await;
+    let nsec = config.nsec.clone();
+    let hex_pubkey = config.hex_pubkey.clone();
+    let signing_mode = config.signing_mode.clone();
+    drop(config);
+
+    let use_nsec = signing_mode == "nsec" && nsec.is_some();
+
+    if use_nsec {
+        let nsec_str = nsec.unwrap();
+        let secret_key = SecretKey::from_bech32(&nsec_str)
+            .map_err(|e| format!("Invalid nsec: {}", e))?;
+        let keys = Keys::new(secret_key);
+        builder.to_event(&keys).map_err(|e| format!("Failed to sign event: {}", e))
+    } else {
+        let pubkey_hex = hex_pubkey.ok_or("No signing key configured")?;
+        let pubkey = PublicKey::from_hex(&pubkey_hex)
+            .map_err(|e| format!("Invalid hex pubkey: {}", e))?;
+        let unsigned = builder.to_unsigned_event(pubkey);
+        let mut signer = {
+            let guard = state.nip46_signer.read().await;
+            guard.clone().ok_or("NIP-46 signer not connected")?
+        };
+        let event = signer.sign_event(unsigned).await
+            .map_err(|e| format!("Remote signer failed: {}", e))?;
+        {
+            let mut guard = state.nip46_signer.write().await;
+            *guard = Some(signer);
+        }
+        Ok(event)
+    }
+}
+
+#[tauri::command]
+async fn upload_to_blossom(
+    file_path: String,
+    server_url: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    use nostr_sdk::prelude::*;
+    use sha2::{Sha256, Digest};
+    use base64::Engine;
+
+    let server = server_url.unwrap_or_else(|| "https://blossom.primal.net".to_string());
+    let server = server.trim_end_matches('/').to_string();
+
+    // Read file
+    let file_bytes = tokio::fs::read(&file_path).await
+        .map_err(|e| format!("Failed to read file: {}", e))?;
+    let file_size = file_bytes.len();
+
+    // Determine MIME type from extension
+    let mime = match file_path.rsplit('.').next().map(|e| e.to_lowercase()).as_deref() {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        Some("mp4") => "video/mp4",
+        Some("webm") => "video/webm",
+        _ => "application/octet-stream",
+    };
+
+    // Calculate SHA-256
+    let mut hasher = Sha256::new();
+    hasher.update(&file_bytes);
+    let hash_bytes = hasher.finalize();
+    let hash_hex = hash_bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+
+    // Create BUD-02 authorization event (kind 24242)
+    let expiration = chrono::Utc::now().timestamp() + 600; // 10 min
+    let tags = vec![
+        Tag::parse(&["t", "upload"]).map_err(|e| format!("bad tag: {}", e))?,
+        Tag::parse(&["x", &hash_hex]).map_err(|e| format!("bad tag: {}", e))?,
+        Tag::parse(&["expiration", &expiration.to_string()]).map_err(|e| format!("bad tag: {}", e))?,
+        Tag::parse(&["size", &file_size.to_string()]).map_err(|e| format!("bad tag: {}", e))?,
+    ];
+    let builder = EventBuilder::new(Kind::Custom(24242), "Upload file", tags);
+    let auth_event = sign_event_only(builder, &state).await?;
+
+    // Serialize auth event to JSON and base64 encode
+    let auth_json = serde_json::json!({
+        "id": auth_event.id.to_hex(),
+        "pubkey": auth_event.pubkey.to_hex(),
+        "created_at": auth_event.created_at.as_u64(),
+        "kind": auth_event.kind.as_u16(),
+        "tags": auth_event.tags.iter()
+            .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect::<Vec<String>>())
+            .collect::<Vec<Vec<String>>>(),
+        "content": auth_event.content.to_string(),
+        "sig": auth_event.sig.to_string(),
+    });
+    let auth_b64 = base64::engine::general_purpose::STANDARD.encode(auth_json.to_string().as_bytes());
+
+    // PUT to Blossom server
+    let upload_url = format!("{}/upload", server);
+    tracing::info!("[blossom] uploading {} bytes ({}) to {} hash={}", file_size, mime, upload_url, &hash_hex[..12]);
+
+    let client = reqwest::Client::new();
+    let response = client.put(&upload_url)
+        .header("Authorization", format!("Nostr {}", auth_b64))
+        .header("Content-Type", mime)
+        .header("Content-Length", file_size)
+        .body(file_bytes)
+        .send()
+        .await
+        .map_err(|e| format!("Upload request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("Blossom upload failed ({}): {}", status, body));
+    }
+
+    let result: serde_json::Value = response.json().await
+        .map_err(|e| format!("Failed to parse upload response: {}", e))?;
+
+    let url = result["url"].as_str()
+        .ok_or_else(|| format!("No URL in upload response: {}", result))?
+        .to_string();
+
+    tracing::info!("[blossom] upload success: {}", url);
+    Ok(url)
+}
+
 #[tauri::command]
 async fn publish_reaction(
     event_id: String,
@@ -6386,6 +6530,85 @@ async fn publish_reaction(
     let reaction_id = signed.id.to_hex();
     tracing::info!("[cmd:publish_reaction] published reaction {} for event {}", &reaction_id[..12.min(reaction_id.len())], &event_id[..12.min(event_id.len())]);
     Ok(reaction_id)
+}
+
+#[tauri::command]
+async fn publish_unreaction(
+    event_id: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    use nostr_sdk::prelude::*;
+
+    let own_pk = state.config.read().await.hex_pubkey.clone()
+        .ok_or_else(|| "No pubkey configured".to_string())?;
+
+    // Find the user's reaction event for this target
+    let reaction_id = state.db()
+        .find_reaction_event_id(&event_id, &own_pk)
+        .map_err(|e| format!("Failed to find reaction: {}", e))?
+        .ok_or_else(|| "No reaction found for this event".to_string())?;
+
+    // Publish kind 5 deletion targeting the reaction
+    let tags = vec![
+        Tag::parse(&["e", &reaction_id]).map_err(|e| format!("bad e-tag: {}", e))?,
+    ];
+    let builder = EventBuilder::new(Kind::EventDeletion, "", tags);
+    let signed = sign_build_publish_store(builder, &state).await?;
+    let deletion_id = signed.id.to_hex();
+
+    // Create local tombstone for the reaction
+    let now = chrono::Utc::now().timestamp();
+    if let Err(e) = state.db().create_tombstone(&reaction_id, &own_pk, &deletion_id, now) {
+        tracing::warn!("[cmd:publish_unreaction] Failed to create tombstone: {}", e);
+    }
+
+    tracing::info!(
+        "[cmd:publish_unreaction] published unreaction {} (deleted reaction {} for event {})",
+        &deletion_id[..12.min(deletion_id.len())],
+        &reaction_id[..12.min(reaction_id.len())],
+        &event_id[..12.min(event_id.len())]
+    );
+    Ok(deletion_id)
+}
+
+#[tauri::command]
+async fn publish_deletion(
+    event_id: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    use nostr_sdk::prelude::*;
+
+    let own_pk = state.config.read().await.hex_pubkey.clone()
+        .ok_or_else(|| "No pubkey configured".to_string())?;
+
+    // Verify the event belongs to the current user (if found locally)
+    let events = state.db().query_events(Some(&[event_id.clone()]), None, None, None, None, 1)
+        .map_err(|e| format!("Failed to query event: {}", e))?;
+    if let Some(row) = events.first() {
+        if row.1 != own_pk {
+            return Err("Cannot delete events authored by others".to_string());
+        }
+    }
+
+    let tags = vec![
+        Tag::parse(&["e", &event_id]).map_err(|e| format!("bad e-tag: {}", e))?,
+    ];
+    let builder = EventBuilder::new(Kind::EventDeletion, "", tags);
+    let signed = sign_build_publish_store(builder, &state).await?;
+    let deletion_id = signed.id.to_hex();
+
+    // Create local tombstone (also deletes from nostr_events)
+    let now = chrono::Utc::now().timestamp();
+    if let Err(e) = state.db().create_tombstone(&event_id, &own_pk, &deletion_id, now) {
+        tracing::warn!("[cmd:publish_deletion] Failed to create tombstone: {}", e);
+    }
+
+    tracing::info!(
+        "[cmd:publish_deletion] published deletion {} for event {}",
+        &deletion_id[..12.min(deletion_id.len())],
+        &event_id[..12.min(event_id.len())]
+    );
+    Ok(deletion_id)
 }
 
 #[tauri::command]
@@ -7405,7 +7628,10 @@ pub fn run() {
             wallet_decode_bolt11,
             wallet_provision,
             send_zap,
+            upload_to_blossom,
             publish_reaction,
+            publish_unreaction,
+            publish_deletion,
             publish_repost,
             publish_note,
             publish_dm,

@@ -3173,6 +3173,27 @@ impl Database {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// Find the user's kind 7 reaction event ID for a given target event.
+    pub fn find_reaction_event_id(&self, target_event_id: &str, user_pubkey: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock();
+        let result = conn.query_row(
+            "SELECT e.id
+             FROM nostr_events e, json_each(e.tags) j
+             WHERE e.kind = 7
+               AND e.pubkey = ?1
+               AND json_extract(j.value, '$[0]') = 'e'
+               AND json_extract(j.value, '$[1]') = ?2
+             LIMIT 1",
+            rusqlite::params![user_pubkey, target_event_id],
+            |row| row.get::<_, String>(0),
+        );
+        match result {
+            Ok(id) => Ok(Some(id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Given a list of target event IDs and the user's pubkey, return those IDs
     /// that the user has already reposted (kind 6 with an e-tag referencing the target).
     pub fn get_reposted_event_ids(&self, event_ids: &[String], user_pubkey: &str) -> Result<Vec<String>> {

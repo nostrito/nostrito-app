@@ -4,7 +4,7 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
-import { IconMessageCircle, IconLock, IconSearch, IconX } from "../components/Icon";
+import { IconMessageCircle, IconLock, IconLockOpen, IconSearch, IconX } from "../components/Icon";
 import { Avatar } from "../components/Avatar";
 import { EmptyState } from "../components/EmptyState";
 import { formatTimestamp } from "../utils/format";
@@ -675,12 +675,15 @@ export const Dms: React.FC = () => {
     return decrypted.length > maxLen ? decrypted.slice(0, maxLen) + "\u2026" : decrypted;
   }
 
-  // Protocol label for a message
+  // Protocol label for a message — NIP-17 = secure (no badge), NIP-04 = warning icon
   function protocolTag(msg: NostrEvent): React.ReactNode {
-    if (msg.kind === 1059) {
-      return <span className="dms-msg-protocol dms-msg-nip17" title="NIP-17 (private)">nip-17</span>;
-    }
-    return <span className="dms-msg-protocol dms-msg-nip04" title="NIP-04 (legacy)">nip-04</span>;
+    if (msg.kind === 1059) return null;
+    return (
+      <span className="dms-msg-protocol dms-msg-nip04" title="legacy encryption — who you're talking to and when is publicly visible on relays">
+        <span className="icon"><IconLockOpen /></span>
+        <span className="dms-nip04-label">insecure</span>
+      </span>
+    );
   }
 
   // Render right panel
