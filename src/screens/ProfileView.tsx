@@ -5,7 +5,7 @@ import {
   IconCheck, IconImage, IconBookOpen, IconFeed, IconZap,
   IconMoreVertical, IconCopy, IconShare, IconVolumeX, IconVolume,
   IconExternalLink, IconDatabase, IconMessageCircle, IconTrash,
-  IconPenSquare, IconX, IconKey,
+  IconPenSquare, IconX, IconKey, IconUsers,
 } from "../components/Icon";
 import { Avatar } from "../components/Avatar";
 import { NoteCard } from "../components/NoteCard";
@@ -86,6 +86,8 @@ export const ProfileView: React.FC = () => {
 
   // Relationship badges
   const [followsMe, setFollowsMe] = useState(false);
+  const [isFollowing, setIsFollowing] = useState(false);
+  const [followLoading, setFollowLoading] = useState(false);
   const [isTracked, setIsTracked] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
 
@@ -181,6 +183,42 @@ export const ProfileView: React.FC = () => {
       setSaving(false);
     }
   }, [editForm, pubkey]);
+
+  const handleFollow = useCallback(async () => {
+    if (!pubkey || followLoading) return;
+    setFollowLoading(true);
+    try {
+      const ownProfile = await invoke<ProfileInfo | null>("get_own_profile");
+      if (!ownProfile) return;
+      const currentFollows = await invoke<string[]>("get_follows", { pubkey: ownProfile.pubkey });
+      if (!currentFollows.includes(pubkey)) {
+        const newFollows = [...currentFollows, pubkey];
+        await invoke("publish_contact_list", { follows: newFollows });
+        setIsFollowing(true);
+      }
+    } catch (err) {
+      console.warn("[profile] Failed to follow:", err);
+    } finally {
+      setFollowLoading(false);
+    }
+  }, [pubkey, followLoading]);
+
+  const handleUnfollow = useCallback(async () => {
+    if (!pubkey || followLoading) return;
+    setFollowLoading(true);
+    try {
+      const ownProfile = await invoke<ProfileInfo | null>("get_own_profile");
+      if (!ownProfile) return;
+      const currentFollows = await invoke<string[]>("get_follows", { pubkey: ownProfile.pubkey });
+      const newFollows = currentFollows.filter((pk) => pk !== pubkey);
+      await invoke("publish_contact_list", { follows: newFollows });
+      setIsFollowing(false);
+    } catch (err) {
+      console.warn("[profile] Failed to unfollow:", err);
+    } finally {
+      setFollowLoading(false);
+    }
+  }, [pubkey, followLoading]);
 
   // Tab data
   const [notes, setNotes] = useState<NostrEvent[]>([]);
@@ -283,6 +321,14 @@ export const ProfileView: React.FC = () => {
         // Check if this profile follows us
         if (ownPubkey && ownPubkey !== pubkey) {
           setFollowsMe(followList.includes(ownPubkey));
+        }
+
+        // Check if we follow this profile
+        if (ownPubkey && ownPubkey !== pubkey) {
+          try {
+            const ownFollows = await invoke<string[]>("get_follows", { pubkey: ownPubkey });
+            setIsFollowing(ownFollows.includes(pubkey));
+          } catch (_) {}
         }
 
         // Batch-load follow profiles via context
@@ -713,6 +759,18 @@ export const ProfileView: React.FC = () => {
                   <button className="profile-edit-btn" onClick={() => navigate("/settings")} title="connect signing key to edit profile">
                     <span className="icon"><IconKey /></span>
                     connect key to edit
+                  </button>
+                )}
+
+                {/* Follow / Unfollow button */}
+                {!isOwn && canWrite && (
+                  <button
+                    className={`profile-follow-btn${isFollowing ? " following" : ""}`}
+                    onClick={isFollowing ? handleUnfollow : handleFollow}
+                    disabled={followLoading}
+                  >
+                    <span className="icon">{isFollowing ? <IconCheck /> : <IconUsers />}</span>
+                    {followLoading ? "..." : isFollowing ? "following" : "follow"}
                   </button>
                 )}
 

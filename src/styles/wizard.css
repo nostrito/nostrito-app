@@ -381,15 +381,20 @@
 
 .relay-card {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 14px 16px;
+  flex-direction: column;
+  padding: 0;
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 10px;
   cursor: pointer;
   transition: all 0.2s;
   user-select: none;
+}
+.relay-card-main {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px;
 }
 
 .relay-card:hover {
@@ -463,6 +468,65 @@
   color: #ef4444;
   background: rgba(239, 68, 68, 0.1);
 }
+
+.relay-info-btn {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 2px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 0.15s;
+}
+.relay-info-btn:hover { color: var(--accent-light); }
+
+/* ── NIP-11 relay details (expanded) ── */
+.relay-card-details {
+  padding: 0 16px 14px;
+  border-top: 1px solid var(--border);
+  margin-top: 0;
+  cursor: default;
+}
+.relay-detail-loading {
+  display: block;
+  padding: 8px 0;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+.relay-detail-row {
+  display: flex;
+  gap: 8px;
+  padding: 5px 0;
+  font-size: 0.76rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+}
+.relay-detail-row:last-child { border-bottom: none; }
+.relay-detail-label {
+  color: var(--text-muted);
+  min-width: 90px;
+  flex-shrink: 0;
+}
+.relay-detail-value {
+  color: var(--text-dim);
+  word-break: break-word;
+}
+.relay-nips {
+  font-family: var(--font-mono, monospace);
+  font-size: 0.72rem;
+}
+.relay-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  margin-right: 4px;
+}
+.relay-badge-paid { background: rgba(245, 158, 11, 0.15); color: #f59e0b; }
+.relay-badge-auth { background: rgba(124, 58, 237, 0.15); color: var(--accent-light); }
 
 .custom-relay-input-row {
   display: flex;

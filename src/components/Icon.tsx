@@ -106,6 +106,10 @@ export const IconAlertTriangle: React.FC<SvgProps> = (p) => (
   <Svg {...p}><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /><path d="M12 9v4" /><path d="M12 17h.01" /></Svg>
 );
 
+export const IconBell: React.FC<SvgProps> = (p) => (
+  <Svg {...p}><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9" /><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0" /></Svg>
+);
+
 export const IconSearch: React.FC<SvgProps> = (p) => (
   <Svg {...p}><circle cx="11" cy="11" r="8" /><path d="m21 21-4.3-4.3" /></Svg>
 );
@@ -211,6 +215,41 @@ export const IconPenSquare: React.FC<SvgProps> = (p) => (
 
 export const IconSend: React.FC<SvgProps> = (p) => (
   <Svg {...p}><path d="M14.536 21.686a.5.5 0 0 0 .937-.024l6.5-19a.496.496 0 0 0-.635-.635l-19 6.5a.5.5 0 0 0-.024.937l7.93 3.18a2 2 0 0 1 1.112 1.11z" /><path d="m21.854 2.147-10.94 10.939" /></Svg>
+);
+
+// Markdown toolbar
+export const IconBold: React.FC<SvgProps> = (p) => (
+  <Svg {...p}><path d="M6 4h8a4 4 0 0 1 4 4 4 4 0 0 1-4 4H6z" /><path d="M6 12h9a4 4 0 0 1 4 4 4 4 0 0 1-4 4H6z" /></Svg>
+);
+export const IconItalic: React.FC<SvgProps> = (p) => (
+  <Svg {...p}><line x1="19" x2="10" y1="4" y2="4" /><line x1="14" x2="5" y1="20" y2="20" /><line x1="15" x2="9" y1="4" y2="20" /></Svg>
+);
+export const IconHeading: React.FC<SvgProps> = (p) => (
+  <Svg {...p}><path d="M6 12h12" /><path d="M6 4v16" /><path d="M18 4v16" /></Svg>
+);
+export const IconLink: React.FC<SvgProps> = (p) => (
+  <Svg {...p}><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" /><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" /></Svg>
+);
+export const IconQuote: React.FC<SvgProps> = (p) => (
+  <Svg {...p}><path d="M17 6H3" /><path d="M21 12H8" /><path d="M21 18H8" /><path d="M3 12v6" /></Svg>
+);
+export const IconCode: React.FC<SvgProps> = (p) => (
+  <Svg {...p}><polyline points="16 18 22 12 16 6" /><polyline points="8 6 2 12 8 18" /></Svg>
+);
+export const IconList: React.FC<SvgProps> = (p) => (
+  <Svg {...p}><line x1="8" x2="21" y1="6" y2="6" /><line x1="8" x2="21" y1="12" y2="12" /><line x1="8" x2="21" y1="18" y2="18" /><line x1="3" x2="3.01" y1="6" y2="6" /><line x1="3" x2="3.01" y1="12" y2="12" /><line x1="3" x2="3.01" y1="18" y2="18" /></Svg>
+);
+export const IconListOrdered: React.FC<SvgProps> = (p) => (
+  <Svg {...p}><line x1="10" x2="21" y1="6" y2="6" /><line x1="10" x2="21" y1="12" y2="12" /><line x1="10" x2="21" y1="18" y2="18" /><path d="M4 6h1v4" /><path d="M4 10h2" /><path d="M6 18H4c0-1 2-2 2-3s-1-1.5-2-1" /></Svg>
+);
+export const IconMinus: React.FC<SvgProps> = (p) => (
+  <Svg {...p}><line x1="5" x2="19" y1="12" y2="12" /></Svg>
+);
+export const IconEye: React.FC<SvgProps> = (p) => (
+  <Svg {...p}><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0" /><circle cx="12" cy="12" r="3" /></Svg>
+);
+export const IconEyeOff: React.FC<SvgProps> = (p) => (
+  <Svg {...p}><path d="M10.733 5.076a10.744 10.744 0 0 1 11.205 6.575 1 1 0 0 1 0 .696 10.747 10.747 0 0 1-1.444 2.49" /><path d="M14.084 14.158a3 3 0 0 1-4.242-4.242" /><path d="M17.479 17.499a10.75 10.75 0 0 1-15.417-5.151 1 1 0 0 1 0-.696 10.75 10.75 0 0 1 4.446-5.143" /><path d="m2 2 20 20" /></Svg>
 );
 
 // Brand

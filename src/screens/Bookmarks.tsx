@@ -65,7 +65,18 @@ export const Bookmarks: React.FC = () => {
       }
       try {
         const count = await invoke<number>("sync_bookmarks_from_relays");
-        if (count > 0) loadBookmarks();
+        if (count > 0) {
+          // Fetch any bookmarked events that aren't stored locally yet
+          try {
+            const missing = await invoke<string[]>("get_missing_bookmarked_event_ids");
+            if (missing.length > 0) {
+              await invoke("fetch_events_by_ids", { ids: missing });
+            }
+          } catch (err) {
+            console.warn("[bookmarks] Fetch missing events failed:", err);
+          }
+          loadBookmarks();
+        }
       } catch (err) {
         console.warn("[bookmarks] Auto-sync failed:", err);
       }

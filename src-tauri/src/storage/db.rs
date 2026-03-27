@@ -749,6 +749,104 @@ impl Database {
         Ok(rows)
     }
 
+    /// Get notifications: events mentioning own pubkey via p-tags (kinds 1, 7, 6, 9735).
+    /// Excludes own events and muted users.
+    pub fn get_notifications(
+        &self,
+        own_pubkey: &str,
+        until: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<(String, String, i64, i64, String, String, String)>> {
+        let conn = self.conn.lock();
+
+        let mut sql = String::from(
+            "SELECT id, pubkey, created_at, kind, tags, content, sig FROM nostr_events \
+             WHERE kind IN (1, 7, 6, 9735) \
+             AND pubkey != ?1 \
+             AND EXISTS (SELECT 1 FROM json_each(tags) WHERE json_extract(value, '$[0]') = 'p' AND json_extract(value, '$[1]') = ?1) \
+             AND pubkey NOT IN (SELECT pubkey FROM muted_users) \
+             AND id NOT IN (SELECT event_id FROM muted_events)",
+        );
+        let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        param_values.push(Box::new(own_pubkey.to_string()));
+
+        if let Some(u) = until {
+            let idx = param_values.len() + 1;
+            sql.push_str(&format!(" AND created_at <= ?{}", idx));
+            param_values.push(Box::new(u as i64));
+        }
+
+        sql.push_str(" ORDER BY created_at DESC");
+        let idx = param_values.len() + 1;
+        sql.push_str(&format!(" LIMIT ?{}", idx));
+        param_values.push(Box::new(limit as i64));
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(rows)
+    }
+
+    /// Count notification events stored since a given timestamp (for unread badge).
+    pub fn get_notification_count_since(
+        &self,
+        own_pubkey: &str,
+        since_stored_at: i64,
+    ) -> Result<i64> {
+        let conn = self.conn.lock();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM nostr_events \
+             WHERE kind IN (1, 7, 6, 9735) \
+             AND pubkey != ?1 \
+             AND stored_at > ?2 \
+             AND EXISTS (SELECT 1 FROM json_each(tags) WHERE json_extract(value, '$[0]') = 'p' AND json_extract(value, '$[1]') = ?1) \
+             AND pubkey NOT IN (SELECT pubkey FROM muted_users)",
+            rusqlite::params![own_pubkey, since_stored_at],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Get popular hashtags from the last 7 days, ranked by usage count.
+    pub fn get_popular_hashtags(&self, limit: u32) -> Result<Vec<(String, i64)>> {
+        let conn = self.conn.lock();
+        let week_ago = chrono::Utc::now().timestamp() - 7 * 86400;
+        let mut stmt = conn.prepare(
+            "SELECT LOWER(json_extract(t.value, '$[1]')) as tag, COUNT(*) as cnt \
+             FROM nostr_events e, json_each(e.tags) t \
+             WHERE e.kind = 1 \
+             AND json_extract(t.value, '$[0]') = 't' \
+             AND e.created_at > ?1 \
+             AND json_extract(t.value, '$[1]') IS NOT NULL \
+             AND LENGTH(json_extract(t.value, '$[1]')) > 0 \
+             GROUP BY tag \
+             ORDER BY cnt DESC \
+             LIMIT ?2"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![week_ago, limit as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+        Ok(rows)
+    }
+
     /// Search events by keyword in content and/or by author pubkey.
     /// Returns feed-worthy kinds (1, 6, 30023) ordered by created_at DESC.
     pub fn search_events(
@@ -3446,6 +3544,21 @@ impl Database {
         )?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Clear all local bookmark data: legacy table + kind 10003/30001 events + migration flag.
+    pub fn clear_all_bookmark_data(&self, own_pubkey: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM bookmarked_events", [])?;
+        conn.execute(
+            "DELETE FROM nostr_events WHERE pubkey = ?1 AND kind IN (10003, 30001)",
+            params![own_pubkey],
+        )?;
+        conn.execute(
+            "DELETE FROM app_config WHERE key = 'bookmark_nip44_migrated'",
+            [],
+        )?;
+        Ok(())
     }
 
     /// Return bookmarked event IDs that do NOT exist in nostr_events (need fetching from relays).

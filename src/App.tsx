@@ -45,7 +45,7 @@ class ErrorBoundary extends React.Component<
 
 // Lazy load screens
 import { Feed } from "./screens/Feed";
-// import { Bookmarks } from "./screens/Bookmarks"; // TODO: NIP-51 bookmarks pending interop fixes
+import { Notifications } from "./screens/Notifications";
 import { Dms } from "./screens/Dms";
 import { Wot } from "./screens/Wot";
 import { Settings } from "./screens/Settings";
@@ -58,9 +58,11 @@ import { StorageTrackedProfiles } from "./screens/StorageTrackedProfiles";
 import { StorageWotProfiles } from "./screens/StorageWotProfiles";
 import { Gallery } from "./screens/Gallery";
 import { Wallet } from "./screens/Wallet";
+import { Bookmarks } from "./screens/Bookmarks";
 
 const SCREEN_LABELS: Record<string, string> = {
   "/": "feed",
+  "/notifications": "notifications",
   "/bookmarks": "bookmarks",
   "/dms": "messages",
   "/gallery": "gallery",
@@ -202,7 +204,8 @@ const AppRoutes: React.FC = () => {
       <Route path="/wizard" element={isInitialized ? <Navigate to="/" replace /> : <Wizard />} />
       <Route element={isInitialized ? <AppShell /> : <Navigate to="/wizard" replace />}>
         <Route path="/" element={<Feed />} />
-        {/* <Route path="/bookmarks" element={<Bookmarks />} /> TODO: NIP-51 bookmarks pending interop fixes */}
+        <Route path="/notifications" element={<Notifications />} />
+        <Route path="/bookmarks" element={<Bookmarks />} />
         <Route path="/dms" element={<Dms />} />
         <Route path="/gallery" element={<Gallery />} />
         <Route path="/wallet" element={<Wallet />} />

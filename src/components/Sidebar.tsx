@@ -1,7 +1,8 @@
-import React, { useState } from "react";
-import { NavLink, useNavigate } from "react-router-dom";
+import React, { useState, useEffect, useRef } from "react";
+import { NavLink, useNavigate, useLocation } from "react-router-dom";
+import { invoke } from "@tauri-apps/api/core";
 import logoUrl from "../assets/logo.png";
-import { IconFeed, IconMessageCircle, IconImage, IconWallet, IconSettings, IconPenSquare, IconLock, IconX, IconSearch } from "./Icon";
+import { IconFeed, IconMessageCircle, IconImage, IconWallet, IconSettings, IconPenSquare, IconLock, IconX, IconSearch, IconBell, IconBookmark } from "./Icon";
 import { useAppContext } from "../context/AppContext";
 import { useCanWrite } from "../context/SigningContext";
 import { ComposeModal } from "./ComposeModal";
@@ -10,19 +11,45 @@ export const Sidebar: React.FC = () => {
   const { ownProfile, appStatus } = useAppContext();
   const canWrite = useCanWrite();
   const navigate = useNavigate();
+  const location = useLocation();
   const [showCompose, setShowCompose] = useState(false);
   const [showSigningPrompt, setShowSigningPrompt] = useState(false);
 
   const [sidebarSearch, setSidebarSearch] = useState("");
 
+  // Notification badge
+  const [notifCount, setNotifCount] = useState(0);
+  const notifTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+    const pollCount = async () => {
+      try {
+        const lastSeen = parseInt(localStorage.getItem("nostrito:notif-last-seen") || "0", 10);
+        const count = await invoke<number>("get_notification_count", { sinceStoredAt: lastSeen });
+        setNotifCount(count);
+      } catch (_) {}
+    };
+    pollCount();
+    notifTimer.current = setInterval(pollCount, 30_000);
+    return () => { if (notifTimer.current) clearInterval(notifTimer.current); };
+  }, []);
+
+  // Clear badge when visiting notifications
+  useEffect(() => {
+    if (location.pathname === "/notifications") {
+      setNotifCount(0);
+    }
+  }, [location.pathname]);
+
   const navItems = [
     { to: "/", icon: <IconFeed />, label: "feed" },
-    // { to: "/bookmarks", icon: <IconBookmark />, label: "bookmarks" }, // TODO: NIP-51 bookmarks pending interop fixes
+    { to: "/notifications", icon: <IconBell />, label: "notifications", badge: notifCount },
+    { to: "/bookmarks", icon: <IconBookmark />, label: "bookmarks" },
     { to: "/dms", icon: <IconMessageCircle />, label: "messages" },
     { to: "/gallery", icon: <IconImage />, label: "gallery" },
     { to: "/wallet", icon: <IconWallet />, label: "wallet" },
     { to: "/settings", icon: <IconSettings />, label: "settings" },
-  ];
+  ] as const;
 
   return (
     <aside className="app-sidebar-nav">
@@ -53,6 +80,9 @@ export const Sidebar: React.FC = () => {
           className={({ isActive }) => `app-nav-item${isActive ? " active" : ""}`}
         >
           <span className="icon">{item.icon}</span> {item.label}
+          {"badge" in item && (item as any).badge > 0 && (
+            <span className="sidebar-badge">{(item as any).badge > 99 ? "99+" : (item as any).badge}</span>
+          )}
         </NavLink>
       ))}
       <div className="sidebar-spacer" />
