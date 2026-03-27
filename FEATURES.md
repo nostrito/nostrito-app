@@ -22,7 +22,7 @@ Last updated: 2026-03-24
 - **Change account** — switch to a different npub (destructive: clears keychain, returns to wizard). Not true multi-account yet — see Future Decisions below
 
 ### Social
-- **Direct Messages (NIP-04 + NIP-17)** — encrypted DMs grouped by conversation; NIP-17 gift wrap (default) + NIP-04 legacy with toggle. NIP-04 messages show danger badge (open-lock icon with tooltip)
+- **Direct Messages (NIP-04 + NIP-17)** — encrypted DMs grouped by conversation; NIP-17 gift wrap (default) with smart NIP-04 detection. When a conversation has recent NIP-04 messages, a prompt lets the user choose protocol once per session. NIP-04 messages show danger badge (open-lock icon with tooltip)
 - **DM notifications** — native macOS notification when a new DM arrives (`check_new_dms_notify`)
 - **Follow/Unfollow** — contact lists (kind 3)
 - **Mute/Unmute** — mute pubkeys (kind 10000)
@@ -93,7 +93,7 @@ Last updated: 2026-03-24
 
 | # | Feature | Notes |
 |---|---------|-------|
-| 6 | **DM compatibility detection + soft warning** | Passive per-contact `dm_protocol_hint` based on received message kinds. Conversation header hint for likely-NIP-04 contacts with one-tap fallback. Per-conversation protocol memory. See DM Strategy section. |
+| 6 | **DM compatibility detection + smart prompt** | **Done** — auto-detects NIP-04 in last 10 messages, prompts protocol choice once per conversation. Indicator pill to change later. See DM Strategy section. |
 | 7 | **Notifications screen** | Aggregated view of reactions, replies, zaps, reposts, new followers directed at you. No backend or UI yet. |
 | 8 | **Media upload** | Upload integration (nostr.build / blossom). Unlocks profile picture editing, article covers, image notes. |
 | 9 | **Mentions autocomplete** | @-mention suggestions when composing. Need profile search-as-you-type in ComposeModal. |
@@ -155,16 +155,17 @@ protocol versions.
 
 1. **NIP-17 is always the default** — never downgrade silently
 2. **NIP-04 messages are visible but marked as insecure** — users learn over time
-3. **Detection is passive, not blocking** — don't interrupt the send flow
+3. **Detection is automatic, prompt is one-time** — ask once per conversation, remember the choice
 4. **Per-conversation, not global** — legacy fallback is contextual
+5. **Minimal user decisions** — no manual toggles, no settings to configure
 
-### UX Design
+### UX Design (Implemented)
 
 #### NIP-04 Danger Badge
 
 Every NIP-04 message (sent or received) shows a small warning icon inline:
 
-- **Icon**: small open-lock or caution triangle next to the message bubble
+- **Icon**: open-lock icon next to the message bubble with "insecure" label
 - **Tooltip on hover**: "legacy encryption — who you're talking to and when is
   publicly visible on relays"
 - **Applies to both sides**: your old sent NIP-04 messages *and* incoming NIP-04
@@ -172,52 +173,45 @@ Every NIP-04 message (sent or received) shows a small warning icon inline:
 - **No badge on NIP-17** — clean bubbles = secure, badge = legacy. Users learn
   the difference without reading docs.
 
-#### Passive NIP-17 Compatibility Detection
+#### Smart NIP-04 Detection + Protocol Prompt
 
-We can infer whether a contact likely supports NIP-17 by observing their behavior
-**over time** — no instant detection, no blocking:
+When the user hits send, the app checks the last 10 messages in the conversation
+for NIP-04 (kind 4) messages. The behavior depends on what it finds:
 
-| Signal | Meaning |
-|--------|---------|
-| We've received NIP-17 (kind 1059) from them | They support NIP-17. No action needed. |
-| We've only ever received NIP-04 (kind 4) from them | Likely on a legacy client. |
-| We've never exchanged DMs with them | Unknown — default to NIP-17 (optimistic). |
-| Their client tag (kind 10002 / NIP-89) names a known NIP-17 client | Likely supports it. Low confidence but useful signal. |
+| Scenario | Behavior |
+|----------|----------|
+| No NIP-04 in last 10 messages | Send as NIP-17 silently. No prompt, no indicator. Normal chatting. |
+| NIP-04 found, no prior choice | Modal prompt: "legacy client detected" with two buttons. |
+| Prior choice already recorded | Send using the recorded protocol immediately. |
 
-**Storage**: per-contact `dm_protocol_hint` field — `"nip17"`, `"nip04_only"`, or
-`null` (unknown). Updated passively whenever we decrypt a DM from them.
+**The prompt modal** appears once per conversation per session when legacy messages
+are detected. It explains the situation and offers two choices:
 
-#### Soft Warning for Likely-NIP-04 Contacts
+- **"send as NIP-04 (legacy)"** — orange lock-open icon. Uses kind 4 encryption.
+- **"send as NIP-17 (private)"** — green lock icon. Uses gift-wrapped kind 1059.
 
-When opening a conversation with a contact flagged as `nip04_only`:
+The user can cancel (Escape or click overlay) to go back without sending — the
+message text is restored to the input field.
 
-- **Conversation header hint** (not a modal, not a blocker): subtle banner like
-  "this contact may be using a legacy client — your messages might not be visible
-  to them"
-- **One-tap fallback**: banner includes a link: "send as legacy instead?" which
-  switches the conversation to NIP-04 mode (same as the existing compose bar
-  toggle, but surfaced contextually)
-- **Dismissable**: user can dismiss the banner; it won't reappear for that contact
-  unless the hint resets
+#### Protocol Indicator + Change
 
-#### No Instant Send-Time Warning
+After the user makes a choice through the modal, a small indicator pill appears
+in the input bar showing the active protocol (`04` or `17`) with a colored icon.
 
-Deliberately **not** showing a warning at the moment you hit send:
-
-- It would interrupt the natural flow for a problem that *might not exist*
-- The passive detection can be wrong (contact may have upgraded clients)
-- NIP-17 is the right default — we shouldn't second-guess it on every message
-- If the contact truly can't read NIP-17, the conversation header hint already
-  told the user before they started typing
+- **Click the indicator** to re-open the prompt modal and change the choice
+- **Only visible in conversations where the modal was shown** — pure NIP-17
+  conversations show no indicator at all
 
 #### Per-Conversation Protocol Memory
 
-- Once a user manually switches to NIP-04 for a conversation, **remember it** for
-  that contact — don't reset to NIP-17 on next session
-- If we later receive a NIP-17 message from that contact (they upgraded), auto-clear
-  the `nip04_only` flag and switch back to NIP-17 default
-- Show a small toast: "this contact now supports modern encryption" — positive
-  reinforcement
+- Choices are stored in a session-scoped ref (`protocolDecisions` Map), keyed by
+  partner pubkey
+- Each conversation has independent tracking — switching partners doesn't affect
+  other conversations
+- Memory resets on page reload (session-scoped) — intentional, since contacts may
+  upgrade clients between sessions
+- No persistent storage needed — the detection re-evaluates fresh each session
+  based on actual message kinds in the conversation
 
 ### Protocol Reference
 
@@ -239,7 +233,7 @@ Deliberately **not** showing a warning at the moment you hit send:
 | **Receiving** | Sync engine fetches both kind 4 and kind 1059. DB returns both in a single call. |
 | **Decryption** | Kind 4 → `nip04::decrypt`. Kind 1059 → three-layer unwrap with `nip44::decrypt`. Both work with nsec and NIP-46 signers. |
 | **Conversation grouping** | Kind 4: partner from `pubkey`/`p` tag. Kind 1059: unwrap to extract real sender/recipient, merge into same conversation. |
-| **Sending** | NIP-17 by default. Per-conversation NIP-04 fallback via compose bar toggle or conversation header hint. |
+| **Sending** | NIP-17 by default. Smart NIP-04 detection: if last 10 messages contain kind 4, prompt user once to choose protocol. Choice remembered per-conversation for session. |
 | **Timestamps** | Gift wrap timestamps randomized. Display uses rumor's `created_at` for actual send time. |
 | **NIP-46 signers** | Seal encrypted via remote `nip44_encrypt`, signed via `sign_event`. Gift wrap uses local random key. |
 
