@@ -56,3 +56,18 @@ export function resolveRelayUrl(alias: string): string {
 export function urlToAlias(url: string): string | null {
   return URL_TO_ALIAS[url] ?? null;
 }
+
+/** Check if a URL is a known (built-in) relay. */
+export function isKnownRelay(urlOrAlias: string): boolean {
+  return urlOrAlias in RELAY_URL_MAP || urlOrAlias in URL_TO_ALIAS;
+}
+
+/** Validate a custom relay URL. */
+export function isValidRelayUrl(url: string): boolean {
+  try {
+    const u = new URL(url);
+    return u.protocol === "wss:" || u.protocol === "ws:";
+  } catch {
+    return false;
+  }
+}

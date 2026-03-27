@@ -1,7 +1,7 @@
 /** Shared note/repost card used in Feed and ProfileView */
 import React, { useMemo, useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { IconMessageCircle, IconRepeat, IconZap, IconHeart, IconHeartFilled, IconTrash } from "./Icon";
+import { IconMessageCircle, IconRepeat, IconZap, IconHeart, IconHeartFilled, IconTrash, IconAlertTriangle } from "./Icon";
 import { Avatar } from "./Avatar";
 import { timeAgo } from "../utils/format";
 import { kindLabel } from "../utils/ui";
@@ -467,7 +467,6 @@ const NoteCardInner: React.FC<{
             <button className={`ev-action${reposted ? " ev-action-reposted" : ""}${!canWrite || reposted || !onRepost ? " ev-action-disabled" : ""}`} onClick={canWrite && !reposted && onRepost ? (e) => { e.stopPropagation(); onRepost(event); } : !canWrite ? handleSigningClick : undefined}><span className="icon"><IconRepeat /></span>{counts?.reposts ? ` ${counts.reposts}` : ""}</button>
             <button className={`ev-action${liked ? " ev-action-liked" : ""}${!canWrite ? " ev-action-disabled" : ""}`} onClick={canWrite ? (e) => { e.stopPropagation(); if (liked) { onUnlike?.(event); } else { onLike?.(event); } } : handleSigningClick}><span className="icon">{liked ? <IconHeartFilled /> : <IconHeart />}</span>{counts?.reactions ? ` ${counts.reactions}` : ""}</button>
             <button className={`ev-action${!canWrite ? " ev-action-disabled" : ""}`} onClick={canWrite ? (e) => { e.stopPropagation(); onZap?.(event); } : handleZapClick}><span className="icon"><IconZap /></span>{counts?.zaps ? ` ${counts.zaps}` : ""}</button>
-            {/* bookmark button disabled — TODO: NIP-51 bookmarks pending interop fixes */}
           </div>
         )}
       </div>
@@ -508,6 +507,21 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, ful
     }
     return map;
   }, [mentionedPubkeys, getProfile]);
+
+  // All hooks MUST be above any conditional return to satisfy React rules of hooks.
+  const replyParentId = useMemo(() => getReplyParentId(event), [event.id, event.tags]);
+  const quotedEventId = useMemo(() => getQuotedEventId(event), [event.id, event.tags]);
+
+  const displayContent = useMemo(() => {
+    if (quotedEventId) return stripQuotedEntity(event.content, quotedEventId);
+    return event.content;
+  }, [event.content, quotedEventId]);
+
+  const contentWarning = useMemo(() => {
+    const cwTag = event.tags.find((t: string[]) => t[0] === "content-warning");
+    return cwTag ? (cwTag[1] || "Content warning") : null;
+  }, [event.tags]);
+  const [cwRevealed, setCwRevealed] = useState(false);
 
   if (event.kind === 6) {
     const original = parseRepostContent(event);
@@ -556,7 +570,6 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, ful
                 <button className={`ev-action${reposted ? " ev-action-reposted" : ""}${!canWrite || reposted || !onRepost ? " ev-action-disabled" : ""}`} onClick={canWrite && !reposted && onRepost ? (e) => { e.stopPropagation(); onRepost(event); } : !canWrite ? handleSigningClick : undefined}><span className="icon"><IconRepeat /></span>{counts?.reposts ? ` ${counts.reposts}` : ""}</button>
                 <button className={`ev-action${liked ? " ev-action-liked" : ""}${!canWrite || liked ? " ev-action-disabled" : ""}`} onClick={canWrite && !liked ? (e) => { e.stopPropagation(); onLike?.(event); } : !canWrite && !liked ? handleSigningClick : undefined}><span className="icon">{liked ? <IconHeartFilled /> : <IconHeart />}</span>{counts?.reactions ? ` ${counts.reactions}` : ""}</button>
                 <button className={`ev-action${!canWrite ? " ev-action-disabled" : ""}`} onClick={canWrite ? (e) => { e.stopPropagation(); onZap?.(event); } : handleZapClick}><span className="icon"><IconZap /></span>{counts?.zaps ? ` ${counts.zaps}` : ""}</button>
-                {/* bookmark button disabled — TODO: NIP-51 bookmarks pending interop fixes */}
               </div>
             )}
           </div>
@@ -564,15 +577,6 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, ful
       </div>
     );
   }
-
-  const replyParentId = useMemo(() => getReplyParentId(event), [event.id, event.tags]);
-  const quotedEventId = useMemo(() => getQuotedEventId(event), [event.id, event.tags]);
-
-  // For quote reposts, strip the embedded nostr: entity from displayed text
-  const displayContent = useMemo(() => {
-    if (quotedEventId) return stripQuotedEntity(event.content, quotedEventId);
-    return event.content;
-  }, [event.content, quotedEventId]);
 
   const eventContent = renderEventContent(displayContent, mentionProfiles, full, { eventId: event.id, pubkey: event.pubkey });
 
@@ -603,11 +607,20 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, ful
           <span className="ev-time">{timeAgo(event.created_at, false)}</span>
         </div>
         {replyParentId && !quotedEventId && <ReplyContext parentId={replyParentId} />}
-        <div className="ev-text" dangerouslySetInnerHTML={{ __html: eventContent.cleanedHtml }} />
-        {eventContent.mediaHtml && (
-          <div dangerouslySetInnerHTML={{ __html: eventContent.mediaHtml }} />
+        {contentWarning && !cwRevealed ? (
+          <div className="content-warning">
+            <span className="cw-label"><span className="icon"><IconAlertTriangle /></span>{contentWarning}</span>
+            <button className="cw-reveal-btn" onClick={(e) => { e.stopPropagation(); setCwRevealed(true); }}>show content</button>
+          </div>
+        ) : (
+          <>
+            <div className="ev-text" dangerouslySetInnerHTML={{ __html: eventContent.cleanedHtml }} />
+            {eventContent.mediaHtml && (
+              <div dangerouslySetInnerHTML={{ __html: eventContent.mediaHtml }} />
+            )}
+            {quotedEventId && <QuotedNote quotedId={quotedEventId} />}
+          </>
         )}
-        {quotedEventId && <QuotedNote quotedId={quotedEventId} />}
         {!compact && (
           <div className="ev-actions" style={{ position: "relative" }}>
             <ActionToast message={toast.message} />
@@ -615,7 +628,8 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, ful
             <button className={`ev-action${reposted ? " ev-action-reposted" : ""}${!canWrite || reposted || !onRepost ? " ev-action-disabled" : ""}`} onClick={canWrite && !reposted && onRepost ? (e) => { e.stopPropagation(); onRepost(event); } : !canWrite ? handleSigningClick : undefined}><span className="icon"><IconRepeat /></span>{counts?.reposts ? ` ${counts.reposts}` : ""}</button>
             <button className={`ev-action${liked ? " ev-action-liked" : ""}${!canWrite ? " ev-action-disabled" : ""}`} onClick={canWrite ? (e) => { e.stopPropagation(); if (liked) { onUnlike?.(event); } else { onLike?.(event); } } : handleSigningClick}><span className="icon">{liked ? <IconHeartFilled /> : <IconHeart />}</span>{counts?.reactions ? ` ${counts.reactions}` : ""}</button>
             <button className={`ev-action${!canWrite ? " ev-action-disabled" : ""}`} onClick={canWrite ? (e) => { e.stopPropagation(); onZap?.(event); } : handleZapClick}><span className="icon"><IconZap /></span>{counts?.zaps ? ` ${counts.zaps}` : ""}</button>
-            {/* bookmark button disabled — TODO: NIP-51 bookmarks pending interop fixes */}
+
+
             {onDelete && <button className="ev-action ev-action-delete" onClick={(e) => { e.stopPropagation(); onDelete(event); }} title="delete note"><span className="icon"><IconTrash /></span></button>}
           </div>
         )}

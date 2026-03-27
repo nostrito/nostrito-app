@@ -201,6 +201,52 @@ impl WotGraph {
         })
     }
 
+    /// Get suggested follows: friends-of-friends ranked by mutual follow count.
+    /// Returns vec of (pubkey, mutual_count) for pubkeys at distance 2 the user doesn't already follow.
+    pub fn get_suggested_follows(&self, own_pubkey: &str, limit: usize) -> Vec<(String, usize)> {
+        let own_id = match self.get_node_id(own_pubkey) {
+            Some(id) => id as usize,
+            None => return vec![],
+        };
+
+        let follows_guard = self.follows.read();
+        let id_to_pubkey = self.id_to_pubkey.read();
+
+        // Get own direct follows
+        let own_follows: std::collections::HashSet<u32> = follows_guard
+            .get(own_id)
+            .map(|list| list.iter().cloned().collect())
+            .unwrap_or_default();
+
+        if own_follows.is_empty() {
+            return vec![];
+        }
+
+        // Score friends-of-friends by how many of our follows also follow them
+        let mut scores: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+        for &follow_id in &own_follows {
+            if let Some(fof_list) = follows_guard.get(follow_id as usize) {
+                for &fof in fof_list {
+                    if fof != own_id as u32 && !own_follows.contains(&fof) {
+                        *scores.entry(fof).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+
+        // Sort by score descending, take top N
+        let mut sorted: Vec<_> = scores.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.truncate(limit);
+
+        sorted
+            .into_iter()
+            .filter_map(|(id, score)| {
+                id_to_pubkey.get(id as usize).map(|pk| (pk.to_string(), score))
+            })
+            .collect()
+    }
+
     /// Return all pubkeys in the WoT graph.
     pub fn get_all_pubkeys(&self) -> Vec<String> {
         let id_to_pubkey = self.id_to_pubkey.read();

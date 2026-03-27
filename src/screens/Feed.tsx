@@ -293,6 +293,12 @@ export const Feed: React.FC = () => {
   const [hasMore, setHasMore] = useState(true);
   const [loadingMoreArticles, setLoadingMoreArticles] = useState(false);
   const [hasMoreArticles, setHasMoreArticles] = useState(true);
+
+  // Trending hashtags
+  const [trendingTags, setTrendingTags] = useState<[string, number][]>([]);
+  // Suggested follows
+  const [suggestedFollows, setSuggestedFollows] = useState<{ pubkey: string; mutual_count: number }[]>([]);
+  const [showSuggestions, setShowSuggestions] = useState(true);
   // Article fetch stages: "local" → "relay-follows" → "relay-wot" → "done"
   const articleStageRef = useRef<"local" | "relay-follows" | "relay-wot" | "done">("local");
   const [fetchingRelay, setFetchingRelay] = useState(false);
@@ -815,6 +821,19 @@ export const Feed: React.FC = () => {
     }
   }, [feedMode]);
 
+  // Load trending hashtags + suggested follows on mount
+  useEffect(() => {
+    invoke<[string, number][]>("get_popular_hashtags", { limit: 8 })
+      .then(setTrendingTags)
+      .catch(() => {});
+    invoke<{ pubkey: string; mutual_count: number }[]>("get_suggested_follows", { limit: 5 })
+      .then((res) => {
+        setSuggestedFollows(res);
+        if (res.length > 0) ensureProfiles(res.map((s) => s.pubkey));
+      })
+      .catch(() => {});
+  }, []);
+
   // Initial load (WoT mode auto-loads; global waits for consent)
   useEffect(() => {
     if (!isSearchMode && feedMode === "wot") {
@@ -1139,6 +1158,50 @@ export const Feed: React.FC = () => {
           )}
         </div>
       </div>
+
+      {trendingTags.length > 0 && !searchQuery && (
+        <div className="feed-trending-tags">
+          {trendingTags.map(([tag, count]) => (
+            <button
+              key={tag}
+              className="trending-tag"
+              onClick={() => navigate(`/?q=${encodeURIComponent("#" + tag)}`)}
+            >
+              #{tag} <span className="trending-count">{count}</span>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {showSuggestions && suggestedFollows.length > 0 && !searchQuery && (
+        <div className="feed-suggestions">
+          <div className="suggestions-header">
+            <span className="suggestions-title">who to follow</span>
+            <button className="suggestions-dismiss" onClick={() => setShowSuggestions(false)}>
+              <span className="icon"><IconX /></span>
+            </button>
+          </div>
+          <div className="suggestions-list">
+            {suggestedFollows.map((s) => {
+              const p = getProfile(s.pubkey);
+              return (
+                <div
+                  key={s.pubkey}
+                  className="suggestion-item"
+                  onClick={() => navigate(`/profile/${s.pubkey}`)}
+                  style={{ cursor: "pointer" }}
+                >
+                  <Avatar picture={p?.picture} pictureLocal={p?.picture_local} pubkey={s.pubkey} className="suggestion-avatar" clickable />
+                  <div className="suggestion-info">
+                    <div className="suggestion-name">{p?.name || p?.display_name || s.pubkey.slice(0, 12)}</div>
+                    <div className="suggestion-mutual">{s.mutual_count} mutual follow{s.mutual_count !== 1 ? "s" : ""}</div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {searchStatus && (
         <div className="feed-search-status">

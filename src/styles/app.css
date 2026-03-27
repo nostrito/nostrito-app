@@ -134,6 +134,22 @@
   font-weight: 600;
 }
 
+.sidebar-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: #f43f5e;
+  color: #fff;
+  font-size: 0.62rem;
+  font-weight: 700;
+  margin-left: auto;
+  line-height: 1;
+}
+
 .sidebar-spacer {
   flex: 1;
 }
@@ -397,13 +413,15 @@
   padding: 0 8px;
 }
 .bookmarks-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 12px 4px;
+  padding: 18px 8px 10px;
 }
 .bookmarks-title {
-  font-size: 1.1rem;
+  font-size: 1.15rem;
   font-weight: 600;
+  color: var(--text-primary);
   margin: 0;
+}
+.bookmarks-list {
+  display: flex;
+  flex-direction: column;
 }

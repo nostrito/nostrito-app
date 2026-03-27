@@ -1391,6 +1391,37 @@
 .profile-dm-btn .icon { display: flex; }
 .profile-dm-btn .icon svg { width: 14px; height: 14px; }
 
+/* ── Follow / Unfollow button ── */
+.profile-follow-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #fff;
+  font-size: 0.78rem;
+  font-weight: 600;
+  font-family: var(--font);
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+.profile-follow-btn:hover { opacity: 0.85; }
+.profile-follow-btn.following {
+  background: transparent;
+  color: var(--text-dim);
+  border-color: var(--border);
+}
+.profile-follow-btn.following:hover {
+  border-color: #dc2626;
+  color: #dc2626;
+}
+.profile-follow-btn:disabled { opacity: 0.5; cursor: wait; }
+.profile-follow-btn .icon { display: flex; }
+.profile-follow-btn .icon svg { width: 14px; height: 14px; }
+
 /* ── Edit profile button ── */
 .profile-edit-btn {
   display: inline-flex; align-items: center; gap: 5px;
