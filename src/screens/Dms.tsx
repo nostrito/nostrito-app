@@ -4,7 +4,7 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
-import { IconMessageCircle, IconLock, IconLockOpen, IconSearch, IconX } from "../components/Icon";
+import { IconMessageCircle, IconLock, IconLockOpen, IconSearch, IconX, IconAlertTriangle } from "../components/Icon";
 import { Avatar } from "../components/Avatar";
 import { EmptyState } from "../components/EmptyState";
 import { formatTimestamp } from "../utils/format";
@@ -25,6 +25,11 @@ interface UnwrappedDm {
 // Session-level flag: only do the expensive 30-day relay scan once
 let hasFullScanned = false;
 
+function conversationHasLegacyMessages(messages: NostrEvent[], limit = 10): boolean {
+  const recent = messages.slice(0, limit);
+  return recent.some((msg) => msg.kind === 4);
+}
+
 function getPartner(event: NostrEvent, ownPk: string): string | null {
   if (event.pubkey === ownPk) {
     const pTag = event.tags.find((t) => t[0] === "p" && t[1]);
@@ -44,7 +49,10 @@ export const Dms: React.FC = () => {
   const [selectedPartner, setSelectedPartner] = useState<string | null>(null);
   const [signingMode, setSigningMode] = useState<"nsec" | "bunker" | "connect" | "read-only">("read-only");
   const [displayCount, setDisplayCount] = useState(30);
-  const [sendAsLegacy, setSendAsLegacy] = useState(false);
+  // Protocol prompt: auto-detect NIP-04 and ask user once per conversation
+  const [showProtocolPrompt, setShowProtocolPrompt] = useState(false);
+  const pendingMessageRef = useRef<string>("");
+  const protocolDecisions = useRef<Map<string, "nip04" | "nip17">>(new Map());
 
   // Message input state
   const [messageInput, setMessageInput] = useState("");
@@ -509,36 +517,30 @@ export const Dms: React.FC = () => {
     }
   }, [conversations, ensureProfiles]);
 
-  // Send a DM — optimistic: message appears instantly, publish happens in background
+  // Core send logic — optimistic UI + background publish
   const pendingIdCounter = useRef(0);
-  const handleSendDm = useCallback(() => {
-    const text = messageInput.trim();
-    if (!text || !selectedPartner || signingMode === "read-only") return;
+  const doSend = useCallback((text: string, legacy: boolean) => {
+    if (!selectedPartner || signingMode === "read-only") return;
 
-    // Generate a temporary optimistic ID
     pendingIdCounter.current += 1;
     const optimisticId = `pending-${Date.now()}-${pendingIdCounter.current}`;
     const now = Math.floor(Date.now() / 1000);
 
-    // Create an optimistic message event
     const optimisticMsg: NostrEvent = {
       id: optimisticId,
       pubkey: ownPubkey,
       created_at: now,
-      kind: sendAsLegacy ? 4 : 1059,
+      kind: legacy ? 4 : 1059,
       tags: [["p", selectedPartner]],
       content: "",
       sig: "",
     };
 
-    // Cache the plaintext so it renders immediately
     decryptedCache.current.set(optimisticId, text);
-    // For gift wraps, also mark as sent by us
-    if (!sendAsLegacy) {
+    if (!legacy) {
       giftWrapSenderCache.current.set(optimisticId, ownPubkey);
     }
 
-    // Insert into conversations optimistically
     setConversations((prev) => {
       const updated = prev.map((conv) => {
         if (conv.partnerPubkey !== selectedPartner) return conv;
@@ -548,7 +550,6 @@ export const Dms: React.FC = () => {
           lastTimestamp: now,
         };
       });
-      // If no conversation existed yet, create one
       if (!updated.find((c) => c.partnerPubkey === selectedPartner)) {
         updated.unshift({
           partnerPubkey: selectedPartner,
@@ -559,23 +560,15 @@ export const Dms: React.FC = () => {
       return updated;
     });
     setDecryptTick((v) => v + 1);
-    // Bump message count so the new-message effect doesn't trigger for our own send
     prevMessageCount.current += 1;
     prevTotalMessages.current += 1;
-    // Ensure we're "at bottom" so the scroll works
     isAtBottomRef.current = true;
 
-    // Clear input immediately — user can keep typing
-    setMessageInput("");
-
-    // Scroll to bottom
     setTimeout(() => {
       if (threadRef.current) threadRef.current.scrollTop = threadRef.current.scrollHeight;
     }, 50);
 
-    // Publish in background — no await, no blocking
     const partner = selectedPartner;
-    const legacy = sendAsLegacy;
     (async () => {
       try {
         if (legacy) {
@@ -583,17 +576,69 @@ export const Dms: React.FC = () => {
         } else {
           await invoke("publish_gift_wrap_dm", { content: text, recipientPubkey: partner });
         }
-        // After publish succeeds, rebuild from local DB to replace optimistic message
         const { convs } = await buildConversations(ownPubkey, signingMode);
         setConversations(convs);
       } catch (e) {
         console.error("[dms] Background publish failed:", e);
-        // Mark the optimistic message as failed
         decryptedCache.current.set(optimisticId, `[send failed] ${text}`);
         setDecryptTick((v) => v + 1);
       }
     })();
-  }, [messageInput, selectedPartner, signingMode, sendAsLegacy, ownPubkey, buildConversations]);
+  }, [selectedPartner, signingMode, ownPubkey, buildConversations]);
+
+  // Entry point when user hits send — checks for NIP-04 and prompts if needed
+  const handleSendAttempt = useCallback(() => {
+    const text = messageInput.trim();
+    if (!text || !selectedPartner || signingMode === "read-only") return;
+
+    const existingDecision = protocolDecisions.current.get(selectedPartner);
+    if (existingDecision) {
+      setMessageInput("");
+      doSend(text, existingDecision === "nip04");
+      return;
+    }
+
+    const conv = conversations.find((c) => c.partnerPubkey === selectedPartner);
+    const hasLegacy = conv ? conversationHasLegacyMessages(conv.messages) : false;
+
+    if (!hasLegacy) {
+      setMessageInput("");
+      doSend(text, false);
+      return;
+    }
+
+    // Legacy detected — show protocol prompt modal
+    pendingMessageRef.current = text;
+    setMessageInput("");
+    setShowProtocolPrompt(true);
+  }, [messageInput, selectedPartner, signingMode, conversations, doSend]);
+
+  // Handle user's choice from the protocol prompt modal
+  const handleProtocolChoice = useCallback((choice: "nip04" | "nip17") => {
+    if (!selectedPartner) return;
+    protocolDecisions.current.set(selectedPartner, choice);
+    setShowProtocolPrompt(false);
+
+    const text = pendingMessageRef.current;
+    pendingMessageRef.current = "";
+    if (text.trim()) {
+      doSend(text.trim(), choice === "nip04");
+    }
+  }, [selectedPartner, doSend]);
+
+  // Close protocol prompt on Escape
+  useEffect(() => {
+    if (!showProtocolPrompt) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setMessageInput(pendingMessageRef.current);
+        pendingMessageRef.current = "";
+        setShowProtocolPrompt(false);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [showProtocolPrompt]);
 
   // Loading state
   if (loading) {
@@ -803,21 +848,33 @@ export const Dms: React.FC = () => {
         </div>
         {signingMode !== "read-only" ? (
           <div className="dms-input-bar">
+            {selectedPartner && protocolDecisions.current.has(selectedPartner) && (
+              <button
+                className={`dms-protocol-indicator ${protocolDecisions.current.get(selectedPartner) === "nip04" ? "dms-protocol-indicator-legacy" : "dms-protocol-indicator-private"}`}
+                onClick={() => {
+                  protocolDecisions.current.delete(selectedPartner);
+                  setShowProtocolPrompt(true);
+                  pendingMessageRef.current = messageInput.trim();
+                  setMessageInput("");
+                }}
+                title={protocolDecisions.current.get(selectedPartner) === "nip04"
+                  ? "Sending as NIP-04 (legacy). Click to change."
+                  : "Sending as NIP-17 (private). Click to change."}
+              >
+                <span className="icon">
+                  {protocolDecisions.current.get(selectedPartner) === "nip04" ? <IconLockOpen /> : <IconLock />}
+                </span>
+                {protocolDecisions.current.get(selectedPartner) === "nip04" ? "04" : "17"}
+              </button>
+            )}
             <input
               type="text"
               placeholder="type a message..."
               value={messageInput}
               onChange={(e) => setMessageInput(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSendDm(); } }}
+              onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSendAttempt(); } }}
             />
-            <button
-              className="dms-protocol-toggle"
-              onClick={() => setSendAsLegacy(!sendAsLegacy)}
-              title={sendAsLegacy ? "Sending as NIP-04 (legacy). Click for NIP-17." : "Sending as NIP-17 (private). Click for NIP-04."}
-            >
-              {sendAsLegacy ? "04" : "17"}
-            </button>
-            <button onClick={handleSendDm} disabled={!messageInput.trim()}>
+            <button onClick={handleSendAttempt} disabled={!messageInput.trim()}>
               send
             </button>
           </div>
@@ -827,6 +884,64 @@ export const Dms: React.FC = () => {
             connect a signer in{" "}
             <span className="dms-settings-link" onClick={() => navigate("/settings")}>settings</span>
             {" "}to send messages
+          </div>
+        )}
+        {showProtocolPrompt && (
+          <div
+            className="wallet-modal-overlay"
+            onClick={(e) => {
+              if (e.target === e.currentTarget) {
+                setMessageInput(pendingMessageRef.current);
+                pendingMessageRef.current = "";
+                setShowProtocolPrompt(false);
+              }
+            }}
+          >
+            <div className="wallet-modal" style={{ width: 380 }}>
+              <div className="wallet-modal-header">
+                <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span className="icon" style={{ color: "#f59e0b" }}>
+                    <IconAlertTriangle />
+                  </span>
+                  legacy client detected
+                </span>
+                <button
+                  className="wallet-modal-close"
+                  onClick={() => {
+                    setMessageInput(pendingMessageRef.current);
+                    pendingMessageRef.current = "";
+                    setShowProtocolPrompt(false);
+                  }}
+                >
+                  <span className="icon"><IconX /></span>
+                </button>
+              </div>
+              <div className="wallet-modal-body">
+                <p style={{ fontSize: "0.85rem", color: "var(--text-dim)", lineHeight: 1.5, margin: 0 }}>
+                  this contact has recent NIP-04 messages, which suggests they may
+                  use a client that doesn't support NIP-17 private messages.
+                </p>
+                <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 8 }}>
+                  <button
+                    className="dms-protocol-choice-btn dms-protocol-legacy"
+                    onClick={() => handleProtocolChoice("nip04")}
+                  >
+                    <span className="icon"><IconLockOpen /></span>
+                    send as NIP-04 (legacy)
+                  </button>
+                  <button
+                    className="dms-protocol-choice-btn dms-protocol-private"
+                    onClick={() => handleProtocolChoice("nip17")}
+                  >
+                    <span className="icon"><IconLock /></span>
+                    send as NIP-17 (private)
+                  </button>
+                </div>
+                <p style={{ fontSize: "0.75rem", color: "var(--text-muted)", margin: "4px 0 0" }}>
+                  your choice will be remembered for this conversation.
+                </p>
+              </div>
+            </div>
           </div>
         )}
       </>
