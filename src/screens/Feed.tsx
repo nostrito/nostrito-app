@@ -6,7 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { IconX, IconHeart, IconHeartFilled, IconMessageCircle, IconZap, IconRepeat, IconTrash } from "../components/Icon";
 import { NoteCard, GroupedRepostCard, getRepostOriginalId, type GroupedRepost } from "../components/NoteCard";
-import { ThreadPreviewCard, type ThreadSummary } from "../components/ThreadPreviewCard";
+
 import { ZapModal } from "../components/ZapModal";
 import { ComposeModal } from "../components/ComposeModal";
 import { ArticleCard, getArticleTitle, getArticleImage, getArticleTimestamp } from "../components/ArticleCard";
@@ -303,7 +303,7 @@ export const Feed: React.FC = () => {
   const articleStageRef = useRef<"local" | "relay-follows" | "relay-wot" | "done">("local");
   const [fetchingRelay, setFetchingRelay] = useState(false);
   const [relayFetched, setRelayFetched] = useState(false);
-  const [threadSummaries, setThreadSummaries] = useState<ThreadSummary[]>([]);
+
 
   const { getProfile, ensureProfiles } = useProfileContext();
 
@@ -431,20 +431,8 @@ export const Feed: React.FC = () => {
         rawEvents = await invoke<NostrEvent[]>("fetch_global_feed", { limit: 50 });
       } else {
         rawEvents = await invoke<NostrEvent[]>("get_feed", {
-          filter: { kinds: [1, 6, 30023], limit: 50, wot_only: true, exclude_replies: true },
+          filter: { kinds: [1, 6, 30023], limit: 50, wot_only: true },
         });
-
-        // Also load thread summaries for WoT mode
-        try {
-          const summaries = await invoke<ThreadSummary[]>("get_feed_thread_roots", { limit: 20 });
-          if (summaries.length > 0) {
-            const pks = summaries.flatMap((s) => [s.root_event.pubkey, ...s.wot_replier_pubkeys]);
-            ensureProfiles([...new Set(pks)]);
-          }
-          setThreadSummaries(summaries);
-        } catch (e) {
-          console.warn("[feed] Failed to load thread summaries:", e);
-        }
       }
 
       const kindFiltered = rawEvents.filter((e) => FEED_KINDS.includes(e.kind));
@@ -634,7 +622,7 @@ export const Feed: React.FC = () => {
         rawEvents = await invoke<NostrEvent[]>("fetch_global_feed", { limit: 50, until });
       } else {
         rawEvents = await invoke<NostrEvent[]>("get_feed", {
-          filter: { kinds: [1, 6, 30023], limit: 50, wot_only: true, until, exclude_replies: true },
+          filter: { kinds: [1, 6, 30023], limit: 50, wot_only: true, until },
         });
       }
 
@@ -806,7 +794,6 @@ export const Feed: React.FC = () => {
     fetchedOriginalIdsRef.current.clear();
     setFeedEvents([]);
     setGroupedReposts(new Map());
-    setThreadSummaries([]);
     setHasMore(true);
     setHasMoreArticles(true);
     articleStageRef.current = "local";
@@ -1078,30 +1065,11 @@ export const Feed: React.FC = () => {
     }
   }
 
-  // Collect root IDs from thread summaries so we don't show them as standalone notes
-  const threadRootIds = new Set(threadSummaries.map((s) => s.root_event.id));
-
-  // Apply filter visibility, excluding individually grouped reposts and thread roots
+  // Apply filter visibility, excluding individually grouped reposts
   const filteredNotes = (activeFilter === "all"
     ? notes
     : notes.filter((e) => kindTag(e.kind) === activeFilter)
-  ).filter((e) => !groupedRepostEventIds.has(e.id) && !threadRootIds.has(e.id));
-
-  // Build combined feed: merge notes + thread summaries sorted by timestamp (WoT notes tab only)
-  type FeedItem =
-    | { type: "note"; event: NostrEvent; ts: number }
-    | { type: "thread"; summary: ThreadSummary; ts: number };
-
-  const combinedFeed: FeedItem[] = [];
-  if (feedMode === "wot" && (activeFilter === "all" || activeFilter === "note") && !isSearchMode) {
-    for (const note of filteredNotes) {
-      combinedFeed.push({ type: "note", event: note, ts: note.created_at });
-    }
-    for (const summary of threadSummaries) {
-      combinedFeed.push({ type: "thread", summary, ts: summary.latest_activity });
-    }
-    combinedFeed.sort((a, b) => b.ts - a.ts);
-  }
+  ).filter((e) => !groupedRepostEventIds.has(e.id));
 
   // Layout: articles on right column, notes on left
   const showArticleColumn = activeFilter === "all" || activeFilter === "long-form";
@@ -1282,49 +1250,20 @@ export const Feed: React.FC = () => {
               />
             ))}
 
-            {combinedFeed.length > 0 ? (
-              combinedFeed.map((item) =>
-                item.type === "thread" ? (
-                  <ThreadPreviewCard
-                    key={`thread-${item.summary.root_event.id}`}
-                    summary={item.summary}
-                    onClick={() => navigate(`/note/${item.summary.root_event.id}`)}
-                  />
-                ) : (
-                  <NoteCard
-                    key={item.event.id}
-                    event={item.event}
-                    profile={getProfile(item.event.pubkey)}
-                    onSave={feedMode === "global" ? saveEvent : undefined}
-                    saved={savedEventIds.has(item.event.id)}
-                    onClick={() => navigate(`/note/${item.event.id}`)}
-                    onZap={setZapTarget}
-                    onLike={handleLike}
-                    onUnlike={handleUnlike}
-                    onReply={setReplyTarget}
-                    onRepost={handleRepost}
-                    onDelete={item.event.pubkey === ownPubkey ? handleDelete : undefined}
-                  />
-                )
-              )
-            ) : (
-              filteredNotes.map((event) => (
-                <NoteCard
-                  key={event.id}
-                  event={event}
-                  profile={getProfile(event.pubkey)}
-                  onSave={feedMode === "global" ? saveEvent : undefined}
-                  saved={savedEventIds.has(event.id)}
-                  onClick={() => navigate(`/note/${event.id}`)}
-                  onZap={setZapTarget}
-                  onLike={handleLike}
-                  onUnlike={handleUnlike}
-                  onReply={setReplyTarget}
-                  onRepost={handleRepost}
-                  onDelete={event.pubkey === ownPubkey ? handleDelete : undefined}
-                />
-              ))
-            )}
+            {filteredNotes.map((event) => (
+              <NoteCard
+                key={event.id}
+                event={event}
+                profile={getProfile(event.pubkey)}
+                onClick={() => navigate(`/note/${event.id}`)}
+                onZap={setZapTarget}
+                onLike={handleLike}
+                onUnlike={handleUnlike}
+                onReply={setReplyTarget}
+                onRepost={handleRepost}
+                onDelete={event.pubkey === ownPubkey ? handleDelete : undefined}
+              />
+            ))}
 
             {!loading && !isSearchMode && hasMore && filteredNotes.length > 0 && (feedMode === "wot" || globalConsent) && (
               <div className="feed-sentinel">

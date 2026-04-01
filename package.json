@@ -7,7 +7,20 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:unit": "vitest run tests/utils.test.ts",
+    "test:relay": "vitest run tests/relay.test.ts",
+    "test:events": "vitest run tests/events.test.ts",
+    "test:profiles": "vitest run tests/profiles.test.ts",
+    "test:interactions": "vitest run tests/interactions.test.ts",
+    "test:advanced": "vitest run tests/advanced.test.ts",
+    "test:bookmarks": "vitest run tests/bookmarks.test.ts",
+    "test:nip19": "vitest run tests/nip19.test.ts",
+    "test:zaps": "vitest run tests/zaps.test.ts",
+    "test:media": "vitest run tests/media-and-filtering.test.ts",
+    "test:protocol": "vitest run tests/protocol-advanced.test.ts"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
@@ -19,11 +32,20 @@
     "react-router-dom": "^7.13.1"
   },
   "devDependencies": {
+    "@noble/curves": "^2.0.1",
+    "@noble/hashes": "^2.0.1",
+    "@scure/base": "^2.0.0",
+    "@scure/bip32": "^2.0.1",
+    "@scure/bip39": "^2.0.1",
     "@tauri-apps/cli": "^2",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
+    "@types/ws": "^8.18.1",
     "@vitejs/plugin-react": "^5.1.4",
+    "nostr-tools": "^2.23.3",
     "typescript": "^5.6",
-    "vite": "^6"
+    "vite": "^6",
+    "vitest": "^4.1.2",
+    "ws": "^8.20.0"
   }
 }

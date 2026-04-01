@@ -1205,6 +1205,87 @@ async fn get_notification_count(
         .map_err(|e| format!("Failed to get notification count: {}", e))
 }
 
+#[tauri::command]
+async fn fetch_notifications_from_relays(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<u32, String> {
+    use nostr_sdk::prelude::*;
+
+    let cfg = state.config.read().await;
+    let hex_pubkey = cfg.hex_pubkey.clone()
+        .ok_or("No pubkey configured")?;
+    let fallback_relays = cfg.outbound_relays.clone();
+    let lookback_days = cfg.sync_lookback_days as i64;
+    drop(cfg);
+
+    let relay_urls = resolve_sync_relays(&state.db(), &hex_pubkey, &fallback_relays);
+    if relay_urls.is_empty() {
+        return Err("No relays available".into());
+    }
+
+    let pk = PublicKey::from_hex(&hex_pubkey)
+        .map_err(|e| format!("Invalid pubkey: {}", e))?;
+
+    let since_ts = chrono::Utc::now().timestamp() - (lookback_days * 86400);
+    let since = Timestamp::from(since_ts.max(0) as u64);
+
+    // Mentions of us (replies, reposts, articles that tag us)
+    let mentions_filter = Filter::new()
+        .pubkey(pk)
+        .kinds(vec![Kind::TextNote, Kind::Repost, Kind::LongFormTextNote])
+        .since(since)
+        .limit(500);
+
+    // Reactions to our notes
+    let reactions_filter = Filter::new()
+        .pubkey(pk)
+        .kind(Kind::Reaction)
+        .since(since)
+        .limit(500);
+
+    // Zaps to our notes
+    let zaps_filter = Filter::new()
+        .pubkey(pk)
+        .kind(Kind::from(9735u16))
+        .since(since)
+        .limit(200);
+
+    let pool = crate::sync::pool::RelayPool::new();
+    let events = pool.subscribe_and_collect(
+        &relay_urls,
+        vec![mentions_filter, reactions_filter, zaps_filter],
+        20,
+    ).await.map_err(|e| format!("Relay fetch failed: {}", e))?;
+
+    if events.is_empty() {
+        app_handle.emit("notifications-updated", 0u32).ok();
+        return Ok(0);
+    }
+
+    let db = state.db();
+    let graph = Arc::clone(&state.wot_graph);
+    let (stored, _) = crate::sync::processing::process_events(
+        &events,
+        &db,
+        &graph,
+        &hex_pubkey,
+        crate::sync::types::EventSource::Sync,
+        None,
+        "notif-fetch",
+    );
+
+    app_handle.emit("notifications-updated", stored as u32).ok();
+
+    tracing::info!(
+        "[cmd:fetch_notifications] stored {} of {} events from relays",
+        stored,
+        events.len()
+    );
+
+    Ok(stored as u32)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SuggestedFollow {
     pub pubkey: String,
@@ -7555,6 +7636,7 @@ pub fn run() {
             publish_dm,
             get_notifications,
             get_notification_count,
+            fetch_notifications_from_relays,
             get_popular_hashtags,
             get_suggested_follows,
             publish_article,

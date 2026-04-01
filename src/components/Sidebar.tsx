@@ -44,8 +44,8 @@ export const Sidebar: React.FC = () => {
   const navItems = [
     { to: "/", icon: <IconFeed />, label: "feed" },
     { to: "/notifications", icon: <IconBell />, label: "notifications", badge: notifCount },
-    { to: "/bookmarks", icon: <IconBookmark />, label: "bookmarks" },
     { to: "/dms", icon: <IconMessageCircle />, label: "messages" },
+    { to: "/bookmarks", icon: <IconBookmark />, label: "bookmarks" },
     { to: "/gallery", icon: <IconImage />, label: "gallery" },
     { to: "/wallet", icon: <IconWallet />, label: "wallet" },
     { to: "/settings", icon: <IconSettings />, label: "settings" },

@@ -27,18 +27,25 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [checked, setChecked] = useState(false);
 
   useEffect(() => {
-    invoke<{ initialized: boolean; relay_port: number; relay_running: boolean }>("get_status")
-      .then((status) => {
-        setInitialized(status.initialized);
-        setAppStatus({ relay_port: status.relay_port, relay_running: status.relay_running });
-        setChecked(true);
-      })
-      .catch(() => {
-        const fallback = localStorage.getItem("nostrito_initialized") === "true";
-        setInitialized(fallback);
-        setChecked(true);
-      });
-  }, []);
+    const fetchStatus = () => {
+      invoke<{ initialized: boolean; relay_port: number; relay_running: boolean }>("get_status")
+        .then((status) => {
+          setInitialized(status.initialized);
+          setAppStatus({ relay_port: status.relay_port, relay_running: status.relay_running });
+          if (!checked) setChecked(true);
+        })
+        .catch(() => {
+          if (!checked) {
+            const fallback = localStorage.getItem("nostrito_initialized") === "true";
+            setInitialized(fallback);
+            setChecked(true);
+          }
+        });
+    };
+    fetchStatus();
+    const interval = setInterval(fetchStatus, 5_000);
+    return () => clearInterval(interval);
+  }, [checked]);
 
   const refreshOwnProfile = () => {
     invoke<ProfileInfo | null>("get_own_profile")

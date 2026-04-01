@@ -13,7 +13,7 @@ import { ZapModal } from "../components/ZapModal";
 import { ArticleCard } from "../components/ArticleCard";
 import { EmptyState } from "../components/EmptyState";
 import { ImageUploadField } from "../components/ImageUploadField";
-import { formatBytes, shortPubkey } from "../utils/format";
+import { shortPubkey } from "../utils/format";
 import { profileDisplayName } from "../utils/profiles";
 import { initMediaViewer } from "../utils/media";
 import { invalidateInteractionCounts } from "../hooks/useInteractionCounts";
@@ -277,6 +277,8 @@ export const ProfileView: React.FC = () => {
 
     const load = async () => {
       setProfileLoading(true);
+      setIsOwn(false);
+      setMenuOpen(false);
 
       // Trigger refresh if stale
       try {
@@ -508,31 +510,48 @@ export const ProfileView: React.FC = () => {
   }, [loadMoreNotes, hasMoreNotes, activeTab]);
 
   /* --- menu actions ------------------------------------------------- */
+  const copyToClipboard = useCallback(async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      // Fallback for Tauri webview
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+    }
+  }, []);
+
   const handleCopyNpub = useCallback(async () => {
     if (!pubkey) return;
     try {
       const npub = await invoke<string>("hex_to_npub", { pubkey });
-      await navigator.clipboard.writeText(npub);
+      await copyToClipboard(npub);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch (e) {
       console.error("[profile] Failed to copy npub:", e);
     }
-  }, [pubkey]);
+    setMenuOpen(false);
+  }, [pubkey, copyToClipboard]);
 
   const handleShareNjump = useCallback(async () => {
     if (!pubkey) return;
     try {
       const npub = await invoke<string>("hex_to_npub", { pubkey });
       const url = `https://njump.me/${npub}`;
-      await navigator.clipboard.writeText(url);
+      await copyToClipboard(url);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch (e) {
       console.error("[profile] Failed to share:", e);
     }
     setMenuOpen(false);
-  }, [pubkey]);
+  }, [pubkey, copyToClipboard]);
 
   const handleToggleMute = useCallback(async () => {
     if (!pubkey) return;
@@ -703,42 +722,44 @@ export const ProfileView: React.FC = () => {
                 )}
 
                 {/* Three-dots menu */}
-                {!isOwn && (
-                  <div className="profile-menu-container" ref={menuRef}>
-                    <button
-                      className="profile-menu-btn"
-                      onClick={() => setMenuOpen(!menuOpen)}
-                      title="profile actions"
-                    >
-                      <IconMoreVertical />
-                    </button>
+                <div className="profile-menu-container" ref={menuRef}>
+                  <button
+                    className="profile-menu-btn"
+                    onClick={() => setMenuOpen(!menuOpen)}
+                    title="profile actions"
+                  >
+                    <IconMoreVertical />
+                  </button>
 
-                    {menuOpen && (
-                      <div className="profile-menu-dropdown">
-                        <button className="profile-menu-item" onClick={handleCopyNpub}>
-                          <span className="icon"><IconCopy /></span>
-                          {copied ? "copied!" : "copy npub"}
-                        </button>
-                        <button className="profile-menu-item" onClick={handleShareNjump}>
-                          <span className="icon"><IconShare /></span>
-                          share via njump.me
-                        </button>
-                        <div className="profile-menu-divider" />
-                        <button className="profile-menu-item" onClick={handleToggleTrack}>
-                          <span className="icon"><IconDatabase /></span>
-                          {isTracked ? "untrack profile" : "track profile"}
-                        </button>
-                        <button
-                          className={`profile-menu-item${isMuted ? " profile-menu-item-danger" : ""}`}
-                          onClick={handleToggleMute}
-                        >
-                          <span className="icon">{isMuted ? <IconVolume /> : <IconVolumeX />}</span>
-                          {isMuted ? "unmute user" : "mute user"}
-                        </button>
-                      </div>
-                    )}
-                  </div>
-                )}
+                  {menuOpen && (
+                    <div className="profile-menu-dropdown">
+                      <button className="profile-menu-item" onClick={handleCopyNpub}>
+                        <span className="icon"><IconCopy /></span>
+                        {copied ? "copied!" : "copy npub"}
+                      </button>
+                      <button className="profile-menu-item" onClick={handleShareNjump}>
+                        <span className="icon"><IconShare /></span>
+                        share via njump.me
+                      </button>
+                      {!isOwn && (
+                        <>
+                          <div className="profile-menu-divider" />
+                          <button className="profile-menu-item" onClick={handleToggleTrack}>
+                            <span className="icon"><IconDatabase /></span>
+                            {isTracked ? "untrack profile" : "track profile"}
+                          </button>
+                          <button
+                            className={`profile-menu-item${isMuted ? " profile-menu-item-danger" : ""}`}
+                            onClick={handleToggleMute}
+                          >
+                            <span className="icon">{isMuted ? <IconVolume /> : <IconVolumeX />}</span>
+                            {isMuted ? "unmute user" : "mute user"}
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  )}
+                </div>
               </div>
 
               <div className="profile-hero-npub">{truncatedPubkey}</div>

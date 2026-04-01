@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { IconHeart, IconRepeat, IconZap, IconMessageCircle } from "../components/Icon";
 import { Avatar } from "../components/Avatar";
 import { timeAgo } from "../utils/format";
@@ -55,6 +56,7 @@ export const Notifications: React.FC = () => {
 
   const [events, setEvents] = useState<NostrEvent[]>([]);
   const [loading, setLoading] = useState(true);
+  const [fetching, setFetching] = useState(false);
   const [hasMore, setHasMore] = useState(true);
   const sentinelRef = useRef<HTMLDivElement>(null);
 
@@ -91,9 +93,42 @@ export const Notifications: React.FC = () => {
     }
   }, [ensureProfiles]);
 
-  // Initial load
+  // Initial load: show local data immediately, then fetch from relays
   useEffect(() => {
     loadNotifications();
+
+    // Fetch fresh notifications from relays in the background
+    setFetching(true);
+    invoke("fetch_notifications_from_relays")
+      .then((stored) => {
+        if (typeof stored === "number" && stored > 0) {
+          // Reload from DB with the new events
+          loadNotifications();
+        }
+      })
+      .catch((err) => console.warn("[notifications] relay fetch failed:", err))
+      .finally(() => setFetching(false));
+  }, [loadNotifications]);
+
+  // Listen for notifications-updated event (from the fetch command)
+  useEffect(() => {
+    const unlisten = listen<number>("notifications-updated", (event) => {
+      if (event.payload > 0) {
+        loadNotifications();
+      }
+    });
+    return () => { unlisten.then((fn) => fn()); };
+  }, [loadNotifications]);
+
+  // Also refresh when sync completes a cycle
+  useEffect(() => {
+    const unlisten = listen("sync:tier_complete", (event: any) => {
+      if (event.payload?.tier === 0) {
+        // tier 0 = idle = full cycle done
+        loadNotifications();
+      }
+    });
+    return () => { unlisten.then((fn) => fn()); };
   }, [loadNotifications]);
 
   // Infinite scroll
@@ -123,13 +158,20 @@ export const Notifications: React.FC = () => {
   if (!loading && events.length === 0) {
     return (
       <div className="notifications-page">
-        <div style={{ padding: 40, color: "var(--text-muted)", textAlign: "center" }}>no notifications yet</div>
+        <div style={{ padding: 40, color: "var(--text-muted)", textAlign: "center" }}>
+          {fetching ? "fetching notifications from relays..." : "no notifications yet"}
+        </div>
       </div>
     );
   }
 
   return (
     <div className="notifications-page">
+      {fetching && (
+        <div style={{ padding: "8px 16px", color: "var(--text-muted)", fontSize: 13, textAlign: "center" }}>
+          fetching from relays...
+        </div>
+      )}
       {events.map((event) => {
         const profile = getProfile(event.pubkey);
         const displayName = profileDisplayName(profile, event.pubkey);

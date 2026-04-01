@@ -98,46 +98,48 @@ Last updated: 2026-03-24
 | 8 | **Media upload** | Upload integration (nostr.build / blossom). Unlocks profile picture editing, article covers, image notes. |
 | 9 | **Mentions autocomplete** | @-mention suggestions when composing. Need profile search-as-you-type in ComposeModal. |
 | 10 | **Image/video preview in compose** | Show preview when pasting media URLs before publishing. |
+| 11 | **Feed layout UX polish** | Improve how the feed feels — spacing, card layout, visual hierarchy, readability. Make the timeline pleasant to scroll through. |
 
 ### P2 — Ecosystem & Discovery (medium effort, differentiating)
 
 | # | Feature | Notes |
 |---|---------|-------|
-| 11 | **Trending / popular content** | Trending notes, hashtags, profiles. Could use relay aggregation or local heuristics. |
-| 12 | **Suggested follows** | WoT-based recommendations — graph is already there, need ranking + UI. |
-| 13 | **Lists** (NIP-51 kind 30000) | Categorized people lists (friends, devs, news, etc.). |
-| 14 | **Event rebroadcasting** | Re-publish tracked users' events that fell off relays. Signed events are immutable — any relay will accept them. |
-| 15 | **Content warnings** (NIP-36) | Support `content-warning` tag — blur/collapse with reveal button. |
+| 12 | **Trending / popular content** | Trending notes, hashtags, profiles. Could use relay aggregation or local heuristics. |
+| 13 | **Suggested follows** | WoT-based recommendations — graph is already there, need ranking + UI. |
+| 14 | **Lists** (NIP-51 kind 30000) | Categorized people lists (friends, devs, news, etc.). |
+| 15 | **Event rebroadcasting** | Re-publish tracked users' events that fell off relays. Signed events are immutable — any relay will accept them. |
+| 16 | **Content warnings** (NIP-36) | Support `content-warning` tag — blur/collapse with reveal button. |
+| 17 | **Spanish translation (i18n)** | Prepare full Spanish localization. Requires i18n infrastructure (string extraction, locale switching) + translated strings. |
 
 ### P3 — Nice to Have (lower urgency)
 
 | # | Feature | Notes |
 |---|---------|-------|
-| 16 | **Drafts** | Auto-save compose state. |
-| 17 | **Keyboard shortcuts** | Navigation, compose, search. |
-| 18 | **Per-relay read/write preferences** | Backend supports directions, UI doesn't expose it. |
-| 19 | **Relay NIP-11 info display** | Show relay capabilities, software, limitations in relay management. |
-| 20 | **Export / import** | Export events to JSON, import from backup. |
-| 21 | **Client tag** (NIP-89) | Tag events with Nostrito client identifier. Also useful as a signal for DM compatibility detection. |
-| 22 | **Theme customization** | Light/dark toggle. CSS variables exist, needs runtime switcher. |
+| 18 | **Drafts** | Auto-save compose state. |
+| 19 | **Keyboard shortcuts** | Navigation, compose, search. |
+| 20 | **Per-relay read/write preferences** | Backend supports directions, UI doesn't expose it. |
+| 21 | **Relay NIP-11 info display** | Show relay capabilities, software, limitations in relay management. |
+| 22 | **Export / import** | Export events to JSON, import from backup. |
+| 23 | **Client tag** (NIP-89) | Tag events with Nostrito client identifier. Also useful as a signal for DM compatibility detection. |
+| 24 | **Theme customization** | Light/dark toggle. CSS variables exist, needs runtime switcher. |
 
 ### P4 — Long Tail
 
 | # | Feature | Notes |
 |---|---------|-------|
-| 23 | **Group DMs** | Multi-party encrypted conversations. |
-| 24 | **Custom emoji** (NIP-30) | Custom emoji reactions and display. |
-| 25 | **Polls** (NIP-1078) | Create and vote on polls. |
-| 26 | **Highlights** (kind 9802) | Highlight text passages from articles. |
-| 27 | **Labels** (NIP-32) | Content labeling/categorization. |
-| 28 | **Communities** (NIP-72) | Moderated community groups. |
-| 29 | **Scheduled posts** | Publish notes at a future time. |
-| 30 | **Auto-zaps / recurring zaps** | Automatic zapping. |
-| 31 | **Split zaps** (NIP-57) | Zap multiple recipients. |
-| 32 | **Lightning address verification** | Verify lud16 before zapping. |
-| 33 | **Media rebroadcasting** | Re-upload dead media from cache. Partially solvable (see Data Preservation notes below). |
-| 34 | **Event signature verification UI** | Verify event authenticity in the UI. |
-| 35 | **Browser extension integration** | Setup exists but incomplete. |
+| 25 | **Group DMs** | Multi-party encrypted conversations. |
+| 26 | **Custom emoji** (NIP-30) | Custom emoji reactions and display. |
+| 27 | **Polls** (NIP-1078) | Create and vote on polls. |
+| 28 | **Highlights** (kind 9802) | Highlight text passages from articles. |
+| 29 | **Labels** (NIP-32) | Content labeling/categorization. |
+| 30 | **Communities** (NIP-72) | Moderated community groups. |
+| 31 | **Scheduled posts** | Publish notes at a future time. |
+| 32 | **Auto-zaps / recurring zaps** | Automatic zapping. |
+| 33 | **Split zaps** (NIP-57) | Zap multiple recipients. |
+| 34 | **Lightning address verification** | Verify lud16 before zapping. |
+| 35 | **Media rebroadcasting** | Re-upload dead media from cache. Partially solvable (see Data Preservation notes below). |
+| 36 | **Event signature verification UI** | Verify event authenticity in the UI. |
+| 37 | **Browser extension integration** | Setup exists but incomplete. |
 
 ---
 
