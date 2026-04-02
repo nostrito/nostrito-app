@@ -32,6 +32,7 @@ import {
   IconArchive,
   IconSearch,
   IconX,
+  IconCode,
 } from "../components/Icon";
 import {
   STORAGE_PRESETS,
@@ -76,7 +77,7 @@ interface TrackedProfile {
   note: string | null;
 }
 
-type TabId = "identity" | "relays" | "storage" | "advanced" | "tracked" | "analytics";
+type TabId = "identity" | "relays" | "storage" | "advanced" | "tracked" | "analytics" | "debug";
 
 interface SaveFeedback {
   type: "success" | "error";
@@ -217,6 +218,7 @@ const TABS: { id: TabId; label: string; Icon: React.FC }[] = [
   { id: "tracked", label: "tracked profiles", Icon: IconUsers },
   { id: "analytics", label: "analytics", Icon: IconDashboard },
   { id: "advanced", label: "advanced", Icon: IconSettingsIcon },
+  { id: "debug", label: "debug", Icon: IconCode },
 ];
 
 // Moved to advanced customize sliders — no longer need standalone preset buttons
@@ -2376,7 +2378,191 @@ export const Settings: React.FC = () => {
             )}
           </div>
         </div>
+
+        {/* ── Debug pane ─────────────────────────────────── */}
+        <div className={`settings-pane${activeTab === "debug" ? " active" : ""}`} id="pane-debug">
+          <DebugPane />
+        </div>
+
       </div>
     </div>
   );
 };
+
+/* ------------------------------------------------------------------ */
+/*  Debug Pane                                                         */
+/* ------------------------------------------------------------------ */
+
+const DEBUG_KINDS: { value: string; label: string }[] = [
+  { value: "",      label: "all kinds" },
+  { value: "0",     label: "0 — Metadata" },
+  { value: "1",     label: "1 — Short Text Note" },
+  { value: "3",     label: "3 — Contact List" },
+  { value: "4",     label: "4 — Encrypted DM" },
+  { value: "5",     label: "5 — Deletion" },
+  { value: "6",     label: "6 — Repost" },
+  { value: "7",     label: "7 — Reaction" },
+  { value: "10000", label: "10000 — Mute List" },
+  { value: "10002", label: "10002 — Relay List" },
+  { value: "10003", label: "10003 — Bookmarks" },
+  { value: "9735",  label: "9735 — Zap Receipt" },
+  { value: "1059",  label: "1059 — Gift Wrap" },
+  { value: "30023", label: "30023 — Long-form Article" },
+];
+
+const KIND_NAMES: Record<number, string> = Object.fromEntries(
+  DEBUG_KINDS.filter(d => d.value).map(d => [Number(d.value), d.label.split(" — ")[1]])
+);
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const DebugEventCard: React.FC<{ ev: any; onDecrypt: (id: string, content: string) => void; decrypted?: string }> = ({ ev, onDecrypt, decrypted }) => {
+  const [expanded, setExpanded] = useState(false);
+  const hasEncrypted = ev.content?.includes("?iv=");
+  const kindLabel = KIND_NAMES[ev.kind] || `kind ${ev.kind}`;
+  const ts = new Date(ev.created_at * 1000).toLocaleString();
+
+  let displayContent = "";
+  if (decrypted) {
+    try { displayContent = JSON.stringify(JSON.parse(decrypted), null, 2); } catch { displayContent = decrypted; }
+  } else if (ev.content) {
+    displayContent = ev.content;
+  }
+
+  return (
+    <div className="debug-event">
+      <div className="debug-event-header" onClick={() => setExpanded(!expanded)}>
+        <span className="debug-event-kind">{kindLabel}</span>
+        <span className="debug-event-time">{ts}</span>
+        <span className="debug-event-id">{ev.id.slice(0, 16)}...</span>
+        <span className="debug-expand">{expanded ? "collapse" : "expand"}</span>
+      </div>
+      {expanded && (
+        <div className="debug-event-body">
+          <div className="debug-section">
+            <div className="debug-label">tags ({Array.isArray(ev.tags) ? ev.tags.length : 0})</div>
+            <pre className="debug-pre">{JSON.stringify(ev.tags, null, 2)}</pre>
+          </div>
+          <div className="debug-section">
+            <div className="debug-label">
+              content ({ev.content?.length || 0} chars)
+              {hasEncrypted && !decrypted && (
+                <button className="debug-decrypt-btn" onClick={(e) => { e.stopPropagation(); onDecrypt(ev.id, ev.content); }}>
+                  decrypt
+                </button>
+              )}
+              {decrypted && <span className="debug-decrypted-badge">decrypted</span>}
+            </div>
+            <pre className="debug-pre">{displayContent || "(empty)"}</pre>
+          </div>
+          <div className="debug-section">
+            <div className="debug-label">full event JSON</div>
+            <pre className="debug-pre">{JSON.stringify(ev, null, 2)}</pre>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const DebugPane: React.FC = () => {
+  const [kind, setKind] = useState("10003");
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const [events, setEvents] = useState<any[]>([]);
+  const [decrypted, setDecrypted] = useState<Record<string, string>>({});
+  const [configKeys, setConfigKeys] = useState<[string, string][]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [tab, setTab] = useState<"events" | "config">("events");
+
+  const queryEvents = useCallback(async () => {
+    setLoading(true);
+    setDecrypted({});
+    setError("");
+    try {
+      const k = kind === "" ? null : parseInt(kind, 10);
+      const result = await invoke<unknown[]>("debug_query_events", {
+        kind: k != null && !isNaN(k) ? k : null,
+        pubkey: null,
+        limit: 50,
+      });
+      setEvents(result as any[]);
+    } catch (err) {
+      setError(String(err));
+      setEvents([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [kind]);
+
+  const decryptContent = useCallback(async (eventId: string, content: string) => {
+    try {
+      const plain = await invoke<string>("debug_decrypt_content", { content });
+      setDecrypted(prev => ({ ...prev, [eventId]: plain }));
+    } catch (err) {
+      setDecrypted(prev => ({ ...prev, [eventId]: `error: ${err}` }));
+    }
+  }, []);
+
+  const loadConfig = useCallback(async () => {
+    try {
+      const result = await invoke<[string, string][]>("debug_get_config_keys");
+      setConfigKeys(result);
+    } catch (err) {
+      console.warn("[debug] config failed:", err);
+    }
+  }, []);
+
+  useEffect(() => { if (tab === "config") loadConfig(); }, [tab, loadConfig]);
+
+  return (
+    <div className="debug-pane">
+      <h3 className="settings-pane-title">debug inspector</h3>
+      <p className="settings-pane-desc">Inspect raw Nostr events stored locally and internal app state.</p>
+
+      <div className="debug-tabs">
+        <button className={`debug-tab${tab === "events" ? " active" : ""}`} onClick={() => setTab("events")}>events</button>
+        <button className={`debug-tab${tab === "config" ? " active" : ""}`} onClick={() => setTab("config")}>app config</button>
+      </div>
+
+      {tab === "events" && (
+        <>
+          <div className="debug-toolbar">
+            <select className="debug-select" value={kind} onChange={e => setKind(e.target.value)}>
+              {DEBUG_KINDS.map(d => <option key={d.value} value={d.value}>{d.label}</option>)}
+            </select>
+            <button className="debug-query-btn" onClick={queryEvents} disabled={loading}>
+              {loading ? "loading..." : "query"}
+            </button>
+            {events.length > 0 && <span className="debug-count">{events.length} results</span>}
+          </div>
+          {error && <div className="debug-error">{error}</div>}
+          <div className="debug-events-list">
+            {events.map((ev) => (
+              <DebugEventCard key={ev.id} ev={ev} onDecrypt={decryptContent} decrypted={decrypted[ev.id]} />
+            ))}
+            {!loading && events.length === 0 && !error && (
+              <div className="debug-empty">No events. Click "query" to search.</div>
+            )}
+          </div>
+        </>
+      )}
+
+      {tab === "config" && (
+        <>
+          <div className="debug-toolbar">
+            <button className="debug-query-btn" onClick={loadConfig}>refresh</button>
+            <span className="debug-count">{configKeys.length} keys</span>
+          </div>
+          <div className="debug-config-list">
+            {configKeys.map(([key, value]) => (
+              <div key={key} className="debug-config-row">
+                <span className="debug-config-key">{key}</span>
+                <span className="debug-config-value">{value}</span>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}

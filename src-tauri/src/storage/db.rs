@@ -152,6 +152,19 @@ impl Database {
                 UNIQUE(event_id, media_url)
             );
             CREATE INDEX IF NOT EXISTS idx_bookmarked_media_at ON bookmarked_media(bookmarked_at DESC);
+
+            CREATE TABLE IF NOT EXISTS bookmark_lists (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+            );
+            CREATE TABLE IF NOT EXISTS bookmark_list_items (
+                list_id TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                added_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                PRIMARY KEY (list_id, event_id),
+                FOREIGN KEY (list_id) REFERENCES bookmark_lists(id) ON DELETE CASCADE
+            );
         "#,
         )?;
 
@@ -3460,6 +3473,185 @@ impl Database {
             }
         }
         Ok(count)
+    }
+
+    /// Replace all bookmarks with the given set (full sync from relay).
+    /// Clears existing bookmarks and inserts the relay's authoritative list.
+    pub fn replace_all_bookmarks(&self, event_ids: &[String]) -> Result<u32> {
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM bookmarked_events", [])?;
+        for event_id in event_ids {
+            conn.execute(
+                "INSERT OR IGNORE INTO bookmarked_events (event_id) VALUES (?1)",
+                params![event_id],
+            )?;
+        }
+        Ok(event_ids.len() as u32)
+    }
+
+    /// Get the latest stored kind 10003 event for a given pubkey.
+    /// Returns (tags_json, content, created_at) or None.
+    pub fn get_latest_bookmark_event(&self, pubkey: &str) -> Result<Option<(String, String, i64)>> {
+        let conn = self.conn.lock();
+        match conn.query_row(
+            "SELECT tags, content, created_at FROM nostr_events WHERE pubkey = ?1 AND kind = 10003 ORDER BY created_at DESC LIMIT 1",
+            params![pubkey],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?)),
+        ) {
+            Ok(row) => Ok(Some(row)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    // ── Bookmark Lists (NIP-51 kind 30003 sets) ─────────────────────
+
+    /// Create a new bookmark list. Returns true if created.
+    pub fn create_bookmark_list(&self, id: &str, name: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let rows = conn.execute(
+            "INSERT OR IGNORE INTO bookmark_lists (id, name) VALUES (?1, ?2)",
+            params![id, name],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Delete a bookmark list and its items.
+    pub fn delete_bookmark_list(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM bookmark_list_items WHERE list_id = ?1", params![id])?;
+        let rows = conn.execute("DELETE FROM bookmark_lists WHERE id = ?1", params![id])?;
+        Ok(rows > 0)
+    }
+
+    /// Rename a bookmark list.
+    pub fn rename_bookmark_list(&self, id: &str, name: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let rows = conn.execute(
+            "UPDATE bookmark_lists SET name = ?1 WHERE id = ?2",
+            params![name, id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Get all bookmark lists.
+    pub fn get_bookmark_lists(&self) -> Result<Vec<(String, String, i64)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, created_at FROM bookmark_lists ORDER BY created_at ASC"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Add an event to a bookmark list.
+    pub fn add_to_bookmark_list(&self, list_id: &str, event_id: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let rows = conn.execute(
+            "INSERT OR IGNORE INTO bookmark_list_items (list_id, event_id) VALUES (?1, ?2)",
+            params![list_id, event_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Remove an event from a bookmark list.
+    pub fn remove_from_bookmark_list(&self, list_id: &str, event_id: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let rows = conn.execute(
+            "DELETE FROM bookmark_list_items WHERE list_id = ?1 AND event_id = ?2",
+            params![list_id, event_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Get event IDs in a bookmark list.
+    pub fn get_bookmark_list_items(&self, list_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT event_id FROM bookmark_list_items WHERE list_id = ?1 ORDER BY added_at DESC"
+        )?;
+        let rows = stmt.query_map(params![list_id], |row| row.get::<_, String>(0))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Get events in a bookmark list (joined with nostr_events).
+    pub fn get_bookmark_list_events(&self, list_id: &str, limit: u32) -> Result<Vec<(String, String, i64, i64, String, String, String, i64)>> {
+        type Row = (String, String, i64, i64, String, String, String, i64);
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT e.id, e.pubkey, e.created_at, e.kind, e.tags, e.content, e.sig, i.added_at
+             FROM bookmark_list_items i
+             INNER JOIN nostr_events e ON e.id = i.event_id
+             WHERE i.list_id = ?1
+             ORDER BY i.added_at DESC
+             LIMIT ?2"
+        )?;
+        let results: Vec<Row> = stmt.query_map(params![list_id, limit], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, i64>(7)?,
+            ))
+        })?.filter_map(|r| r.ok()).collect();
+        Ok(results)
+    }
+
+    /// Get all list IDs that contain a given event.
+    pub fn get_lists_containing_event(&self, event_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT list_id FROM bookmark_list_items WHERE event_id = ?1"
+        )?;
+        let rows = stmt.query_map(params![event_id], |row| row.get::<_, String>(0))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Debug: query raw events by kind and/or pubkey.
+    pub fn debug_query_events(&self, kind: Option<u32>, pubkey: &str, limit: u32)
+        -> Result<Vec<(String, String, i64, i64, String, String, String)>>
+    {
+        let conn = self.conn.lock();
+        let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match kind {
+            Some(k) => (
+                "SELECT id, pubkey, created_at, kind, tags, content, sig FROM nostr_events WHERE pubkey = ?1 AND kind = ?2 ORDER BY created_at DESC LIMIT ?3".to_string(),
+                vec![Box::new(pubkey.to_string()), Box::new(k as i64), Box::new(limit as i64)],
+            ),
+            None => (
+                "SELECT id, pubkey, created_at, kind, tags, content, sig FROM nostr_events WHERE pubkey = ?1 ORDER BY created_at DESC LIMIT ?2".to_string(),
+                vec![Box::new(pubkey.to_string()), Box::new(limit as i64)],
+            ),
+        };
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_refs.as_slice(), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })?.collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Debug: get all app_config key/value pairs.
+    pub fn debug_get_all_config(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("SELECT key, value FROM app_config ORDER BY key")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?.collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Get all thread events for a given root ID (the root itself + all events referencing it).

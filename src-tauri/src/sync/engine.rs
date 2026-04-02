@@ -278,7 +278,7 @@ impl SyncEngine {
         // Fetch own metadata + contacts (replaceable events — always get latest)
         let meta_filter = Filter::new()
             .author(pk)
-            .kinds(vec![Kind::Metadata, Kind::ContactList, Kind::MuteList, Kind::RelayList])
+            .kinds(vec![Kind::Metadata, Kind::ContactList, Kind::MuteList, Kind::RelayList, Kind::from(10003)])
             .limit(10);
 
         // Use cursor to avoid re-fetching own events we already have
@@ -396,6 +396,12 @@ impl SyncEngine {
 
         // Touch own cursor so next cycle uses this as the since bound
         self.db.touch_user_cursor(&self.hex_pubkey).ok();
+
+        // If kind 10003 was fetched, trigger bookmark cache refresh
+        if events.iter().any(|e| e.kind().as_u16() == 10003) {
+            self.app_handle.emit("bookmarks:refresh", ()).ok();
+            info!("Phase 1: emitted bookmarks:refresh (kind 10003 found)");
+        }
 
         {
             let mut ss = self.sync_stats.write().await;

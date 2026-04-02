@@ -425,3 +425,250 @@
   display: flex;
   flex-direction: column;
 }
+
+/* Bookmark tabs */
+.bk-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 0 8px 8px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.bk-tabs::-webkit-scrollbar { display: none; }
+.bk-tab {
+  padding: 6px 14px;
+  font-size: 0.78rem;
+  font-weight: 500;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.15s;
+}
+.bk-tab:hover { color: var(--text-primary); border-color: var(--text-dim); }
+.bk-tab.active {
+  color: var(--accent-light);
+  border-color: var(--accent);
+  background: rgba(124,58,237,0.08);
+}
+.bk-tab-count {
+  margin-left: 4px;
+  font-size: 0.68rem;
+  opacity: 0.6;
+}
+.bk-tab-add {
+  font-size: 0.9rem;
+  padding: 6px 12px;
+  color: var(--text-dim);
+}
+.bk-tab-add:hover { color: var(--accent-light); }
+.bk-tab-create {
+  display: flex;
+  align-items: center;
+}
+.bk-tab-input {
+  padding: 5px 10px;
+  font-size: 0.78rem;
+  background: var(--bg);
+  border: 1px solid var(--accent);
+  border-radius: 16px;
+  color: var(--text-primary);
+  outline: none;
+  width: 120px;
+}
+
+/* Bookmark list management bar */
+.bk-list-bar {
+  padding: 4px 8px 8px;
+}
+.bk-list-actions {
+  display: flex;
+  gap: 8px;
+}
+.bk-list-action {
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  background: none;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.bk-list-action:hover { color: var(--text-primary); }
+.bk-list-action-danger:hover { color: #dc2626; }
+.bk-list-edit {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.bk-list-edit-save {
+  font-size: 0.72rem;
+  color: var(--accent-light);
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+/* Bookmark note row with remove button */
+.bk-note-row {
+  position: relative;
+}
+.bk-remove-btn {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-dim);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s, color 0.15s;
+  z-index: 2;
+}
+.bk-note-row:hover .bk-remove-btn { opacity: 1; }
+.bk-remove-btn:hover { color: #dc2626; border-color: #dc2626; }
+.bk-remove-btn .icon svg { width: 12px; height: 12px; }
+
+/* ── Bookmark Popover ─────────────────────────────────────── */
+.bk-popover {
+  position: fixed;
+  z-index: 1100;
+  width: 240px;
+  background: var(--bg-card, var(--bg));
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+  overflow: hidden;
+}
+.bk-popover-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px 6px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.bk-popover-close {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 2px;
+}
+.bk-popover-close:hover { color: var(--text-primary); }
+.bk-popover-close .icon svg { width: 14px; height: 14px; }
+
+.bk-popover-primary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 12px;
+  font-size: 0.78rem;
+  color: var(--text-primary);
+  background: none;
+  border: none;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+.bk-popover-primary:hover { background: rgba(255,255,255,0.04); }
+.bk-popover-primary.active {
+  color: var(--accent-light);
+}
+.bk-popover-primary .icon svg { width: 16px; height: 16px; }
+
+.bk-popover-lists {
+  border-top: 1px solid var(--border);
+  padding: 4px 0;
+}
+.bk-popover-section-title {
+  padding: 6px 12px 2px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.bk-popover-list-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 12px;
+  font-size: 0.76rem;
+  color: var(--text-primary);
+  background: none;
+  border: none;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+.bk-popover-list-item:hover { background: rgba(255,255,255,0.04); }
+.bk-popover-list-item.active { color: var(--accent-light); }
+.bk-list-check {
+  width: 16px;
+  text-align: center;
+  font-size: 0.72rem;
+  color: var(--accent-light);
+}
+.bk-list-name {
+  flex: 1;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bk-list-count {
+  font-size: 0.68rem;
+  color: var(--text-dim);
+}
+
+.bk-popover-new-list {
+  display: block;
+  width: 100%;
+  padding: 8px 12px;
+  font-size: 0.76rem;
+  color: var(--text-dim);
+  background: none;
+  border: none;
+  border-top: 1px solid var(--border);
+  cursor: pointer;
+  text-align: left;
+}
+.bk-popover-new-list:hover { color: var(--accent-light); }
+
+.bk-popover-create {
+  display: flex;
+  gap: 6px;
+  padding: 6px 10px 8px;
+  border-top: 1px solid var(--border);
+}
+.bk-popover-input {
+  flex: 1;
+  padding: 4px 8px;
+  font-size: 0.76rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-primary);
+  outline: none;
+}
+.bk-popover-input:focus { border-color: var(--accent); }
+.bk-popover-create-btn {
+  font-size: 0.72rem;
+  color: var(--accent-light);
+  background: none;
+  border: none;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.bk-popover-create-btn:disabled { opacity: 0.4; cursor: default; }

@@ -14,7 +14,8 @@ import { useInteractionCounts } from "../hooks/useInteractionCounts";
 import { useEnrichment } from "../hooks/useEnrichment";
 import { useReactionStatus } from "../hooks/useReactionStatus";
 import { useRepostStatus } from "../hooks/useRepostStatus";
-import { useBookmarkStatus, markBookmarked, markUnbookmarked } from "../hooks/useBookmarkStatus";
+import { useBookmarkStatus } from "../hooks/useBookmarkStatus";
+import { BookmarkPopover } from "./BookmarkPopover";
 import type { NostrEvent } from "../types/nostr";
 
 /** Hook to show a transient toast when user clicks a disabled action. */
@@ -443,16 +444,16 @@ const NoteCardInner: React.FC<{
   const toast = useActionToast();
   const displayName = profileDisplayName(profile, event.pubkey);
 
+  const [bookmarkPopover, setBookmarkPopover] = useState<DOMRect | null>(null);
+
   const handleSigningClick = (e: React.MouseEvent) => { e.stopPropagation(); toast.show("signing"); };
   const handleZapClick = (e: React.MouseEvent) => { e.stopPropagation(); toast.show("zap"); };
-  const handleBookmarkClick = useCallback(async (e: React.MouseEvent) => {
+  const handleBookmarkClick = useCallback((e: React.MouseEvent) => {
     e.stopPropagation();
     if (!canWrite) { toast.show("signing"); return; }
-    try {
-      const nowBookmarked = await invoke<boolean>("toggle_bookmark", { eventId: event.id });
-      if (nowBookmarked) { markBookmarked(event.id); } else { markUnbookmarked(event.id); }
-    } catch (err) { console.warn("[bookmark] toggle failed:", err); }
-  }, [event.id, canWrite]);
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    setBookmarkPopover((prev) => prev ? null : rect);
+  }, [canWrite]);
 
   const mentionedPubkeys = useMemo(() => {
     const pks = extractMentionedPubkeys(event.content);
@@ -494,6 +495,7 @@ const NoteCardInner: React.FC<{
             <button className={`ev-action${!canWrite ? " ev-action-disabled" : ""}`} onClick={canWrite ? (e) => { e.stopPropagation(); onZap?.(event); } : handleZapClick}><span className="icon"><IconZap /></span>{counts?.zaps ? ` ${counts.zaps}` : ""}</button>
           </div>
         )}
+        {bookmarkPopover && <BookmarkPopover event={event} onClose={() => setBookmarkPopover(null)} anchorRect={bookmarkPopover} />}
       </div>
     </div>
   );
@@ -511,16 +513,16 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, ful
   const { canWrite } = useSigningContext();
   const toast = useActionToast();
 
+  const [bookmarkPopover, setBookmarkPopover] = useState<DOMRect | null>(null);
+
   const handleSigningClick = (e: React.MouseEvent) => { e.stopPropagation(); toast.show("signing"); };
   const handleZapClick = (e: React.MouseEvent) => { e.stopPropagation(); toast.show("zap"); };
-  const handleBookmarkClick = useCallback(async (e: React.MouseEvent) => {
+  const handleBookmarkClick = useCallback((e: React.MouseEvent) => {
     e.stopPropagation();
     if (!canWrite) { toast.show("signing"); return; }
-    try {
-      const nowBookmarked = await invoke<boolean>("toggle_bookmark", { eventId: event.id });
-      if (nowBookmarked) { markBookmarked(event.id); } else { markUnbookmarked(event.id); }
-    } catch (err) { console.warn("[bookmark] toggle failed:", err); }
-  }, [event.id, canWrite]);
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    setBookmarkPopover((prev) => prev ? null : rect);
+  }, [canWrite]);
 
   // Extract and ensure profiles for mentioned pubkeys (+ original author for reposts)
   const mentionedPubkeys = useMemo(() => {
@@ -606,6 +608,7 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, ful
                 <button className={`ev-action${!canWrite ? " ev-action-disabled" : ""}`} onClick={canWrite ? (e) => { e.stopPropagation(); onZap?.(event); } : handleZapClick}><span className="icon"><IconZap /></span>{counts?.zaps ? ` ${counts.zaps}` : ""}</button>
               </div>
             )}
+            {bookmarkPopover && <BookmarkPopover event={event} onClose={() => setBookmarkPopover(null)} anchorRect={bookmarkPopover} />}
           </div>
         </div>
       </div>
@@ -666,6 +669,7 @@ export const NoteCard: React.FC<NoteCardProps> = ({ event, profile, compact, ful
             {onDelete && <button className="ev-action ev-action-delete" onClick={(e) => { e.stopPropagation(); onDelete(event); }} title="delete note"><span className="icon"><IconTrash /></span></button>}
           </div>
         )}
+        {bookmarkPopover && <BookmarkPopover event={event} onClose={() => setBookmarkPopover(null)} anchorRect={bookmarkPopover} />}
       </div>
     </div>
   );
